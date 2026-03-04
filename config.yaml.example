@@ -1,0 +1,88 @@
+# Obsidian Vault Semantic Index — config (cloud providers)
+# Copy to config.yaml and set vault_root / index_root for your environment.
+# API keys: use env vars (e.g. GEMINI_API_KEY), not this file.
+#
+# This config uses cloud APIs only — no local servers required.
+# For local/self-hosted providers, see config.local.yaml.example.
+
+vault_root: "/path/to/your/obsidian-vault"
+index_root: "/path/to/index/output"
+
+scan:
+  # Supported file types: md (Markdown), pdf, and images (png/jpg/jpeg).
+  # Adding other extensions here will scan them but the extractor will
+  # silently skip them — new formats need an extractor in extractors.py.
+  include:
+    - "**/*.md"
+    - "**/*.pdf"
+    - "**/*.png"
+    - "**/*.jpg"
+    - "**/*.jpeg"
+  exclude:
+    - ".obsidian/**"
+    - ".trash/**"
+    - "**/.DS_Store"
+    - "**/node_modules/**"                # npm dependencies — not user content
+    # Add your own exclude patterns here
+
+pdf:
+  strategy: "text_then_ocr"
+  ocr_page_limit: 200
+  min_text_chars_before_ocr: 200
+
+ocr:
+  enabled: true
+  provider: "gemini"                      # cloud OCR via Gemini Vision
+  model: "gemini-2.0-flash"
+  timeout: 120
+  concurrency: 2
+  # Local alternative: provider: "deepseek_ocr2" — see config.local.yaml.example
+
+embeddings:
+  provider: "openrouter"                  # Qwen3-Embedding-8B via OpenRouter
+  model: "qwen/qwen3-embedding-8b"
+  batch_size: 64
+  concurrency: 2
+  # Alternatives: "baseten", "ollama" (local), "gemini" — see config.local.yaml.example
+
+chunking:
+  max_chars: 1800
+  overlap: 200
+  min_chars: 150
+  semantic:
+    enabled: false                        # disabled — requires local Ollama server
+    # Enable with local Ollama: see config.local.yaml.example
+
+enrichment:
+  enabled: true
+  provider: "openrouter"                  # GPT-4.1 Mini via OpenRouter
+  model: "openai/gpt-4.1-mini"
+  max_input_chars: 20000                  # head+tail sampling: 10000 chars from start + 10000 from end
+  max_output_tokens: 5000
+  # Alternatives: "baseten", "ollama" (local) — see config.local.yaml.example
+
+search:
+  mode: "hybrid"                          # parallel vector + keyword (BM25/FTS), fused with RRF
+  vector_top_k: 50
+  keyword_top_k: 50
+  final_top_k: 10
+  rrf_k: 60
+  recency:
+    half_life_days: 90
+    weight: 0.3
+  reranker:
+    enabled: true
+    provider: "baseten"                   # Qwen3-Reranker-8B via Baseten (cloud)
+    model_id: "wnppr2y3"
+    timeout: 120
+    # Local alternative: provider: "llama_cpp" — see config.local.yaml.example
+
+lancedb:
+  table: "chunks"
+
+logging:
+  level: "WARNING"                        # DEBUG, INFO, WARNING, ERROR
+
+mcp:
+  host: "127.0.0.1"
+  port: 7788

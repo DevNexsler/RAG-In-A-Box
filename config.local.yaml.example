@@ -1,0 +1,95 @@
+# Obsidian Vault Semantic Index — config (local/self-hosted providers)
+# Copy to config.yaml and set vault_root / index_root for your environment.
+# API keys: use env vars (e.g. OPENROUTER_API_KEY), not this file.
+#
+# This config uses local servers (Ollama, DeepSeek OCR2, llama-server).
+# For a simpler cloud-only setup, see config.yaml.example.
+
+vault_root: "/path/to/your/obsidian-vault"
+index_root: "/path/to/index/output"
+
+scan:
+  include:
+    - "**/*.md"
+    - "**/*.pdf"
+    - "**/*.png"
+    - "**/*.jpg"
+    - "**/*.jpeg"
+  exclude:
+    - ".obsidian/**"
+    - ".trash/**"
+    - "**/.DS_Store"
+    - "**/node_modules/**"
+
+pdf:
+  strategy: "text_then_ocr"
+  ocr_page_limit: 200
+  min_text_chars_before_ocr: 200
+
+ocr:
+  enabled: true
+  provider: "deepseek_ocr2"               # local DeepSeek OCR2 server
+  base_url: "http://localhost:8790"
+  timeout: 120
+  concurrency: 1                          # sequential — DeepSeek OCR2 handles 1 request at a time
+  # Cloud alternative: provider: "gemini", model: "gemini-2.0-flash", concurrency: 2
+
+embeddings:
+  provider: "ollama"                      # local Ollama embeddings
+  model: "qwen3-embedding:4b-q8_0"
+  base_url: "http://localhost:11434"
+  batch_size: 64
+  concurrency: 2
+  # Cloud alternative: provider: "openrouter", model: "qwen/qwen3-embedding-8b"
+
+chunking:
+  max_chars: 1800
+  overlap: 200
+  min_chars: 150
+  semantic:
+    enabled: true                         # topic-boundary detection via local Ollama model
+    provider: "ollama"
+    model: "qwen3-embedding:0.6b"         # lightweight model — fast, no API calls
+    base_url: "http://localhost:11434"
+    threshold: 3600                       # chars above which semantic splitting activates (2x max_chars)
+    breakpoint_percentile: 95             # sensitivity: higher = fewer splits (range: 50-99)
+    buffer_size: 1                        # sentences grouped per similarity comparison
+
+enrichment:
+  enabled: true
+  provider: "ollama"                      # local Ollama LLM
+  model: "qwen3:14b-udq6"
+  base_url: "http://localhost:11434"
+  max_input_chars: 20000
+  max_output_tokens: 5000
+  # Cloud alternative: provider: "openrouter", model: "openai/gpt-4.1-mini"
+
+search:
+  mode: "hybrid"
+  vector_top_k: 50
+  keyword_top_k: 50
+  final_top_k: 10
+  rrf_k: 60
+  recency:
+    half_life_days: 90
+    weight: 0.3
+  reranker:
+    enabled: true
+    provider: "llama_cpp"                 # local llama-server reranker
+    base_url: "http://localhost:8787"
+    model_path: "models/qwen3-reranker-4b-q8_0.gguf"
+    idle_timeout: 300
+    # Cloud alternative: provider: "baseten", model_id: "wnppr2y3", timeout: 120
+
+server:
+  heartbeat_dir: "/tmp/llama-server"      # lifecycle management for local llama-server
+
+lancedb:
+  table: "chunks"
+
+logging:
+  level: "WARNING"
+
+mcp:
+  host: "127.0.0.1"
+  port: 7788

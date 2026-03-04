@@ -1,0 +1,7 @@
+[project]
+name = "obsidian-vault-semantic-index"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+markers = ["live: tests requiring live services (API keys, running servers)"]

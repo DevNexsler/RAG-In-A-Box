@@ -1,0 +1,39 @@
+# Secrets
+.env
+
+# Config (contains local paths — use config.yaml.example as template)
+config.yaml
+config_test.yaml
+
+# Claude Code
+.claude/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LanceDB index data (generated, not code)
+*.lance/
+*.lancedb/
+test_index/
+
+# Model weights (large files — download separately)
+models/
+*.gguf

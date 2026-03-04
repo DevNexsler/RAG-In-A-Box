@@ -1,0 +1,66 @@
+# Obsidian Vault Semantic Index — Python deps
+# Python 3.10+
+
+# Config
+PyYAML>=6.0
+python-dotenv>=1.0.0
+
+# Orchestration
+prefect>=3.0
+
+# LlamaIndex core
+llama-index-core>=0.11.0
+
+# LlamaIndex: LanceDB vector store
+llama-index-vector-stores-lancedb>=0.4.0
+lancedb>=0.5.0
+tantivy>=0.20.1
+pyarrow>=14.0.0
+pandas>=2.0.0
+
+# LlamaIndex: Gemini embeddings (cloud fallback provider)
+llama-index-embeddings-google-genai>=0.3.0
+
+# HTTP client (for llama.cpp server API calls: embeddings + reranking)
+httpx>=0.27.0
+
+# MCP server (for vault_search, vault_get_chunk, vault_status)
+mcp>=1.0.0
+
+# Optional: Ollama embeddings
+# llama-index-embeddings-ollama>=0.3.0
+
+# Optional: HuggingFace / sentence-transformers embeddings
+# llama-index-embeddings-huggingface>=0.3.0
+
+# Optional: Cross-encoder re-ranker (provider: "cross_encoder" in config.yaml)
+# sentence-transformers>=3.0.0
+
+# Embeddings: Qwen3-Embedding-4B via llama.cpp server (provider: "llama_cpp" in config.yaml)
+# Install: brew install llama.cpp
+# Download: huggingface-cli download Qwen/Qwen3-Embedding-4B-GGUF Qwen3-Embedding-4B-Q8_0.gguf --local-dir models
+# Server auto-starts: llama-server -m models/Qwen3-Embedding-4B-Q8_0.gguf --port 8788 --embedding -c 8192
+# Asymmetric retrieval: queries get an instruction prefix, documents don't (handled by LlamaCppEmbedProvider)
+
+# Reranker: Qwen3-Reranker-4B via llama.cpp server (provider: "llama_cpp" in config.yaml)
+# Install: brew install llama.cpp
+# Convert: python convert_hf_to_gguf.py Qwen/Qwen3-Reranker-4B --outtype q8_0 --outfile models/qwen3-reranker-4b-q8_0.gguf
+# Server auto-starts: llama-server -m models/qwen3-reranker-4b-q8_0.gguf --port 8787 --reranking
+# NOTE: Community GGUF downloads are broken for reranking — must convert yourself with llama.cpp's script
+
+# Testing
+pytest>=8.0.0
+
+# PDF extraction
+pymupdf>=1.24.0
+
+# Semantic chunking (MLX — Apple Silicon only, optional)
+# Uses a small 0.6B embedding model in-process for topic-boundary detection.
+# Only activates for large text sections; no server needed.
+mlx-embeddings>=0.0.5
+
+# LLM document enrichment (MLX — Apple Silicon only, optional)
+# Legacy MLX fallback uses Qwen3-4B-Instruct in-process (default is Qwen3-14B via Ollama).
+# Extracts summary, entities, topics, keywords from each document.
+# mlx-lm is already a dependency of mlx-embeddings, listed here explicitly.
+mlx-lm>=0.20.0

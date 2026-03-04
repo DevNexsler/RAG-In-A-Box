@@ -1,0 +1,70 @@
+# Test config — mirrors production config with test directories
+# Identical to config.yaml except vault_root, index_root, and mcp port.
+vault_root: "./test_vault"
+index_root: "./test_index"
+
+scan:
+  include:
+    - "**/*.md"
+    - "**/*.pdf"
+    - "**/*.png"
+    - "**/*.jpg"
+    - "**/*.jpeg"
+  exclude:
+    - ".obsidian/**"
+    - ".trash/**"
+    - "**/.DS_Store"
+
+pdf:
+  strategy: "text_then_ocr"
+  ocr_page_limit: 200
+  min_text_chars_before_ocr: 200
+
+ocr:
+  enabled: true
+  provider: "gemini"
+  model: "gemini-2.0-flash"
+  timeout: 120
+  concurrency: 2
+
+embeddings:
+  provider: "openrouter"
+  model: "qwen/qwen3-embedding-8b"
+  batch_size: 64
+  concurrency: 2
+
+chunking:
+  max_chars: 1800
+  overlap: 200
+  min_chars: 150
+  semantic:
+    enabled: false
+
+enrichment:
+  enabled: true
+  provider: "openrouter"
+  model: "openai/gpt-4.1-mini"
+  max_input_chars: 10000
+  max_output_tokens: 768
+
+search:
+  mode: "hybrid"
+  vector_top_k: 50
+  keyword_top_k: 50
+  final_top_k: 10
+  rrf_k: 60
+  recency:
+    half_life_days: 90
+    weight: 0.3
+  reranker:
+    enabled: true
+    provider: "baseten"
+    model_id: "wnppr2y3"
+    timeout: 120
+
+lancedb:
+  table: "chunks"
+
+mcp:
+  host: "127.0.0.1"
+  port: 7788
