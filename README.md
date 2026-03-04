@@ -1,3 +1,12 @@
+# Why? 
+
+Instead of spending 30 mins organizing my File folder and Obsidian vault, i decided to spend few days building another semantic search. 
+
+Ones currently avaiable didnt meet all my requirement which were - LLM enrichment, frontmatter extraction, different chunking strategy (summary added to each chunk for context), work with Qwen 3 8B models, filter + keyword with BM25/Semantic search. 
+
+Seems to work well for my use which is throw various document into folder with poor organization... 
+
+
 # Obsidian Vault Semantic Index
 
 Index an Obsidian vault (Markdown, PDFs, images) into a vector store and expose it as an **MCP server** — any MCP-compatible AI assistant (Claude Code, OpenClaw, Claude Desktop, Cursor, etc.) can search your vault with a single config entry. Supports both **cloud APIs** (default — no local servers needed) and **local/self-hosted** providers.
@@ -5,6 +14,7 @@ Index an Obsidian vault (Markdown, PDFs, images) into a vector store and expose 
 Uses **Qwen3-Embedding-8B** (via OpenRouter) for embeddings, **GPT-4.1 Mini** (via OpenRouter) for document enrichment, **Gemini Vision** (cloud) or **DeepSeek OCR2** (local) for OCR, **Qwen3-Reranker-8B** (via Baseten) for cross-encoder reranking, **Prefect** for orchestration, **LanceDB** for storage + full-text search.
 
 ## Getting started
+
 
 ### 1. Install
 
