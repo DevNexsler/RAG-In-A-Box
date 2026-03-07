@@ -340,6 +340,7 @@ def process_doc_task(doc: dict) -> None:
 
     # --- LLM document enrichment (summary, entities, topics, etc.) ---
     llm_generator = _RUNTIME.get("llm_generator")
+    taxonomy_store = _RUNTIME.get("taxonomy_store")
     enrichment_cfg = _RUNTIME.get("config", {}).get("enrichment", {})
     if llm_generator:
         enrichment = enrich_document(
@@ -349,6 +350,7 @@ def process_doc_task(doc: dict) -> None:
             generator=llm_generator,
             max_input_chars=enrichment_cfg.get("max_input_chars", 4000),
             max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
+            taxonomy_store=taxonomy_store,
         )
         if enrichment.get("_enrichment_failed"):
             reason = enrichment.pop("_enrichment_failed")
@@ -589,6 +591,20 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
             logger.warning("Failed to load semantic chunking model, falling back to SentenceSplitter: %s", exc)
             _RUNTIME.setdefault("_warnings", []).append(f"semantic_chunking_failed: {exc}")
 
+    # Taxonomy store (optional — provides controlled vocabulary for enrichment)
+    taxonomy_store = None
+    try:
+        from core.taxonomy import load_taxonomy_store
+        taxonomy_store = load_taxonomy_store(config)
+        tax_count = taxonomy_store.count()
+        if tax_count > 0:
+            logger.info("Taxonomy store loaded (%d entries)", tax_count)
+        else:
+            taxonomy_store = None
+            logger.info("Taxonomy store empty, skipping taxonomy-guided enrichment")
+    except Exception as exc:
+        logger.info("Taxonomy store not available: %s", exc)
+
     # LLM enrichment (optional — extracts summary, entities, topics from each doc)
     llm_generator = None
     enrichment_cfg = config.get("enrichment", {})
@@ -611,6 +627,7 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     _RUNTIME["semantic_threshold"] = semantic_threshold
     _RUNTIME["ocr_provider"] = ocr_provider
     _RUNTIME["llm_generator"] = llm_generator
+    _RUNTIME["taxonomy_store"] = taxonomy_store
     _RUNTIME["config"] = config
 
     # --- Run pipeline ---

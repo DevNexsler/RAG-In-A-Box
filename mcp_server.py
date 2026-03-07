@@ -80,6 +80,8 @@ def _hit_to_dict(h: SearchHit, include_text: bool = False) -> dict:
         "enr_entities_orgs": h.enr_entities_orgs,
         "enr_entities_dates": h.enr_entities_dates,
         "enr_key_facts": h.enr_key_facts,
+        "enr_suggested_tags": h.enr_suggested_tags,
+        "enr_suggested_folder": h.enr_suggested_folder,
     }
     # Include dynamic metadata fields (e.g. section, sentiment)
     for k, v in (h.extra_metadata or {}).items():
@@ -559,6 +561,134 @@ def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Taxonomy tool implementations
+# ---------------------------------------------------------------------------
+
+
+def _get_taxonomy_store():
+    """Lazily build and cache the taxonomy store."""
+    from core.taxonomy import load_taxonomy_store
+    _, _, config = _get_deps()
+    return load_taxonomy_store(config)
+
+
+def _file_taxonomy_list_impl(kind: str | None = None, status: str = "active") -> list[dict] | dict:
+    try:
+        store = _get_taxonomy_store()
+    except Exception as exc:
+        return _error("service_unavailable", f"Failed to initialize taxonomy: {exc}")
+    if kind:
+        return store.list_by_kind(kind, status=status)
+    # List all kinds
+    results = []
+    for k in ("tag", "folder", "doc_type"):
+        results.extend(store.list_by_kind(k, status=status))
+    return results
+
+
+def _file_taxonomy_get_impl(entry_id: str) -> dict:
+    if not entry_id or not entry_id.strip():
+        return _error("invalid_parameter", "id must not be empty.")
+    try:
+        store = _get_taxonomy_store()
+    except Exception as exc:
+        return _error("service_unavailable", f"Failed to initialize taxonomy: {exc}")
+    result = store.get(entry_id)
+    if result is None:
+        return _error("not_found", f"Taxonomy entry '{entry_id}' not found.",
+                       "Use file_taxonomy_list to see available entries.")
+    return result
+
+
+def _file_taxonomy_search_impl(query: str, kind: str | None = None, top_k: int = 10) -> list[dict] | dict:
+    if not query or not query.strip():
+        return _error("empty_query", "Query must not be empty.")
+    try:
+        store = _get_taxonomy_store()
+    except Exception as exc:
+        return _error("service_unavailable", f"Failed to initialize taxonomy: {exc}")
+    return store.search(query, kind=kind, top_k=top_k)
+
+
+def _file_taxonomy_add_impl(
+    kind: str, name: str, description: str,
+    aliases: str = "", parent: str = "", status: str = "active",
+    contents_type: str = "", created_by: str = "AI",
+) -> dict:
+    if kind not in ("tag", "folder", "doc_type"):
+        return _error("invalid_parameter", f"kind must be 'tag', 'folder', or 'doc_type'. Got: '{kind}'.")
+    if not name or not name.strip():
+        return _error("invalid_parameter", "name must not be empty.")
+    try:
+        store = _get_taxonomy_store()
+    except Exception as exc:
+        return _error("service_unavailable", f"Failed to initialize taxonomy: {exc}")
+    # Check for duplicates
+    entry_id = f"{kind}:{name}"
+    if store.get(entry_id) is not None:
+        return _error("duplicate", f"Entry '{entry_id}' already exists.",
+                       "Use file_taxonomy_update to modify existing entries.")
+    row = store.add(kind, name, description, aliases, parent, status,
+                    0, 1, contents_type, created_by)
+    row.pop("vector", None)
+    return row
+
+
+def _file_taxonomy_update_impl(
+    entry_id: str,
+    description: str | None = None,
+    aliases: str | None = None,
+    status: str | None = None,
+    parent: str | None = None,
+    contents_type: str | None = None,
+) -> dict:
+    if not entry_id or not entry_id.strip():
+        return _error("invalid_parameter", "id must not be empty.")
+    try:
+        store = _get_taxonomy_store()
+    except Exception as exc:
+        return _error("service_unavailable", f"Failed to initialize taxonomy: {exc}")
+    fields = {}
+    if description is not None:
+        fields["description"] = description
+    if aliases is not None:
+        fields["aliases"] = aliases
+    if status is not None:
+        fields["status"] = status
+    if parent is not None:
+        fields["parent"] = parent
+    if contents_type is not None:
+        fields["contents_type"] = contents_type
+    if not fields:
+        return _error("invalid_parameter", "No fields to update. Provide at least one field.")
+    result = store.update(entry_id, **fields)
+    if result is None:
+        return _error("not_found", f"Taxonomy entry '{entry_id}' not found.")
+    return result
+
+
+def _file_taxonomy_delete_impl(entry_id: str) -> dict:
+    if not entry_id or not entry_id.strip():
+        return _error("invalid_parameter", "id must not be empty.")
+    try:
+        store = _get_taxonomy_store()
+    except Exception as exc:
+        return _error("service_unavailable", f"Failed to initialize taxonomy: {exc}")
+    if store.delete(entry_id):
+        return {"deleted": True}
+    return _error("not_found", f"Taxonomy entry '{entry_id}' not found.")
+
+
+def _file_taxonomy_import_impl() -> dict:
+    try:
+        from scripts.seed_taxonomy import seed_taxonomy
+        return seed_taxonomy()
+    except Exception as exc:
+        return _error("import_failed", f"Taxonomy import failed: {exc}",
+                       "Check that SQLite databases exist at ~/Documents/Primary/0-AI/directory_info/.")
+
+
+# ---------------------------------------------------------------------------
 # MCP tool registration (FastMCP)
 # ---------------------------------------------------------------------------
 
@@ -834,6 +964,137 @@ if HAS_MCP and FastMCP is not None:
               service is running (Baseten deployment active, or llama-server started).
         """
         return _file_status_impl()
+
+    # --- Taxonomy tools ---
+
+    @mcp.tool()
+    def file_taxonomy_list(
+        kind: str | None = None,
+        status: str = "active",
+    ) -> dict | list[dict]:
+        """List taxonomy entries filtered by kind and/or status.
+
+        Args:
+            kind: Filter by kind: "tag", "folder", or "doc_type". If omitted, lists all kinds.
+            status: Filter by status (default "active"). Use "archived" to see archived entries.
+
+        Returns a list of taxonomy entry dicts, each containing:
+            - id: Unique identifier (e.g., "tag:machine-learning").
+            - kind: Entry type ("tag", "folder", "doc_type").
+            - name: Canonical name.
+            - description: Human-readable description.
+            - aliases: Comma-separated alternative names.
+            - status: "active" or "archived".
+            - usage_count: Number of times used in enrichment.
+            - ai_managed: 1 if AI-managed, 0 if human-managed.
+            - contents_type: For folders, the type of contents (e.g., "notes", "data").
+            - created_by: Who created the entry.
+        """
+        return _file_taxonomy_list_impl(kind, status)
+
+    @mcp.tool()
+    def file_taxonomy_get(id: str) -> dict:
+        """Get a single taxonomy entry by its id.
+
+        Args:
+            id: The taxonomy entry id (e.g., "tag:machine-learning", "folder:Projects/").
+
+        Returns the entry dict, or an error if not found.
+        """
+        return _file_taxonomy_get_impl(id)
+
+    @mcp.tool()
+    def file_taxonomy_search(
+        query: str,
+        kind: str | None = None,
+        top_k: int = 10,
+    ) -> list[dict] | dict:
+        """Semantic search over taxonomy descriptions.
+
+        Finds entries whose descriptions are semantically similar to the query.
+
+        Args:
+            query: Natural-language search query (e.g., "property management").
+            kind: Optional filter by kind: "tag", "folder", or "doc_type".
+            top_k: Max results to return (default 10).
+
+        Returns a list of matching taxonomy entries ranked by relevance.
+        """
+        return _file_taxonomy_search_impl(query, kind, top_k)
+
+    @mcp.tool()
+    def file_taxonomy_add(
+        kind: str,
+        name: str,
+        description: str,
+        aliases: str = "",
+        parent: str = "",
+        status: str = "active",
+        contents_type: str = "",
+        created_by: str = "AI",
+    ) -> dict:
+        """Add a new taxonomy entry.
+
+        Args:
+            kind: Entry type: "tag", "folder", or "doc_type".
+            name: Canonical name (e.g., "machine-learning", "Projects/").
+            description: Human-readable description for semantic matching.
+            aliases: Comma-separated alternative names (e.g., "ml,deep-learning").
+            parent: Parent entry id for hierarchy (optional, for future use).
+            status: "active" (default) or "archived".
+            contents_type: For folders, the type of contents (e.g., "notes", "data").
+            created_by: Who is creating this entry (default "AI").
+
+        Returns the created entry dict.
+        """
+        return _file_taxonomy_add_impl(kind, name, description, aliases, parent, status, contents_type, created_by)
+
+    @mcp.tool()
+    def file_taxonomy_update(
+        id: str,
+        description: str | None = None,
+        aliases: str | None = None,
+        status: str | None = None,
+        parent: str | None = None,
+        contents_type: str | None = None,
+    ) -> dict:
+        """Update an existing taxonomy entry.
+
+        Args:
+            id: The taxonomy entry id (e.g., "tag:machine-learning").
+            description: New description (re-embeds for semantic search).
+            aliases: New comma-separated aliases.
+            status: New status ("active" or "archived"). Use "archived" to soft-delete.
+            parent: New parent entry id.
+            contents_type: New contents type (folders only).
+
+        Returns the updated entry dict, or an error if not found.
+        """
+        return _file_taxonomy_update_impl(id, description, aliases, status, parent, contents_type)
+
+    @mcp.tool()
+    def file_taxonomy_delete(id: str) -> dict:
+        """Hard delete a taxonomy entry.
+
+        Args:
+            id: The taxonomy entry id (e.g., "tag:old-tag").
+
+        Returns {"deleted": true} on success, or an error if not found.
+        Consider using file_taxonomy_update with status="archived" instead.
+        """
+        return _file_taxonomy_delete_impl(id)
+
+    @mcp.tool()
+    def file_taxonomy_import() -> dict:
+        """Import taxonomy data from existing SQLite databases.
+
+        Reads tags from ~/Documents/Primary/0-AI/directory_info/tags.db and
+        directories from ~/Documents/Primary/0-AI/directory_info/directory.db.
+        Idempotent: skips entries that already exist.
+
+        Returns import statistics (counts added, skipped, totals).
+        """
+        return _file_taxonomy_import_impl()
 
     @mcp.tool()
     def file_index_update() -> dict:

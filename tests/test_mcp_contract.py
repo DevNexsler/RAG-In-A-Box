@@ -3,7 +3,7 @@
 No external services needed. Uses mocks and direct function calls."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -629,6 +629,93 @@ def test_search_enr_params_default_none():
         assert kwargs["enr_topics"] is None
     finally:
         mcp_server._cache = old_cache
+
+
+# ---------------------------------------------------------------------------
+# Taxonomy tool contracts
+# ---------------------------------------------------------------------------
+
+
+def test_taxonomy_list_empty_query():
+    """_file_taxonomy_list_impl should return list (possibly empty) without error."""
+    old_cache = mcp_server._cache
+    try:
+        mock_store = MagicMock()
+        mock_embed = MagicMock()
+        mock_config = {"index_root": "/tmp/test", "embeddings": {"provider": "openrouter"}}
+        mcp_server._cache = (mock_store, mock_embed, mock_config)
+
+        with patch("core.taxonomy.load_taxonomy_store") as mock_load:
+            mock_tax = MagicMock()
+            mock_tax.list_by_kind.return_value = [
+                {"id": "tag:test", "kind": "tag", "name": "test", "description": "Test tag"},
+            ]
+            mock_load.return_value = mock_tax
+            result = mcp_server._file_taxonomy_list_impl(kind="tag")
+        assert isinstance(result, list)
+    finally:
+        mcp_server._cache = old_cache
+
+
+def test_taxonomy_get_not_found():
+    """_file_taxonomy_get_impl returns error for missing entry."""
+    old_cache = mcp_server._cache
+    try:
+        mock_store = MagicMock()
+        mock_embed = MagicMock()
+        mock_config = {"index_root": "/tmp/test", "embeddings": {"provider": "openrouter"}}
+        mcp_server._cache = (mock_store, mock_embed, mock_config)
+
+        with patch("core.taxonomy.load_taxonomy_store") as mock_load:
+            mock_tax = MagicMock()
+            mock_tax.get.return_value = None
+            mock_load.return_value = mock_tax
+            result = mcp_server._file_taxonomy_get_impl("tag:nonexistent")
+        assert result["error"] is True
+        assert result["code"] == "not_found"
+    finally:
+        mcp_server._cache = old_cache
+
+
+def test_taxonomy_add_invalid_kind():
+    """_file_taxonomy_add_impl rejects invalid kind."""
+    result = mcp_server._file_taxonomy_add_impl("invalid_kind", "test", "desc")
+    assert result["error"] is True
+    assert result["code"] == "invalid_parameter"
+
+
+def test_taxonomy_update_empty_id():
+    """_file_taxonomy_update_impl rejects empty id."""
+    result = mcp_server._file_taxonomy_update_impl("", description="new desc")
+    assert result["error"] is True
+    assert result["code"] == "invalid_parameter"
+
+
+def test_taxonomy_delete_empty_id():
+    """_file_taxonomy_delete_impl rejects empty id."""
+    result = mcp_server._file_taxonomy_delete_impl("")
+    assert result["error"] is True
+    assert result["code"] == "invalid_parameter"
+
+
+def test_taxonomy_search_empty_query():
+    """_file_taxonomy_search_impl rejects empty query."""
+    result = mcp_server._file_taxonomy_search_impl("")
+    assert result["error"] is True
+    assert result["code"] == "empty_query"
+
+
+def test_hit_to_dict_includes_taxonomy_fields():
+    """_hit_to_dict should include enr_suggested_tags and enr_suggested_folder."""
+    hit = SearchHit(
+        doc_id="a.md", loc="c:0", snippet="test", text="test text",
+        score=0.5,
+        enr_suggested_tags="work, finance",
+        enr_suggested_folder="Financial/",
+    )
+    d = mcp_server._hit_to_dict(hit)
+    assert d["enr_suggested_tags"] == "work, finance"
+    assert d["enr_suggested_folder"] == "Financial/"
 
 
 def test_file_status_health_reranker_disabled():

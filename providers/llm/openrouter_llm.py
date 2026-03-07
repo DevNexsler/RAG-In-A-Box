@@ -79,10 +79,20 @@ _ENRICHMENT_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "Most important facts, conclusions, or action items",
             },
+            "suggested_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Classification tags for this document, preferring taxonomy entries when available",
+            },
+            "suggested_folder": {
+                "type": "string",
+                "description": "Best folder path for filing this document from the taxonomy, or empty string",
+            },
         },
         "required": [
             "summary", "doc_type", "entities_people", "entities_places",
             "entities_orgs", "entities_dates", "topics", "keywords", "key_facts",
+            "suggested_tags", "suggested_folder",
         ],
         "additionalProperties": False,
     },

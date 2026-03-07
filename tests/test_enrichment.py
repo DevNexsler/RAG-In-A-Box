@@ -170,6 +170,8 @@ class TestEnrichDocument:
             "topics": ["tax filing", "deductions"],
             "keywords": ["Form 1040", "W-2"],
             "key_facts": ["Total income: $85,000"],
+            "suggested_tags": ["finance", "tax"],
+            "suggested_folder": "Financial/",
         })
         gen = self._make_generator(llm_response)
         result = enrich_document("Some tax document text...", "TaxReturn.pdf", "pdf", gen)
@@ -177,6 +179,8 @@ class TestEnrichDocument:
         assert result["enr_summary"] == "Tax return filing for 2022."
         assert "tax" in result["enr_doc_type"]
         assert result["enr_entities_people"] == "John Doe"
+        assert "finance" in result["enr_suggested_tags"]
+        assert result["enr_suggested_folder"] == "Financial/"
         gen.generate.assert_called_once()
 
     def test_empty_text_returns_empty(self):
@@ -238,6 +242,26 @@ class TestEnrichDocument:
         result = enrich_document("Some text", "doc.md", "md", gen)
         assert result["enr_summary"] == "Analyzed"
         assert result["enr_topics"] == "AI"
+
+
+    def test_taxonomy_block_in_prompt(self):
+        """When taxonomy_store is provided, its format_for_prompt output appears in the LLM prompt."""
+        gen = self._make_generator('{"summary": "test"}')
+        mock_taxonomy = MagicMock()
+        mock_taxonomy.format_for_prompt.return_value = "## Available Tags\n- work: Work stuff"
+        mock_taxonomy.increment_usage = MagicMock()
+
+        enrich_document("Some text", "doc.md", "md", gen, taxonomy_store=mock_taxonomy)
+        call_args = gen.generate.call_args[0][0]
+        assert "## Available Tags" in call_args
+        assert "work: Work stuff" in call_args
+
+    def test_no_taxonomy_no_block(self):
+        """Without taxonomy_store, no taxonomy block in prompt."""
+        gen = self._make_generator('{"summary": "test"}')
+        enrich_document("Some text", "doc.md", "md", gen, taxonomy_store=None)
+        call_args = gen.generate.call_args[0][0]
+        assert "## Available Tags" not in call_args
 
 
 class TestFailedEnrichment:
@@ -324,3 +348,98 @@ class TestEnrichmentLiveOpenRouter:
         has_people = bool(result["enr_entities_people"])
         has_orgs = bool(result["enr_entities_orgs"])
         assert has_people or has_orgs, f"Expected entities, got: {result}"
+
+    def test_enrichment_with_taxonomy_suggests_tags(self, enrichment_config):
+        """Real LLM + semantic inference should suggest tags from the taxonomy."""
+        import tempfile
+        from taxonomy_store import TaxonomyStore
+        from providers.embed import build_embed_provider
+        from core.config import load_config
+
+        config = load_config()
+        embed_provider = build_embed_provider(config)
+
+        def embed_fn(text):
+            return embed_provider.embed_texts([text])[0]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tax_store = TaxonomyStore(tmpdir, "taxonomy", embed_fn=embed_fn)
+            tax_store.add("tag", "insurance", "Insurance policies, claims, and coverage")
+            tax_store.add("tag", "property", "Real estate and property matters")
+            tax_store.add("tag", "finance", "Financial documents, invoices, budgets")
+            tax_store.add("folder", "Insurance/Claims/", "Insurance claim documents")
+
+            result = enrich_document(
+                text=(
+                    "# Insurance Claim Report\n\n"
+                    "Claim #2024-5678 for roof damage at 123 Main St, "
+                    "filed by John Smith on 2024-03-15. "
+                    "Adjuster Sarah Johnson inspected for ABC Insurance. "
+                    "Estimated repair cost: $12,500."
+                ),
+                title="claim_report.pdf",
+                source_type="pdf",
+                generator=enrichment_config["generator"],
+                max_input_chars=enrichment_config["max_input_chars"],
+                max_output_tokens=enrichment_config["max_output_tokens"],
+                taxonomy_store=tax_store,
+            )
+            assert result["enr_summary"], "Summary should not be empty"
+            assert "_enrichment_failed" not in result
+            # Semantic inference should suggest at least one tag
+            suggested = result.get("enr_suggested_tags", "")
+            assert suggested, (
+                f"Expected taxonomy tag suggestions (via LLM or semantic inference), "
+                f"got empty. Full result: {result}"
+            )
+            # Insurance tag should be the best match
+            assert "insurance" in suggested.lower(), (
+                f"Expected 'insurance' in suggestions, got: '{suggested}'"
+            )
+
+    def test_enrichment_with_taxonomy_suggests_folder(self, enrichment_config):
+        """Real LLM + semantic inference should suggest a folder from the taxonomy."""
+        import tempfile
+        from taxonomy_store import TaxonomyStore
+        from providers.embed import build_embed_provider
+        from core.config import load_config
+
+        config = load_config()
+        embed_provider = build_embed_provider(config)
+
+        def embed_fn(text):
+            return embed_provider.embed_texts([text])[0]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tax_store = TaxonomyStore(tmpdir, "taxonomy", embed_fn=embed_fn)
+            tax_store.add("tag", "insurance", "Insurance policies, claims, and coverage")
+            tax_store.add("tag", "property", "Real estate and property matters")
+            tax_store.add("folder", "Insurance/Claims/", "Insurance claim documents and reports")
+            tax_store.add("folder", "Recipes/", "Cooking recipes and food preparation guides")
+            tax_store.add("folder", "Work/Meetings/", "Meeting notes and minutes")
+
+            result = enrich_document(
+                text=(
+                    "# Insurance Claim Report\n\n"
+                    "Claim #2024-5678 for roof damage at 123 Main St, "
+                    "filed by John Smith on 2024-03-15. "
+                    "Adjuster Sarah Johnson inspected for ABC Insurance. "
+                    "Estimated repair cost: $12,500."
+                ),
+                title="claim_report.pdf",
+                source_type="pdf",
+                generator=enrichment_config["generator"],
+                max_input_chars=enrichment_config["max_input_chars"],
+                max_output_tokens=enrichment_config["max_output_tokens"],
+                taxonomy_store=tax_store,
+            )
+            assert result["enr_summary"], "Summary should not be empty"
+            assert "_enrichment_failed" not in result
+            folder = result.get("enr_suggested_folder", "")
+            assert folder, (
+                f"Expected folder suggestion (via LLM or semantic inference), "
+                f"got empty. Full result: {result}"
+            )
+            assert "insurance" in folder.lower() or "claims" in folder.lower(), (
+                f"Expected 'Insurance/Claims/' folder suggestion, got: '{folder}'"
+            )

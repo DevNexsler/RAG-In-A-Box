@@ -37,6 +37,9 @@ class SearchHit:
         enr_topics: str = "",
         enr_keywords: str = "",
         enr_key_facts: str = "",
+        # Taxonomy-suggested fields from enrichment
+        enr_suggested_tags: str = "",
+        enr_suggested_folder: str = "",
         # Dynamic metadata (fields not in the hardcoded set above)
         extra_metadata: dict[str, str] | None = None,
     ):
@@ -67,6 +70,8 @@ class SearchHit:
         self.enr_topics = enr_topics
         self.enr_keywords = enr_keywords
         self.enr_key_facts = enr_key_facts
+        self.enr_suggested_tags = enr_suggested_tags
+        self.enr_suggested_folder = enr_suggested_folder
         # Dynamic metadata for fields added after initial schema
         self.extra_metadata = extra_metadata or {}
 

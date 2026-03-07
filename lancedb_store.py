@@ -20,6 +20,7 @@ _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _ENRICHMENT_FIELDS = (
     "enr_summary", "enr_doc_type", "enr_entities_people", "enr_entities_places",
     "enr_entities_orgs", "enr_entities_dates", "enr_topics", "enr_keywords", "enr_key_facts",
+    "enr_suggested_tags", "enr_suggested_folder",
 )
 
 _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
@@ -32,6 +33,7 @@ _CORE_META_KEYS = {
     "description", "author", "keywords", "custom_meta",
     "enr_summary", "enr_doc_type", "enr_entities_people", "enr_entities_places",
     "enr_entities_orgs", "enr_entities_dates", "enr_topics", "enr_keywords", "enr_key_facts",
+    "enr_suggested_tags", "enr_suggested_folder",
 }
 
 

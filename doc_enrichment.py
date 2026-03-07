@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from providers.llm import LLMGenerator
+    from taxonomy_store import TaxonomyStore
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +37,22 @@ Extract metadata from this document. Respond with ONLY valid JSON, no other text
   "entities_dates": ["YYYY-MM-DD format dates mentioned"],
   "topics": ["5-10 high-level topics"],
   "keywords": ["10-20 specific terms and phrases"],
-  "key_facts": ["most important facts, conclusions, or action items"]
+  "key_facts": ["most important facts, conclusions, or action items"],
+  "suggested_tags": ["classification tags for this document"],
+  "suggested_folder": "best folder path for filing this document"
 }}
-
+{taxonomy_block}
 Document title: {title}
 Document type: {source_type}
 
 Document text:
 {text}"""
+
+_TAXONOMY_INSTRUCTION = """
+For "suggested_tags" and "suggested_folder": use the taxonomy below.
+Pick the most relevant tags from Available Tags (you may also add new ones).
+Pick the single best matching folder path from Available Folders (use the exact path).
+"""
 
 # Raw keys the LLM prompt asks for (unprefixed)
 _ENRICHMENT_KEYS_RAW = (
@@ -56,6 +65,8 @@ _ENRICHMENT_KEYS_RAW = (
     "topics",
     "keywords",
     "key_facts",
+    "suggested_tags",
+    "suggested_folder",
 )
 
 # Prefixed field names stored in LanceDB metadata (prevent collision with frontmatter)
@@ -183,7 +194,7 @@ def _normalize_enrichment(raw: dict[str, Any]) -> dict[str, str]:
         value = raw.get(raw_key)
         if value is None:
             result[enr_key] = ""
-        elif raw_key == "summary":
+        elif raw_key in ("summary", "suggested_folder"):
             result[enr_key] = str(value).strip()
         elif raw_key == "key_facts":
             if isinstance(value, list):
@@ -206,6 +217,7 @@ def enrich_document(
     generator: "LLMGenerator",
     max_input_chars: int = 4000,
     max_output_tokens: int = 512,
+    taxonomy_store: "TaxonomyStore | None" = None,
 ) -> dict[str, str]:
     """Extract structured metadata from document text using an LLM.
 
@@ -223,10 +235,22 @@ def enrich_document(
         # conclusions/facts that a simple head truncation would miss.
         half = max_input_chars // 2
         truncated = text[:half] + "\n\n[...]\n\n" + text[-half:]
+
+    # Build taxonomy context block for the prompt
+    taxonomy_block = ""
+    if taxonomy_store is not None:
+        try:
+            raw_block = taxonomy_store.format_for_prompt()
+            if raw_block:
+                taxonomy_block = f"\n{_TAXONOMY_INSTRUCTION}\n{raw_block}\n"
+        except Exception as exc:
+            logger.warning("Failed to load taxonomy for prompt: %s", exc)
+
     prompt = _PROMPT_TEMPLATE.format(
         title=title,
         source_type=source_type,
         text=truncated,
+        taxonomy_block=taxonomy_block,
     )
 
     try:
@@ -241,6 +265,19 @@ def enrich_document(
                 "LLM returned empty summary for '%s'. Raw response: %s",
                 title, raw_response[:300],
             )
+
+        # Increment usage_count for matched taxonomy entries
+        if taxonomy_store is not None:
+            try:
+                for tag in (enrichment.get("enr_suggested_tags") or "").split(","):
+                    tag = tag.strip()
+                    if tag:
+                        taxonomy_store.increment_usage(f"tag:{tag}")
+                folder = (enrichment.get("enr_suggested_folder") or "").strip()
+                if folder:
+                    taxonomy_store.increment_usage(f"folder:{folder}")
+            except Exception as exc:
+                logger.warning("Failed to increment taxonomy usage: %s", exc)
 
         logger.info(
             "Enriched '%s': doc_type=%s, topics=%s",
