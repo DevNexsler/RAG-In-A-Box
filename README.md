@@ -1,15 +1,15 @@
-# Why? 
+# Why?
 
-Instead of spending 30 mins organizing my File folder and Obsidian vault, i decided to spend few days building another semantic search. 
+Instead of spending 30 mins organizing my File folder and Obsidian vault, i decided to spend few days building another semantic search.
 
-Ones currently avaiable didnt meet all my requirement which were - LLM enrichment, frontmatter extraction, different chunking strategy (summary added to each chunk for context), work with Qwen 3 8B models, filter + keyword with BM25/Semantic search. 
+Ones currently avaiable didnt meet all my requirement which were - LLM enrichment, frontmatter extraction, different chunking strategy (summary added to each chunk for context), work with Qwen 3 8B models, filter + keyword with BM25/Semantic search.
 
-Seems to work well for my use which is throw various document into folder with poor organization... 
+Seems to work well for my use which is throw various document into folder with poor organization...
 
 
-# Obsidian Vault Semantic Index
+# Document Organizer
 
-Index an Obsidian vault (Markdown, PDFs, images) into a vector store and expose it as an **MCP server** — any MCP-compatible AI assistant (Claude Code, OpenClaw, Claude Desktop, Cursor, etc.) can search your vault with a single config entry. Supports both **cloud APIs** (default — no local servers needed) and **local/self-hosted** providers.
+Index a document collection (Markdown, PDFs, images) into a vector store and expose it as an **MCP server** — any MCP-compatible AI assistant (Claude Code, OpenClaw, Claude Desktop, Cursor, etc.) can search your documents with a single config entry. Supports both **cloud APIs** (default — no local servers needed) and **local/self-hosted** providers.
 
 Uses **Qwen3-Embedding-8B** (via OpenRouter) for embeddings, **GPT-4.1 Mini** (via OpenRouter) for document enrichment, **Gemini Vision** (cloud) or **DeepSeek OCR2** (local) for OCR, **Qwen3-Reranker-8B** (via Baseten) for cross-encoder reranking, **Prefect** for orchestration, **LanceDB** for storage + full-text search.
 
@@ -19,8 +19,8 @@ Uses **Qwen3-Embedding-8B** (via OpenRouter) for embeddings, **GPT-4.1 Mini** (v
 ### 1. Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/Document-Organizer.git
-cd Document-Organizer
+git clone https://github.com/DevNexsler/dans_lazy_file_dump.git
+cd dans_lazy_file_dump
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -35,7 +35,7 @@ cp config.yaml.example config.yaml   # cloud providers (default)
 ```
 
 Open `config.yaml` and set:
-- `vault_root` — path to your Obsidian vault
+- `documents_root` — path to your document collection
 - `index_root` — where the index will be stored
 
 > **Self-hosting?** Use `cp config.local.yaml.example config.yaml` instead. This config uses Ollama, DeepSeek OCR2, and llama-server — see [Local mode](#local-mode-optional) below.
@@ -56,11 +56,11 @@ BASETEN_API_KEY=...              # reranker — https://app.baseten.co/settings/
 python run_index.py
 ```
 
-This scans your vault, extracts text (Markdown, PDFs, images), generates embeddings, and writes everything to a LanceDB index. Prefect auto-starts a temporary server for flow/task logging — dashboard at `http://127.0.0.1:4200`.
+This scans your documents, extracts text (Markdown, PDFs, images), generates embeddings, and writes everything to a LanceDB index. Prefect auto-starts a temporary server for flow/task logging — dashboard at `http://127.0.0.1:4200`.
 
 ### 5. Connect your AI assistant
 
-The MCP server gives any compatible AI assistant access to your vault via tools like `vault_search`, `vault_status`, and `vault_recent`. The assistant launches the server automatically — you just add a config entry.
+The MCP server gives any compatible AI assistant access to your documents via tools like `file_search`, `file_status`, and `file_recent`. The assistant launches the server automatically — you just add a config entry.
 
 #### Claude Code
 
@@ -69,7 +69,7 @@ Add to your project's `.mcp.json` (or `~/.claude.json` for global access):
 ```json
 {
   "mcpServers": {
-    "vault-index": {
+    "doc-organizer": {
       "command": "/path/to/Document-Organizer/.venv/bin/python",
       "args": ["/path/to/Document-Organizer/mcp_server.py"],
       "cwd": "/path/to/Document-Organizer"
@@ -85,7 +85,7 @@ Add to your OpenClaw MCP config:
 ```json
 {
   "mcpServers": {
-    "vault-index": {
+    "doc-organizer": {
       "command": "/path/to/Document-Organizer/.venv/bin/python",
       "args": ["mcp_server.py"],
       "cwd": "/path/to/Document-Organizer"
@@ -101,7 +101,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 ```json
 {
   "mcpServers": {
-    "vault-index": {
+    "doc-organizer": {
       "command": "/path/to/Document-Organizer/.venv/bin/python",
       "args": ["/path/to/Document-Organizer/mcp_server.py"],
       "cwd": "/path/to/Document-Organizer"
@@ -137,7 +137,7 @@ No cloud API keys needed in local mode.
 ## Features
 
 ```
-Obsidian Vault                          AI Assistants
+Document Collection                    AI Assistants
  +------------------+                   +-------------------+
  | Markdown (.md)   |                   | Claude Code       |
  | PDFs             |    +---------+    | OpenClaw          |
@@ -148,22 +148,24 @@ Obsidian Vault                          AI Assistants
                    +----------+----------+       | MCP (stdio)
                    |     LanceDB Index   |       |
                    |  vectors + metadata |<------+
-                   |  + full-text (BM25) |  vault_search
-                   +---------------------+  vault_status
-                                            vault_recent ...
+                   |  + full-text (BM25) |  file_search
+                   +---------------------+  file_status
+                                            file_recent ...
 ```
 
 **Hybrid search** — Every query runs vector (semantic) and keyword (BM25) search in parallel, fuses results with Reciprocal Rank Fusion, then reranks with a cross-encoder. Pre-filters (tags, folders, doc type, topics) apply at the database level before retrieval so every result matches.
 
 **Multi-format extraction** — Indexes Markdown, PDFs, and images. PDFs use text extraction first, falling back to OCR for scanned pages. Images get OCR text plus visual descriptions. EXIF metadata (camera, GPS, dates) is extracted automatically.
 
-**LLM enrichment** — Each document is analyzed by an LLM to extract structured metadata: summary, document type, entities (people, places, orgs, dates), topics, keywords, and key facts. All fields are searchable and filterable.
+**LLM enrichment** — Each document is analyzed by an LLM to extract structured metadata: summary, document type, entities (people, places, orgs, dates), topics, keywords, key facts, suggested tags, and suggested folder. All fields are searchable and filterable.
+
+**Taxonomy system** — A controlled vocabulary of tags and folder paths stored in a separate LanceDB table with embedded descriptions. The LLM uses the taxonomy during enrichment to suggest consistent tags and filing locations. Seeded from existing tag/directory databases. Managed via 7 MCP CRUD tools (`file_taxonomy_*`).
 
 **Smart chunking** — Markdown is split by headings, PDFs by pages. Large sections get semantic chunking (topic-boundary detection via sentence embeddings). Every chunk gets a contextual header prepended with its title, path, and topics — so each chunk is self-describing for better retrieval.
 
-**Rich metadata & filtering** — Obsidian YAML frontmatter (tags, status, author, dates, custom fields) is automatically extracted and promoted to filterable columns. Custom frontmatter keys are auto-promoted — no schema changes needed.
+**Rich metadata & filtering** — YAML frontmatter (tags, status, author, dates, custom fields) is automatically extracted and promoted to filterable columns. Custom frontmatter keys are auto-promoted — no schema changes needed.
 
-**MCP server** — Exposes 9 tools over the Model Context Protocol. Any MCP-compatible assistant can search, browse, and filter your vault. Works over stdio (launched automatically by the assistant) or HTTP.
+**MCP server** — Exposes 17 tools over the Model Context Protocol. Any MCP-compatible assistant can search, browse, filter your documents, and manage taxonomy entries. Works over stdio (launched automatically by the assistant) or HTTP.
 
 **Incremental updates** — Only new and modified files are processed on re-index. Deleted files are cleaned up automatically. Failed documents are tracked and retried.
 
@@ -175,39 +177,49 @@ Obsidian Vault                          AI Assistants
 
 | Tool | Description |
 |------|-------------|
-| `vault_search` | Hybrid semantic + keyword search with filters (tags, folder, source_type, doc_type, topics, etc.) |
-| `vault_get_chunk` | Get full text + metadata for one chunk by doc_id and loc |
-| `vault_get_doc_chunks` | Get all chunks for a document, sorted by position |
-| `vault_list_documents` | Browse all indexed documents with pagination and filters |
-| `vault_recent` | Recently modified/indexed docs (newest first) |
-| `vault_facets` | Distinct values + counts for all filterable fields |
-| `vault_folders` | Vault folder/directory structure with file counts |
-| `vault_status` | Index stats, provider settings, health checks |
-| `vault_index_update` | Incrementally update the index without leaving the assistant |
+| `file_search` | Hybrid semantic + keyword search with filters (tags, folder, source_type, doc_type, topics, etc.) |
+| `file_get_chunk` | Get full text + metadata for one chunk by doc_id and loc |
+| `file_get_doc_chunks` | Get all chunks for a document, sorted by position |
+| `file_list_documents` | Browse all indexed documents with pagination and filters |
+| `file_recent` | Recently modified/indexed docs (newest first) |
+| `file_facets` | Distinct values + counts for all filterable fields |
+| `file_folders` | Document folder/directory structure with file counts |
+| `file_status` | Index stats, provider settings, health checks |
+| `file_index_update` | Incrementally update the index without leaving the assistant |
+| `file_taxonomy_list` | List taxonomy entries (tags, folders, doc_types) with filters |
+| `file_taxonomy_get` | Get a single taxonomy entry by id |
+| `file_taxonomy_search` | Semantic search on taxonomy descriptions |
+| `file_taxonomy_add` | Add a new taxonomy entry |
+| `file_taxonomy_update` | Update an existing taxonomy entry |
+| `file_taxonomy_delete` | Delete a taxonomy entry |
+| `file_taxonomy_import` | Import taxonomy from SQLite seed databases |
 
 ## Run tests
 
 ```bash
-python -m pytest tests/ -m "not live" -x    # ~240 offline tests (no API keys)
-python -m pytest tests/ -x                   # ~290 full suite (requires API keys)
+python -m pytest tests/ -m "not live" -x    # ~320 offline tests (no API keys)
+python -m pytest tests/ -x                   # ~358 full suite (requires API keys)
 ```
 
 ## Project layout
 
 ```
-core/                        Config + storage interface
+core/                        Config, storage interface, taxonomy helpers
 providers/embed/             Embedding providers (OpenRouter, Ollama, Baseten, Gemini)
 providers/llm/               LLM providers (OpenRouter, Ollama, Baseten)
 providers/ocr/               OCR providers (Gemini Vision, DeepSeek OCR2)
-doc_enrichment.py            LLM metadata extraction
+taxonomy_store.py            Taxonomy LanceDB store (CRUD, vector search, FTS)
+doc_enrichment.py            LLM metadata extraction (with taxonomy integration)
 extractors.py                Text extraction (MD, PDF, images)
 flow_index_vault.py          Prefect indexing flow
 lancedb_store.py             LanceDB storage + search
 search_hybrid.py             4-stage hybrid search pipeline
-mcp_server.py                MCP server (stdio + HTTP)
+mcp_server.py                MCP server (stdio + HTTP, 17 tools)
 run_index.py                 CLI entrypoint
+scripts/seed_taxonomy.py     Import taxonomy from existing SQLite DBs
 config.yaml.example          Cloud config template
 config.local.yaml.example    Local/self-hosted config template
-tests/                       ~290 tests
+tests/                       ~358 tests
 docs/architecture.md         Search pipeline, schema, component details
+docs/vps-architecture.md     VPS/cloud deployment architecture
 ```

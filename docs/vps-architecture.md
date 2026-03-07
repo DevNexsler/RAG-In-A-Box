@@ -2,250 +2,126 @@
 
 ## Goals
 
-1. **No Obsidian dependency** — works with any markdown source (HackMD, Notion exports, GitBook, plain `.md` files, Google Docs exports, etc.)
-2. **VPS / Render.com ready** — all services run in cloud with persistent storage
-3. **Collaborative** — multiple users can feed documents; not tied to a single local vault
-4. **Stateless compute, persistent data** — app servers can restart/redeploy without data loss
+1. **No Obsidian dependency** — works with any markdown source
+2. **VPS-ready** — runs on any Linux server with persistent disk
+3. **Stateless compute, persistent data** — server can restart without data loss
 
 ---
 
-## Current State (Local)
+## What's Already Done (VPS-Version branch)
+
+These items from the original plan are **complete**:
+
+- [x] `documents_root` config key (replaces `vault_root`, with fallback alias)
+- [x] All MCP tools renamed from `vault_*` to `file_*`
+- [x] Cloud providers (OpenRouter embeddings + enrichment, Baseten reranker) — no local GPU needed
+- [x] Taxonomy system for consistent tagging (7 MCP CRUD tools)
+- [x] MCP HTTP mode already works (`--http` flag)
+- [x] 358 tests passing
+
+---
+
+## Current Architecture
 
 ```
-Local Machine
-  Obsidian Vault (local folder)
+Local Machine / VPS
+  Documents folder (any path)
        |
-  [Indexer] → LanceDB (local folder)
+  [Indexer] → LanceDB (local .lance/ files)
+       |            + Taxonomy table
+  [MCP Server] ← AI assistants (stdio or HTTP)
        |
-  [MCP Server] ← AI assistants (stdio)
+  Cloud APIs:
+    OpenRouter (embeddings + enrichment)
+    Baseten (reranker)
+    Gemini or DeepSeek OCR2 (OCR)
 ```
 
-**Problems for VPS deployment:**
-- `vault_root` / `index_root` are local filesystem paths
-- LanceDB index is a local directory (`.lance/` files)
-- MCP server uses stdio transport (requires co-located process)
-- Prefect runs a temp local server
-- Config references "Obsidian vault" everywhere
-- No document ingestion API — relies on filesystem scanning
+The core engine is already cloud-API-only (no local GPU). The remaining VPS work is just **deployment packaging** — how to run it remotely, accept files, and secure it.
 
 ---
 
-## Target Architecture (VPS)
+## Remaining Work — 3 Phases
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     VPS / Render.com                     │
-│                                                         │
-│  ┌──────────────┐    ┌──────────────┐                   │
-│  │  Web API      │    │  MCP Server  │ (SSE transport)   │
-│  │  (FastAPI)    │    │  (HTTP mode) │                   │
-│  │  /upload      │    │              │                   │
-│  │  /search      │    └──────┬───────┘                   │
-│  │  /status      │           │                           │
-│  └──────┬───────┘           │                           │
-│         │                    │                           │
-│         ▼                    ▼                           │
-│  ┌─────────────────────────────────┐                    │
-│  │         Core Engine              │                    │
-│  │  indexer / search / enrichment   │                    │
-│  └──────────────┬──────────────────┘                    │
-│                 │                                        │
-│                 ▼                                        │
-│  ┌─────────────────────────────────┐                    │
-│  │     Persistent Storage           │                    │
-│  │  Option A: Render Disk           │                    │
-│  │  Option B: S3/R2 + local cache   │                    │
-│  │  Option C: VPS disk (ext4/ZFS)   │                    │
-│  └─────────────────────────────────┘                    │
-│                                                         │
-│  Documents dir:  /data/documents/                       │
-│  LanceDB index:  /data/index/                           │
-└─────────────────────────────────────────────────────────┘
+### Phase 1: Deployable Server (minimum viable VPS)
 
-External (cloud APIs — same as current):
-  - OpenRouter (embeddings + enrichment)
-  - Baseten (reranker)
-  - Gemini (OCR)
-```
+**Goal:** Run on a VPS, accept MCP connections over HTTP, serve from persistent disk.
+
+| Task | What to do | Complexity |
+|------|-----------|------------|
+| **`server.py`** | Unified entrypoint: starts MCP HTTP server on `$PORT` (default 7788). Just wraps existing `mcp_server.py --http`. | Small — ~30 lines |
+| **`Dockerfile`** | Python 3.13-slim, `pip install -r requirements.txt`, `VOLUME /data`, `CMD python server.py` | Small |
+| **`config.vps.yaml.example`** | Same as cloud config but with `/data/documents` and `/data/index` paths | Small — copy + edit |
+| **Auth middleware** | `API_KEY` env var checked on every HTTP request. Single `Bearer` token. Add to `mcp_server.py` HTTP handler. | Small — ~20 lines |
+| **Env var overrides** | `DOCUMENTS_ROOT`, `INDEX_ROOT`, `PORT` override config.yaml values | Small — in `core/config.py` |
+
+**Result:** `docker build && docker run -v /data:/data -e API_KEY=... -e OPENROUTER_API_KEY=...` and it works. MCP clients connect via HTTP/SSE.
+
+### Phase 2: Document Ingestion API
+
+**Goal:** Accept files from external sources (upload, git sync, web UI).
+
+| Task | What to do | Complexity |
+|------|-----------|------------|
+| **`api_server.py`** | FastAPI app with REST routes. Mount alongside MCP server in `server.py`. | Medium |
+| `POST /api/upload` | Multipart file upload → save to `documents_root` → trigger incremental index | Medium |
+| `POST /api/sync` | Trigger `file_index_update` (re-scan documents_root) | Small — calls existing flow |
+| `GET /api/search` | REST wrapper around `file_search` for non-MCP clients | Small |
+| `GET /api/status` | REST wrapper around `file_status` | Small |
+| `DELETE /api/documents/{doc_id}` | Remove file from documents_root + delete from index | Small |
+
+**Note:** The REST API is optional. MCP HTTP already provides full functionality for AI assistants. The REST API is for web UIs and scripts that don't speak MCP.
+
+### Phase 3: Platform Configs (as needed)
+
+| Platform | Config file | Notes |
+|----------|------------|-------|
+| **Render.com** | `render.yaml` | Render Disk at `/data`, auto-deploy from git |
+| **Docker Compose** | `docker-compose.yml` | Optional Prefect container if you want dashboards |
+| **Systemd** | `doc-organizer.service` | For bare-metal VPS (Hetzner, DO, etc.) |
+| **Fly.io** | `fly.toml` | Fly Volume for persistence |
+
+Add these as needed per deployment target. Don't pre-build all of them.
 
 ---
 
-## Key Changes from Local Version
+## Design Principles
 
-### 1. Document Source — Filesystem-Agnostic
+**Keep it simple:**
+- One process serves everything (MCP + optional REST API)
+- LanceDB is the only data store (no Postgres, no Redis, no external DBs)
+- Cloud APIs handle all ML inference (no GPU, no model downloads on server)
+- Persistent disk at `/data` — documents + index side by side
 
-**Current:** Scans a local Obsidian vault directory via glob patterns.
+**Evolve incrementally:**
+- Phase 1 is a weekend project — it's just Docker + auth
+- Phase 2 adds ingestion only when you need non-filesystem sources
+- Phase 3 is platform-specific glue, done only for platforms you actually deploy to
 
-**VPS Version:** Documents come from multiple sources. The indexer operates on a **documents directory** (`/data/documents/`) regardless of how files got there.
+**Don't over-engineer:**
+- No multi-tenant auth until you actually have multiple users
+- No S3-backed LanceDB until you need multi-instance scaling
+- No message queue for indexing until throughput demands it
+- No Kubernetes — a single Docker container is fine for thousands of documents
 
-**Ingestion methods (any combination):**
+---
 
-| Method | How it works | Best for |
-|--------|-------------|----------|
-| **Upload API** | `POST /api/documents/upload` — multipart file upload | Web UI, scripts, integrations |
-| **Git sync** | Clone/pull a git repo of markdown files on a schedule | Teams using git-based MD (HackMD, GitBook, Obsidian Git) |
-| **Watch directory** | Mount a volume or sync folder; indexer detects changes | VPS with shared storage |
-| **S3/R2 sync** | Pull from object storage bucket on schedule or webhook | Cloud-native workflows |
-| **CLI push** | `curl` or client script pushes files to upload API | Quick one-off imports |
+## Storage
 
-The scanner already uses glob patterns — just point `documents_root` at `/data/documents/` instead of an Obsidian vault. No Obsidian-specific logic to remove (frontmatter parsing works on any YAML-frontmatter markdown, which HackMD/Jekyll/Hugo/etc. all use).
+LanceDB stores everything as local `.lance/` files. This must survive container restarts.
 
-### 2. Storage Strategy
+| Platform | Approach |
+|----------|---------|
+| **Any VPS** | Regular disk at `/data` (ext4/ZFS). Back up with rsync/restic. |
+| **Render.com** | Render Disk (persistent SSD at `/data`). Survives deploys. |
+| **Fly.io** | Fly Volume (NVMe). |
+| **Docker** | Bind mount or named volume at `/data`. |
 
-LanceDB stores everything as local files (`.lance/` directory). This must survive container restarts and redeployments.
-
-| Platform | Storage approach | Notes |
-|----------|-----------------|-------|
-| **Render.com** | Render Disk (persistent SSD mounted at `/data`) | Survives deploys. 1 service per disk. |
-| **VPS (Hetzner, DigitalOcean, etc.)** | Regular disk (`/data` on ext4/ZFS) | Most straightforward. Back up with rsync/restic. |
-| **Fly.io** | Fly Volume (persistent NVMe) | Attached to one machine. |
-| **Railway** | Volume mount | Similar to Render Disk. |
-| **S3-backed (future)** | LanceDB-Cloud or lance + S3 object store | LanceDB supports remote storage natively. Best for multi-instance. |
-
-**Config change:**
 ```yaml
-# Old
-vault_root: "/Users/dan/obsidian-vault"
-index_root: "/Users/dan/index"
-
-# New (VPS)
+# config.vps.yaml
 documents_root: "/data/documents"
 index_root: "/data/index"
 ```
-
-### 3. Transport — MCP over HTTP/SSE
-
-**Current:** MCP server uses stdio (process launched by AI assistant locally).
-
-**VPS Version:** MCP server runs as a persistent HTTP service. Already supported via `--http` flag. For remote AI assistants, expose as SSE (Server-Sent Events) transport — the MCP spec supports this.
-
-```
-AI Assistant ──(SSE/HTTP)──> VPS:7788 ──> MCP Server ──> LanceDB
-```
-
-**Also add:** A REST API layer (FastAPI) for non-MCP clients:
-- `POST /api/documents/upload` — upload files
-- `POST /api/documents/sync` — trigger git pull / re-scan
-- `GET /api/search?q=...&filters=...` — search without MCP
-- `GET /api/status` — index health
-- `DELETE /api/documents/{doc_id}` — remove a document
-
-### 4. Naming — Drop "Obsidian" / "Vault" Terminology
-
-| Old | New |
-|-----|-----|
-| `vault_root` | `documents_root` |
-| `vault_search` | `doc_search` |
-| `vault_status` | `index_status` |
-| `vault_recent` | `doc_recent` |
-| `vault_facets` | `index_facets` |
-| `vault_folders` | `doc_folders` |
-| `vault_get_chunk` | `doc_get_chunk` |
-| `vault_get_doc_chunks` | `doc_get_chunks` |
-| `vault_list_documents` | `doc_list` |
-| `vault_index_update` | `index_update` |
-| Obsidian Vault Semantic Index | Document Organizer |
-
-Keep backward compatibility: accept both old and new tool names in MCP server during transition.
-
-### 5. Process Management
-
-**Current:** Prefect starts a temp local server. Works for CLI usage.
-
-**VPS Version:**
-
-| Component | How to run |
-|-----------|-----------|
-| **MCP Server** | Long-running process (`python mcp_server.py --http`) — Render Web Service or `systemd` on VPS |
-| **API Server** | FastAPI app (`uvicorn api_server:app`) — can combine with MCP in one process |
-| **Indexer** | Triggered via API call, cron, or file-watch. Not a persistent process. |
-| **Prefect** | Optional. For VPS, a simple cron + logging may suffice. Keep Prefect support for users who want dashboards. |
-
-**Render.com deployment:**
-```
-# render.yaml
-services:
-  - type: web
-    name: doc-organizer
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python server.py
-    disk:
-      name: data
-      mountPath: /data
-      sizeGB: 10
-    envVars:
-      - key: OPENROUTER_API_KEY
-        sync: false
-      - key: BASETEN_API_KEY
-        sync: false
-      - key: GEMINI_API_KEY
-        sync: false
-```
-
-**Docker (VPS):**
-```dockerfile
-FROM python:3.13-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-VOLUME /data
-EXPOSE 7788
-CMD ["python", "server.py"]
-```
-
-### 6. Authentication
-
-Local version has none (localhost only). VPS needs basic auth at minimum.
-
-**Phase 1:** API key in header (`Authorization: Bearer <key>`) — single shared key from env var `API_KEY`.
-
-**Phase 2 (later):** Per-user keys, JWT, or OAuth if multi-tenant.
-
----
-
-## File Structure (New/Modified)
-
-```
-server.py                    NEW — unified entrypoint (starts API + MCP HTTP server)
-api_server.py                NEW — FastAPI REST API (upload, search, sync, status)
-core/config.py               MODIFY — support documents_root, detect VPS vs local mode
-core/storage.py              MODIFY — ensure paths work with /data mount
-core/auth.py                 NEW — API key middleware
-mcp_server.py                MODIFY — rename tools, keep backward compat aliases
-flow_index_vault.py          MODIFY — rename to flow_index.py, accept documents_root
-Dockerfile                   NEW
-docker-compose.yml           NEW (optional — for multi-container with Prefect)
-render.yaml                  NEW — Render.com deploy config
-config.vps.yaml.example      NEW — VPS config template
-docs/vps-architecture.md     THIS FILE
-```
-
----
-
-## Migration Path
-
-1. **Rename config keys** — `vault_root` → `documents_root` (keep `vault_root` as fallback alias)
-2. **Rename MCP tools** — add new names, keep old as aliases
-3. **Add `server.py`** — unified HTTP entrypoint combining MCP + REST API
-4. **Add `api_server.py`** — FastAPI routes for upload/search/sync
-5. **Add auth middleware** — API key from env var
-6. **Add Dockerfile + render.yaml** — containerized deployment
-7. **Add `config.vps.yaml.example`** — cloud config pointing to `/data/` paths
-8. **Update README** — document both local and VPS deployment
-
----
-
-## What Stays the Same
-
-- LanceDB as the storage engine (works great with local files on persistent disk)
-- All cloud providers (OpenRouter, Baseten, Gemini) — already stateless API calls
-- Hybrid search pipeline (vector + BM25 + RRF + reranker)
-- LLM enrichment pipeline
-- Frontmatter extraction (works with any YAML frontmatter, not Obsidian-specific)
-- Chunking strategies
-- Test suite (point at `/data/` in test config)
 
 ---
 
@@ -255,27 +131,40 @@ docs/vps-architecture.md     THIS FILE
 |----------|----------|-------------|
 | `OPENROUTER_API_KEY` | Yes | Embeddings + enrichment |
 | `BASETEN_API_KEY` | Yes | Reranker |
-| `GEMINI_API_KEY` | Yes | OCR |
-| `API_KEY` | Yes (VPS) | Auth for REST API + MCP HTTP |
-| `DOCUMENTS_ROOT` | No | Override config (default: `/data/documents`) |
-| `INDEX_ROOT` | No | Override config (default: `/data/index`) |
-| `PORT` | No | Server port (default: 7788, Render sets this) |
+| `GEMINI_API_KEY` | No | OCR (only if using Gemini instead of DeepSeek OCR2) |
+| `API_KEY` | Yes (VPS) | Bearer token auth for HTTP access |
+| `DOCUMENTS_ROOT` | No | Override config (default: from config.yaml) |
+| `INDEX_ROOT` | No | Override config (default: from config.yaml) |
+| `PORT` | No | Server port (default: 7788) |
 
 ---
 
-## Collaborative MD Software Compatibility
+## What Stays the Same (no changes needed)
 
-The system works with any tool that produces standard markdown files with optional YAML frontmatter:
+- LanceDB as the storage engine
+- All cloud providers (already stateless API calls)
+- Hybrid search pipeline (vector + BM25 + RRF + reranker)
+- LLM enrichment + taxonomy integration
+- Frontmatter extraction (works with any YAML frontmatter)
+- Chunking strategies
+- Full test suite
 
-| Software | Integration method |
-|----------|-------------------|
-| **HackMD / CodiMD** | Git sync (HackMD pushes to git), or export + upload API |
-| **Notion** | Export as markdown + upload, or use Notion API → markdown converter |
-| **Obsidian** | Git sync (Obsidian Git plugin), or point documents_root at vault |
-| **Logseq** | Git sync (Logseq uses git natively) |
-| **GitBook** | Git sync (GitBook stores as markdown in git) |
-| **Typora / iA Writer** | Sync folder or upload API |
-| **Google Docs** | Export as markdown via API/Zapier + upload |
-| **VS Code / any editor** | Direct file access or git sync |
+---
 
-The frontmatter parser already handles standard YAML frontmatter (`---` delimited), which is the universal standard across all these tools. No Obsidian-specific syntax (like `[[wikilinks]]`) is required for indexing to work.
+## Ingestion Methods (Phase 2+)
+
+| Method | How it works | When to add |
+|--------|-------------|-------------|
+| **Filesystem scan** | Point `documents_root` at a folder, run indexer | Already works (Phase 1) |
+| **Upload API** | `POST /api/upload` with file | Phase 2 |
+| **Git sync** | Clone/pull a repo to `documents_root` on schedule | Phase 2 (cron + git pull) |
+| **Watch directory** | inotify/fswatch triggers re-index | Phase 2 (optional) |
+| **S3/R2 sync** | Pull from bucket on schedule | Future (if needed) |
+
+---
+
+## Compatible Software
+
+Works with any tool that produces markdown with optional YAML frontmatter:
+
+Obsidian, HackMD/CodiMD, Notion (export), Logseq, GitBook, Typora, iA Writer, VS Code, Google Docs (export), Jekyll, Hugo — all use standard `---` delimited YAML frontmatter.
