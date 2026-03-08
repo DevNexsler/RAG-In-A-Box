@@ -1152,9 +1152,10 @@ if HAS_MCP and FastMCP is not None:
                 from api_server import build_api_app
 
                 api_key = os.environ.get("API_KEY")
+                config = load_config()
 
                 mcp_app = mcp.streamable_http_app()
-                api_app = build_api_app()
+                api_app = build_api_app(documents_root=Path(config["documents_root"]))
 
                 # Compose: /api/* → REST API, everything else → MCP
                 app = Starlette(routes=[
