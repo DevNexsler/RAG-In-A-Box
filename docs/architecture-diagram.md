@@ -109,10 +109,10 @@ User query: "property insurance claim in Springfield"
                     ▼
 ┌───────────────────────────────────────┐
 │  4. CROSS-ENCODER RERANKING           │
-│     Qwen3-Reranker-8B (Baseten)      │
+│     Qwen3-Reranker-8B (DeepInfra)    │
 │     Scores each query-doc pair        │
 │     Re-sorts by relevance score       │
-│     (timeout: 120s, graceful fallback)│
+│     (timeout: 30s, graceful fallback) │
 └───────────────────┬───────────────────┘
                     ▼
 ┌───────────────────────────────────────┐
@@ -218,7 +218,7 @@ New document text
 │  AI Assistants   │    │  Cloud APIs              │
 │  (remote MCP)    │    │  ├─ OpenRouter           │
 │  ├─ Claude Code  │    │  │  (embed + enrich)     │
-│  ├─ OpenClaw     │    │  ├─ Baseten (reranker)   │
+│  ├─ OpenClaw     │    │  ├─ DeepInfra (reranker) │
 │  └─ Claude Desktop│   │  └─ Gemini (OCR)         │
 └──────────────────┘    └──────────────────────────┘
 ```

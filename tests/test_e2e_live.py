@@ -1,7 +1,7 @@
 """End-to-end live tests: real cloud services, real LanceDB, full pipeline.
 
 Exercises the full chain: enrich → embed → store → search → rerank.
-Requires OPENROUTER_API_KEY and BASETEN_API_KEY. Skipped when keys are missing.
+Requires OPENROUTER_API_KEY and DEEPINFRA_API_KEY. Skipped when keys are missing.
 
 Run with:  pytest tests/test_e2e_live.py -v
 """
@@ -19,7 +19,7 @@ except ImportError:
     pass
 
 _has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
-_has_baseten = bool(os.environ.get("BASETEN_API_KEY"))
+_has_deepinfra = bool(os.environ.get("DEEPINFRA_API_KEY"))
 _has_tags_db = os.path.exists(os.path.expanduser("~/Documents/Primary/0-AI/directory_info/tags.db"))
 _has_dir_db = os.path.exists(os.path.expanduser("~/Documents/Primary/0-AI/directory_info/directory.db"))
 
@@ -30,8 +30,8 @@ _has_dir_db = os.path.exists(os.path.expanduser("~/Documents/Primary/0-AI/direct
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    not (_has_openrouter and _has_baseten),
-    reason="OPENROUTER_API_KEY and/or BASETEN_API_KEY not set",
+    not (_has_openrouter and _has_deepinfra),
+    reason="OPENROUTER_API_KEY and/or DEEPINFRA_API_KEY not set",
 )
 class TestEndToEndLive:
     """Full pipeline test with real cloud services and real LanceDB."""

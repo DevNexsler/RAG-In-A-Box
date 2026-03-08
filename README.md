@@ -160,9 +160,8 @@ To run everything on your own hardware instead of cloud APIs:
    - `ollama pull qwen3-embedding:0.6b` (semantic chunking)
    - `ollama pull qwen3-embedding:4b-q8_0` (embeddings)
 3. Start **DeepSeek OCR2** on port 8790 (for PDF/image OCR)
-4. Place reranker GGUF model in `models/` (for llama_cpp reranker)
 
-No cloud API keys needed in local mode.
+No cloud API keys needed in local mode (except reranker — DeepInfra is always cloud).
 
 ## Features
 
@@ -235,8 +234,8 @@ python -m pytest tests/ -x                   # ~358 full suite (requires API key
 
 ```
 core/                        Config, storage interface, taxonomy helpers
-providers/embed/             Embedding providers (OpenRouter, Ollama, Baseten, Gemini)
-providers/llm/               LLM providers (OpenRouter, Ollama, Baseten)
+providers/embed/             Embedding providers (OpenRouter, Ollama, Gemini)
+providers/llm/               LLM providers (OpenRouter, Ollama)
 providers/ocr/               OCR providers (Gemini Vision, DeepSeek OCR2)
 taxonomy_store.py            Taxonomy LanceDB store (CRUD, vector search, FTS)
 doc_enrichment.py            LLM metadata extraction (with taxonomy integration)

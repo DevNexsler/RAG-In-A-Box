@@ -8,7 +8,7 @@ Developer-facing details about the search pipeline, storage schema, taxonomy sys
 |----------------------|----------------------------------------------------------|
 | `GEMINI_API_KEY`     | Default cloud config — OCR via Gemini Vision (not needed if using local DeepSeek OCR2) |
 | `OPENROUTER_API_KEY` | Default cloud config — embeddings (Qwen3-Embedding-8B) + enrichment (GPT-4.1 Mini) |
-| `BASETEN_API_KEY`    | Default cloud config — reranker (Qwen3-Reranker-8B) (not needed if using local llama_cpp) |
+| `DEEPINFRA_API_KEY`  | Default cloud config — reranker (Qwen3-Reranker-8B via DeepInfra) |
 
 Store these in a `.env` file in the project root. The MCP server and indexer load it automatically.
 
@@ -27,7 +27,7 @@ Store these in a `.env` file in the project root. The MCP server and indexer loa
 | Image description | Gemini Vision `describe()` — text + detailed visual description (when Gemini OCR enabled) |
 | Image metadata    | Pillow EXIF extraction (camera, date, GPS, dimensions)        |
 | PDF metadata      | PyMuPDF (title, author, dates, page count)                    |
-| Reranking         | Qwen3-Reranker-8B via Baseten (cloud, scale-to-zero with cold-start check) |
+| Reranking         | Qwen3-Reranker-8B via DeepInfra (cloud, always-on, batch scoring, 30s timeout) |
 | Orchestration     | Prefect 3.x — flow/task logging, retry, dashboard at `http://127.0.0.1:4200` |
 
 ## Search pipeline
@@ -35,7 +35,7 @@ Store these in a `.env` file in the project root. The MCP server and indexer loa
 1. **Pre-filter:** Build SQL WHERE clause from filters (source_type, folder, tags, enr_doc_type, enr_topics, etc.) and apply at LanceDB level via `.where(clause, prefilter=True)` — filters run before ANN/FTS scoring so full `top_k` results match the criteria
 2. **Parallel retrieval:** vector search (semantic) + BM25/FTS (keyword) — run concurrently, both with pre-filters applied
 3. **RRF fusion:** Reciprocal Rank Fusion merges both ranked lists
-4. **Cross-encoder reranking:** Qwen3-Reranker-8B (Baseten) scores query-document pairs (timeout: 120s)
+4. **Cross-encoder reranking:** Qwen3-Reranker-8B (DeepInfra) scores query-document pairs (timeout: 30s)
 5. **Diagnostics:** Every response includes `{vector_search_active, keyword_search_active, reranker_applied, degraded}` so callers detect silent degradation
 
 ## Taxonomy system

@@ -42,11 +42,8 @@ mcp>=1.0.0
 # Server auto-starts: llama-server -m models/Qwen3-Embedding-4B-Q8_0.gguf --port 8788 --embedding -c 8192
 # Asymmetric retrieval: queries get an instruction prefix, documents don't (handled by LlamaCppEmbedProvider)
 
-# Reranker: Qwen3-Reranker-4B via llama.cpp server (provider: "llama_cpp" in config.yaml)
-# Install: brew install llama.cpp
-# Convert: python convert_hf_to_gguf.py Qwen/Qwen3-Reranker-4B --outtype q8_0 --outfile models/qwen3-reranker-4b-q8_0.gguf
-# Server auto-starts: llama-server -m models/qwen3-reranker-4b-q8_0.gguf --port 8787 --reranking
-# NOTE: Community GGUF downloads are broken for reranking — must convert yourself with llama.cpp's script
+# Reranker: Qwen3-Reranker-8B via DeepInfra (cloud, always-on)
+# API key: DEEPINFRA_API_KEY in .env
 
 # Testing
 pytest>=8.0.0

@@ -115,18 +115,19 @@ storage_options:
 
 **No architecture changes needed** — requires only the `DocumentStorage` abstraction above and passing `storage_options` to `lancedb.connect()`. All search, enrichment, chunking, and MCP logic stays the same.
 
-### Phase 2: Document Ingestion API
+### Phase 2: Document Ingestion API (PARTIALLY DONE)
 
 **Goal:** Accept files from external sources (upload, git sync, web UI).
 
-| Task | What to do | Complexity |
-|------|-----------|------------|
-| **`api_server.py`** | FastAPI app with REST routes. Mount alongside MCP server in `server.py`. | Medium |
-| `POST /api/upload` | Multipart file upload → save to `documents_root` → trigger incremental index | Medium |
-| `POST /api/sync` | Trigger `file_index_update` (re-scan documents_root) | Small — calls existing flow |
-| `GET /api/search` | REST wrapper around `file_search` for non-MCP clients | Small |
-| `GET /api/status` | REST wrapper around `file_status` | Small |
-| `DELETE /api/documents/{doc_id}` | Remove file from documents_root + delete from index | Small |
+| Task | Status | Details |
+|------|--------|---------|
+| **`api_server.py`** | Done | Starlette REST app mounted alongside MCP in `server.py` |
+| `POST /api/upload` | Done | Multipart file upload with directory param, path traversal protection |
+| `GET /api/documents/{path}` | Done | Download file by doc_id path |
+| `GET /api/documents/` | Done | List files with pagination (limit/offset) |
+| `POST /api/sync` | TODO | Trigger `file_index_update` (re-scan documents_root) |
+| `GET /api/search` | TODO | REST wrapper around `file_search` for non-MCP clients |
+| `DELETE /api/documents/{doc_id}` | TODO | Remove file from documents_root + delete from index |
 
 **Note:** The REST API is optional. MCP HTTP already provides full functionality for AI assistants. The REST API is for web UIs and scripts that don't speak MCP.
 

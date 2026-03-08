@@ -480,23 +480,19 @@ class TestMCPHandlers:
 
 
 # ---------------------------------------------------------------------------
-# Reranker tests — real Qwen3-Reranker via llama.cpp server
+# Reranker tests — real Qwen3-Reranker-8B via DeepInfra
 # ---------------------------------------------------------------------------
 
-def _reranker_model_available() -> bool:
-    """Check if the reranker GGUF model exists and llama-server is installed."""
-    import shutil
-    model_path = "models/qwen3-reranker-4b-q8_0.gguf"
-    return os.path.isfile(model_path) and shutil.which("llama-server") is not None
+_has_deepinfra_key = bool(os.environ.get("DEEPINFRA_API_KEY"))
 
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    not _reranker_model_available(),
-    reason="Reranker GGUF model or llama-server not available",
+    not _has_deepinfra_key,
+    reason="DEEPINFRA_API_KEY not set",
 )
 class TestReranker:
-    """Test Qwen3-Reranker-4B via llama.cpp with real scoring (server auto-starts)."""
+    """Test Qwen3-Reranker-8B via DeepInfra with real scoring."""
 
     def _print_stage(self, label, hits, score_label="score"):
         """Helper: print a ranked list of hits for a pipeline stage."""
@@ -551,7 +547,7 @@ class TestReranker:
         reranked = reranker.rerank(query, fused)
         elapsed = time.perf_counter() - t0
         self._print_stage(
-            f"STAGE 4: Qwen3-Reranker (llama.cpp) — {elapsed:.2f}s",
+            f"STAGE 4: Qwen3-Reranker (DeepInfra) — {elapsed:.2f}s",
             reranked, "relev.",
         )
 
