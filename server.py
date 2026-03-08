@@ -3,10 +3,6 @@
 import logging
 import os
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 from core.config import load_config
 
 config = load_config()

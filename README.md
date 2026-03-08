@@ -114,12 +114,42 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 The pattern is the same for Cursor, Windsurf, or any tool that supports MCP stdio servers. Point `command` at the venv Python and `args` at `mcp_server.py`. API keys are loaded from the `.env` file automatically — no need to pass them in the MCP config.
 
-#### HTTP mode (testing / non-MCP clients)
+#### HTTP mode (remote / non-MCP clients)
 
 ```bash
 python mcp_server.py --http
-# Listens on 127.0.0.1:7788
+# Listens on 0.0.0.0:7788
 ```
+
+#### VPS / Docker deployment
+
+Run as a standalone HTTP server on any VPS or container platform. All ML inference uses cloud APIs — no GPU needed.
+
+```bash
+# Docker
+docker build -t doc-organizer .
+docker run -v /path/to/data:/data -p 7788:7788 \
+  -e OPENROUTER_API_KEY=... \
+  -e BASETEN_API_KEY=... \
+  -e API_KEY=your-secret-token \
+  doc-organizer
+
+# Or run directly
+API_KEY=your-secret-token python server.py
+```
+
+**Environment variable overrides** (for container/VPS use):
+
+| Variable | Description |
+|----------|-------------|
+| `DOCUMENTS_ROOT` | Override documents path (default: from config.yaml) |
+| `INDEX_ROOT` | Override index path (default: from config.yaml) |
+| `PORT` | Server port (default: 7788) |
+| `API_KEY` | Bearer token for HTTP auth. No auth when unset. |
+
+When `API_KEY` is set, all HTTP requests must include `Authorization: Bearer <API_KEY>`. See `config.vps.yaml.example` for VPS-specific config.
+
+**Render.com:** One-click deploy with `render.yaml` — persistent disk at `/data`, auto-generated API key.
 
 ### Local mode (optional)
 
@@ -171,7 +201,7 @@ Document Collection                    AI Assistants
 
 **Cloud or local** — Every component (OCR, embeddings, enrichment, reranker) has both cloud and local provider options. Default config uses cloud APIs with no servers to run. Switch to fully self-hosted with a single config file swap.
 
-**Resilient by default** — Per-document error handling with retries, structured MCP error responses, search diagnostics on every query (`vector_search_active`, `reranker_applied`, `degraded`), and SQL injection protection on filter keys.
+**Resilient by default** — Per-document error handling with retries, structured MCP error responses, search diagnostics on every query (`vector_search_active`, `reranker_applied`, `degraded`), SQL injection protection on filter keys, and automatic LanceDB corruption recovery (version rollback + rebuild).
 
 ### MCP tools
 
@@ -215,10 +245,15 @@ flow_index_vault.py          Prefect indexing flow
 lancedb_store.py             LanceDB storage + search
 search_hybrid.py             4-stage hybrid search pipeline
 mcp_server.py                MCP server (stdio + HTTP, 17 tools)
+server.py                    VPS entrypoint — starts HTTP server on $PORT
 run_index.py                 CLI entrypoint
 scripts/seed_taxonomy.py     Import taxonomy from existing SQLite DBs
 config.yaml.example          Cloud config template
 config.local.yaml.example    Local/self-hosted config template
+config.vps.yaml.example      VPS/container config template
+Dockerfile                   Docker image (Python 3.13-slim, no GPU)
+.dockerignore                Docker build exclusions
+render.yaml                  Render.com deployment descriptor
 tests/                       ~358 tests
 docs/architecture.md         Search pipeline, schema, component details
 docs/vps-architecture.md     VPS/cloud deployment architecture

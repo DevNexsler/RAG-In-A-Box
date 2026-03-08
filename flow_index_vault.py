@@ -547,22 +547,24 @@ def _recover_corrupt_table(index_root: str | Path, table_name: str, logger) -> L
         logger.error("Cannot read dataset versions: %s", exc)
         return None
 
-    clean_table = None
+    # Find the last clean version (cheap probe first, full read only once)
     clean_version = None
     for v in versions:
         ver = v["version"]
         try:
             ds_v = lance.dataset(lance_path, version=ver)
-            clean_table = ds_v.to_table()
+            ds_v.to_table(limit=1)  # cheap validation — don't load full dataset
             clean_version = ver
             break
         except Exception:
             continue
 
-    if clean_table is None:
+    if clean_version is None:
         logger.error("No readable version found — manual recovery needed")
         return None
 
+    # Full read only for the validated version
+    clean_table = lance.dataset(lance_path, version=clean_version).to_table()
     logger.info(
         "Found clean version %d with %d rows — rebuilding table",
         clean_version, clean_table.num_rows,

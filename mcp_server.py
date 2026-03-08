@@ -1143,10 +1143,8 @@ if HAS_MCP and FastMCP is not None:
             import anyio
 
             async def _run_http():
+                import hmac
                 import uvicorn
-                from starlette.applications import Starlette
-                from starlette.middleware import Middleware
-                from starlette.requests import Request
                 from starlette.responses import JSONResponse
 
                 api_key = os.environ.get("API_KEY")
@@ -1155,12 +1153,16 @@ if HAS_MCP and FastMCP is not None:
 
                 if api_key:
                     original_app = app
+                    expected = f"Bearer {api_key}".encode()
 
                     async def auth_app(scope, receive, send):
-                        if scope["type"] == "http":
-                            request = Request(scope, receive)
-                            auth_header = request.headers.get("authorization", "")
-                            if auth_header != f"Bearer {api_key}":
+                        if scope["type"] in ("http", "websocket"):
+                            auth_value = b""
+                            for name, value in scope.get("headers", []):
+                                if name == b"authorization":
+                                    auth_value = value
+                                    break
+                            if not hmac.compare_digest(auth_value, expected):
                                 response = JSONResponse(
                                     {"error": "Unauthorized"}, status_code=401
                                 )
@@ -1170,8 +1172,8 @@ if HAS_MCP and FastMCP is not None:
 
                     app = auth_app
 
-                config = uvicorn.Config(app, host=host, port=port, log_level="info")
-                server = uvicorn.Server(config)
+                uvi_config = uvicorn.Config(app, host=host, port=port, log_level="info")
+                server = uvicorn.Server(uvi_config)
                 await server.serve()
 
             anyio.run(_run_http)
