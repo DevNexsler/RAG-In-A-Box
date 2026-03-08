@@ -276,7 +276,7 @@ class TestEndToEndLive:
         assert result.hits[0].doc_id == "recipe.md"
 
     def test_search_with_reranker(self, pipeline_result):
-        """Full search with Baseten reranker should return properly scored results."""
+        """Full search with DeepInfra reranker should return properly scored results."""
         from search_hybrid import hybrid_search, build_reranker
 
         store = pipeline_result["store"]

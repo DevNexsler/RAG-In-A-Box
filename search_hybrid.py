@@ -125,104 +125,50 @@ class Reranker:
         raise NotImplementedError
 
 
-class CrossEncoderReranker(Reranker):
-    """Re-rank using a cross-encoder model from sentence-transformers.
+class DeepInfraReranker(Reranker):
+    """Re-rank using Qwen3-Reranker-8B via DeepInfra inference API.
 
-    Default model: cross-encoder/ms-marco-MiniLM-L-6-v2 (~80MB, fast).
-    Install: pip install sentence-transformers
-    """
-
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
-        try:
-            from sentence_transformers import CrossEncoder
-        except ImportError:
-            raise ImportError(
-                "Cross-encoder re-ranking requires sentence-transformers. "
-                "Install with: pip install sentence-transformers"
-            )
-        self._model = CrossEncoder(model_name)
-        logger.info("CrossEncoderReranker loaded: %s", model_name)
-
-    def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
-        if not hits:
-            return hits
-        pairs = [(query, h.text) for h in hits]
-        scores = self._model.predict(pairs)
-        for hit, score in zip(hits, scores):
-            hit.score = float(score)
-        return sorted(hits, key=lambda h: -h.score)
-
-
-class LlamaCppReranker(Reranker):
-    """Re-rank using Qwen3-Reranker via llama.cpp server's native /v1/rerank endpoint.
-
-    The server is auto-managed: started on first use, shut down after idle timeout.
-    If the server cannot be started, reranking blocks and retries rather than skipping.
-
-    Setup:
-        brew install llama.cpp
-        # Model GGUF must be converted with llama.cpp's convert_hf_to_gguf.py
+    Always-on (no cold start), batch scoring (one API call), direct relevance scores.
     """
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8787",
-        model_name: str = "qwen3-reranker",
-        timeout: float = 120.0,
-        model_path: str = "",
-        idle_timeout: float = 300.0,
-        heartbeat_dir: str = "",
+        model: str = "Qwen/Qwen3-Reranker-8B",
+        api_key: str | None = None,
+        timeout: float = 30.0,
     ):
-        self.base_url = base_url.rstrip("/")
-        self.model_name = model_name
-        self.timeout = timeout
-        self.model_path = model_path
-        self.idle_timeout = idle_timeout
-        self._server_manager = None
+        import os
 
-        if model_path:
-            from llama_server import LlamaServerManager, DEFAULT_HEARTBEAT_DIR
-            parsed_port = int(base_url.rstrip("/").rsplit(":", 1)[-1])
-            self._server_manager = LlamaServerManager.get_instance(
-                name="reranker",
-                model_path=model_path,
-                port=parsed_port,
-                server_flags=["--reranking", "-c", "4096", "-b", "4096", "-ub", "4096"],
-                idle_timeout=idle_timeout,
-                heartbeat_dir=heartbeat_dir or DEFAULT_HEARTBEAT_DIR,
+        self.model = model
+        self.api_key = api_key or os.environ.get("DEEPINFRA_API_KEY", "")
+        self.timeout = timeout
+        self.base_url = f"https://api.deepinfra.com/v1/inference/{model}"
+
+        if not self.api_key:
+            raise ValueError(
+                "DEEPINFRA_API_KEY not set. Set it in .env or pass api_key."
             )
 
-        logger.info(
-            "LlamaCppReranker initialized: %s/v1/rerank (model=%s, auto_manage=%s)",
-            self.base_url, model_name, bool(self._server_manager),
-        )
+        logger.info("DeepInfraReranker initialized: model=%s", model)
 
     def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
-        """Score all candidates in one batch call, return sorted by relevance.
-
-        If the server is not running and a model_path was configured, the server
-        is started automatically (blocking until ready). The server shuts down
-        after idle_timeout seconds of inactivity.
-
-        Raises RuntimeError on failure so the caller can track degradation.
-        """
+        """Score all candidates in one batch call, return sorted by relevance."""
         if not hits:
             return hits
 
         import httpx
 
-        if self._server_manager:
-            if not self._server_manager.ensure_running():
-                raise RuntimeError("Could not start llama-server for reranking")
-
         documents = [h.text[:4000] for h in hits]
 
         try:
             resp = httpx.post(
-                f"{self.base_url}/v1/rerank",
+                self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
                 json={
-                    "model": self.model_name,
-                    "query": query,
+                    "queries": [query],
                     "documents": documents,
                 },
                 timeout=self.timeout,
@@ -230,277 +176,44 @@ class LlamaCppReranker(Reranker):
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            if self._server_manager:
-                logger.warning(
-                    "Rerank call failed, attempting server restart: %s", e,
-                )
-                if self._server_manager.ensure_running():
-                    try:
-                        resp = httpx.post(
-                            f"{self.base_url}/v1/rerank",
-                            json={
-                                "model": self.model_name,
-                                "query": query,
-                                "documents": documents,
-                            },
-                            timeout=self.timeout,
-                        )
-                        resp.raise_for_status()
-                        data = resp.json()
-                    except Exception as e2:
-                        raise RuntimeError(f"Rerank failed after server restart: {e2}") from e2
-                else:
-                    raise RuntimeError("Reranker server restart failed") from e
-            else:
-                raise RuntimeError(f"Reranker call failed: {e}") from e
+            raise RuntimeError(f"DeepInfra reranker failed: {e}") from e
 
-        scores_by_idx: dict[int, float] = {}
-        for result in data.get("results", []):
-            scores_by_idx[result["index"]] = result["relevance_score"]
-
-        for i, hit in enumerate(hits):
-            hit.score = scores_by_idx.get(i, 0.0)
+        scores = data.get("scores", [])
+        for i, score in enumerate(scores):
+            if i < len(hits):
+                hits[i].score = score
 
         ranked = sorted(hits, key=lambda h: -h.score)
-
-        if self._server_manager:
-            self._server_manager.touch()
-
         logger.info(
-            "LlamaCppReranker: scored %d candidates, top_score=%.4f",
+            "DeepInfraReranker: scored %d candidates, top_score=%.4f",
             len(ranked),
             ranked[0].score if ranked else 0.0,
         )
         return ranked
 
 
-class BasetenReranker(Reranker):
-    """Re-rank using Qwen3-Reranker-8B via Baseten vLLM.
-
-    Uses /v1/chat/completions with logprobs to compute P(yes) relevance
-    scores. Each (query, doc) pair is scored individually via the
-    Qwen3-Reranker chat template with thinking disabled.
-    """
-
-    _RETRY_BACKOFF = (10.0, 20.0, 30.0)
-    _MAX_RETRIES = 3
-
-    def __init__(
-        self,
-        model_id: str,
-        api_key: str | None = None,
-        timeout: float = 60.0,
-        instruction: str = "Given a web search query, retrieve relevant passages that answer the query",
-    ):
-        import os
-
-        self.model_id = model_id
-        self.api_key = api_key or os.environ.get("BASETEN_API_KEY", "")
-        self.timeout = timeout
-        self.instruction = instruction
-        self.base_url = (
-            f"https://model-{model_id}.api.baseten.co"
-            f"/environments/production/sync"
-        )
-
-        if not self.api_key:
-            raise ValueError(
-                "BASETEN_API_KEY not set. Set it in .env or pass api_key."
-            )
-
-        self._ready = False
-        logger.info("BasetenReranker initialized: model_id=%s", model_id)
-
-    def _ensure_ready(self) -> None:
-        """Wake the Baseten deployment and wait until it responds.
-
-        Sends a lightweight /v1/models probe every 10s for up to 120s.
-        This absorbs scale-to-zero cold start time *before* scoring,
-        so actual rerank requests don't timeout mid-flight.
-        """
-        if self._ready:
-            return
-
-        import httpx
-        import time
-
-        headers = {"Authorization": f"Api-Key {self.api_key}"}
-        max_wait = 120.0
-        poll_interval = 10.0
-        start = time.monotonic()
-
-        logger.info("Waiting for Baseten reranker to become ready...")
-        while time.monotonic() - start < max_wait:
-            try:
-                resp = httpx.get(
-                    f"{self.base_url}/v1/models",
-                    headers=headers,
-                    timeout=15.0,
-                )
-                if resp.status_code == 200:
-                    elapsed = time.monotonic() - start
-                    self._ready = True
-                    logger.info("Baseten reranker ready (%.1fs)", elapsed)
-                    return
-            except Exception:
-                pass
-            time.sleep(poll_interval)
-
-        logger.warning(
-            "Baseten reranker not ready after %.0fs — proceeding anyway",
-            time.monotonic() - start,
-        )
-
-    def _score_hit(self, query: str, hit: SearchHit, client: "httpx.Client") -> float:
-        """Score a single (query, doc) pair via vLLM logprobs."""
-        import math
-
-        prompt = (
-            f"<Instruct>: {self.instruction}\n"
-            f"<Query>: {query}\n"
-            f"<Document>: {hit.text[:4000]}"
-        )
-        resp = client.post(
-            f"{self.base_url}/v1/chat/completions",
-            json={
-                "model": "qwen3-reranker",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1,
-                "temperature": 0.0,
-                "logprobs": True,
-                "top_logprobs": 20,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        choices = data.get("choices", [])
-        if not choices:
-            return 0.0
-
-        logprobs_data = choices[0].get("logprobs", {})
-        content = logprobs_data.get("content", []) if logprobs_data else []
-        if not content:
-            return 0.0
-
-        top_lps = content[0].get("top_logprobs", [])
-        yes_lp = next((lp["logprob"] for lp in top_lps if lp["token"].lower() == "yes"), None)
-        no_lp = next((lp["logprob"] for lp in top_lps if lp["token"].lower() == "no"), None)
-
-        if yes_lp is not None and no_lp is not None:
-            max_lp = max(yes_lp, no_lp)
-            yes_exp = math.exp(yes_lp - max_lp)
-            no_exp = math.exp(no_lp - max_lp)
-            return yes_exp / (yes_exp + no_exp)
-        if yes_lp is not None:
-            return math.exp(yes_lp)
-        return 0.0
-
-    def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
-        """Score candidates via vLLM logprobs, return sorted by relevance.
-
-        On first call, waits for the deployment to wake up (scale-to-zero).
-        Then retries with backoff on transient failures.
-        """
-        if not hits:
-            return hits
-
-        self._ensure_ready()
-
-        import httpx
-        import time
-
-        headers = {
-            "Authorization": f"Api-Key {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        last_exc = None
-        for attempt in range(self._MAX_RETRIES + 1):
-            try:
-                with httpx.Client(headers=headers, timeout=self.timeout) as client:
-                    for hit in hits:
-                        hit.score = self._score_hit(query, hit, client)
-
-                ranked = sorted(hits, key=lambda h: -h.score)
-                logger.info(
-                    "BasetenReranker: scored %d candidates, top_score=%.4f",
-                    len(ranked),
-                    ranked[0].score if ranked else 0.0,
-                )
-                return ranked
-
-            except Exception as e:
-                last_exc = e
-                if attempt < self._MAX_RETRIES:
-                    backoff = self._RETRY_BACKOFF[min(attempt, len(self._RETRY_BACKOFF) - 1)]
-                    logger.warning(
-                        "rerank() attempt %d/%d failed (%s: %s), retrying in %.0fs...",
-                        attempt + 1, self._MAX_RETRIES + 1,
-                        type(e).__name__, e, backoff,
-                    )
-                    time.sleep(backoff)
-                else:
-                    raise RuntimeError(
-                        f"Baseten reranker failed after {attempt + 1} attempts: {e}"
-                    ) from e
-
-        raise RuntimeError(f"Baseten reranker failed: {last_exc}") from last_exc
-
-
 def build_reranker(config: dict) -> Reranker | None:
     """Factory: build a Reranker from the search.reranker config section.
 
-    Config example (baseten — cloud):
+    Config example:
         search:
           reranker:
             enabled: true
-            provider: "baseten"
-            model_id: "wnppr2y3"
-
-    Config example (llama_cpp — local, with auto-managed server):
-        search:
-          reranker:
-            enabled: true
-            provider: "llama_cpp"
-            base_url: "http://localhost:8787"
-            model_path: "models/qwen3-reranker-4b-q8_0.gguf"
-            idle_timeout: 300
-
-    Config example (cross_encoder):
-        search:
-          reranker:
-            enabled: true
-            provider: "cross_encoder"
-            model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+            provider: "deepinfra"
+            model: "Qwen/Qwen3-Reranker-8B"
+            timeout: 30
     """
     reranker_cfg = config.get("search", {}).get("reranker", {})
     if not reranker_cfg.get("enabled", False):
         return None
 
-    provider = reranker_cfg.get("provider", "llama_cpp")
+    provider = reranker_cfg.get("provider", "deepinfra")
 
-    if provider == "baseten":
-        return BasetenReranker(
-            model_id=reranker_cfg.get("model_id", ""),
+    if provider == "deepinfra":
+        return DeepInfraReranker(
+            model=reranker_cfg.get("model", "Qwen/Qwen3-Reranker-8B"),
             api_key=reranker_cfg.get("api_key"),
-            timeout=reranker_cfg.get("timeout", 60.0),
-        )
-    elif provider == "llama_cpp":
-        return LlamaCppReranker(
-            base_url=reranker_cfg.get("base_url", "http://localhost:8787"),
-            model_name=reranker_cfg.get("model", "qwen3-reranker"),
-            timeout=reranker_cfg.get("timeout", 120.0),
-            model_path=reranker_cfg.get("model_path", ""),
-            idle_timeout=reranker_cfg.get("idle_timeout", 1800.0),
-            heartbeat_dir=config.get("server", {}).get("heartbeat_dir", ""),
-        )
-    elif provider == "cross_encoder":
-        return CrossEncoderReranker(
-            model_name=reranker_cfg.get(
-                "model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
-            ),
+            timeout=reranker_cfg.get("timeout", 30.0),
         )
     else:
         logger.warning("Unknown reranker provider: %s", provider)

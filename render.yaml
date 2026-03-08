@@ -7,7 +7,7 @@ services:
     envVars:
       - key: OPENROUTER_API_KEY
         sync: false
-      - key: BASETEN_API_KEY
+      - key: DEEPINFRA_API_KEY
         sync: false
       - key: API_KEY
         generateValue: true

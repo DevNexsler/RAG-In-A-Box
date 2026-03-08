@@ -521,16 +521,16 @@ def test_file_status_includes_health():
                 "search": {
                     "reranker": {
                         "enabled": True,
-                        "provider": "baseten",
-                        "model_id": "wnppr2y3",
+                        "provider": "deepinfra",
+                        "model": "Qwen/Qwen3-Reranker-8B",
                     },
                 },
             }
             mcp_server._cache = (mock_store, MagicMock(), mock_config)
 
-            # Mock reranker health check to return 200 (Baseten uses httpx.get)
+            # Mock reranker health check to return 200 (DeepInfra uses httpx.post)
             import httpx
-            with patch.object(httpx, "get", return_value=MagicMock(status_code=200)):
+            with patch.object(httpx, "post", return_value=MagicMock(status_code=200)):
                 result = mcp_server._file_status_impl()
 
             assert "health" in result

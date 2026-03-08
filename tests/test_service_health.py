@@ -96,31 +96,32 @@ class TestOpenRouterHealth:
 
 
 # -----------------------------------------------------------------------
-# Baseten (reranker)
+# DeepInfra (reranker)
 # -----------------------------------------------------------------------
 
-_has_baseten_key = bool(os.environ.get("BASETEN_API_KEY"))
+_has_deepinfra_key = bool(os.environ.get("DEEPINFRA_API_KEY"))
 
 
 @pytest.mark.live
-@pytest.mark.skipif(not _has_baseten_key, reason="BASETEN_API_KEY not set")
-class TestBasetenRerankerHealth:
-    """Verify Baseten reranker endpoint is reachable."""
+@pytest.mark.skipif(not _has_deepinfra_key, reason="DEEPINFRA_API_KEY not set")
+class TestDeepInfraRerankerHealth:
+    """Verify DeepInfra reranker endpoint is reachable."""
 
-    def test_predict_reachable(self):
-        """Minimal /predict returns 200."""
-        from core.config import load_config
-
-        config = load_config()
-        model_id = config.get("search", {}).get("reranker", {}).get("model_id", "wnppr2y3")
-
-        base = f"https://model-{model_id}.api.baseten.co/environments/production/sync"
-        resp = httpx.get(
-            f"{base}/v1/models",
-            headers={"Authorization": f"Api-Key {os.environ['BASETEN_API_KEY']}"},
-            timeout=60.0,
+    def test_rerank_reachable(self):
+        """Minimal inference endpoint returns 200."""
+        resp = httpx.post(
+            "https://api.deepinfra.com/v1/inference/Qwen/Qwen3-Reranker-8B",
+            headers={
+                "Authorization": f"Bearer {os.environ['DEEPINFRA_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "queries": ["test"],
+                "documents": ["test document"],
+            },
+            timeout=15.0,
         )
-        assert resp.status_code == 200, f"Baseten reranker: {resp.status_code} {resp.text[:200]}"
+        assert resp.status_code == 200, f"DeepInfra reranker: {resp.status_code} {resp.text[:200]}"
 
 
 # -----------------------------------------------------------------------

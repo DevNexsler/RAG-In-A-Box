@@ -389,23 +389,23 @@ def _file_status_impl() -> dict:
     reranker_enabled = reranker_cfg.get("enabled", False)
     reranker_responsive = None
     if reranker_enabled:
-        provider = reranker_cfg.get("provider", "llama_cpp")
         try:
             import httpx
-            if provider == "baseten":
-                model_id = reranker_cfg.get("model_id", "")
-                api_key = os.environ.get("BASETEN_API_KEY", "")
-                base = f"https://model-{model_id}.api.baseten.co/environments/production/sync"
-                resp = httpx.get(
-                    f"{base}/v1/models",
-                    headers={"Authorization": f"Api-Key {api_key}"},
-                    timeout=10.0,
-                )
-                reranker_responsive = resp.status_code == 200
-            else:
-                base_url = reranker_cfg.get("base_url", "http://localhost:8787").rstrip("/")
-                resp = httpx.get(f"{base_url}/health", timeout=2.0)
-                reranker_responsive = resp.status_code == 200
+            api_key = os.environ.get("DEEPINFRA_API_KEY", "")
+            model = reranker_cfg.get("model", "Qwen/Qwen3-Reranker-8B")
+            resp = httpx.post(
+                f"https://api.deepinfra.com/v1/inference/{model}",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "queries": ["test"],
+                    "documents": ["test"],
+                },
+                timeout=10.0,
+            )
+            reranker_responsive = resp.status_code == 200
         except Exception:
             reranker_responsive = False
 
@@ -960,8 +960,8 @@ if HAS_MCP and FastMCP is not None:
             - If last_run_at is null, the index has never been built.
             - If health.fts_available is false, run file_index_update to rebuild
               the FTS index.
-            - If health.reranker_responsive is false, check configured reranker
-              service is running (Baseten deployment active, or llama-server started).
+            - If health.reranker_responsive is false, check DEEPINFRA_API_KEY is set
+              and DeepInfra API is reachable.
         """
         return _file_status_impl()
 

@@ -11,7 +11,7 @@ Seems to work well for my use which is throw various document into folder with p
 
 Index a document collection (Markdown, PDFs, images) into a vector store and expose it as an **MCP server** — any MCP-compatible AI assistant (Claude Code, OpenClaw, Claude Desktop, Cursor, etc.) can search your documents with a single config entry. Supports both **cloud APIs** (default — no local servers needed) and **local/self-hosted** providers.
 
-Uses **Qwen3-Embedding-8B** (via OpenRouter) for embeddings, **GPT-4.1 Mini** (via OpenRouter) for document enrichment, **Gemini Vision** (cloud) or **DeepSeek OCR2** (local) for OCR, **Qwen3-Reranker-8B** (via Baseten) for cross-encoder reranking, **Prefect** for orchestration, **LanceDB** for storage + full-text search.
+Uses **Qwen3-Embedding-8B** (via OpenRouter) for embeddings, **GPT-4.1 Mini** (via OpenRouter) for document enrichment, **Gemini Vision** (cloud) or **DeepSeek OCR2** (local) for OCR, **Qwen3-Reranker-8B** (via DeepInfra) for cross-encoder reranking, **Prefect** for orchestration, **LanceDB** for storage + full-text search.
 
 ## Getting started
 
@@ -47,7 +47,7 @@ Create a `.env` file in the project root:
 ```bash
 GEMINI_API_KEY=...               # OCR — get one at https://aistudio.google.com/apikey
 OPENROUTER_API_KEY=sk-or-...     # embeddings + enrichment — https://openrouter.ai/keys
-BASETEN_API_KEY=...              # reranker — https://app.baseten.co/settings/api_keys
+DEEPINFRA_API_KEY=...            # reranker — https://deepinfra.com/dash/api_keys
 ```
 
 ### 4. Build the index
@@ -130,7 +130,7 @@ Run as a standalone HTTP server on any VPS or container platform. All ML inferen
 docker build -t doc-organizer .
 docker run -v /path/to/data:/data -p 7788:7788 \
   -e OPENROUTER_API_KEY=... \
-  -e BASETEN_API_KEY=... \
+  -e DEEPINFRA_API_KEY=... \
   -e API_KEY=your-secret-token \
   doc-organizer
 

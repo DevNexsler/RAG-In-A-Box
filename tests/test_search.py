@@ -435,11 +435,11 @@ def test_diagnostics_both_fail():
 
 
 # -----------------------------------------------------------------------
-# Live integration tests — real OpenRouter embedding + Baseten reranker
+# Live integration tests — real OpenRouter embedding + DeepInfra reranker
 # -----------------------------------------------------------------------
 
 _has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
-_has_baseten = bool(os.environ.get("BASETEN_API_KEY"))
+_has_deepinfra = bool(os.environ.get("DEEPINFRA_API_KEY"))
 
 
 @pytest.mark.live
@@ -468,9 +468,9 @@ class TestOpenRouterEmbeddingLive:
 
 
 @pytest.mark.live
-@pytest.mark.skipif(not _has_baseten, reason="BASETEN_API_KEY not set")
-class TestBasetenRerankerLive:
-    """Live tests for Baseten-hosted Qwen3-Reranker."""
+@pytest.mark.skipif(not _has_deepinfra, reason="DEEPINFRA_API_KEY not set")
+class TestDeepInfraRerankerLive:
+    """Live tests for DeepInfra-hosted Qwen3-Reranker."""
 
     def test_reranker_scores_and_sorts(self):
         """Real reranker should assign higher scores to relevant docs."""

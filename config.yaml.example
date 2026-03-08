@@ -72,10 +72,9 @@ search:
     weight: 0.3
   reranker:
     enabled: true
-    provider: "baseten"                   # Qwen3-Reranker-8B via Baseten (cloud)
-    model_id: "wnppr2y3"
-    timeout: 120
-    # Local alternative: provider: "llama_cpp" — see config.local.yaml.example
+    provider: "deepinfra"                 # Qwen3-Reranker-8B via DeepInfra (always-on, no cold start)
+    model: "Qwen/Qwen3-Reranker-8B"
+    timeout: 30
 
 lancedb:
   table: "chunks"

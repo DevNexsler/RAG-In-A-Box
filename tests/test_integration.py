@@ -516,7 +516,7 @@ class TestReranker:
         return build_reranker(config)
 
     def test_reranker_returns_continuous_scores(self, indexed_store):
-        """LlamaCppReranker should return continuous relevance scores (0.0–1.0)."""
+        """Reranker should return continuous relevance scores (0.0–1.0)."""
         import time
         from search_hybrid import hybrid_search, reciprocal_rank_fusion
 

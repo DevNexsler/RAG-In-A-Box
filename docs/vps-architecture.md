@@ -14,7 +14,7 @@ These items from the original plan are **complete**:
 
 - [x] `documents_root` config key (replaces `vault_root`, with fallback alias)
 - [x] All MCP tools renamed from `vault_*` to `file_*`
-- [x] Cloud providers (OpenRouter embeddings + enrichment, Baseten reranker) — no local GPU needed
+- [x] Cloud providers (OpenRouter embeddings + enrichment, DeepInfra reranker) — no local GPU needed
 - [x] Taxonomy system for consistent tagging (7 MCP CRUD tools)
 - [x] MCP HTTP mode already works (`--http` flag)
 - [x] 358 tests passing
@@ -34,7 +34,7 @@ Local Machine / VPS
        |
   Cloud APIs:
     OpenRouter (embeddings + enrichment)
-    Baseten (reranker)
+    DeepInfra (reranker)
     Gemini or DeepSeek OCR2 (OCR)
 ```
 
@@ -187,7 +187,7 @@ index_root: "/data/index"
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `OPENROUTER_API_KEY` | Yes | Embeddings + enrichment |
-| `BASETEN_API_KEY` | Yes | Reranker |
+| `DEEPINFRA_API_KEY` | Yes | Reranker |
 | `GEMINI_API_KEY` | No | OCR (only if using Gemini instead of DeepSeek OCR2) |
 | `API_KEY` | Yes (VPS) | Bearer token auth for HTTP access |
 | `DOCUMENTS_ROOT` | No | Override config (default: from config.yaml) |

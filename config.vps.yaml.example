@@ -78,9 +78,9 @@ search:
     weight: 0.3
   reranker:
     enabled: true
-    provider: "baseten"
-    model_id: "wnppr2y3"
-    timeout: 120
+    provider: "deepinfra"
+    model: "Qwen/Qwen3-Reranker-8B"
+    timeout: 30
 
 lancedb:
   table: "chunks"
