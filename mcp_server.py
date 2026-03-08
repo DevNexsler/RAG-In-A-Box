@@ -1145,11 +1145,22 @@ if HAS_MCP and FastMCP is not None:
             async def _run_http():
                 import hmac
                 import uvicorn
+                from starlette.applications import Starlette
                 from starlette.responses import JSONResponse
+                from starlette.routing import Mount
+
+                from api_server import build_api_app
 
                 api_key = os.environ.get("API_KEY")
 
-                app = mcp.streamable_http_app()
+                mcp_app = mcp.streamable_http_app()
+                api_app = build_api_app()
+
+                # Compose: /api/* → REST API, everything else → MCP
+                app = Starlette(routes=[
+                    Mount("/api", app=api_app),
+                    Mount("/", app=mcp_app),
+                ])
 
                 if api_key:
                     original_app = app

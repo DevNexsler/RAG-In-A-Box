@@ -1,4 +1,10 @@
-"""Unified VPS entrypoint — starts MCP HTTP server on $PORT (default 7788)."""
+"""Unified VPS entrypoint — starts MCP + REST API on $PORT (default 7788).
+
+Routes:
+    /mcp/*          MCP streamable-HTTP (for AI assistants)
+    /api/upload     POST file upload
+    /api/documents  GET list / GET download
+"""
 
 import logging
 import os

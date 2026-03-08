@@ -80,6 +80,41 @@ lancedb:
 
 Both `lancedb_store.py` and `taxonomy_store.py` call `lancedb.connect(index_root)` — S3 URIs work transparently. The only code addition needed is passing `storage_options` and `read_consistency_interval` from config to the `lancedb.connect()` calls.
 
+#### Document Storage Abstraction (when S3 is needed)
+
+LanceDB index storage is S3-ready (config change), but **document file access** still uses local filesystem calls (`os.walk`, `open()`, `os.path.getmtime()` in `flow_index_vault.py`, `extractors.py`, `mcp_server.py`). When S3-backed document storage is needed, introduce a `DocumentStorage` interface with `LocalStorage` and `S3Storage` implementations to replace these ~5 touch points. Keep on local filesystem until then — the refactor is small and straightforward.
+
+#### Self-Hosted Shared Drive (MinIO + Web UI)
+
+For a team/business setup with a shared file browser, use **MinIO** (open-source, S3-compatible storage with built-in web UI):
+
+```
+┌──────────────┐     ┌──────────────┐     ┌─────────────────┐
+│ MinIO         │     │ S3 bucket    │     │ Doc Organizer   │
+│ Web UI :9001  │────→│ (documents   │←────│ (index + search │
+│ S3 API :9000  │     │  + index)    │     │  + MCP + REST)  │
+└──────────────┘     └──────────────┘     └─────────────────┘
+     ↑ users browse/upload                      ↑ AI assistants
+```
+
+- Users upload/browse documents via MinIO web UI (or Nextcloud/FileBrowser for richer UX)
+- Doc Organizer reads from the same S3 bucket for indexing and search
+- Both LanceDB index and documents live in S3 — any number of services can connect
+- No shared volumes needed — all access via S3 API
+
+```yaml
+# config.yaml — point at MinIO instead of local disk
+documents_root: "s3://documents/"
+index_root: "s3://doc-organizer-index/"
+
+storage_options:
+  endpoint_url: "http://minio:9000"
+  aws_access_key_id: "${MINIO_ACCESS_KEY}"
+  aws_secret_access_key: "${MINIO_SECRET_KEY}"
+```
+
+**No architecture changes needed** — requires only the `DocumentStorage` abstraction above and passing `storage_options` to `lancedb.connect()`. All search, enrichment, chunking, and MCP logic stays the same.
+
 ### Phase 2: Document Ingestion API
 
 **Goal:** Accept files from external sources (upload, git sync, web UI).
