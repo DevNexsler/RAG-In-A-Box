@@ -182,7 +182,7 @@ Document Collection                    AI Assistants
                                             file_recent ...
 ```
 
-**Hybrid search** — Every query runs vector (semantic) and keyword (BM25) search in parallel, fuses results with Reciprocal Rank Fusion, then reranks with a cross-encoder. Pre-filters (tags, folders, doc type, topics) apply at the database level before retrieval so every result matches.
+**Hybrid search** — Every query runs vector (semantic) and keyword (BM25) search in parallel, fuses results with Reciprocal Rank Fusion, applies length normalization, optional recency boost with time decay floor, cross-encoder reranking (60/40 blend with cosine fallback), and MMR diversity filtering. Pre-filters (tags, folders, doc type, topics) apply at the database level before retrieval so every result matches.
 
 **Multi-format extraction** — Indexes Markdown, PDFs, and images. PDFs use text extraction first, falling back to OCR for scanned pages. Images get OCR text plus visual descriptions. EXIF metadata (camera, GPS, dates) is extracted automatically.
 
@@ -234,15 +234,15 @@ python -m pytest tests/ -x                   # ~358 full suite (requires API key
 
 ```
 core/                        Config, storage interface, taxonomy helpers
-providers/embed/             Embedding providers (OpenRouter, Ollama, Gemini)
-providers/llm/               LLM providers (OpenRouter, Ollama)
+providers/embed/             Embedding providers (OpenRouter, Ollama, Baseten, LlamaIndex)
+providers/llm/               LLM providers (OpenRouter, Ollama, Baseten)
 providers/ocr/               OCR providers (Gemini Vision, DeepSeek OCR2)
 taxonomy_store.py            Taxonomy LanceDB store (CRUD, vector search, FTS)
 doc_enrichment.py            LLM metadata extraction (with taxonomy integration)
 extractors.py                Text extraction (MD, PDF, images)
 flow_index_vault.py          Prefect indexing flow
 lancedb_store.py             LanceDB storage + search
-search_hybrid.py             4-stage hybrid search pipeline
+search_hybrid.py             8-step hybrid search pipeline
 mcp_server.py                MCP server (stdio + HTTP, 17 tools)
 server.py                    VPS entrypoint — starts HTTP server on $PORT
 run_index.py                 CLI entrypoint
