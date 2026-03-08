@@ -63,9 +63,11 @@ Query
   → parallel: vector search (ANN) + keyword search (BM25/tantivy)
   → Reciprocal Rank Fusion (k=60)
   → length normalization (log-based penalty for long chunks, anchor=800)
+  → importance weighting (score *= (1-w + w*importance); configurable field + weight)
   → optional recency boost + time decay with floor (when prefer_recent=true; old docs keep ≥50% score)
   → optional cross-encoder reranking (60/40 blend with original scores; cosine fallback on failure)
   → MMR diversity (defers near-duplicate chunks, cosine threshold=0.85)
+  → minimum score threshold (discard results below configurable cutoff; default 0.0 = disabled)
   → SearchResult with hits[] + diagnostics{}
 ```
 
@@ -158,10 +160,12 @@ Query
 - Step 2: Parallel vector (ANN) + keyword (BM25/tantivy) retrieval
 - Step 3: Reciprocal Rank Fusion (k=60)
 - Step 4: Length normalization (log-based penalty, anchor=800 chars)
-- Step 5: Optional recency boost + time decay with floor
-- Step 6: Optional cross-encoder reranking (60/40 blend; cosine fallback on failure)
-- Step 7: MMR diversity filtering (cosine threshold=0.85)
-- Step 8: Return SearchResult with hits[] and diagnostics{}
+- Step 5: Importance weighting (configurable field + weight)
+- Step 6: Optional recency boost + time decay with floor
+- Step 7: Optional cross-encoder reranking (60/40 blend; cosine fallback on failure)
+- Step 8: MMR diversity filtering (cosine threshold=0.85)
+- Step 9: Minimum score threshold (discard noise below cutoff)
+- Step 10: Return SearchResult with hits[] and diagnostics{}
 
 #### AC-SEARCH-2: Graceful Degradation
 - Vector search failure → keyword-only, diagnostics.vector_search_active=false
@@ -204,6 +208,22 @@ Query
 - If similarity > 0.85 to any selected result, defer (append at end of results list)
 - Prevents near-duplicate chunks from consuming all top-K slots
 - Looks up vectors by chunk_uid format `{doc_id}::{loc}` via `get_vector()` on LanceDBStore
+
+#### AC-SEARCH-9: Importance Weighting
+- Formula: `score *= (1 - weight + weight * importance)` where importance is [0, 1]
+- Reads from configurable metadata field (default: `importance`); checked on hit attributes then `extra_metadata`
+- Missing or non-numeric values default to 0.5 (neutral — no boost or penalty)
+- Values outside [0, 1] clamped to range
+- Default weight=0.3: importance=1.0 → 1.0x, importance=0.5 → 0.85x, importance=0.0 → 0.7x
+- Config: `search.importance.field` (default: "importance"), `search.importance.weight` (default: 0.3)
+- Applied after length normalization (Step 5), before recency boost
+
+#### AC-SEARCH-10: Minimum Score Threshold
+- Discards results with score below configurable threshold
+- Default: 0.0 (disabled — all results pass through)
+- Config: `search.min_score_threshold` (default: 0.0)
+- Applied after all scoring and diversity steps (Step 9), before final top_k
+- Typical tuning range: 0.01–0.05 for RRF-based scores
 
 ### 3.4 Indexing Pipeline (`flow_index_vault.py`)
 
@@ -313,3 +333,4 @@ Query
 |------|---------|-------------|--------|
 | 2026-03-08 | 1.0 | Initial creation | Claude |
 | 2026-03-08 | 1.1 | Added 5 search enhancements (length normalization, MMR diversity, cross-encoder blend, cosine fallback, time decay floor) inspired by memory-lancedb-pro | Claude |
+| 2026-03-08 | 1.2 | Added importance weighting (AC-SEARCH-9) and minimum score threshold (AC-SEARCH-10); pipeline now 10-step | Claude |

@@ -36,10 +36,12 @@ Store these in a `.env` file in the project root. The MCP server and indexer loa
 2. **Parallel retrieval:** vector search (semantic) + BM25/FTS (keyword) — run concurrently, both with pre-filters applied
 3. **RRF fusion:** Reciprocal Rank Fusion merges both ranked lists (k=60)
 4. **Length normalization:** Log-based penalty for long chunks — `score *= 1 / (1 + 0.5 * log2(len/anchor))` with anchor=800 chars. Chunks at or below anchor are unaffected.
-5. **Recency boost (optional):** When `prefer_recent=true`, multiplicative time decay with floor (`0.5 + 0.5 * exp(-age/half_life)`) + additive bonus. Old docs keep ≥50% score.
-6. **Cross-encoder reranking:** Qwen3-Reranker-8B (DeepInfra) with 60/40 blend — 60% reranker score + 40% original fusion score (both normalized to [0,1]). On failure, falls back to cosine similarity rerank (70% original + 30% cosine) instead of giving up.
-7. **MMR diversity:** Greedy selection defers near-duplicate chunks (cosine similarity > 0.85) to end of results list, preventing redundancy in top-K.
-8. **Diagnostics:** Every response includes `{vector_search_active, keyword_search_active, reranker_applied, degraded}` so callers detect silent degradation
+5. **Importance weighting:** Boosts docs with higher importance/priority metadata — `score *= (0.7 + 0.3 * importance)`. Reads configurable metadata field (default: `importance`). Missing values treated as neutral (0.5).
+6. **Recency boost (optional):** When `prefer_recent=true`, multiplicative time decay with floor (`0.5 + 0.5 * exp(-age/half_life)`) + additive bonus. Old docs keep ≥50% score.
+7. **Cross-encoder reranking:** Qwen3-Reranker-8B (DeepInfra) with 60/40 blend — 60% reranker score + 40% original fusion score (both normalized to [0,1]). On failure, falls back to cosine similarity rerank (70% original + 30% cosine) instead of giving up.
+8. **MMR diversity:** Greedy selection defers near-duplicate chunks (cosine similarity > 0.85) to end of results list, preventing redundancy in top-K.
+9. **Minimum score threshold:** Discards results below configurable threshold (default: 0.0 = disabled). Filters noise from low-relevance matches.
+10. **Diagnostics:** Every response includes `{vector_search_active, keyword_search_active, reranker_applied, degraded}` so callers detect silent degradation
 
 ## Taxonomy system
 

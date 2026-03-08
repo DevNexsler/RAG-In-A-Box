@@ -70,6 +70,10 @@ search:
   recency:
     half_life_days: 90
     weight: 0.3
+  min_score_threshold: 0.0                # discard results below this score (0.0 = disabled; try 0.01-0.05)
+  importance:
+    field: "importance"                    # metadata field name to read (frontmatter or dynamic column)
+    weight: 0.3                            # scaling: score *= (0.7 + 0.3 * importance); 0.0 = disabled
   reranker:
     enabled: true
     provider: "deepinfra"                 # Qwen3-Reranker-8B via DeepInfra (always-on, no cold start)

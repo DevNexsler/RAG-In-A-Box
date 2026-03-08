@@ -5,20 +5,24 @@ Architecture:
   2. Keyword search (BM25/FTS via tantivy) — runs in parallel with step 1
   3. Reciprocal Rank Fusion (RRF) to merge both ranked lists
   4. Length normalization (prevents long chunks from dominating)
-  5. Optional recency boost + time decay with floor
-  6. Optional cross-encoder re-rank with cosine fallback on failure
-  7. MMR diversity (removes near-duplicate chunks)
-  8. Final top_k
+  5. Importance weighting (boosts high-priority documents)
+  6. Optional recency boost + time decay with floor
+  7. Optional cross-encoder re-rank with cosine fallback on failure
+  8. MMR diversity (removes near-duplicate chunks)
+  9. Minimum score threshold (discards low-relevance noise)
+  10. Final top_k
 
 RRF reference: Cormack et al., "Reciprocal Rank Fusion outperforms Condorcet
 and individual Rank Learning Methods" (SIGIR 2009).
 
 Enhancements inspired by memory-lancedb-pro (win4r/memory-lancedb-pro):
   - Length normalization: log-based penalty for overly long chunks
+  - Importance weighting: score *= (1 - w + w * importance) based on metadata field
   - MMR diversity: cosine similarity deduplication (threshold 0.85)
   - Cross-encoder blend: 60/40 reranker/original score preservation
   - Cosine fallback: lightweight rerank when cross-encoder fails
   - Time decay floor: old docs never lose more than 50% relevance
+  - Minimum score threshold: filters noise below configurable cutoff
 """
 
 from __future__ import annotations
@@ -147,6 +151,73 @@ def _apply_length_normalization(
             hit.score *= factor
     hits.sort(key=lambda h: -h.score)
     return hits
+
+
+# ---------------------------------------------------------------------------
+# Importance weighting
+# ---------------------------------------------------------------------------
+
+def _apply_importance_weighting(
+    hits: list[SearchHit],
+    field: str = "importance",
+    weight: float = 0.3,
+) -> list[SearchHit]:
+    """Boost documents with higher importance/priority metadata.
+
+    Reads a numeric metadata field (0.0–1.0) from each hit and scales the score:
+        score *= (1 - weight + weight * importance)
+
+    With default weight=0.3:
+        importance=1.0 → score *= 1.0 (no change)
+        importance=0.5 → score *= 0.85
+        importance=0.0 → score *= 0.7
+
+    The field is looked up on the hit object first (e.g., frontmatter-promoted
+    columns like ``priority``), then in ``extra_metadata``. If the field is
+    missing or non-numeric, importance defaults to 0.5 (neutral).
+
+    Inspired by memory-lancedb-pro's importance weighting.
+    """
+    for hit in hits:
+        # Try direct attribute, then extra_metadata
+        raw = getattr(hit, field, None)
+        if raw is None:
+            raw = (hit.extra_metadata or {}).get(field)
+
+        # Parse to float, default to 0.5 (neutral) if missing/invalid
+        try:
+            importance = float(raw) if raw is not None else 0.5
+        except (TypeError, ValueError):
+            importance = 0.5
+
+        # Clamp to [0, 1]
+        importance = max(0.0, min(1.0, importance))
+
+        factor = (1.0 - weight) + weight * importance
+        hit.score *= factor
+
+    hits.sort(key=lambda h: -h.score)
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Minimum score threshold
+# ---------------------------------------------------------------------------
+
+def _apply_min_score_threshold(
+    hits: list[SearchHit],
+    threshold: float = 0.0,
+) -> list[SearchHit]:
+    """Discard results below a minimum score threshold.
+
+    Set threshold=0.0 (default) to disable — all results pass through.
+    Typical production values: 0.01–0.05 for RRF scores.
+
+    Inspired by memory-lancedb-pro's noise filtering.
+    """
+    if threshold <= 0.0:
+        return hits
+    return [h for h in hits if h.score >= threshold]
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +545,9 @@ def hybrid_search(
     metadata_filters: dict[str, str] | None = None,
     enr_doc_type: str | None = None,
     enr_topics: str | None = None,
+    importance_field: str = "importance",
+    importance_weight: float = 0.3,
+    min_score_threshold: float = 0.0,
 ) -> SearchResult:
     """Run vector + keyword search in parallel, fuse with RRF, optionally re-rank.
 
@@ -482,10 +556,12 @@ def hybrid_search(
       2. Parallel vector + keyword retrieval
       3. RRF fusion
       4. Length normalization
-      5. Optional recency boost + time decay (with floor)
-      6. Optional cross-encoder re-rank (60/40 blend, cosine fallback)
-      7. MMR diversity (removes near-duplicate chunks)
-      8. Final top_k
+      5. Importance weighting (boosts docs with high importance/priority metadata)
+      6. Optional recency boost + time decay (with floor)
+      7. Optional cross-encoder re-rank (60/40 blend, cosine fallback)
+      8. MMR diversity (removes near-duplicate chunks)
+      9. Minimum score threshold (discards noise)
+      10. Final top_k
 
     Returns a SearchResult (list-compatible) with a diagnostics dict.
     """
@@ -545,11 +621,14 @@ def hybrid_search(
     # 4. Length normalization (prevents long keyword-rich chunks from dominating)
     fused = _apply_length_normalization(fused)
 
-    # 5. Optional recency boost + time decay (applied after fusion so boost is uniform)
+    # 5. Importance weighting (boost high-priority docs via metadata field)
+    fused = _apply_importance_weighting(fused, field=importance_field, weight=importance_weight)
+
+    # 6. Optional recency boost + time decay (applied after fusion so boost is uniform)
     if prefer_recent:
         fused = _apply_recency_boost(fused, recency_half_life_days, recency_weight)
 
-    # 6. Optional cross-encoder re-rank (on top N candidates for efficiency)
+    # 7. Optional cross-encoder re-rank (on top N candidates for efficiency)
     #    On failure: cosine similarity fallback instead of giving up entirely.
     if reranker is not None:
         rerank_pool = fused[: final_top_k * 6]
@@ -560,15 +639,18 @@ def hybrid_search(
             logger.warning("Reranker failed, falling back to cosine rerank: %s", e)
             fused = _cosine_fallback_rerank(query_vector, rerank_pool, store)
 
-    # 7. MMR diversity (remove near-duplicate chunks)
+    # 8. MMR diversity (remove near-duplicate chunks)
     fused = _apply_mmr_diversity(fused, store)
 
-    # 8. Compute degraded flag
+    # 9. Minimum score threshold (discard noise)
+    fused = _apply_min_score_threshold(fused, threshold=min_score_threshold)
+
+    # 10. Compute degraded flag
     diagnostics["degraded"] = (
         not diagnostics["vector_search_active"]
         or not diagnostics["keyword_search_active"]
         or (reranker is not None and not diagnostics["reranker_applied"])
     )
 
-    # 9. Final top_k
+    # 11. Final top_k
     return SearchResult(hits=fused[:final_top_k], diagnostics=diagnostics)

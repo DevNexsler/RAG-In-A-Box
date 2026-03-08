@@ -1,5 +1,6 @@
 """Tests for search enhancements: length normalization, MMR diversity,
-cross-encoder blend, cosine fallback, time decay floor.
+cross-encoder blend, cosine fallback, time decay floor, importance weighting,
+minimum score threshold.
 
 Inspired by memory-lancedb-pro (win4r/memory-lancedb-pro).
 """
@@ -14,7 +15,9 @@ from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
 from core.storage import SearchHit
 from lancedb_store import LanceDBStore
 from search_hybrid import (
+    _apply_importance_weighting,
     _apply_length_normalization,
+    _apply_min_score_threshold,
     _apply_mmr_diversity,
     _apply_recency_boost,
     _cosine_fallback_rerank,
@@ -378,3 +381,113 @@ class TestLengthNormInHybrid:
             # Both have same vector; long one gets length penalty
             scores = {h.doc_id: h.score for h in result}
             assert scores["short.md"] > scores["long.md"]
+
+
+# ---------------------------------------------------------------------------
+# Importance weighting
+# ---------------------------------------------------------------------------
+
+class TestImportanceWeighting:
+    def test_high_importance_boosted(self):
+        """A high-importance doc should score higher than a low-importance one."""
+        high = SearchHit(doc_id="high.md", loc="c:0", snippet="x", text="x", score=1.0)
+        high.extra_metadata = {"importance": "1.0"}
+        low = SearchHit(doc_id="low.md", loc="c:0", snippet="x", text="x", score=1.0)
+        low.extra_metadata = {"importance": "0.0"}
+        result = _apply_importance_weighting([low, high], field="importance", weight=0.3)
+        assert result[0].doc_id == "high.md"
+        assert result[1].score < result[0].score
+
+    def test_default_weight_magnitude(self):
+        """With weight=0.3, importance=1.0 gives 1.0x and importance=0.0 gives 0.7x."""
+        high = SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=1.0)
+        high.extra_metadata = {"importance": "1.0"}
+        _apply_importance_weighting([high], field="importance", weight=0.3)
+        assert high.score == pytest.approx(1.0)
+
+        low = SearchHit(doc_id="b.md", loc="c:0", snippet="x", text="x", score=1.0)
+        low.extra_metadata = {"importance": "0.0"}
+        _apply_importance_weighting([low], field="importance", weight=0.3)
+        assert low.score == pytest.approx(0.7)
+
+    def test_missing_field_is_neutral(self):
+        """A hit with no importance field should get neutral treatment (0.5)."""
+        hit = SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=1.0)
+        _apply_importance_weighting([hit], field="importance", weight=0.3)
+        # 0.7 + 0.3 * 0.5 = 0.85
+        assert hit.score == pytest.approx(0.85)
+
+    def test_invalid_field_is_neutral(self):
+        """Non-numeric importance values should default to neutral."""
+        hit = SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=1.0)
+        hit.extra_metadata = {"importance": "high"}
+        _apply_importance_weighting([hit], field="importance", weight=0.3)
+        assert hit.score == pytest.approx(0.85)
+
+    def test_clamped_to_range(self):
+        """Values outside [0, 1] should be clamped."""
+        hit = SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=1.0)
+        hit.extra_metadata = {"importance": "5.0"}
+        _apply_importance_weighting([hit], field="importance", weight=0.3)
+        assert hit.score == pytest.approx(1.0)  # clamped to 1.0
+
+    def test_zero_weight_disables(self):
+        """With weight=0.0, importance should have no effect."""
+        hit = SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=1.0)
+        hit.extra_metadata = {"importance": "0.0"}
+        _apply_importance_weighting([hit], field="importance", weight=0.0)
+        assert hit.score == pytest.approx(1.0)
+
+    def test_custom_field_name(self):
+        """Should work with custom field names like 'priority'."""
+        hit = SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=1.0)
+        hit.extra_metadata = {"priority": "1.0"}
+        _apply_importance_weighting([hit], field="priority", weight=0.3)
+        assert hit.score == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Minimum score threshold
+# ---------------------------------------------------------------------------
+
+class TestMinScoreThreshold:
+    def test_filters_low_scores(self):
+        """Hits below threshold should be removed."""
+        hits = [
+            SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=0.5),
+            SearchHit(doc_id="b.md", loc="c:0", snippet="x", text="x", score=0.01),
+            SearchHit(doc_id="c.md", loc="c:0", snippet="x", text="x", score=0.001),
+        ]
+        result = _apply_min_score_threshold(hits, threshold=0.02)
+        assert len(result) == 1
+        assert result[0].doc_id == "a.md"
+
+    def test_zero_threshold_passes_all(self):
+        """Threshold of 0.0 should let everything through."""
+        hits = [
+            SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=0.001),
+        ]
+        result = _apply_min_score_threshold(hits, threshold=0.0)
+        assert len(result) == 1
+
+    def test_all_above_threshold(self):
+        """All hits above threshold should be kept."""
+        hits = [
+            SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=0.5),
+            SearchHit(doc_id="b.md", loc="c:0", snippet="x", text="x", score=0.3),
+        ]
+        result = _apply_min_score_threshold(hits, threshold=0.1)
+        assert len(result) == 2
+
+    def test_empty_list(self):
+        """Empty input should return empty output."""
+        result = _apply_min_score_threshold([], threshold=0.5)
+        assert result == []
+
+    def test_exact_threshold_included(self):
+        """A hit at exactly the threshold should be kept."""
+        hits = [
+            SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="x", score=0.05),
+        ]
+        result = _apply_min_score_threshold(hits, threshold=0.05)
+        assert len(result) == 1
