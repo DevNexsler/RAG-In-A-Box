@@ -46,7 +46,8 @@ Files on disk
   → diff_index_task (mtime comparison with stored index)
   → process_doc_task per file:
       → extract text (MD frontmatter, PDF pages+OCR, image OCR+description)
-      → LLM enrichment (summary, doc_type, entities, topics, keywords, key_facts, suggested_tags/folder)
+      → LLM enrichment (summary, doc_type, entities, topics, keywords, key_facts, suggested_tags/folder, importance)
+      → importance override (frontmatter importance → overrides LLM; tracks source in enr_importance_source)
       → chunk (heading-aware MD, page-aware PDF, SentenceSplitter)
       → prepend contextual headers to chunks
       → embed via provider
@@ -107,7 +108,7 @@ Query
 
 #### AC-MCP-1: file_search
 - Parameters: query (required), top_k, doc_id_prefix, source_type, tags, status, folder, prefer_recent, metadata_filters (JSON), enr_doc_type, enr_topics
-- Returns: `{results: [{doc_id, loc, snippet, score, title, tags, folder, status, source_type, enr_* fields, ...}], diagnostics: {vector_search_active, keyword_search_active, reranker_applied, degraded}}`
+- Returns: `{results: [{doc_id, loc, snippet, score, title, tags, folder, status, source_type, description, author, keywords, custom_meta, enr_summary, enr_doc_type, enr_topics, enr_keywords, enr_entities_*, enr_key_facts, enr_suggested_tags, enr_suggested_folder, enr_importance, enr_importance_source, ...extra_metadata}], diagnostics: {vector_search_active, keyword_search_active, reranker_applied, degraded}}`
 - Error on empty query with code "empty_query"
 
 #### AC-MCP-2: file_get_chunk
@@ -211,11 +212,11 @@ Query
 
 #### AC-SEARCH-9: Importance Weighting
 - Formula: `score *= (1 - weight + weight * importance)` where importance is [0, 1]
-- Reads from configurable metadata field (default: `importance`); checked on hit attributes then `extra_metadata`
+- Reads from configurable metadata field (default: `enr_importance`); checked on hit attributes then `extra_metadata`
 - Missing or non-numeric values default to 0.5 (neutral — no boost or penalty)
 - Values outside [0, 1] clamped to range
 - Default weight=0.3: importance=1.0 → 1.0x, importance=0.5 → 0.85x, importance=0.0 → 0.7x
-- Config: `search.importance.field` (default: "importance"), `search.importance.weight` (default: 0.3)
+- Config: `search.importance.field` (default: "enr_importance"), `search.importance.weight` (default: 0.3)
 - Applied after length normalization (Step 5), before recency boost
 
 #### AC-SEARCH-10: Minimum Score Threshold
@@ -244,7 +245,9 @@ Query
 - Contextual headers prepended before embedding
 
 #### AC-INDEX-4: Enrichment
-- LLM extracts: enr_summary, enr_doc_type, enr_entities_*, enr_topics, enr_keywords, enr_key_facts, enr_suggested_tags, enr_suggested_folder
+- LLM extracts: enr_summary, enr_doc_type, enr_entities_*, enr_topics, enr_keywords, enr_key_facts, enr_suggested_tags, enr_suggested_folder, enr_importance
+- LLM prompt includes importance rating guidelines (0.0-1.0 scale: 1.0 = critical, 0.5 = average, 0.0 = trivial)
+- Normalization clamps enr_importance to [0, 1]; non-numeric values default to 0.5
 - Taxonomy-aware: active taxonomy entries injected into LLM prompt
 - Head+tail sampling for documents exceeding max_input_chars
 
@@ -257,6 +260,13 @@ Query
 #### AC-INDEX-6: Metadata
 - index_metadata.json written after each run
 - Fields: last_run_at, doc_count, chunk_count, failed_count, warnings
+
+#### AC-INDEX-7: Importance Override
+- After enrichment, checks if frontmatter contains an `importance` field
+- Frontmatter override: `enr_importance` set to clamped [0, 1] value, `enr_importance_source` = "frontmatter"
+- LLM-generated: if enrichment produced `enr_importance`, `enr_importance_source` = "llm"
+- Default: if no enrichment and no frontmatter, `enr_importance` = "0.5", `enr_importance_source` = "default"
+- Source tracking enables auditing whether importance was human-curated or machine-generated
 
 ### 3.5 Configuration (`core/config.py`)
 
@@ -298,6 +308,7 @@ Query
 #### AC-PROV-1: Embed Providers
 - Protocol: `embed(texts: list[str]) -> list[list[float]]`
 - Implementations: OpenRouter, Ollama, Baseten, LlamaIndex wrapper
+- Note: Baseten embed provider is available as an alternative. The Baseten reranker was removed and replaced by DeepInfra; see reranker configuration.
 
 #### AC-PROV-2: OCR Providers
 - Protocol: `extract(image_path) -> str`, `describe(image_path) -> str`
@@ -306,6 +317,7 @@ Query
 #### AC-PROV-3: LLM Providers
 - Protocol: `generate(prompt: str) -> str`
 - Implementations: OpenRouter, Ollama, Baseten
+- Note: Baseten LLM provider is available as an alternative. The Baseten reranker was removed and replaced by DeepInfra.
 
 ---
 
@@ -334,3 +346,13 @@ Query
 | 2026-03-08 | 1.0 | Initial creation | Claude |
 | 2026-03-08 | 1.1 | Added 5 search enhancements (length normalization, MMR diversity, cross-encoder blend, cosine fallback, time decay floor) inspired by memory-lancedb-pro | Claude |
 | 2026-03-08 | 1.2 | Added importance weighting (AC-SEARCH-9) and minimum score threshold (AC-SEARCH-10); pipeline now 10-step | Claude |
+| 2026-03-09 | 1.3 | Synced with codebase: | Claude |
+|  |  | - Fixed AC-SEARCH-9 default field to "enr_importance" |  |
+|  |  | - Added enr_importance to AC-INDEX-4 enrichment fields with LLM prompt guidelines |  |
+|  |  | - Added AC-INDEX-7 frontmatter importance override with source tracking |  |
+|  |  | - Updated data flow diagram |  |
+|  |  | - Expanded AC-MCP-1 response field listing and documented enr_importance/enr_importance_source MCP serialization gap |  |
+| 2026-03-09 | 1.4 | Reviewer cleanup: | Claude |
+|  |  | - AC-MCP-1: added enr_importance and enr_importance_source to response fields (code gap fixed in _hit_to_dict) |  |
+|  |  | - AC-PROV-1, AC-PROV-3: clarified Baseten embed/LLM still available; Baseten reranker replaced by DeepInfra |  |
+|  |  | - Improved v1.3 change history readability (bulleted sub-list) |  |

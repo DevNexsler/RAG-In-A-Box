@@ -82,6 +82,8 @@ def _hit_to_dict(h: SearchHit, include_text: bool = False) -> dict:
         "enr_key_facts": h.enr_key_facts,
         "enr_suggested_tags": h.enr_suggested_tags,
         "enr_suggested_folder": h.enr_suggested_folder,
+        "enr_importance": h.enr_importance,
+        "enr_importance_source": h.enr_importance_source,
     }
     # Include dynamic metadata fields (e.g. section, sentiment)
     for k, v in (h.extra_metadata or {}).items():
