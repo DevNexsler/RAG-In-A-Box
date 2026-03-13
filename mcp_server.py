@@ -1149,6 +1149,7 @@ if HAS_MCP and FastMCP is not None:
             import anyio
 
             async def _run_http():
+                import contextlib
                 import hmac
                 import uvicorn
                 from starlette.applications import Starlette
@@ -1163,32 +1164,44 @@ if HAS_MCP and FastMCP is not None:
                 mcp_app = mcp.streamable_http_app()
                 api_app = build_api_app(documents_root=Path(config["documents_root"]))
 
+                # The MCP session manager must be initialized via its lifespan.
+                # When mounting mcp_app inside an outer Starlette, the inner
+                # lifespan doesn't propagate, so we run it on the outer app.
+                @contextlib.asynccontextmanager
+                async def lifespan(app):
+                    async with mcp.session_manager.run():
+                        yield
+
                 # Compose: /api/* → REST API, everything else → MCP
                 app = Starlette(routes=[
                     Mount("/api", app=api_app),
                     Mount("/", app=mcp_app),
-                ])
+                ], lifespan=lifespan)
 
                 if api_key:
-                    original_app = app
                     expected = f"Bearer {api_key}".encode()
 
-                    async def auth_app(scope, receive, send):
-                        if scope["type"] in ("http", "websocket"):
-                            auth_value = b""
-                            for name, value in scope.get("headers", []):
-                                if name == b"authorization":
-                                    auth_value = value
-                                    break
-                            if not hmac.compare_digest(auth_value, expected):
-                                response = JSONResponse(
-                                    {"error": "Unauthorized"}, status_code=401
-                                )
-                                await response(scope, receive, send)
-                                return
-                        await original_app(scope, receive, send)
+                    class AuthMiddleware:
+                        def __init__(self, app, expected):
+                            self.app = app
+                            self.expected = expected
 
-                    app = auth_app
+                        async def __call__(self, scope, receive, send):
+                            if scope["type"] in ("http", "websocket"):
+                                auth_value = b""
+                                for name, value in scope.get("headers", []):
+                                    if name == b"authorization":
+                                        auth_value = value
+                                        break
+                                if not hmac.compare_digest(auth_value, self.expected):
+                                    response = JSONResponse(
+                                        {"error": "Unauthorized"}, status_code=401
+                                    )
+                                    await response(scope, receive, send)
+                                    return
+                            await self.app(scope, receive, send)
+
+                    app = AuthMiddleware(app, expected)
 
                 uvi_config = uvicorn.Config(app, host=host, port=port, log_level="info")
                 server = uvicorn.Server(uvi_config)

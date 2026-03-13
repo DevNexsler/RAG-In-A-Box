@@ -1,0 +1,24 @@
+services:
+  doc-organizer:
+    build: .
+    image: doc-organizer:latest
+    container_name: doc-organizer
+    restart: unless-stopped
+    ports:
+      - "7788:7788"
+    volumes:
+      - /home/danpark/documents/doc-organizer:/data/documents
+      - doc-organizer-data:/data/index
+      - ./config.yaml:/app/config.yaml:ro
+    command: ["sh", "-c", "mkdir -p /data/documents /data/index && python server.py"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - DEEPINFRA_API_KEY=${DEEPINFRA_API_KEY}
+      - API_KEY=${API_KEY}
+      - DOCUMENTS_ROOT=/data/documents
+      - INDEX_ROOT=/data/index
+
+volumes:
+  doc-organizer-data:
