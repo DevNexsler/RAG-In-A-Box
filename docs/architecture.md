@@ -74,9 +74,7 @@ The taxonomy provides a controlled vocabulary for consistent document classifica
 
 ### Seed data
 
-The taxonomy can be seeded from existing SQLite databases via `file_taxonomy_import` or `scripts/seed_taxonomy.py`:
-- `tags.db` — 21 tags with descriptions and usage counts
-- `directory.db` — 62 folders with descriptions, purposes, and ai_managed flags
+The taxonomy is managed exclusively via MCP tools (`file_taxonomy_add`, `file_taxonomy_update`, `file_taxonomy_delete`). Initial data (21 tags, 62 folders) was seeded from SQLite databases (now removed). `file_taxonomy_import` is deprecated.
 
 ## LanceDB schema (per chunk)
 

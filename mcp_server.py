@@ -686,12 +686,9 @@ def _file_taxonomy_delete_impl(entry_id: str) -> dict:
 
 
 def _file_taxonomy_import_impl() -> dict:
-    try:
-        from scripts.seed_taxonomy import seed_taxonomy
-        return seed_taxonomy()
-    except Exception as exc:
-        return _error("import_failed", f"Taxonomy import failed: {exc}",
-                       "Check that SQLite databases exist at ~/Documents/Primary/0-AI/directory_info/.")
+    return _error("deprecated", "file_taxonomy_import is deprecated. "
+                  "Taxonomy is now managed exclusively via file_taxonomy_add/update/delete in LanceDB. "
+                  "The original SQLite seed databases have been removed.")
 
 
 # ---------------------------------------------------------------------------
@@ -1092,13 +1089,10 @@ if HAS_MCP and FastMCP is not None:
 
     @mcp.tool()
     def file_taxonomy_import() -> dict:
-        """Import taxonomy data from existing SQLite databases.
+        """[Deprecated] Previously imported taxonomy from SQLite seed databases.
 
-        Reads tags from ~/Documents/Primary/0-AI/directory_info/tags.db and
-        directories from ~/Documents/Primary/0-AI/directory_info/directory.db.
-        Idempotent: skips entries that already exist.
-
-        Returns import statistics (counts added, skipped, totals).
+        Taxonomy is now managed exclusively via file_taxonomy_add, file_taxonomy_update,
+        and file_taxonomy_delete. This tool returns a deprecation notice.
         """
         return _file_taxonomy_import_impl()
 

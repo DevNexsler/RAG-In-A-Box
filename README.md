@@ -1,17 +1,44 @@
-# Why?
+# RAG In A Box
 
-Instead of spending 30 mins organizing my File folder and Obsidian vault, i decided to spend few days building another semantic search.
+Drop your documents into a folder, run the indexer, and get a production-grade RAG pipeline with an **MCP server** — any MCP-compatible AI assistant (Claude Code, OpenClaw, Claude Desktop, Cursor, etc.) can search your documents with a single config entry.
 
-Ones currently avaiable didnt meet all my requirement which were - LLM enrichment, frontmatter extraction, different chunking strategy (summary added to each chunk for context), work with Qwen 3 8B models, filter + keyword with BM25/Semantic search.
+No infrastructure to manage. No GPU required. Works with **cloud APIs** out of the box or **fully self-hosted**.
 
-Seems to work well for my use which is throw various document into folder with poor organization...
+## Use cases
 
+- **Personal knowledge base** — Index your notes, PDFs, and documents. Ask your AI assistant questions and get answers grounded in your own files.
+- **Company document search** — Drop legal contracts, reports, SOPs into a folder. Employees search via any MCP-compatible assistant with metadata filters (by department, doc type, date, tags).
+- **Research assistant** — Index papers, datasets, and notes. Search by meaning, not just keywords. LLM enrichment auto-extracts entities, topics, and key facts.
+- **Obsidian / Markdown vault** — Works with any markdown source (Obsidian, HackMD, Notion exports, GitBook). Extracts YAML frontmatter for rich filtering.
+- **PDF-heavy workflows** — Scanned PDFs get OCR automatically. Page-aware chunking keeps context intact. Metadata (author, dates, page count) extracted from PDF properties.
+- **Multi-agent tool** — Expose your document collection as 16 MCP tools. Multiple agents can search, browse, filter, and manage taxonomy concurrently.
 
-# Document Organizer
+## Why this over other RAG tools?
 
-Index a document collection (Markdown, PDFs, images) into a vector store and expose it as an **MCP server** — any MCP-compatible AI assistant (Claude Code, OpenClaw, Claude Desktop, Cursor, etc.) can search your documents with a single config entry. Supports both **cloud APIs** (default — no local servers needed) and **local/self-hosted** providers.
+| Capability | RAG In A Box | Typical RAG |
+|---|---|---|
+| Search quality | 10-step hybrid pipeline (vector + BM25 + reranker + MMR) | Vector-only or basic hybrid |
+| Document understanding | LLM enrichment extracts summary, entities, topics, importance | Raw chunks, no enrichment |
+| Filtering | Pre-filter by tags, folder, doc type, topics, custom fields | Post-filter or none |
+| Chunking | Heading-aware (MD) + page-aware (PDF) + semantic boundary detection | Fixed-size windows |
+| Chunk context | Each chunk gets title, path, topics prepended for self-describing retrieval | Chunks lose document context |
+| Metadata | YAML frontmatter auto-extracted, custom fields auto-promoted to filters | Manual schema setup |
+| Taxonomy | Controlled vocabulary with semantic matching, managed via MCP tools | None |
+| OCR | Built-in for scanned PDFs and images (cloud or local) | Separate pipeline needed |
+| Deployment | Single container, cloud APIs, no GPU | Often needs GPU or complex infra |
+| Integration | MCP server (16 tools) — works with Claude, Cursor, any MCP client | Custom API or SDK |
+| Resilience | Per-query diagnostics, auto-recovery from DB corruption, structured errors | Silent failures |
 
-Uses **Qwen3-Embedding-8B** (via OpenRouter) for embeddings, **GPT-4.1 Mini** (via OpenRouter) for document enrichment, **Gemini Vision** (cloud) or **DeepSeek OCR2** (local) for OCR, **Qwen3-Reranker-8B** (via DeepInfra) for cross-encoder reranking, **Prefect** for orchestration, **LanceDB** for storage + full-text search.
+## Stack
+
+| Component | Provider |
+|---|---|
+| Embeddings | Qwen3-Embedding-8B via OpenRouter |
+| LLM enrichment | GPT-4.1 Mini via OpenRouter |
+| OCR | Gemini Vision (cloud) or DeepSeek OCR2 (local) |
+| Reranker | Qwen3-Reranker-8B via DeepInfra |
+| Vector + FTS | LanceDB + tantivy (BM25) |
+| Orchestration | Prefect 3.x |
 
 ## Getting started
 
@@ -150,6 +177,40 @@ API_KEY=your-secret-token python server.py
 When `API_KEY` is set, all HTTP requests must include `Authorization: Bearer <API_KEY>`. See `config.vps.yaml.example` for VPS-specific config.
 
 **Render.com:** One-click deploy with `render.yaml` — persistent disk at `/data`, auto-generated API key.
+
+#### REST API (file management)
+
+When running in HTTP mode (`--http` or `server.py`), a REST API is available alongside the MCP server for uploading, downloading, and listing documents. Auth uses the same `API_KEY` bearer token.
+
+**Upload a file:**
+```bash
+curl -X POST http://localhost:7788/api/upload \
+  -H "Authorization: Bearer $API_KEY" \
+  -F "file=@report.pdf" \
+  -F "directory=2-Area/Legal"
+# -> {"uploaded": true, "doc_id": "2-Area/Legal/report.pdf", "size": 84521}
+```
+
+**Download a file:**
+```bash
+curl http://localhost:7788/api/documents/2-Area/Legal/report.pdf \
+  -H "Authorization: Bearer $API_KEY" -o report.pdf
+```
+
+**List files in a directory:**
+```bash
+curl "http://localhost:7788/api/documents/?directory=2-Area&limit=50" \
+  -H "Authorization: Bearer $API_KEY"
+# -> {"directory": "2-Area", "files": [...], "total": 12, "offset": 0, "limit": 50}
+```
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/upload` | POST | Upload a file (multipart form: `file` + optional `directory`) |
+| `/api/documents/{doc_id}` | GET | Download a file by path |
+| `/api/documents/` | GET | List files (query params: `directory`, `limit`, `offset`) |
+
+**Constraints:** Max upload 100 MB. Allowed types: `.md`, `.pdf`, `.png`, `.jpg`, `.jpeg`. Path traversal is blocked. After uploading, run `file_index_update` (via MCP) to index the new document.
 
 ### Local mode (optional)
 
