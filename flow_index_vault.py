@@ -73,6 +73,17 @@ _RUNTIME: dict[str, Any] = {}
 # --- Helpers ---
 
 
+_SOURCE_TYPE_MAP = {
+    "md": "md", "pdf": "pdf",
+    "docx": "doc", "doc": "doc", "rtf": "doc",
+    "xlsx": "sheet", "xls": "sheet",
+    "pptx": "pres", "csv": "csv",
+    "html": "html", "htm": "html",
+    "epub": "epub", "txt": "txt",
+    "png": "img", "jpg": "img", "jpeg": "img", "gif": "img", "webp": "img",
+}
+
+
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
 
 
@@ -383,7 +394,7 @@ def process_doc_task(doc: dict) -> None:
     logger.info(f"Processing: {rel_path} (id={doc_id})")
 
     # --- Determine source_type ---
-    source_type = "md" if ext == "md" else "pdf" if ext == "pdf" else "img"
+    source_type = _SOURCE_TYPE_MAP.get(ext, "other")
 
     # --- Extract text (Markdown / PDF / Image) ---
     pdf_cfg = config.get("pdf", {})
@@ -520,7 +531,7 @@ def process_doc_task(doc: dict) -> None:
                 node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
                 nodes.append(node)
 
-    elif source_type == "md":
+    elif source_type in ("md", "doc", "pres", "html", "epub", "csv"):
         # Heading-aware: split at h1-h3 boundaries, then SentenceSplitter within.
         sections = _split_markdown_by_headings(result.full_text)
         all_raw: list[str] = []

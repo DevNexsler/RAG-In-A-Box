@@ -9,15 +9,25 @@ vault_root: "/path/to/your/obsidian-vault"
 index_root: "/path/to/index/output"
 
 scan:
-  # Supported file types: md (Markdown), pdf, and images (png/jpg/jpeg).
-  # Adding other extensions here will scan them but the extractor will
-  # silently skip them — new formats need an extractor in extractors.py.
+  # Supported file types: md, pdf, images (png/jpg/jpeg), documents
+  # (docx/doc/pptx/rtf/epub/html/htm/csv/txt), and spreadsheets (xlsx/xls).
   include:
     - "**/*.md"
     - "**/*.pdf"
     - "**/*.png"
     - "**/*.jpg"
     - "**/*.jpeg"
+    - "**/*.docx"
+    - "**/*.doc"
+    - "**/*.pptx"
+    - "**/*.rtf"
+    - "**/*.epub"
+    - "**/*.html"
+    - "**/*.htm"
+    - "**/*.csv"
+    - "**/*.txt"
+    - "**/*.xlsx"
+    - "**/*.xls"
   exclude:
     - ".obsidian/**"
     - ".trash/**"

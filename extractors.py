@@ -447,6 +447,111 @@ def extract_image(
 
 
 # ---------------------------------------------------------------------------
+# MarkItDown (docx, doc, pptx, html, epub, rtf, csv)
+# ---------------------------------------------------------------------------
+
+_markitdown_instance = None
+
+
+def _get_markitdown():
+    """Lazy-init singleton. Returns None if markitdown not installed."""
+    global _markitdown_instance
+    if _markitdown_instance is not None:
+        return _markitdown_instance
+    try:
+        from markitdown import MarkItDown
+        _markitdown_instance = MarkItDown()
+        return _markitdown_instance
+    except ImportError:
+        logger.warning("markitdown not installed — install with: pip install 'markitdown[all]'")
+        return None
+
+
+def extract_markitdown(file_path: str | Path) -> ExtractionResult:
+    """Convert a document to Markdown via MarkItDown and return as ExtractionResult.
+
+    Supports: docx, doc, pptx, html, htm, epub, rtf, csv.
+    """
+    md = _get_markitdown()
+    if md is None:
+        return ExtractionResult.from_text("")
+
+    try:
+        result = md.convert(str(file_path))
+        text = result.text_content or ""
+    except Exception as e:
+        logger.warning("MarkItDown conversion failed for %s: %s", file_path, e)
+        return ExtractionResult.from_text("")
+
+    return ExtractionResult.from_text(text)
+
+
+# ---------------------------------------------------------------------------
+# Excel (xlsx, xls) — text-only extraction
+# ---------------------------------------------------------------------------
+
+def extract_excel(file_path: str | Path) -> ExtractionResult:
+    """Extract text-only cells from an Excel workbook.
+
+    Headers (first row) are always included. Remaining rows include only
+    cells whose value is a string — numbers, dates, and empty cells are skipped.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        logger.warning("openpyxl not installed — install with: pip install openpyxl")
+        return ExtractionResult.from_text("")
+
+    try:
+        wb = openpyxl.load_workbook(str(file_path), read_only=True, data_only=True)
+    except Exception as e:
+        logger.warning("Failed to open workbook %s: %s", file_path, e)
+        return ExtractionResult.from_text("")
+
+    parts: list[str] = []
+    try:
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = list(ws.iter_rows())
+            if not rows:
+                continue
+
+            section_lines: list[str] = [f"Sheet: {sheet_name}"]
+
+            # First row → headers (always included regardless of type)
+            header_cells = [str(c.value).strip() if c.value is not None else "" for c in rows[0]]
+            section_lines.append("Headers: " + " | ".join(header_cells))
+
+            # Remaining rows → text-only cells
+            for row in rows[1:]:
+                text_cells = [
+                    str(cell.value).strip()
+                    for cell in row
+                    if isinstance(cell.value, str) and cell.value.strip()
+                ]
+                if text_cells:
+                    section_lines.append(" | ".join(text_cells))
+
+            parts.append("\n".join(section_lines))
+    finally:
+        wb.close()
+
+    full_text = "\n\n".join(parts)
+    return ExtractionResult.from_text(full_text)
+
+
+# ---------------------------------------------------------------------------
+# Plain text (txt)
+# ---------------------------------------------------------------------------
+
+def extract_plaintext(file_path: str | Path) -> ExtractionResult:
+    """Read a plain text file (UTF-8, with replacement for bad bytes)."""
+    with open(file_path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    return ExtractionResult.from_text(text)
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -471,5 +576,11 @@ def extract_text(
         )
     elif ext in ("png", "jpg", "jpeg", "gif", "webp"):
         return extract_image(file_path, ocr_provider=ocr_provider)
+    elif ext == "txt":
+        return extract_plaintext(file_path)
+    elif ext in ("xlsx", "xls"):
+        return extract_excel(file_path)
+    elif ext in ("docx", "doc", "pptx", "html", "htm", "epub", "rtf", "csv"):
+        return extract_markitdown(file_path)
     else:
         return ExtractionResult.from_text("")

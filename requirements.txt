@@ -51,6 +51,12 @@ pytest>=8.0.0
 # PDF extraction
 pymupdf>=1.24.0
 
+# Document format conversion (docx, doc, pptx, html, epub, rtf, csv → Markdown)
+markitdown[all]>=0.1.0
+
+# Excel text-only extraction (xlsx/xls with cell-level type control)
+openpyxl>=3.1.0
+
 # Semantic chunking (MLX — Apple Silicon only, optional)
 # Uses a small 0.6B embedding model in-process for topic-boundary detection.
 # Only activates for large text sections; no server needed.

@@ -373,9 +373,274 @@ def test_dispatch_image():
     assert "Image OCR text" in result.full_text
 
 
+def test_dispatch_txt(tmp_path):
+    """Dispatcher routes .txt to extract_plaintext."""
+    from extractors import extract_text
+
+    txt_file = tmp_path / "test.txt"
+    txt_file.write_text("Plain text content", encoding="utf-8")
+
+    result = extract_text(txt_file, ext="txt")
+    assert "Plain text content" in result.full_text
+
+
+def test_dispatch_xlsx(tmp_path):
+    """Dispatcher routes .xlsx to extract_excel."""
+    from extractors import extract_text
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Name", "Age"])
+    ws.append(["Alice", 30])
+    xlsx_path = tmp_path / "test.xlsx"
+    wb.save(str(xlsx_path))
+
+    result = extract_text(xlsx_path, ext="xlsx")
+    assert "Name" in result.full_text
+    assert "Alice" in result.full_text
+
+
+def test_dispatch_docx(tmp_path):
+    """Dispatcher routes .docx to extract_markitdown."""
+    from extractors import extract_text
+    from unittest.mock import patch, MagicMock
+
+    mock_result = MagicMock()
+    mock_result.text_content = "# Converted Document\n\nBody text."
+    mock_md = MagicMock()
+    mock_md.convert.return_value = mock_result
+
+    with patch("extractors._get_markitdown", return_value=mock_md):
+        result = extract_text("/fake/doc.docx", ext="docx")
+
+    assert "Converted Document" in result.full_text
+
+
+def test_dispatch_csv(tmp_path):
+    """Dispatcher routes .csv to extract_markitdown."""
+    from extractors import extract_text
+    from unittest.mock import patch, MagicMock
+
+    mock_result = MagicMock()
+    mock_result.text_content = "| col1 | col2 |\n|---|---|\n| a | b |"
+    mock_md = MagicMock()
+    mock_md.convert.return_value = mock_result
+
+    with patch("extractors._get_markitdown", return_value=mock_md):
+        result = extract_text("/fake/data.csv", ext="csv")
+
+    assert "col1" in result.full_text
+
+
+def test_dispatch_html():
+    """Dispatcher routes .html to extract_markitdown."""
+    from extractors import extract_text
+    from unittest.mock import patch, MagicMock
+
+    mock_result = MagicMock()
+    mock_result.text_content = "# Page Title\n\nParagraph content."
+    mock_md = MagicMock()
+    mock_md.convert.return_value = mock_result
+
+    with patch("extractors._get_markitdown", return_value=mock_md):
+        result = extract_text("/fake/page.html", ext="html")
+
+    assert "Page Title" in result.full_text
+
+
+def test_dispatch_pptx():
+    """Dispatcher routes .pptx to extract_markitdown."""
+    from extractors import extract_text
+    from unittest.mock import patch, MagicMock
+
+    mock_result = MagicMock()
+    mock_result.text_content = "# Slide 1\n\nBullet point."
+    mock_md = MagicMock()
+    mock_md.convert.return_value = mock_result
+
+    with patch("extractors._get_markitdown", return_value=mock_md):
+        result = extract_text("/fake/deck.pptx", ext="pptx")
+
+    assert "Slide 1" in result.full_text
+
+
 def test_dispatch_unknown_ext(tmp_path):
     """Unknown extension returns empty text."""
     from extractors import extract_text
 
     result = extract_text("/fake/file.xyz", ext="xyz")
+    assert result.full_text == ""
+
+
+# --- Plaintext extraction ---
+
+
+def test_extract_plaintext_basic(tmp_path):
+    """Plaintext extraction reads file content."""
+    from extractors import extract_plaintext
+
+    txt_file = tmp_path / "test.txt"
+    txt_file.write_text("Hello, world!", encoding="utf-8")
+
+    result = extract_plaintext(txt_file)
+    assert result.full_text == "Hello, world!"
+    assert result.frontmatter == {}
+
+
+def test_extract_plaintext_unicode(tmp_path):
+    """Plaintext handles Unicode characters."""
+    from extractors import extract_plaintext
+
+    txt_file = tmp_path / "unicode.txt"
+    txt_file.write_text("日本語テスト café 🚀", encoding="utf-8")
+
+    result = extract_plaintext(txt_file)
+    assert "日本語テスト" in result.full_text
+    assert "café" in result.full_text
+
+
+def test_extract_plaintext_empty(tmp_path):
+    """Empty plaintext file returns empty text."""
+    from extractors import extract_plaintext
+
+    txt_file = tmp_path / "empty.txt"
+    txt_file.write_text("", encoding="utf-8")
+
+    result = extract_plaintext(txt_file)
+    assert result.full_text == ""
+
+
+# --- Excel extraction ---
+
+
+def test_extract_excel_text_only(tmp_path):
+    """Excel extraction includes text cells and skips numbers."""
+    from extractors import extract_excel
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws.append(["Name", "Score", "Notes"])
+    ws.append(["Alice", 95, "Excellent"])
+    ws.append(["Bob", 80, "Good"])
+    ws.append([None, 100, None])
+    xlsx_path = tmp_path / "test.xlsx"
+    wb.save(str(xlsx_path))
+
+    result = extract_excel(xlsx_path)
+    assert "Sheet: Data" in result.full_text
+    assert "Headers: Name | Score | Notes" in result.full_text
+    assert "Alice" in result.full_text
+    assert "Excellent" in result.full_text
+    assert "Bob" in result.full_text
+    assert "Good" in result.full_text
+    # Numbers should NOT appear as standalone extracted values (only in headers)
+    lines = result.full_text.split("\n")
+    data_lines = [l for l in lines if not l.startswith(("Sheet:", "Headers:"))]
+    for line in data_lines:
+        assert "95" not in line
+        assert "80" not in line
+        assert "100" not in line
+
+
+def test_extract_excel_headers_always_included(tmp_path):
+    """Excel headers are always included even if they contain numbers."""
+    from extractors import extract_excel
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append([2024, "Q1", "Revenue"])
+    ws.append([None, "Good quarter", None])
+    xlsx_path = tmp_path / "headers.xlsx"
+    wb.save(str(xlsx_path))
+
+    result = extract_excel(xlsx_path)
+    assert "Headers: 2024 | Q1 | Revenue" in result.full_text
+
+
+def test_extract_excel_multiple_sheets(tmp_path):
+    """Excel extraction handles multiple sheets."""
+    from extractors import extract_excel
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "Sheet1"
+    ws1.append(["Header1"])
+    ws1.append(["Value1"])
+
+    ws2 = wb.create_sheet("Sheet2")
+    ws2.append(["Header2"])
+    ws2.append(["Value2"])
+
+    xlsx_path = tmp_path / "multi.xlsx"
+    wb.save(str(xlsx_path))
+
+    result = extract_excel(xlsx_path)
+    assert "Sheet: Sheet1" in result.full_text
+    assert "Sheet: Sheet2" in result.full_text
+    assert "Value1" in result.full_text
+    assert "Value2" in result.full_text
+
+
+def test_extract_excel_empty_workbook(tmp_path):
+    """Empty Excel workbook returns empty text."""
+    from extractors import extract_excel
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    # Default sheet exists but has no rows
+    xlsx_path = tmp_path / "empty.xlsx"
+    wb.save(str(xlsx_path))
+
+    result = extract_excel(xlsx_path)
+    # Empty sheet has no rows via iter_rows in read_only mode
+    assert result.frontmatter == {}
+
+
+# --- MarkItDown extraction ---
+
+
+def test_extract_markitdown_mock():
+    """MarkItDown conversion works with a mock."""
+    from extractors import extract_markitdown
+    from unittest.mock import patch, MagicMock
+
+    mock_result = MagicMock()
+    mock_result.text_content = "# Document Title\n\nConverted content here."
+    mock_md = MagicMock()
+    mock_md.convert.return_value = mock_result
+
+    with patch("extractors._get_markitdown", return_value=mock_md):
+        result = extract_markitdown("/fake/doc.docx")
+
+    assert "Document Title" in result.full_text
+    assert "Converted content" in result.full_text
+
+
+def test_extract_markitdown_not_installed():
+    """Graceful fallback when markitdown is not installed."""
+    from extractors import extract_markitdown
+    from unittest.mock import patch
+
+    with patch("extractors._get_markitdown", return_value=None):
+        result = extract_markitdown("/fake/doc.docx")
+
+    assert result.full_text == ""
+
+
+def test_extract_markitdown_conversion_error():
+    """Graceful fallback when conversion fails."""
+    from extractors import extract_markitdown
+    from unittest.mock import patch, MagicMock
+
+    mock_md = MagicMock()
+    mock_md.convert.side_effect = RuntimeError("Conversion failed")
+
+    with patch("extractors._get_markitdown", return_value=mock_md):
+        result = extract_markitdown("/fake/doc.docx")
+
     assert result.full_text == ""
