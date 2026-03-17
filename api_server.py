@@ -17,7 +17,11 @@ logger = logging.getLogger(__name__)
 # Max upload size: 100 MB
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
-_ALLOWED_EXTENSIONS = {".md", ".pdf", ".png", ".jpg", ".jpeg"}
+_ALLOWED_EXTENSIONS = {
+    ".md", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".docx", ".doc", ".pptx", ".rtf", ".epub",
+    ".html", ".htm", ".csv", ".txt", ".xlsx", ".xls",
+}
 
 _DEFAULT_LIST_LIMIT = 200
 

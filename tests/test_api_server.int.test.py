@@ -309,16 +309,18 @@ async def test_list_documents_filters_extensions(api_client, tmp_docs_root):
     # Create files with disallowed extensions
     (tmp_docs_root / "notes.txt").write_text("text file")
     (tmp_docs_root / "script.py").write_text("python file")
+    (tmp_docs_root / "data.json").write_text("{}")
 
     resp = await api_client.get("/documents")
 
     body = resp.json()
     names = {f["name"] for f in body["files"] if f["type"] == "file"}
 
-    # .md and .pdf should be present, .txt and .py should NOT
+    # .md and .txt are allowed, .py and .json are NOT
     assert "sample.md" in names
-    assert "notes.txt" not in names
+    assert "notes.txt" in names
     assert "script.py" not in names
+    assert "data.json" not in names
 
 
 @pytest.mark.anyio

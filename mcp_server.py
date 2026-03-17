@@ -27,7 +27,10 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-_VALID_SOURCE_TYPES = {"md", "pdf", "img"}
+_VALID_SOURCE_TYPES = {
+    "md", "pdf", "img",
+    "doc", "sheet", "pres", "csv", "html", "epub", "txt", "other",
+}
 _MAX_TOP_K = 100
 _MAX_LIMIT = 200
 
@@ -50,7 +53,7 @@ def _validate_source_type(source_type: str | None) -> dict | None:
         return _error(
             "invalid_parameter",
             f"source_type must be one of: {', '.join(sorted(_VALID_SOURCE_TYPES))}. Got: '{source_type}'.",
-            "Valid values: 'md' (Markdown), 'pdf' (PDF documents), 'img' (images).",
+            "Valid values: md, pdf, img, doc, sheet, pres, csv, html, epub, txt, other.",
         )
     return None
 
