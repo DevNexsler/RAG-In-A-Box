@@ -1,4 +1,4 @@
-"""Tests for extractors.py — Markdown, PDF, image extraction, and frontmatter parsing."""
+"""Tests for extractors.py — extraction and frontmatter parsing for all supported formats."""
 
 import tempfile
 from pathlib import Path

@@ -1,13 +1,15 @@
-"""Text extraction from Markdown, PDF, and image files.
+"""Text extraction from Markdown, PDF, images, and document files.
 
-PDF extraction uses PyMuPDF (fitz) for native text, with optional OCR fallback.
-PDF metadata (title, author, dates) is extracted via PyMuPDF and stored in frontmatter.
-
-Image extraction uses OCR provider's describe() for rich text + visual description.
-Image metadata (EXIF: camera, date, GPS, dimensions) is extracted via Pillow.
-
-Markdown extraction parses YAML frontmatter (tags, status, title, created, etc.)
-and strips it from the indexed content so embeddings aren't polluted by YAML syntax.
+Supported formats:
+- Markdown (.md): YAML frontmatter parsed and stripped from indexed content.
+- PDF (.pdf): PyMuPDF for native text, with optional OCR fallback.
+  Metadata (title, author, dates) stored in frontmatter.
+- Images (.png, .jpg, .jpeg, .gif, .webp): OCR provider's describe() for
+  rich text + visual description. EXIF metadata extracted via Pillow.
+- Documents (.docx, .doc, .pptx, .html, .htm, .epub, .rtf, .csv):
+  MarkItDown converts to Markdown for heading-aware chunking.
+- Spreadsheets (.xlsx, .xls): openpyxl extracts headers + text-only cells.
+- Plain text (.txt): UTF-8 reader with error replacement.
 """
 
 import logging

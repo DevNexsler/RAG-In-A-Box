@@ -2,7 +2,7 @@
 
 Uses LlamaIndex for chunking (SentenceSplitter) and embeddings.
 Storage via our LanceDBStore (which wraps LlamaIndex's LanceDBVectorStore).
-Extraction via extractors.py (Markdown, PDF with PyMuPDF, images with OCR).
+Extraction via extractors.py (Markdown, PDF, images, documents, spreadsheets, plain text).
 
 Chunking enhancements:
 - Contextual headers: each chunk is prepended with document metadata
@@ -374,7 +374,7 @@ def process_doc_task(doc: dict) -> None:
     """Extract text, chunk with LlamaIndex, embed, upsert into store.
 
     Reads store / embed_provider / splitter / ocr_provider / config from _RUNTIME.
-    Handles Markdown, PDF (with page-level chunking), and images (via OCR).
+    Handles Markdown, PDF, images, documents (docx/pptx/html/etc.), spreadsheets, and plain text.
     """
     store: LanceDBStore = _RUNTIME["store"]
     embed_provider: EmbedProvider = _RUNTIME["embed_provider"]

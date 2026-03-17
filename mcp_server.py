@@ -1198,7 +1198,7 @@ if HAS_MCP and FastMCP is not None:
             1. Scans the documents directory for all supported files.
             2. Diffs against the current index (by file modification time) to find
                new, modified, and deleted files.
-            3. Extracts text from new/modified files only (Markdown, PDF, images via OCR).
+            3. Extracts text from new/modified files only (Markdown, PDF, images, documents, spreadsheets, plain text).
             4. Runs LLM enrichment (enr_summary, enr_entities_*, enr_topics) on new/modified files if enabled.
             5. Chunks text and generates embeddings for new/modified files.
             6. Removes deleted files from the index.
