@@ -545,11 +545,11 @@ def test_build_where_clause_source_type():
 
 
 def test_build_where_clause_doc_id_prefix():
-    """doc_id_prefix should produce LIKE on top-level doc_id."""
+    """doc_id_prefix should produce LIKE on metadata.rel_path (path-based browsing)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
         clause = store._build_where_clause(doc_id_prefix="Projects/")
-        assert clause == "doc_id LIKE 'Projects/%'"
+        assert clause == "metadata.rel_path LIKE 'Projects/%'"
 
 
 def test_build_where_clause_comma_fields():

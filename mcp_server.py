@@ -59,6 +59,7 @@ def _hit_to_dict(h: SearchHit, include_text: bool = False) -> dict:
     """Convert a SearchHit to a response dict."""
     d: dict = {
         "doc_id": h.doc_id,
+        "rel_path": h.rel_path,
         "loc": h.loc,
         "snippet": h.snippet,
         "score": h.score,
@@ -355,6 +356,42 @@ def _file_list_documents_impl(
     _enrich_doc_list(page)
 
     return {"documents": page, "total": total, "offset": offset, "limit": limit}
+
+
+def _file_audit_log_impl(
+    doc_id: str | None = None,
+    event: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    try:
+        _, _, config = _get_deps()
+    except Exception as exc:
+        return _error("service_unavailable", f"Failed to initialize: {exc}")
+
+    from doc_id_store import DocIDStore
+    index_root = Path(config["index_root"])
+    db_path = index_root / "doc_registry.db"
+    if not db_path.exists():
+        return {"entries": [], "total": 0, "offset": offset, "limit": limit}
+
+    store = DocIDStore(db_path)
+    try:
+        limit = max(1, min(limit, _MAX_LIMIT))
+        entries = store.audit_log(doc_id=doc_id, event=event, limit=limit, offset=offset)
+        total = store.audit_log_count(doc_id=doc_id, event=event)
+    finally:
+        store.close()
+
+    # Convert timestamps to ISO for readability
+    from datetime import datetime, timezone
+    for e in entries:
+        try:
+            e["ts_iso"] = datetime.fromtimestamp(e["ts"], tz=timezone.utc).isoformat()
+        except (ValueError, OSError):
+            e["ts_iso"] = None
+
+    return {"entries": entries, "total": total, "offset": offset, "limit": limit}
 
 
 def _file_status_impl() -> dict:
@@ -720,8 +757,10 @@ if HAS_MCP and FastMCP is not None:
         Args:
             query: Natural-language search query (required, non-empty).
             top_k: Max results to return (1-100, default 10).
-            doc_id_prefix: Filter to docs under this path prefix
+            doc_id_prefix: Filter to docs under this vault-relative path prefix
                 (e.g., "Projects/" to search only the Projects folder).
+                Filters on rel_path (the vault-relative file path), not doc_id
+                (which is now a persistent 5-char base-62 identifier).
             source_type: Filter by file type: "md", "pdf", or "img".
             tags: Comma-separated tags to filter by. Matches documents that
                 have ANY of the listed tags (OR logic). Example: "recipe,korean".
@@ -743,7 +782,8 @@ if HAS_MCP and FastMCP is not None:
 
         Returns a dict with:
             - results: List of result dicts, each containing:
-                - doc_id: Document-relative file path (e.g., "Projects/recipe.md").
+                - doc_id: Persistent 5-char base-62 identifier (e.g., "00001").
+                - rel_path: Vault-relative file path (e.g., "Projects/recipe@00001@.md").
                 - loc: Chunk locator within the document (e.g., "c:0" for first chunk,
                   "p:3:c:1" for page 3 chunk 1 of a PDF).
                 - snippet: First ~200 characters of the chunk text (preview).
@@ -785,8 +825,8 @@ if HAS_MCP and FastMCP is not None:
         Use this after file_search to get the complete text of a result.
 
         Args:
-            doc_id: Document-relative file path, exactly as returned by file_search
-                (e.g., "Projects/recipe.md" or "Archive/2024/report.pdf").
+            doc_id: Persistent 5-char base-62 document ID, exactly as returned
+                by file_search (e.g., "00001").
             loc: Chunk locator, exactly as returned by file_search
                 (e.g., "c:0" for chunk 0, "p:3:c:1" for page 3 chunk 1).
 
@@ -929,8 +969,8 @@ if HAS_MCP and FastMCP is not None:
             - total_folders: Number of folders containing files.
             - total_files: Total supported files across all folders.
 
-        Use folder paths with file_search (doc_id_prefix) or file_list_documents
-        (folder) to narrow results to a specific directory.
+        Use folder paths with file_search (doc_id_prefix filters on rel_path)
+        or file_list_documents (folder) to narrow results to a specific directory.
         """
         return _file_folders_impl()
 
@@ -967,6 +1007,53 @@ if HAS_MCP and FastMCP is not None:
               and DeepInfra API is reachable.
         """
         return _file_status_impl()
+
+    @mcp.tool()
+    def file_audit_log(
+        doc_id: str | None = None,
+        event: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Query the document lifecycle audit log.
+
+        Every document ID assignment, move, deletion, collision, and rename
+        failure is recorded in an append-only audit log. Use this tool to
+        trace what happened to a document over time or to investigate issues.
+
+        Args:
+            doc_id: Filter to events for this specific document ID (5-char base-62).
+            event: Filter by event type. Valid values:
+                - "registered": New file got an ID assigned.
+                - "moved": File moved to a different path (old_path shows previous location).
+                - "deleted": File was removed from the vault.
+                - "collision": Duplicate ID detected — the file was re-assigned a new ID.
+                  The detail field shows which file already held the ID.
+                - "rename_failed": OS refused the rename (e.g., read-only filesystem).
+                  The detail field shows the OS error.
+                - "migrated": Legacy path-based ID was migrated to a persistent ID.
+            limit: Max entries to return (1-200, default 50).
+            offset: Skip this many entries (for pagination).
+
+        Returns a dict with:
+            - entries: List of audit log entries (newest first), each containing:
+                - ts: Unix timestamp of the event.
+                - ts_iso: ISO 8601 formatted timestamp.
+                - event: Event type string.
+                - doc_id: The document ID involved.
+                - rel_path: Vault-relative path at the time of the event.
+                - old_path: Previous path (for "moved" events, empty otherwise).
+                - detail: Extra context (e.g., collision info, OS error message).
+            - total: Total matching entries (for pagination).
+            - offset, limit: Echo of pagination parameters.
+
+        Examples:
+            - See all recent activity: file_audit_log()
+            - Trace a specific document: file_audit_log(doc_id="00001")
+            - Find all deletions: file_audit_log(event="deleted")
+            - Find all collisions: file_audit_log(event="collision")
+        """
+        return _file_audit_log_impl(doc_id, event, limit, offset)
 
     # --- Taxonomy tools ---
 

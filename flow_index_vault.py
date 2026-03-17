@@ -31,6 +31,7 @@ than as task arguments.  This avoids Prefect 3's input-serialisation warnings
 while keeping the flow easy to read.
 """
 
+import logging
 import os
 import re
 import shutil
@@ -39,6 +40,14 @@ from typing import Any
 
 from prefect import flow, task
 from prefect.logging import get_run_logger
+
+
+def _get_logger():
+    """Get a Prefect run logger if available, otherwise fall back to stdlib."""
+    try:
+        return get_run_logger()
+    except Exception:
+        return logging.getLogger(__name__)
 
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
 from llama_index.core.node_parser import SentenceSplitter
@@ -49,6 +58,10 @@ from extractors import extract_text, extract_title, derive_folder, normalize_tag
 from providers.embed import build_embed_provider
 from providers.embed.base import EmbedProvider
 from providers.ocr import build_ocr_provider
+from doc_id_store import (
+    DocIDStore, extract_id_from_filename, inject_id_into_filename,
+    strip_id_from_filename as _strip_id_from_filename,
+)
 from lancedb_store import LanceDBStore
 
 
@@ -200,11 +213,23 @@ def _matches_any(rel_str: str, patterns: list[str]) -> bool:
 
 @task
 def scan_vault_task(vault_root: str | Path, include: list[str], exclude: list[str]) -> list[dict]:
-    """Scan vault; return list of file records as dicts."""
+    """Scan vault; return list of file records as dicts.
+
+    Each file gets a persistent 5-char base-62 doc_id embedded in its filename
+    as @XXXXX@. Files already carrying an ID keep it; new files get one assigned
+    and are renamed on disk.
+    """
     root = Path(vault_root)
     if not root.exists():
         return []
+
+    doc_id_store: DocIDStore | None = _RUNTIME.get("doc_id_store")
+    logger = _get_logger()
+
     records = []
+    # Track IDs seen this scan to detect collisions (two files with same @XXXXX@)
+    seen_ids: dict[str, str] = {}  # doc_id → rel_path of first file seen
+
     # os.walk with followlinks=True so symlinked directories (e.g. NAS mounts) are traversed.
     # Path.rglob does not follow symlinks in Python 3.13+.
     # Track visited real paths to guard against symlink cycles.
@@ -225,8 +250,76 @@ def scan_vault_task(vault_root: str | Path, include: list[str], exclude: list[st
                 stat = full_path.stat()
             except OSError:
                 continue
+
+            # --- Persistent doc_id assignment ---
+            existing_id = extract_id_from_filename(fname)
+            if existing_id and doc_id_store:
+                # Check for retired ID: was this ID previously deleted?
+                # Copy-pasted files may carry a stale @XXXXX@ from a deleted doc.
+                if doc_id_store.is_retired(existing_id):
+                    retired = doc_id_store.retired_info(existing_id)
+                    last_path = retired["last_path"] if retired else "unknown"
+                    logger.warning(
+                        "Retired ID %s (was %s) found on %s — assigning fresh ID",
+                        existing_id, last_path, rel_str,
+                    )
+                    doc_id_store.log_event(
+                        DocIDStore.COLLISION, existing_id, rel_str,
+                        detail=f"retired ID, previously used by {last_path}",
+                    )
+                    existing_id = None  # fall through to "no ID" path below
+                # Check for collision: another file already claimed this ID
+                elif existing_id in seen_ids:
+                    # Collision! Re-assign a fresh ID to this file
+                    logger.warning(
+                        "ID collision: %s already used by %s — re-assigning %s",
+                        existing_id, seen_ids[existing_id], rel_str,
+                    )
+                    doc_id_store.log_event(
+                        DocIDStore.COLLISION, existing_id, rel_str,
+                        detail=f"already claimed by {seen_ids[existing_id]}",
+                    )
+                    existing_id = None  # fall through to "no ID" path below
+                else:
+                    doc_id = existing_id
+                    seen_ids[doc_id] = rel_str
+                    # Register/update mapping in SQLite
+                    stored_path = doc_id_store.lookup_path(doc_id)
+                    if stored_path != rel_str:
+                        doc_id_store.register(doc_id, rel_str)
+
+            if existing_id is None and doc_id_store:
+                # No ID in filename (or collision stripped it) — assign one and rename
+                doc_id = doc_id_store.next_id()
+                # Strip any old @XXXXX@ from filename before injecting new one
+                clean_fname = _strip_id_from_filename(fname)
+                new_fname = inject_id_into_filename(clean_fname, doc_id)
+                new_full_path = full_path.parent / new_fname
+                try:
+                    full_path.rename(new_full_path)
+                except OSError as exc:
+                    # Rename failed (permissions, read-only mount, etc.)
+                    # Fall back to using rel_path as doc_id — file stays un-tagged
+                    logger.warning("Cannot rename %s → %s: %s", fname, new_fname, exc)
+                    doc_id_store.log_event(
+                        DocIDStore.RENAME_FAILED, doc_id, rel_str,
+                        detail=str(exc),
+                    )
+                    doc_id = rel_str
+                    doc_id_store.register(doc_id, rel_str)
+                    seen_ids[doc_id] = rel_str
+                else:
+                    full_path = new_full_path
+                    rel_str = str(full_path.relative_to(root)).replace("\\", "/")
+                    doc_id_store.register(doc_id, rel_str)
+                    seen_ids[doc_id] = rel_str
+            elif not doc_id_store:
+                # Fallback: no doc_id_store (shouldn't happen in normal flow)
+                doc_id = rel_str
+
             records.append({
-                "doc_id": rel_str,
+                "doc_id": doc_id,
+                "rel_path": rel_str,
                 "abs_path": str(full_path.resolve()),
                 "mtime": stat.st_mtime,
                 "size": stat.st_size,
@@ -282,11 +375,12 @@ def process_doc_task(doc: dict) -> None:
 
     logger = get_run_logger()
     doc_id = doc["doc_id"]
+    rel_path = doc.get("rel_path", doc_id)
     abs_path = doc["abs_path"]
     mtime = doc["mtime"]
     size = doc["size"]
     ext = doc["ext"]
-    logger.info(f"Processing: {doc_id}")
+    logger.info(f"Processing: {rel_path} (id={doc_id})")
 
     # --- Determine source_type ---
     source_type = "md" if ext == "md" else "pdf" if ext == "pdf" else "img"
@@ -310,7 +404,7 @@ def process_doc_task(doc: dict) -> None:
     fm = result.frontmatter  # from Markdown frontmatter; empty dict for PDF/images
     title = fm.get("title") or extract_title(result.full_text, doc_id)
     tags = normalize_tags(fm.get("tags"))
-    folder = derive_folder(doc_id)
+    folder = derive_folder(rel_path)
     status = fm.get("status", "archived" if folder.lower() in ("archive", "archived") else "active")
     created = str(fm["created"]) if "created" in fm else ""
     description = str(fm.get("description", "")).strip()
@@ -326,6 +420,7 @@ def process_doc_task(doc: dict) -> None:
     # Shared metadata for all chunks of this doc
     doc_meta = {
         "doc_id": doc_id,
+        "rel_path": rel_path,
         "source_type": source_type,
         "mtime": mtime,
         "size": size,
@@ -625,7 +720,11 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     chunk_cfg = config.get("chunking", {})
 
     # --- Build components from config (stored in _RUNTIME for tasks) ---
-    store = LanceDBStore(index_root, config.get("lancedb", {}).get("table", "chunks"))
+    table_name = config.get("lancedb", {}).get("table", "chunks")
+    store = LanceDBStore(index_root, table_name)
+
+    # Persistent document ID registry
+    doc_id_store = DocIDStore(Path(index_root) / "doc_registry.db")
 
     embed_provider = build_embed_provider(config)
 
@@ -710,6 +809,7 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
             logger.warning("Failed to load LLM enrichment model: %s", exc)
 
     _RUNTIME["store"] = store
+    _RUNTIME["doc_id_store"] = doc_id_store
     _RUNTIME["embed_provider"] = embed_provider
     _RUNTIME["splitter"] = splitter
     _RUNTIME["semantic_splitter"] = semantic_splitter
@@ -718,6 +818,25 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     _RUNTIME["llm_generator"] = llm_generator
     _RUNTIME["taxonomy_store"] = taxonomy_store
     _RUNTIME["config"] = config
+
+    # --- Migration: first run with existing LanceDB data but empty registry ---
+    # If the registry is empty but the store has data, the old doc_ids were paths.
+    # Wipe the LanceDB table to force full re-index with new persistent IDs.
+    if doc_id_store.count() == 0:
+        existing_doc_ids = store.list_doc_ids()
+        if existing_doc_ids:
+            logger.info(
+                "Migration: registry empty but store has %d docs — wiping table for re-index",
+                len(existing_doc_ids),
+            )
+            import lancedb as _ldb
+            try:
+                db = _ldb.connect(str(index_root))
+                db.drop_table(table_name)
+            except Exception as exc:
+                logger.warning("Failed to drop table during migration: %s", exc)
+            store = LanceDBStore(index_root, table_name)
+            _RUNTIME["store"] = store
 
     # --- Run pipeline ---
     t0 = time.perf_counter()
@@ -738,6 +857,14 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
 
     delete_docs_task(to_delete)
 
+    # Clean up deleted doc IDs from the persistent registry
+    if to_delete:
+        for did in to_delete:
+            try:
+                doc_id_store.delete(did)
+            except Exception:
+                pass
+
     # Rebuild FTS index for keyword search (BM25/tantivy)
     if to_add_or_update or to_delete:
         logger.info("Rebuilding FTS index...")
@@ -751,7 +878,6 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     index_stats_task(len(to_add_or_update), len(to_delete), run_seconds)
 
     # Read final counts — auto-recover if table is corrupt
-    table_name = config.get("lancedb", {}).get("table", "chunks")
     try:
         doc_count = len(store.list_doc_ids())
         chunk_count = store.count_chunks()

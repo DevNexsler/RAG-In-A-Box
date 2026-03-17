@@ -22,6 +22,7 @@ class SearchHit:
         status: str | None = None,
         created: str | None = None,
         mtime: float = 0.0,
+        rel_path: str = "",
         # Frontmatter metadata
         description: str = "",
         author: str = "",
@@ -58,6 +59,7 @@ class SearchHit:
         self.status = status      # "active", "archived", "draft", etc.
         self.created = created    # from frontmatter, e.g. "2026-01-15"
         self.mtime = mtime        # file last-modified timestamp
+        self.rel_path = rel_path  # vault-relative path (doc_id is now persistent ID)
         # Frontmatter metadata
         self.description = description  # from frontmatter "description" field
         self.author = author            # from frontmatter "author" field

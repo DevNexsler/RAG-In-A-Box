@@ -29,7 +29,7 @@ _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
 # Anything NOT in this set goes into SearchHit.extra_metadata.
 _CORE_META_KEYS = {
     "doc_id", "source_type", "mtime", "size", "title", "tags", "folder",
-    "status", "created", "loc", "snippet",
+    "status", "created", "loc", "snippet", "rel_path",
     "description", "author", "keywords", "custom_meta",
     "enr_summary", "enr_doc_type", "enr_entities_people", "enr_entities_places",
     "enr_entities_orgs", "enr_entities_dates", "enr_topics", "enr_keywords", "enr_key_facts",
@@ -168,9 +168,10 @@ class LanceDBStore:
         if folder:
             parts.append(f"lower(metadata.folder) = '{self._sql_escape(folder.lower())}'")
 
-        # Prefix match on top-level doc_id column (case-sensitive — paths)
+        # Prefix match on rel_path metadata field (case-sensitive — paths)
+        # doc_id is now a persistent 5-char ID; path-based browsing uses rel_path
         if doc_id_prefix:
-            parts.append(f"doc_id LIKE '{self._sql_escape(doc_id_prefix)}%'")
+            parts.append(f"metadata.rel_path LIKE '{self._sql_escape(doc_id_prefix)}%'")
 
         # Comma-separated OR fields (tags, enr_doc_type, enr_topics) — case-insensitive
         for field, value in [
@@ -240,6 +241,7 @@ class LanceDBStore:
             status=meta.get("status") or row.get("status"),
             created=meta.get("created") or row.get("created"),
             mtime=float(raw_mtime) if raw_mtime else 0.0,
+            rel_path=meta.get("rel_path") or row.get("rel_path", ""),
             **_extract_enrichment(combined_meta),
             extra_metadata=_extract_extra_metadata(meta),
         )
