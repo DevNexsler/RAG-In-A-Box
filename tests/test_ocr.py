@@ -172,7 +172,7 @@ def _deepseek_ocr2_running() -> bool:
         return False
 
 
-_TEST_IMAGE = Path(__file__).parent.parent / "test_vault" / "meeting_notes.png"
+_TEST_IMAGE = Path(__file__).parent.parent / "test_vault" / "meeting_notes@00004@.png"
 
 
 @pytest.mark.live

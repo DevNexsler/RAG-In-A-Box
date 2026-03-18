@@ -46,6 +46,15 @@ def test_no_exclude_normal():
 
 # --- scan_vault_task ---
 
+@pytest.fixture(autouse=True)
+def _clear_doc_id_store():
+    """Ensure scan tests run without a doc_id_store (tests expect rel_path as doc_id)."""
+    saved = _RUNTIME.pop("doc_id_store", None)
+    yield
+    if saved is not None:
+        _RUNTIME["doc_id_store"] = saved
+
+
 def test_scan_finds_md_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)

@@ -141,12 +141,12 @@ class TestIndexing:
     def test_all_docs_indexed(self, indexed_store):
         """All test_vault files should be in the index."""
         doc_ids = indexed_store["store"].list_doc_ids()
-        # At minimum: note1.md, note2.md, subfolder/recipe.md, sample.pdf
+        # At minimum: note1, note2, recipe, sample.pdf (filenames include @ID@ suffix)
         assert len(doc_ids) >= 4, f"Expected >= 4 docs, got {len(doc_ids)}: {doc_ids}"
-        assert "note1.md" in doc_ids
-        assert "note2.md" in doc_ids
-        assert "subfolder/recipe.md" in doc_ids
-        assert "sample.pdf" in doc_ids
+        assert any("note1" in d for d in doc_ids), f"note1 not found in {doc_ids}"
+        assert any("note2" in d for d in doc_ids), f"note2 not found in {doc_ids}"
+        assert any("recipe" in d for d in doc_ids), f"recipe not found in {doc_ids}"
+        assert any("sample" in d for d in doc_ids), f"sample not found in {doc_ids}"
 
     def test_markdown_indexed(self, indexed_store):
         """Markdown files should produce chunks."""
@@ -157,7 +157,7 @@ class TestIndexing:
     def test_pdf_indexed(self, indexed_store):
         """PDF should produce chunks."""
         doc_ids = indexed_store["store"].list_doc_ids()
-        assert "sample.pdf" in doc_ids
+        assert any("sample" in d for d in doc_ids), f"sample not found in {doc_ids}"
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +180,8 @@ class TestSemanticSearch:
         )
         assert len(hits) >= 1
         # The recipe should be the top hit
-        assert hits[0].doc_id == "subfolder/recipe.md", \
-            f"Expected recipe.md as top hit, got {hits[0].doc_id} (snippet: {hits[0].snippet[:80]})"
+        assert "recipe" in hits[0].doc_id, \
+            f"Expected recipe as top hit, got {hits[0].doc_id} (snippet: {hits[0].snippet[:80]})"
 
     def test_search_insurance_claim(self, indexed_store):
         """Searching for 'roof insurance claim' should return note2.md."""
@@ -195,8 +195,8 @@ class TestSemanticSearch:
             final_top_k=5,
         )
         assert len(hits) >= 1
-        assert hits[0].doc_id == "note2.md", \
-            f"Expected note2.md as top hit, got {hits[0].doc_id} (snippet: {hits[0].snippet[:80]})"
+        assert "note2" in hits[0].doc_id, \
+            f"Expected note2 as top hit, got {hits[0].doc_id} (snippet: {hits[0].snippet[:80]})"
 
     def test_search_semantic_search_project(self, indexed_store):
         """Searching for 'semantic search' should return note1.md or sample.pdf."""
@@ -212,8 +212,8 @@ class TestSemanticSearch:
         assert len(hits) >= 1
         # note1.md talks about semantic search; sample.pdf talks about indexer architecture
         top_doc = hits[0].doc_id
-        assert top_doc in ("note1.md", "sample.pdf"), \
-            f"Expected note1.md or sample.pdf, got {top_doc} (snippet: {hits[0].snippet[:80]})"
+        assert any(name in top_doc for name in ("note1", "sample")), \
+            f"Expected note1 or sample, got {top_doc} (snippet: {hits[0].snippet[:80]})"
 
     def test_search_scores_are_reasonable(self, indexed_store):
         """Scores should be between 0 and 1 and ordered descending."""
@@ -296,8 +296,8 @@ class TestGetChunk:
     def test_get_chunk_returns_text(self, indexed_store):
         """get_chunk with valid doc_id and loc should return the chunk text."""
         store = indexed_store["store"]
-        hit = store.get_chunk("subfolder/recipe.md", "c:0")
-        assert hit is not None, "get_chunk returned None for recipe.md c:0"
+        hit = store.get_chunk("subfolder/recipe@00005@.md", "c:0")
+        assert hit is not None, "get_chunk returned None for recipe (00005) c:0"
         assert "cabbage" in hit.text.lower() or "kimchi" in hit.text.lower(), \
             f"Expected recipe content, got: {hit.text[:100]}"
 
@@ -310,7 +310,7 @@ class TestGetChunk:
     def test_get_chunk_wrong_loc(self, indexed_store):
         """get_chunk with wrong loc should return None."""
         store = indexed_store["store"]
-        hit = store.get_chunk("note1.md", "c:999")
+        hit = store.get_chunk("note1@00001@.md", "c:999")
         assert hit is None
 
 
@@ -344,7 +344,7 @@ class TestMCPHandlers:
         assert "loc" in r
         assert "snippet" in r
         assert "score" in r
-        assert r["doc_id"] == "subfolder/recipe.md"
+        assert "recipe" in r["doc_id"]
         # Diagnostics should report healthy search
         assert response["diagnostics"]["degraded"] is False
 
@@ -357,7 +357,7 @@ class TestMCPHandlers:
             indexed_store["config"],
         )
 
-        result = mcp_server._file_get_chunk_impl("note2.md", "c:0")
+        result = mcp_server._file_get_chunk_impl("note2@00002@.md", "c:0")
         assert result is not None
         assert "doc_id" in result
         assert "text" in result
@@ -416,7 +416,7 @@ class TestMCPHandlers:
             indexed_store["config"],
         )
 
-        result = mcp_server._file_get_doc_chunks_impl("note2.md")
+        result = mcp_server._file_get_doc_chunks_impl("note2@00002@.md")
         assert isinstance(result, list)
         assert len(result) >= 1
         assert "text" in result[0]
@@ -579,8 +579,8 @@ class TestReranker:
         self._print_stage("Final results (reranked)", hits, "relev.")
 
         assert len(hits) >= 1
-        assert hits[0].doc_id == "subfolder/recipe.md", \
-            f"Expected recipe.md as #1, got {hits[0].doc_id}"
+        assert "recipe" in hits[0].doc_id, \
+            f"Expected recipe as #1, got {hits[0].doc_id}"
         assert hits[0].score > 0.5, \
             f"Expected high relevance for recipe, got {hits[0].score:.4f}"
 
@@ -602,10 +602,10 @@ class TestReranker:
 
         print(f"\n    Query: \"{query}\"  →  Checking irrelevant doc scores")
         for h in hits:
-            tag = " ← RELEVANT" if h.doc_id == "subfolder/recipe.md" else ""
+            tag = " ← RELEVANT" if "recipe" in h.doc_id else ""
             print(f"    relev.={h.score:.6f}  {h.doc_id}{tag}")
 
-        non_recipe = [h for h in hits if h.doc_id != "subfolder/recipe.md"]
+        non_recipe = [h for h in hits if "recipe" not in h.doc_id]
         for h in non_recipe:
             assert h.score < 0.1, \
                 f"Non-recipe doc {h.doc_id} got unexpectedly high score: {h.score:.4f}"
@@ -654,8 +654,8 @@ class TestReranker:
         self._print_stage("Final results (reranked)", hits, "relev.")
 
         assert len(hits) >= 1
-        assert hits[0].doc_id == "note2.md", \
-            f"Expected note2.md as #1 for insurance query, got {hits[0].doc_id}"
+        assert "note2" in hits[0].doc_id, \
+            f"Expected note2 as #1 for insurance query, got {hits[0].doc_id}"
         assert hits[0].score > 0.5, \
             f"Expected high relevance for insurance doc, got {hits[0].score:.4f}"
 
@@ -770,17 +770,18 @@ class TestFullPipelineWithEnrichment:
         doc_ids = pipeline_result["store"].list_doc_ids()
         print(f"\n    Indexed docs: {doc_ids}")
         assert len(doc_ids) >= 3, f"Expected >= 3 docs, got {len(doc_ids)}: {doc_ids}"
-        assert "note1.md" in doc_ids
-        assert "note2.md" in doc_ids
-        assert "subfolder/recipe.md" in doc_ids
+        # Persistent doc IDs: note1@00001@.md → "00001", etc.
+        assert "00001" in doc_ids
+        assert "00002" in doc_ids
+        assert "00005" in doc_ids
 
     def test_chunks_have_enrichment_metadata(self, pipeline_result):
         """Chunks should carry enrichment fields in their metadata."""
         store = pipeline_result["store"]
-        hit = store.get_chunk("subfolder/recipe.md", "c:0")
-        assert hit is not None, "get_chunk returned None for recipe.md c:0"
+        hit = store.get_chunk("00005", "c:0")
+        assert hit is not None, "get_chunk returned None for recipe (00005) c:0"
 
-        print(f"\n    Enrichment fields on recipe.md c:0:")
+        print(f"\n    Enrichment fields on recipe (00005) c:0:")
         print(f"      enr_summary: {hit.enr_summary[:120] if hit.enr_summary else '(empty)'}")
         print(f"      enr_doc_type: {hit.enr_doc_type}")
         print(f"      enr_topics: {hit.enr_topics}")
@@ -791,13 +792,13 @@ class TestFullPipelineWithEnrichment:
         print(f"      enr_entities_dates: {hit.enr_entities_dates}")
         print(f"      enr_key_facts: {hit.enr_key_facts[:120] if hit.enr_key_facts else '(empty)'}")
 
-        assert hit.enr_summary, "enr_summary should be populated for recipe.md"
-        assert hit.enr_topics, "enr_topics should be populated for recipe.md"
+        assert hit.enr_summary, "enr_summary should be populated for recipe (00005)"
+        assert hit.enr_topics, "enr_topics should be populated for recipe (00005)"
 
     def test_contextual_header_includes_summary(self, pipeline_result):
         """Chunk text should start with a contextual header containing summary."""
         store = pipeline_result["store"]
-        hit = store.get_chunk("note2.md", "c:0")
+        hit = store.get_chunk("00002", "c:0")
         assert hit is not None
 
         print(f"\n    Chunk text (first 500 chars):\n{hit.text[:500]}")
@@ -808,7 +809,7 @@ class TestFullPipelineWithEnrichment:
     def test_contextual_header_includes_topics(self, pipeline_result):
         """Contextual header should include topics from enrichment."""
         store = pipeline_result["store"]
-        hit = store.get_chunk("subfolder/recipe.md", "c:0")
+        hit = store.get_chunk("00005", "c:0")
         assert hit is not None
         assert "Topics:" in hit.text, "Contextual header should include Topics"
 
@@ -865,10 +866,10 @@ class TestFullPipelineWithEnrichment:
             pipeline_result["config"],
         )
 
-        result = mcp_server._file_get_chunk_impl("note1.md", "c:0")
+        result = mcp_server._file_get_chunk_impl("00001", "c:0")
         assert result is not None
 
-        print(f"\n    MCP get_chunk result for note1.md c:0:")
+        print(f"\n    MCP get_chunk result for note1 (00001) c:0:")
         for field in ("enr_summary", "enr_doc_type", "enr_topics", "enr_keywords"):
             val = result.get(field, "(missing)")
             print(f"      {field}: {val}")
@@ -877,11 +878,11 @@ class TestFullPipelineWithEnrichment:
     def test_enrichment_fields_consistent_across_chunks(self, pipeline_result):
         """All chunks of the same document should share identical enrichment values."""
         store = pipeline_result["store"]
-        c0 = store.get_chunk("subfolder/recipe.md", "c:0")
+        c0 = store.get_chunk("00005", "c:0")
         assert c0 is not None
 
         # Try to get a second chunk (if the doc produced more than one)
-        c1 = store.get_chunk("subfolder/recipe.md", "c:1")
+        c1 = store.get_chunk("00005", "c:1")
         if c1 is not None:
             print(f"\n    Comparing enrichment across chunks c:0 and c:1:")
             print(f"      c:0 enr_summary: {c0.enr_summary[:80]}")
@@ -895,10 +896,10 @@ class TestFullPipelineWithEnrichment:
     def test_note_with_frontmatter_preserves_tags_and_enrichment(self, pipeline_result):
         """Documents with YAML frontmatter should have both tags AND enrichment."""
         store = pipeline_result["store"]
-        hit = store.get_chunk("note1.md", "c:0")
+        hit = store.get_chunk("00001", "c:0")
         assert hit is not None
 
-        print(f"\n    note1.md metadata:")
+        print(f"\n    note1 (00001) metadata:")
         print(f"      tags (frontmatter): {hit.tags}")
         print(f"      enr_summary (LLM): {hit.enr_summary[:100] if hit.enr_summary else '(empty)'}")
         print(f"      enr_topics (LLM): {hit.enr_topics}")
