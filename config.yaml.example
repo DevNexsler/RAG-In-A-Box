@@ -42,11 +42,15 @@ pdf:
 
 ocr:
   enabled: true
-  provider: "gemini"                      # cloud OCR via Gemini Vision
+  provider: "gemini"                      # default for both PDF pages and images
   model: "gemini-2.0-flash"
   timeout: 120
   concurrency: 2
-  # Local alternative: provider: "deepseek_ocr2" — see config.local.yaml.example
+  # Optional: override just the image description provider
+  # describe:
+  #   provider: "ollama_vision"           # uses Ollama vision model for photos/screenshots
+  #   model: "qwen3-vl:8b"
+  #   base_url: "http://localhost:11434"
 
 embeddings:
   provider: "openrouter"                  # Qwen3-Embedding-8B via OpenRouter

@@ -747,7 +747,13 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     # OCR provider (may be None if disabled or provider="none")
     ocr_provider = build_ocr_provider(config)
     if ocr_provider:
-        logger.info(f"OCR enabled: {config.get('ocr', {}).get('provider', 'none')}")
+        ocr_cfg = config.get("ocr", {})
+        extract_name = ocr_cfg.get("extract", {}).get("provider", ocr_cfg.get("provider", "none"))
+        describe_name = ocr_cfg.get("describe", {}).get("provider", ocr_cfg.get("provider", "none"))
+        if extract_name == describe_name:
+            logger.info("OCR enabled: %s", extract_name)
+        else:
+            logger.info("OCR enabled: extract=%s, describe=%s", extract_name, describe_name)
     else:
         logger.info("OCR disabled (set ocr.enabled=true in config to enable)")
 

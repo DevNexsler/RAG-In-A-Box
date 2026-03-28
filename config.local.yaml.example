@@ -39,11 +39,16 @@ pdf:
 
 ocr:
   enabled: true
-  provider: "deepseek_ocr2"               # local DeepSeek OCR2 server
+  provider: "deepseek_ocr2"               # PDF page extraction — local DeepSeek OCR2 server
   base_url: "http://localhost:8790"
   timeout: 120
   concurrency: 1                          # sequential — DeepSeek OCR2 handles 1 request at a time
-  # Cloud alternative: provider: "gemini", model: "gemini-2.0-flash", concurrency: 2
+  # Override image description with Ollama vision model (better for photos/screenshots)
+  describe:
+    provider: "ollama_vision"
+    model: "qwen3-vl:8b"
+    base_url: "http://localhost:11434"
+    timeout: 120
 
 embeddings:
   provider: "ollama"                      # local Ollama embeddings
