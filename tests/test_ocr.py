@@ -1,7 +1,9 @@
 """Tests for DeepSeek-OCR2 OCR provider (local mlx-vlm service).
 
 Unit tests mock HTTP calls (always run).
-Live tests require the service at localhost:8790 (skipped otherwise).
+Live tests hit the real service at the URL resolved from, in order:
+OCR_BASE_URL env var, ocr.base_url in config_test.yaml / config.yaml, or
+http://localhost:8790. They are skipped if unreachable.
 
 Run with:  pytest tests/test_ocr.py -v
 """
@@ -161,12 +163,40 @@ class TestDeepSeekOCR2Unit:
 
 
 # -----------------------------------------------------------------------
-# Live integration tests (require DeepSeek-OCR2 at localhost:8790)
+# Live integration tests (require DeepSeek-OCR2 reachable at its configured
+# base_url). Resolution order:
+#   1. OCR_BASE_URL env var
+#   2. ocr.base_url from config_test.yaml (or config.yaml as fallback)
+#   3. http://localhost:8790
 # -----------------------------------------------------------------------
+
+def _resolve_ocr_base_url() -> str:
+    env_url = os.environ.get("OCR_BASE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    repo_root = Path(__file__).parent.parent
+    for cfg_name in ("config_test.yaml", "config.yaml"):
+        cfg_path = repo_root / cfg_name
+        if not cfg_path.exists():
+            continue
+        try:
+            import yaml
+            with open(cfg_path) as f:
+                raw = yaml.safe_load(f) or {}
+            url = (raw.get("ocr") or {}).get("base_url")
+            if url:
+                return url.rstrip("/")
+        except Exception:
+            continue
+    return "http://localhost:8790"
+
+
+_OCR_BASE_URL = _resolve_ocr_base_url()
+
 
 def _deepseek_ocr2_running() -> bool:
     try:
-        resp = httpx.get("http://localhost:8790/health", timeout=3.0)
+        resp = httpx.get(f"{_OCR_BASE_URL}/health", timeout=3.0)
         return resp.status_code < 500
     except Exception:
         return False
@@ -178,14 +208,14 @@ _TEST_IMAGE = Path(__file__).parent.parent / "test_vault" / "meeting_notes@00004
 @pytest.mark.live
 @pytest.mark.skipif(
     not _deepseek_ocr2_running(),
-    reason="DeepSeek-OCR2 not running at localhost:8790",
+    reason=f"DeepSeek-OCR2 not reachable at {_OCR_BASE_URL}",
 )
 class TestDeepSeekOCR2Live:
     """Live integration tests against real DeepSeek-OCR2 service."""
 
     @pytest.fixture(scope="class")
     def provider(self):
-        return DeepSeekOCR2Local(base_url="http://localhost:8790", timeout=120.0)
+        return DeepSeekOCR2Local(base_url=_OCR_BASE_URL, timeout=120.0)
 
     def test_extract_returns_nonempty_text(self, provider):
         """Real OCR should return non-empty text for a real image."""

@@ -1,5 +1,12 @@
-# Test config — mirrors production config with test directories
-# Identical to config.yaml except vault_root, index_root, and mcp port.
+# Test config — mirrors the production config stack (OpenRouter / DeepInfra /
+# DeepSeek-OCR2) with test-only vault and index paths. Loaded by
+# tests/test_integration.py.
+#
+# Required env vars for live tests:
+#   OPENROUTER_API_KEY, DEEPINFRA_API_KEY
+# DeepSeek-OCR2 OCR tests are skipped if the configured ocr.base_url is
+# unreachable.
+
 vault_root: "./test_vault"
 index_root: "./test_index"
 
@@ -10,6 +17,17 @@ scan:
     - "**/*.png"
     - "**/*.jpg"
     - "**/*.jpeg"
+    - "**/*.docx"
+    - "**/*.doc"
+    - "**/*.pptx"
+    - "**/*.rtf"
+    - "**/*.epub"
+    - "**/*.html"
+    - "**/*.htm"
+    - "**/*.csv"
+    - "**/*.txt"
+    - "**/*.xlsx"
+    - "**/*.xls"
   exclude:
     - ".obsidian/**"
     - ".trash/**"
@@ -22,10 +40,10 @@ pdf:
 
 ocr:
   enabled: true
-  provider: "gemini"
-  model: "gemini-2.0-flash"
+  provider: "deepseek_ocr2"
+  base_url: "http://localhost:8790"
   timeout: 120
-  concurrency: 2
+  concurrency: 1
 
 embeddings:
   provider: "openrouter"
@@ -58,9 +76,9 @@ search:
     weight: 0.3
   reranker:
     enabled: true
-    provider: "baseten"
-    model_id: "wnppr2y3"
-    timeout: 120
+    provider: "deepinfra"
+    model: "Qwen/Qwen3-Reranker-8B"
+    timeout: 30
 
 lancedb:
   table: "chunks"

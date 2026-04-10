@@ -125,26 +125,51 @@ class TestDeepInfraRerankerHealth:
 
 
 # -----------------------------------------------------------------------
-# DeepSeek-OCR2 (local)
+# DeepSeek-OCR2 (configured via ocr.base_url)
 # -----------------------------------------------------------------------
 
-_deepseek_ocr2_available = _probe_url("http://localhost:8790/health")
+def _resolve_ocr_base_url() -> str:
+    """Resolve DeepSeek-OCR2 URL: OCR_BASE_URL env, config_test.yaml,
+    config.yaml, then http://localhost:8790 fallback."""
+    env_url = os.environ.get("OCR_BASE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    from pathlib import Path
+    repo_root = Path(__file__).parent.parent
+    for cfg_name in ("config_test.yaml", "config.yaml"):
+        cfg_path = repo_root / cfg_name
+        if not cfg_path.exists():
+            continue
+        try:
+            import yaml
+            with open(cfg_path) as f:
+                raw = yaml.safe_load(f) or {}
+            url = (raw.get("ocr") or {}).get("base_url")
+            if url:
+                return url.rstrip("/")
+        except Exception:
+            continue
+    return "http://localhost:8790"
+
+
+_OCR_BASE_URL = _resolve_ocr_base_url()
+_deepseek_ocr2_available = _probe_url(f"{_OCR_BASE_URL}/health")
 
 
 @pytest.mark.live
-@pytest.mark.skipif(not _deepseek_ocr2_available, reason="DeepSeek-OCR2 not running at localhost:8790")
+@pytest.mark.skipif(not _deepseek_ocr2_available, reason=f"DeepSeek-OCR2 not reachable at {_OCR_BASE_URL}")
 class TestDeepSeekOCR2Health:
-    """Verify local DeepSeek-OCR2 service is responding."""
+    """Verify DeepSeek-OCR2 service is responding at its configured base_url."""
 
     def test_health_endpoint(self):
         """GET /health returns 200."""
-        resp = httpx.get("http://localhost:8790/health", timeout=5.0)
+        resp = httpx.get(f"{_OCR_BASE_URL}/health", timeout=5.0)
         assert resp.status_code == 200
 
     def test_extract_endpoint_accepts_post(self):
         """POST /extract with minimal PNG returns non-5xx."""
         resp = httpx.post(
-            "http://localhost:8790/extract",
+            f"{_OCR_BASE_URL}/extract",
             files={"file": ("test.png", _minimal_png(), "image/png")},
             timeout=30.0,
         )

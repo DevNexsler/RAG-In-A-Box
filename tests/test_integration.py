@@ -1,7 +1,10 @@
-"""Integration tests: real embeddings (OpenRouter or Gemini), real LanceDB, real search, real reranker.
+"""Integration tests: real embeddings, real LanceDB, real search, real reranker.
 
-These tests use the embedding provider configured in config_test.yaml (default: OpenRouter
-with Qwen3-Embedding-4B-Q8_0). OCR still uses Gemini (needs GEMINI_API_KEY).
+Uses the provider stack defined in config_test.yaml — currently OpenRouter
+(embeddings + enrichment) and DeepInfra (reranker). Image OCR is DeepSeek-OCR2
+at the URL configured in ocr.base_url; image-OCR assertions are skipped
+automatically if that service is unreachable.
+
 Run with:  pytest tests/test_integration.py -v -s
 
 The test flow:
@@ -9,7 +12,7 @@ The test flow:
   2. Run semantic search queries and verify results make sense
   3. Test MCP tool handler implementations
   4. Verify get_chunk returns correct text
-  5. Test Qwen3-Reranker via llama.cpp server with continuous scoring
+  5. Test Qwen3-Reranker via DeepInfra with continuous scoring
   6. Full-pipeline test via index_vault_flow with LLM enrichment via OpenRouter
 """
 
@@ -18,21 +21,23 @@ import sys
 import tempfile
 from pathlib import Path
 
+import httpx
 import pytest
 
-# Load .env so GEMINI_API_KEY is available for OCR
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Skip entire module if GEMINI_API_KEY is not set (still needed for OCR)
+_has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
+_has_deepinfra = bool(os.environ.get("DEEPINFRA_API_KEY"))
+
 pytestmark = [
     pytest.mark.live,
     pytest.mark.skipif(
-        not os.environ.get("GEMINI_API_KEY"),
-        reason="GEMINI_API_KEY not set — skipping integration tests (needed for Gemini OCR)",
+        not (_has_openrouter and _has_deepinfra),
+        reason="OPENROUTER_API_KEY and DEEPINFRA_API_KEY required for integration tests",
     ),
 ]
 
@@ -708,13 +713,23 @@ class TestFullPipelineWithEnrichment:
     @pytest.fixture(scope="class")
     def pipeline_result(self):
         """Run index_vault_flow with enrichment enabled. Returns store + config."""
+        import shutil
         import yaml
 
         from core.config import load_config
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            # index_vault_flow calls scan_vault_task which renames files with
+            # @NNNNN@ doc-id suffixes. Copy test_vault into tmpdir so the
+            # tracked repo isn't mutated by the flow.
+            vault_copy = Path(tmpdir) / "vault"
+            src_vault = Path(__file__).parent.parent / "test_vault"
+            shutil.copytree(src_vault, vault_copy)
+
             # Build a temp config with enrichment enabled via OpenRouter
             base_config = load_config("config_test.yaml")
+            base_config["vault_root"] = str(vault_copy)
+            base_config["documents_root"] = str(vault_copy)
             base_config["index_root"] = tmpdir
             # Use production enrichment config (model, token limits, etc.)
             prod_config = load_config()
@@ -730,11 +745,20 @@ class TestFullPipelineWithEnrichment:
             # Run Prefect flow in ephemeral mode (no server required).
             # Must set env vars AND reset Prefect's cached settings so the
             # ephemeral server is used even if Prefect was imported earlier.
+            # Also override DOCUMENTS_ROOT/INDEX_ROOT so load_config inside
+            # the flow points at the vault copy, not the host env values.
             saved_env = {}
-            for key in ("PREFECT_API_URL", "PREFECT_SERVER_ALLOW_EPHEMERAL_MODE"):
+            for key in (
+                "PREFECT_API_URL",
+                "PREFECT_SERVER_ALLOW_EPHEMERAL_MODE",
+                "DOCUMENTS_ROOT",
+                "INDEX_ROOT",
+            ):
                 saved_env[key] = os.environ.get(key)
             os.environ["PREFECT_API_URL"] = ""
             os.environ["PREFECT_SERVER_ALLOW_EPHEMERAL_MODE"] = "true"
+            os.environ["DOCUMENTS_ROOT"] = str(vault_copy)
+            os.environ["INDEX_ROOT"] = tmpdir
             try:
                 from prefect.settings.models.root import Settings as PrefectSettings
                 import prefect.context
@@ -754,32 +778,50 @@ class TestFullPipelineWithEnrichment:
 
             from lancedb_store import LanceDBStore
             from providers.embed import build_embed_provider
+            from doc_id_store import DocIDStore, strip_id_from_filename
 
             store = LanceDBStore(tmpdir, base_config.get("lancedb", {}).get("table", "chunks"))
             embed_provider = build_embed_provider(base_config)
+
+            # Build a reverse map: original filename (pre-rename) -> doc_id.
+            # The flow renames files to `name@XXXXX@.ext` and registers the
+            # renamed path in the registry. We strip the @XXXXX@ suffix so
+            # tests can look up chunks by their pre-rename filenames.
+            registry = DocIDStore(Path(tmpdir) / "doc_registry.db")
+            try:
+                doc_ids_by_orig_name: dict[str, str] = {}
+                for did, rel_path in registry.all_mappings().items():
+                    parts = rel_path.split("/")
+                    parts[-1] = strip_id_from_filename(parts[-1])
+                    doc_ids_by_orig_name["/".join(parts)] = did
+            finally:
+                registry.close()
 
             yield {
                 "store": store,
                 "embed_provider": embed_provider,
                 "config": base_config,
                 "tmpdir": tmpdir,
+                "doc_ids_by_orig_name": doc_ids_by_orig_name,
             }
 
     def test_all_docs_indexed(self, pipeline_result):
         """The flow should index all test_vault files."""
-        doc_ids = pipeline_result["store"].list_doc_ids()
-        print(f"\n    Indexed docs: {doc_ids}")
-        assert len(doc_ids) >= 3, f"Expected >= 3 docs, got {len(doc_ids)}: {doc_ids}"
-        # Persistent doc IDs: note1@00001@.md → "00001", etc.
-        assert "00001" in doc_ids
-        assert "00002" in doc_ids
-        assert "00005" in doc_ids
+        store_doc_ids = pipeline_result["store"].list_doc_ids()
+        by_name = pipeline_result["doc_ids_by_orig_name"]
+        print(f"\n    Indexed docs: {store_doc_ids}")
+        print(f"    Name→id map: {by_name}")
+        assert len(store_doc_ids) >= 3, f"Expected >= 3 docs, got {len(store_doc_ids)}: {store_doc_ids}"
+        for name in ("note1.md", "note2.md", "subfolder/recipe.md"):
+            assert name in by_name, f"{name} missing from registry map"
+            assert by_name[name] in store_doc_ids, f"doc_id for {name} not in store"
 
     def test_chunks_have_enrichment_metadata(self, pipeline_result):
         """Chunks should carry enrichment fields in their metadata."""
         store = pipeline_result["store"]
-        hit = store.get_chunk("00005", "c:0")
-        assert hit is not None, "get_chunk returned None for recipe (00005) c:0"
+        recipe_id = pipeline_result["doc_ids_by_orig_name"]["subfolder/recipe.md"]
+        hit = store.get_chunk(recipe_id, "c:0")
+        assert hit is not None, f"get_chunk returned None for recipe.md (id={recipe_id}) c:0"
 
         print(f"\n    Enrichment fields on recipe (00005) c:0:")
         print(f"      enr_summary: {hit.enr_summary[:120] if hit.enr_summary else '(empty)'}")
@@ -798,7 +840,8 @@ class TestFullPipelineWithEnrichment:
     def test_contextual_header_includes_summary(self, pipeline_result):
         """Chunk text should start with a contextual header containing summary."""
         store = pipeline_result["store"]
-        hit = store.get_chunk("00002", "c:0")
+        note2_id = pipeline_result["doc_ids_by_orig_name"]["note2.md"]
+        hit = store.get_chunk(note2_id, "c:0")
         assert hit is not None
 
         print(f"\n    Chunk text (first 500 chars):\n{hit.text[:500]}")
@@ -809,7 +852,8 @@ class TestFullPipelineWithEnrichment:
     def test_contextual_header_includes_topics(self, pipeline_result):
         """Contextual header should include topics from enrichment."""
         store = pipeline_result["store"]
-        hit = store.get_chunk("00005", "c:0")
+        recipe_id = pipeline_result["doc_ids_by_orig_name"]["subfolder/recipe.md"]
+        hit = store.get_chunk(recipe_id, "c:0")
         assert hit is not None
         assert "Topics:" in hit.text, "Contextual header should include Topics"
 
@@ -866,10 +910,11 @@ class TestFullPipelineWithEnrichment:
             pipeline_result["config"],
         )
 
-        result = mcp_server._file_get_chunk_impl("00001", "c:0")
+        note1_id = pipeline_result["doc_ids_by_orig_name"]["note1.md"]
+        result = mcp_server._file_get_chunk_impl(note1_id, "c:0")
         assert result is not None
 
-        print(f"\n    MCP get_chunk result for note1 (00001) c:0:")
+        print(f"\n    MCP get_chunk result for note1.md (id={note1_id}) c:0:")
         for field in ("enr_summary", "enr_doc_type", "enr_topics", "enr_keywords"):
             val = result.get(field, "(missing)")
             print(f"      {field}: {val}")
@@ -878,11 +923,12 @@ class TestFullPipelineWithEnrichment:
     def test_enrichment_fields_consistent_across_chunks(self, pipeline_result):
         """All chunks of the same document should share identical enrichment values."""
         store = pipeline_result["store"]
-        c0 = store.get_chunk("00005", "c:0")
+        recipe_id = pipeline_result["doc_ids_by_orig_name"]["subfolder/recipe.md"]
+        c0 = store.get_chunk(recipe_id, "c:0")
         assert c0 is not None
 
         # Try to get a second chunk (if the doc produced more than one)
-        c1 = store.get_chunk("00005", "c:1")
+        c1 = store.get_chunk(recipe_id, "c:1")
         if c1 is not None:
             print(f"\n    Comparing enrichment across chunks c:0 and c:1:")
             print(f"      c:0 enr_summary: {c0.enr_summary[:80]}")
@@ -896,7 +942,8 @@ class TestFullPipelineWithEnrichment:
     def test_note_with_frontmatter_preserves_tags_and_enrichment(self, pipeline_result):
         """Documents with YAML frontmatter should have both tags AND enrichment."""
         store = pipeline_result["store"]
-        hit = store.get_chunk("00001", "c:0")
+        note1_id = pipeline_result["doc_ids_by_orig_name"]["note1.md"]
+        hit = store.get_chunk(note1_id, "c:0")
         assert hit is not None
 
         print(f"\n    note1 (00001) metadata:")
