@@ -1234,6 +1234,7 @@ if HAS_MCP and FastMCP is not None:
 
             async def _run_http():
                 import contextlib
+                import hashlib
                 import hmac
                 import uvicorn
                 from starlette.applications import Starlette
@@ -1244,6 +1245,15 @@ if HAS_MCP and FastMCP is not None:
 
                 api_key = os.environ.get("API_KEY")
                 config = load_config()
+
+                if api_key:
+                    fp = hashlib.sha256(api_key.encode()).hexdigest()[:6]
+                    logger.info(
+                        "Auth enabled: API_KEY set (len=%d, sha256:%s…)",
+                        len(api_key), fp,
+                    )
+                else:
+                    logger.warning("Auth DISABLED: API_KEY env var not set")
 
                 mcp_app = mcp.streamable_http_app()
                 api_app = build_api_app(documents_root=Path(config["documents_root"]))
@@ -1273,11 +1283,30 @@ if HAS_MCP and FastMCP is not None:
                         async def __call__(self, scope, receive, send):
                             if scope["type"] in ("http", "websocket"):
                                 auth_value = b""
+                                user_agent = b""
                                 for name, value in scope.get("headers", []):
                                     if name == b"authorization":
                                         auth_value = value
-                                        break
+                                    elif name == b"user-agent":
+                                        user_agent = value
                                 if not hmac.compare_digest(auth_value, self.expected):
+                                    if not auth_value:
+                                        reason = "missing"
+                                    elif not auth_value.startswith(b"Bearer "):
+                                        reason = "not_bearer"
+                                    elif len(auth_value) != len(self.expected):
+                                        reason = "wrong_length"
+                                    else:
+                                        reason = "mismatch"
+                                    client = scope.get("client") or ("?", 0)
+                                    logger.warning(
+                                        "401 %s %s reason=%s client=%s:%s ua=%r",
+                                        scope.get("method", "?"),
+                                        scope.get("path", "?"),
+                                        reason,
+                                        client[0], client[1],
+                                        user_agent.decode("latin-1", "replace")[:120],
+                                    )
                                     response = JSONResponse(
                                         {"error": "Unauthorized"}, status_code=401
                                     )
