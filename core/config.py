@@ -128,6 +128,13 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
         if not isinstance(raw["sources"], list) or not raw["sources"]:
             raise ValueError("'sources' must be a non-empty list")
 
+        # DOCUMENTS_ROOT env var: in new-style mode, apply it to the first
+        # filesystem source's root (same as legacy mode applies it to
+        # documents_root). This lets host-side tests override the container
+        # path without knowing which source index it is.
+        env_docs_root = os.environ.get("DOCUMENTS_ROOT")
+        fs_overridden = False
+
         seen_names: set[str] = set()
         for i, src in enumerate(raw["sources"]):
             if not isinstance(src, dict):
@@ -140,11 +147,12 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
                 raise ValueError(f"duplicate source name: {src['name']!r}")
             seen_names.add(src["name"])
 
-            # Validate that filesystem source roots exist on disk (fail fast).
-            # Pure-postgres (or other non-filesystem) configs skip this check.
             if src["type"] == "filesystem":
                 if "root" not in src:
                     raise ValueError(f"sources[{i}] (filesystem) missing required key 'root'")
+                if env_docs_root and not fs_overridden:
+                    src["root"] = env_docs_root
+                    fs_overridden = True
                 root_path = Path(src["root"])
                 if not root_path.exists():
                     raise ValueError(
