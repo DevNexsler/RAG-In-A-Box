@@ -266,18 +266,44 @@ class DocIDStore:
         The ID is moved to the ``retired_ids`` table so it can never be
         reused by a different file — even if someone copies a file that
         still carries the old @XXXXX@ suffix.
+
+        Accepts both the exact registered doc_id and the namespaced form
+        returned by ``all_mappings()``.  The lookup strategy is:
+
+        1. Try the exact ``doc_id`` passed in (handles the new multi-source
+           flow where ``"alpha::00001"`` is stored verbatim in the registry).
+        2. If no row is found **and** the caller passed a namespaced ID
+           (``"::"`` present), fall back to the bare suffix (``"00001"``).
+           This keeps backward compatibility with legacy callers that pass
+           ``all_mappings()`` keys — those keys are prefixed by that method
+           even though the registry row itself stores only the bare 5-char ID.
+
+        In either case the *actual* stored doc_id (bare or namespaced) is used
+        when writing to ``retired_ids`` and the audit log, so that
+        ``is_retired()`` queries remain consistent with ``all_mappings()``.
         """
+        # Step 1: exact match
         row = self._conn.execute(
             "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (doc_id,)
         ).fetchone()
-        self._conn.execute("DELETE FROM doc_registry WHERE doc_id = ?", (doc_id,))
+        # Step 2: bare-suffix fallback for legacy bare IDs accessed via
+        #         all_mappings() keys (e.g. "documents::abc12" → "abc12")
+        stored_key = doc_id
+        if row is None and "::" in doc_id:
+            bare = doc_id.split("::", 1)[-1]
+            row = self._conn.execute(
+                "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (bare,)
+            ).fetchone()
+            if row is not None:
+                stored_key = bare
+        self._conn.execute("DELETE FROM doc_registry WHERE doc_id = ?", (stored_key,))
         if row:
             self._conn.execute(
                 "INSERT OR REPLACE INTO retired_ids (doc_id, retired_at, last_path) "
                 "VALUES (?, ?, ?)",
-                (doc_id, time.time(), row[0]),
+                (stored_key, time.time(), row[0]),
             )
-            self._log(self.DELETED, doc_id, row[0])
+            self._log(self.DELETED, stored_key, row[0])
         self._conn.commit()
 
     def is_retired(self, doc_id: str) -> bool:
@@ -301,9 +327,30 @@ class DocIDStore:
         return None
 
     def all_mappings(self) -> dict[str, str]:
-        """Return {doc_id: rel_path} for all registered documents."""
-        rows = self._conn.execute("SELECT doc_id, rel_path FROM doc_registry").fetchall()
-        return {r[0]: r[1] for r in rows}
+        """Return {namespaced_doc_id: rel_path} for all registered documents.
+
+        The key is prefixed with source_name (e.g. ``documents::00001``) so
+        it matches what LanceDB stores in its doc_id column after the Task-8
+        multi-source namespacing.  If the stored doc_id already contains
+        ``::`` (i.e. it was registered as a pre-namespaced ID by the flow),
+        it is returned as-is without an additional prefix.
+
+        Callers that need the raw 5-char ID can split on ``"::"`` and take
+        the last part.
+        """
+        rows = self._conn.execute(
+            "SELECT doc_id, rel_path, source_name FROM doc_registry"
+        ).fetchall()
+        result: dict[str, str] = {}
+        for doc_id, rel_path, source_name in rows:
+            if "::" in doc_id:
+                # Already namespaced — store as-is
+                result[doc_id] = rel_path
+            else:
+                # Legacy bare ID — prefix with source_name
+                sn = source_name or "documents"
+                result[f"{sn}::{doc_id}"] = rel_path
+        return result
 
     def distinct_source_names(self) -> set[str]:
         """Return the set of source_name values currently in the registry.

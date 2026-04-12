@@ -52,11 +52,29 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
     has_sources_key = "sources" in raw
 
     if has_legacy_key and has_sources_key:
-        raise ValueError(
-            "Cannot use both 'documents_root' and 'sources' in the same config. "
-            "Pick one: either keep 'documents_root' (legacy single-source) or "
-            "switch to 'sources:' (multi-source)."
+        # Allow the case where the config was produced by a previous load_config call
+        # that synthesized a single 'documents' source from documents_root (round-trip
+        # via yaml.dump / yaml.safe_load).  Detect this by checking that sources is a
+        # single-entry list with name='documents' and type='filesystem'.  If so, strip
+        # the synthesized sources key so the legacy path re-synthesises it correctly
+        # (applying DOCUMENTS_ROOT env override and fresh path validation).
+        sources_list = raw.get("sources") or []
+        _is_shim = (
+            isinstance(sources_list, list)
+            and len(sources_list) == 1
+            and isinstance(sources_list[0], dict)
+            and sources_list[0].get("name") == "documents"
+            and sources_list[0].get("type") == "filesystem"
         )
+        if _is_shim:
+            del raw["sources"]
+            has_sources_key = False
+        else:
+            raise ValueError(
+                "Cannot use both 'documents_root' and 'sources' in the same config. "
+                "Pick one: either keep 'documents_root' (legacy single-source) or "
+                "switch to 'sources:' (multi-source)."
+            )
 
     if not has_legacy_key and not has_sources_key:
         raise ValueError(

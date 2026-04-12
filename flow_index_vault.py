@@ -387,25 +387,41 @@ def process_doc_task(doc: dict) -> None:
     logger = get_run_logger()
     doc_id = doc["doc_id"]
     rel_path = doc.get("rel_path", doc_id)
-    abs_path = doc["abs_path"]
     mtime = doc["mtime"]
     size = doc["size"]
-    ext = doc["ext"]
+    ext = doc.get("ext", "")
+    source_name = doc.get("source_name", "documents")
     logger.info(f"Processing: {rel_path} (id={doc_id})")
 
     # --- Determine source_type ---
-    source_type = _SOURCE_TYPE_MAP.get(ext, "other")
+    # Prefer explicit source_type from the record (set by SourceRecord); fall back
+    # to the extension-based map for backward compat.
+    source_type = doc.get("source_type") or _SOURCE_TYPE_MAP.get(ext, "other")
 
-    # --- Extract text (Markdown / PDF / Image) ---
-    pdf_cfg = config.get("pdf", {})
-    result = extract_text(
-        file_path=abs_path,
-        ext=ext,
-        ocr_provider=ocr_provider,
-        pdf_strategy=pdf_cfg.get("strategy", "text_then_ocr"),
-        min_text_chars=pdf_cfg.get("min_text_chars_before_ocr", 200),
-        ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
-    )
+    # --- Extract text via Source dispatch ---
+    # Look up the owning Source and original SourceRecord, then call source.extract().
+    # This is source-agnostic: FilesystemSource reads files; PostgresSource uses
+    # cached text from scan(); future sources can do whatever they need.
+    sources_by_name: dict = _RUNTIME.get("sources_by_name", {})
+    source_records_by_ns_doc_id: dict = _RUNTIME.get("source_records_by_ns_doc_id", {})
+    src = sources_by_name.get(source_name)
+    source_record = source_records_by_ns_doc_id.get(doc_id)
+
+    if src is not None and source_record is not None:
+        result = src.extract(source_record)
+    else:
+        # Fallback: direct extract_text for records that pre-date the source refactor
+        # (e.g., tasks spawned from a _RUNTIME that doesn't have sources_by_name yet).
+        pdf_cfg = config.get("pdf", {})
+        abs_path = doc.get("abs_path", doc_id)
+        result = extract_text(
+            file_path=abs_path,
+            ext=ext,
+            ocr_provider=ocr_provider,
+            pdf_strategy=pdf_cfg.get("strategy", "text_then_ocr"),
+            min_text_chars=pdf_cfg.get("min_text_chars_before_ocr", 200),
+            ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
+        )
 
     if not result.full_text.strip():
         logger.warning(f"No text extracted: {doc_id}")
@@ -433,6 +449,7 @@ def process_doc_task(doc: dict) -> None:
         "doc_id": doc_id,
         "rel_path": rel_path,
         "source_type": source_type,
+        "source_name": source_name,
         "mtime": mtime,
         "size": size,
         "title": title,
@@ -723,11 +740,7 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     import time
     logger = get_run_logger()
     config = load_config(config_path)
-    vault_root = Path(config["documents_root"])
     index_root = Path(config["index_root"])
-    scan_cfg = config.get("scan", {})
-    include = scan_cfg.get("include", ["**/*.md"])
-    exclude = scan_cfg.get("exclude", [".obsidian/**", ".trash/**", "**/.DS_Store"])
     chunk_cfg = config.get("chunking", {})
 
     # --- Build components from config (stored in _RUNTIME for tasks) ---
@@ -756,6 +769,24 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
             logger.info("OCR enabled: extract=%s, describe=%s", extract_name, describe_name)
     else:
         logger.info("OCR disabled (set ocr.enabled=true in config to enable)")
+
+    # --- Build Sources from config (always has a 'sources' key via Task 3 shim) ---
+    from sources import build_source
+
+    sources_cfg = config.get("sources", [])
+    if not sources_cfg:
+        raise ValueError("No sources configured. Set 'sources:' or legacy 'documents_root:' in config.yaml")
+
+    pdf_cfg_for_sources = config.get("pdf", {})
+    all_sources = [
+        build_source(s, registry=doc_id_store, pdf_config=pdf_cfg_for_sources)
+        for s in sources_cfg
+    ]
+
+    # Inject OCR provider into filesystem sources that support it
+    for src in all_sources:
+        if hasattr(src, "set_ocr_provider"):
+            src.set_ocr_provider(ocr_provider)
 
     # Semantic splitter (optional — for large sections that need topic-boundary detection)
     semantic_cfg = chunk_cfg.get("semantic", {})
@@ -835,6 +866,7 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     _RUNTIME["llm_generator"] = llm_generator
     _RUNTIME["taxonomy_store"] = taxonomy_store
     _RUNTIME["config"] = config
+    _RUNTIME["sources_by_name"] = {s.name: s for s in all_sources}
 
     # --- Migration: first run with existing LanceDB data but empty registry ---
     # If the registry is empty but the store has data, the old doc_ids were paths.
@@ -857,7 +889,32 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
 
     # --- Run pipeline ---
     t0 = time.perf_counter()
-    scanned = scan_vault_task(vault_root, include, exclude)
+
+    # Multi-source scan: iterate over all configured sources, namespace doc_ids
+    all_records: list[dict] = []
+    source_records_by_ns_doc_id: dict[str, object] = {}  # namespaced doc_id → SourceRecord
+    for src in all_sources:
+        for rec in src.scan():
+            ns_doc_id = f"{src.name}::{rec.doc_id}"
+            all_records.append({
+                "doc_id": ns_doc_id,
+                "rel_path": rec.natural_key,
+                "abs_path": rec.metadata.get("abs_path", rec.natural_key),
+                "mtime": rec.mtime,
+                "size": rec.size,
+                "ext": rec.metadata.get("ext", ""),
+                "source_type": rec.source_type,
+                "source_name": src.name,
+            })
+            source_records_by_ns_doc_id[ns_doc_id] = rec
+            # Register the namespaced doc_id in the persistent registry so that:
+            # 1. all_mappings() returns {namespaced_id: rel_path} for test/tool use
+            # 2. distinct_source_names() can enumerate all sources that have indexed docs
+            doc_id_store.register(ns_doc_id, rec.natural_key, source_name=src.name)
+
+    _RUNTIME["source_records_by_ns_doc_id"] = source_records_by_ns_doc_id
+    scanned = all_records
+
     stored_mtimes = store.list_doc_mtimes()
     to_add_or_update, to_delete = diff_index_task(scanned, stored_mtimes)
 

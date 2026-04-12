@@ -217,7 +217,9 @@ class TestDocIDStore:
         id_store.register("00001", "a.md")
         id_store.register("00002", "b.md")
         mappings = id_store.all_mappings()
-        assert mappings == {"00001": "a.md", "00002": "b.md"}
+        # all_mappings() returns namespaced doc_ids ({source_name::doc_id: rel_path})
+        # Bare register() calls default source_name to 'documents'.
+        assert mappings == {"documents::00001": "a.md", "documents::00002": "b.md"}
 
     def test_count(self, id_store):
         assert id_store.count() == 0
@@ -1078,4 +1080,26 @@ class TestSourceNameMigration:
         row = cur.fetchone()
         assert row[0] == "path2"              # path was updated
         assert row[1] == "comm_messages"      # source_name was preserved, not reset
+        store.close()
+
+    def test_delete_works_with_namespaced_doc_id(self, tmp_path):
+        """delete() must handle namespaced IDs ('alpha::00001') that
+        were registered with the namespace prefix."""
+        from doc_id_store import DocIDStore
+
+        store = DocIDStore(tmp_path / "reg.db")
+        store.register("alpha::00001", "a.md", source_name="alpha")
+
+        # Verify it's registered
+        assert "alpha::00001" in store.all_mappings()
+
+        # Delete with the same namespaced ID
+        store.delete("alpha::00001")
+
+        # Should be gone from registry
+        assert "alpha::00001" not in store.all_mappings()
+
+        # Should be retired (copy-paste protection)
+        assert store.is_retired("alpha::00001")
+
         store.close()
