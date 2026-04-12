@@ -386,8 +386,8 @@ In `doc_id_store.py`, modify `_init_schema` (line 107). Replace the `doc_registr
 
 - [ ] **Step 2.5: Update `register` to accept `source_name`**
 
-Find the current `register` method (line ~156). Change its signature and the INSERT:
-```python
+Find the current `register` method (around line 156). Change its signature to use a None sentinel:
+
     def register(
         self,
         doc_id: str,
@@ -395,29 +395,31 @@ Find the current `register` method (line ~156). Change its signature and the INS
         *,
         event: str = "",
         detail: str = "",
-        source_name: str = "documents",
+        source_name: str | None = None,
     ) -> None:
-        """Insert or update a doc_id → rel_path mapping.
 
-        Args:
-            doc_id: Globally unique ID within its source.
-            rel_path: Path relative to the source root. For Postgres rows
-                this is the natural key (e.g. "quo/abc123"), not a filesystem path.
-            source_name: Which Source this row belongs to. Defaults to
-                "documents" for backward compat with the single-source era.
-        """
-        # ... existing audit-log logic unchanged ...
-        c = self._conn
+When `source_name is None` (legacy callers that don't know about sources), the INSERT uses a literal `'documents'` default for new rows and the `ON CONFLICT DO UPDATE SET` clause updates ONLY `rel_path` (preserving the existing `source_name` on the row). When `source_name` is an explicit string, both `rel_path` and `source_name` are updated on conflict. Branch like:
+
+    if source_name is None:
+        c.execute(
+            "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
+            "VALUES (?, ?, ?, 'documents') "
+            "ON CONFLICT(doc_id) DO UPDATE SET rel_path=excluded.rel_path",
+            (doc_id, rel_path, time.time()),
+        )
+    else:
         c.execute(
             "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
             "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(doc_id) DO UPDATE SET rel_path=excluded.rel_path, source_name=excluded.source_name",
+            "ON CONFLICT(doc_id) DO UPDATE SET "
+            "    rel_path=excluded.rel_path, "
+            "    source_name=excluded.source_name",
             (doc_id, rel_path, time.time(), source_name),
         )
-        # ... existing audit-log commit ...
-```
 
-Preserve any existing audit logging inside the method — only the INSERT and signature change.
+The `None` sentinel is load-bearing: it means "caller didn't specify, don't touch existing source_name". `FilesystemSource` and `PostgresSource` always pass their instance name explicitly, so they take the second branch. Legacy callers in `scan_vault_task` that don't pass source_name take the first branch, which preserves any source_name that was already on the row.
+
+Preserve all existing audit-log logic inside the method.
 
 - [ ] **Step 2.6: Add `distinct_source_names` method**
 

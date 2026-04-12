@@ -989,4 +989,93 @@ class TestScenarioCopyPasteDeletedFile:
         assert store.is_retired("00001")
         assert not store.is_retired("00002")  # still active
         assert store.is_retired("00003")
+
+
+class TestSourceNameMigration:
+    """Schema migration adds source_name column, backfills existing rows."""
+
+    def test_new_store_has_source_name_column(self, tmp_path):
+        from doc_id_store import DocIDStore
+
+        store = DocIDStore(tmp_path / "reg.db")
+        store.register("abc", "note.md")
+
+        # Column exists and defaults to 'documents' for rows registered
+        # without an explicit source_name (backward compat — FilesystemSource
+        # will pass it explicitly in a later task).
+        cur = store._conn.execute("SELECT source_name FROM doc_registry WHERE doc_id = 'abc'")
+        assert cur.fetchone()[0] == "documents"
+        store.close()
+
+    def test_legacy_store_gets_backfilled_on_open(self, tmp_path):
+        """A pre-migration DB (no source_name column) opens cleanly and
+        existing rows get backfilled to 'documents'."""
+        import sqlite3
+
+        db = tmp_path / "legacy.db"
+        # Simulate a pre-migration DB: create doc_registry without source_name
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE doc_registry (
+                doc_id TEXT PRIMARY KEY,
+                rel_path TEXT NOT NULL,
+                created REAL NOT NULL
+            );
+            CREATE TABLE counter (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO counter VALUES (1, 0);
+            INSERT INTO doc_registry VALUES ('old1', 'old.md', 0.0);
+        """)
+        conn.commit()
+        conn.close()
+
+        # Opening via DocIDStore should run the migration
+        from doc_id_store import DocIDStore
+        store = DocIDStore(db)
+
+        cur = store._conn.execute("SELECT source_name FROM doc_registry WHERE doc_id = 'old1'")
+        assert cur.fetchone()[0] == "documents"
+        store.close()
+
+    def test_register_accepts_source_name(self, tmp_path):
+        """New register() signature accepts source_name kwarg."""
+        from doc_id_store import DocIDStore
+
+        store = DocIDStore(tmp_path / "reg.db")
+        store.register("pg1", "quo/abc123", source_name="comm_messages")
+
+        cur = store._conn.execute(
+            "SELECT rel_path, source_name FROM doc_registry WHERE doc_id = 'pg1'"
+        )
+        row = cur.fetchone()
+        assert row[0] == "quo/abc123"
+        assert row[1] == "comm_messages"
+        store.close()
+
+    def test_distinct_source_names(self, tmp_path):
+        """Helper for mcp_server to derive _VALID_SOURCE_NAMES at request time."""
+        from doc_id_store import DocIDStore
+
+        store = DocIDStore(tmp_path / "reg.db")
+        store.register("a", "x.md", source_name="documents")
+        store.register("b", "y.md", source_name="documents")
+        store.register("c", "quo/123", source_name="comm_messages")
+
+        assert store.distinct_source_names() == {"documents", "comm_messages"}
+        store.close()
+
+    def test_register_without_source_name_preserves_existing(self, tmp_path):
+        """Calling register() without source_name must not reset the existing
+        source_name on the row (prevents accidental clobber from legacy callers)."""
+        from doc_id_store import DocIDStore
+
+        store = DocIDStore(tmp_path / "reg.db")
+        store.register("x", "path1", source_name="comm_messages")
+        store.register("x", "path2")  # no source_name kwarg
+
+        cur = store._conn.execute(
+            "SELECT rel_path, source_name FROM doc_registry WHERE doc_id = 'x'"
+        )
+        row = cur.fetchone()
+        assert row[0] == "path2"              # path was updated
+        assert row[1] == "comm_messages"      # source_name was preserved, not reset
         store.close()

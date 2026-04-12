@@ -108,11 +108,22 @@ class DocIDStore:
         c = self._conn
         c.execute("""
             CREATE TABLE IF NOT EXISTS doc_registry (
-                doc_id   TEXT PRIMARY KEY,
-                rel_path TEXT NOT NULL,
-                created  REAL NOT NULL
+                doc_id      TEXT PRIMARY KEY,
+                rel_path    TEXT NOT NULL,
+                created     REAL NOT NULL,
+                source_name TEXT NOT NULL DEFAULT 'documents'
             )
         """)
+        # Migration: add source_name column to pre-existing tables (idempotent).
+        # SQLite ALTER TABLE ADD COLUMN raises OperationalError if the column
+        # already exists, so we detect and swallow.
+        try:
+            c.execute(
+                "ALTER TABLE doc_registry ADD COLUMN source_name "
+                "TEXT NOT NULL DEFAULT 'documents'"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists (fresh DB from CREATE above, or already migrated)
         c.execute("""
             CREATE TABLE IF NOT EXISTS counter (
                 id    INTEGER PRIMARY KEY CHECK (id = 1),
@@ -153,12 +164,27 @@ class DocIDStore:
         c.commit()
         return _int_to_base62(row[0])
 
-    def register(self, doc_id: str, rel_path: str, *, event: str = "", detail: str = "") -> None:
+    def register(
+        self,
+        doc_id: str,
+        rel_path: str,
+        *,
+        event: str = "",
+        detail: str = "",
+        source_name: str | None = None,
+    ) -> None:
         """Insert or update a doc_id → rel_path mapping.
 
         If *event* is provided it is written to the audit log. Otherwise a
         ``registered`` event is logged automatically for new entries, and a
         ``moved`` event for path changes.
+
+        Args:
+            source_name: Which Source this doc_id belongs to. Defaults to None,
+                meaning "do not touch source_name on conflict — preserve any
+                existing value, or insert 'documents' for new rows." Pass an
+                explicit string when the caller owns the namespace for this row
+                (e.g. FilesystemSource always passes its own name).
         """
         old_path = ""
         if not event:
@@ -172,10 +198,26 @@ class DocIDStore:
                 old_path = existing[0]
             # else: unchanged — no audit entry needed
 
-        self._conn.execute(
-            "INSERT OR REPLACE INTO doc_registry (doc_id, rel_path, created) VALUES (?, ?, ?)",
-            (doc_id, rel_path, time.time()),
-        )
+        c = self._conn
+        if source_name is None:
+            # Caller didn't specify — insert 'documents' for new rows,
+            # preserve existing source_name on conflict.
+            c.execute(
+                "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
+                "VALUES (?, ?, ?, 'documents') "
+                "ON CONFLICT(doc_id) DO UPDATE SET rel_path=excluded.rel_path",
+                (doc_id, rel_path, time.time()),
+            )
+        else:
+            # Caller specified — insert or overwrite source_name.
+            c.execute(
+                "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(doc_id) DO UPDATE SET "
+                "    rel_path=excluded.rel_path, "
+                "    source_name=excluded.source_name",
+                (doc_id, rel_path, time.time(), source_name),
+            )
         if event:
             self._log(event, doc_id, rel_path, old_path=old_path, detail=detail)
         self._conn.commit()
@@ -246,6 +288,15 @@ class DocIDStore:
         """Return {doc_id: rel_path} for all registered documents."""
         rows = self._conn.execute("SELECT doc_id, rel_path FROM doc_registry").fetchall()
         return {r[0]: r[1] for r in rows}
+
+    def distinct_source_names(self) -> set[str]:
+        """Return the set of source_name values currently in the registry.
+
+        Used by mcp_server to validate the `source_name` filter parameter
+        on MCP tool calls without hardcoding the valid set.
+        """
+        cur = self._conn.execute("SELECT DISTINCT source_name FROM doc_registry")
+        return {row[0] for row in cur.fetchall()}
 
     def count(self) -> int:
         """Return total number of registered documents."""
