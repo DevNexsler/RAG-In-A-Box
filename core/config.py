@@ -151,6 +151,15 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
                         f"sources[{i}] (filesystem) root does not exist: {root_path}"
                     )
 
+        # Populate documents_root / vault_root for downstream callers that
+        # still reference config["documents_root"] (MCP server, REST API).
+        # Uses the first filesystem source's root, or falls back to index_root
+        # for pure-postgres configs that have no filesystem at all.
+        first_fs = next((s for s in raw["sources"] if s["type"] == "filesystem"), None)
+        docs_root = first_fs["root"] if first_fs else raw.get("index_root", "")
+        raw.setdefault("documents_root", docs_root)
+        raw.setdefault("vault_root", docs_root)
+
     # --- Validate chunking parameters ---
     chunk_cfg = raw.get("chunking", {})
     max_chars = chunk_cfg.get("max_chars")
