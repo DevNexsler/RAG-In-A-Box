@@ -244,6 +244,22 @@ class DocIDStore:
         )
         self._conn.commit()
 
+    def set_source_name(self, doc_id: str, source_name: str) -> None:
+        """Explicitly set source_name for an already-registered doc_id.
+
+        Used by FilesystemSource after scan_vault_task registers rows via
+        the None-sentinel path (which defaults to 'documents'). When the
+        source instance name is something else, this corrects the row.
+
+        No-op if doc_id is not present in doc_registry.
+        """
+        c = self._conn
+        c.execute(
+            "UPDATE doc_registry SET source_name = ? WHERE doc_id = ?",
+            (source_name, doc_id),
+        )
+        c.commit()
+
     def delete(self, doc_id: str) -> None:
         """Remove a doc_id entry from the registry, retire it, and log a ``deleted`` event.
 
