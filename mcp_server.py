@@ -150,6 +150,7 @@ def _file_search_impl(
     top_k: int = 10,
     doc_id_prefix: str | None = None,
     source_type: str | None = None,
+    source_name: str | None = None,
     tags: str | None = None,
     status: str | None = None,
     folder: str | None = None,
@@ -169,6 +170,21 @@ def _file_search_impl(
     err = _validate_source_type(source_type)
     if err:
         return err
+
+    if source_name and _cache is not None:
+        store, embed, config = _cache
+        registry_path = Path(config["index_root"]) / "doc_registry.db"
+        if registry_path.exists():
+            from doc_id_store import DocIDStore
+            reg = DocIDStore(registry_path)
+            valid_names = reg.distinct_source_names()
+            reg.close()
+            if source_name not in valid_names:
+                return _error(
+                    "invalid_source_name",
+                    f"source_name must be one of: {', '.join(sorted(valid_names))}. Got: {source_name!r}.",
+                    fix="Use file_list_documents to discover which source_names are indexed.",
+                )
 
     # Parse metadata_filters JSON string
     parsed_filters: dict[str, str] | None = None
@@ -211,6 +227,7 @@ def _file_search_impl(
             rrf_k=search_cfg.get("rrf_k", 60),
             doc_id_prefix=doc_id_prefix,
             source_type=source_type,
+            source_name=source_name,
             tags=tags,
             status=status,
             folder=folder,
@@ -744,6 +761,7 @@ if HAS_MCP and FastMCP is not None:
         top_k: int = 10,
         doc_id_prefix: str | None = None,
         source_type: str | None = None,
+        source_name: str | None = None,
         tags: str | None = None,
         status: str | None = None,
         folder: str | None = None,
@@ -765,6 +783,9 @@ if HAS_MCP and FastMCP is not None:
                 Filters on rel_path (the vault-relative file path), not doc_id
                 (which is now a persistent 5-char base-62 identifier).
             source_type: Filter by file type: "md", "pdf", or "img".
+            source_name: Filter results to a specific source (e.g. 'documents',
+                'comm_messages'). Omit for cross-source search. Use
+                file_list_documents to discover which source_names are indexed.
             tags: Comma-separated tags to filter by. Matches documents that
                 have ANY of the listed tags (OR logic). Example: "recipe,korean".
             status: Filter by document status (e.g., "active", "archived", "draft").
@@ -817,7 +838,7 @@ if HAS_MCP and FastMCP is not None:
         On error, returns {"error": true, "code": "...", "message": "...", "fix": "..."}.
         """
         return _file_search_impl(
-            query, top_k, doc_id_prefix, source_type, tags, status, folder,
+            query, top_k, doc_id_prefix, source_type, source_name, tags, status, folder,
             prefer_recent, metadata_filters, enr_doc_type, enr_topics,
         )
 

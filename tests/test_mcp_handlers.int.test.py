@@ -259,3 +259,102 @@ def test_recent_returns_sorted_by_mtime(wired_mcp):
     mtimes = [d.get("mtime", 0) for d in result if d.get("mtime")]
     for i in range(len(mtimes) - 1):
         assert mtimes[i] >= mtimes[i + 1], "Documents not sorted by mtime descending"
+
+
+# ===================================================================
+# TEST: source_name filter parameter
+# ===================================================================
+
+
+def test_file_search_accepts_source_name_kwarg(wired_mcp):
+    """_file_search_impl accepts source_name as a keyword argument without crashing."""
+    # No doc_registry.db in the temp store, so validation is skipped and the
+    # search runs through normally (or returns results if any match).
+    result = mcp_server._file_search_impl("bibimbap", source_name="documents")
+
+    # Must not be a TypeError / AttributeError — just a normal search result
+    # or a structured error dict (not a Python exception).
+    assert isinstance(result, dict)
+    # If validation fired it must use our structured error code, not a crash
+    if "error" in result:
+        assert result.get("code") in {"invalid_source_name", "search_failed", "service_unavailable"}
+    else:
+        assert "results" in result
+
+
+def test_file_search_source_name_none_is_noop(wired_mcp):
+    """Passing source_name=None behaves identically to omitting the parameter."""
+    result_default = mcp_server._file_search_impl("report")
+    result_none = mcp_server._file_search_impl("report", source_name=None)
+
+    assert type(result_default) == type(result_none)
+    # Both should succeed (no error from source_name=None)
+    if "error" not in result_default:
+        assert "error" not in result_none
+
+
+def test_file_search_source_name_invalid_with_registry(wired_mcp, tmp_path):
+    """When a doc_registry.db exists, an unknown source_name returns invalid_source_name."""
+    import sqlite3
+    store, embed, config = wired_mcp
+
+    # Create a minimal doc_registry.db with one source_name entry
+    registry_path = tmp_path / "doc_registry.db"
+    conn = sqlite3.connect(str(registry_path))
+    conn.execute(
+        "CREATE TABLE doc_registry "
+        "(doc_id TEXT PRIMARY KEY, rel_path TEXT NOT NULL, created REAL NOT NULL, "
+        "source_name TEXT NOT NULL DEFAULT 'documents')"
+    )
+    conn.execute(
+        "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
+        "VALUES ('00001', 'a.md', 0.0, 'documents')"
+    )
+    conn.commit()
+    conn.close()
+
+    # Point config at the tmp_path so the registry is found
+    patched_config = dict(config, index_root=str(tmp_path))
+    original_cache = mcp_server._cache
+    mcp_server._cache = (store, embed, patched_config)
+    try:
+        result = mcp_server._file_search_impl("anything", source_name="no_such_source")
+    finally:
+        mcp_server._cache = original_cache
+
+    assert result.get("error") is True
+    assert result.get("code") == "invalid_source_name"
+    assert "documents" in result["message"]
+    assert "fix" in result
+
+
+def test_file_search_source_name_valid_with_registry(wired_mcp, tmp_path):
+    """When a doc_registry.db exists, a known source_name passes validation."""
+    import sqlite3
+    store, embed, config = wired_mcp
+
+    registry_path = tmp_path / "doc_registry.db"
+    conn = sqlite3.connect(str(registry_path))
+    conn.execute(
+        "CREATE TABLE doc_registry "
+        "(doc_id TEXT PRIMARY KEY, rel_path TEXT NOT NULL, created REAL NOT NULL, "
+        "source_name TEXT NOT NULL DEFAULT 'documents')"
+    )
+    conn.execute(
+        "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
+        "VALUES ('00001', 'a.md', 0.0, 'documents')"
+    )
+    conn.commit()
+    conn.close()
+
+    patched_config = dict(config, index_root=str(tmp_path))
+    original_cache = mcp_server._cache
+    mcp_server._cache = (store, embed, patched_config)
+    try:
+        result = mcp_server._file_search_impl("bibimbap", source_name="documents")
+    finally:
+        mcp_server._cache = original_cache
+
+    # Validation passed — must not get invalid_source_name error
+    assert result.get("code") != "invalid_source_name"
+    assert isinstance(result, dict)
