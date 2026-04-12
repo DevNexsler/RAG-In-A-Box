@@ -24,6 +24,10 @@ llama-index-embeddings-google-genai>=0.3.0
 # HTTP client (for llama.cpp server API calls: embeddings + reranking)
 httpx>=0.27.0
 
+# PostgreSQL client (for sources.postgres.PostgresSource)
+# Binary wheel: no pg_config, no build tools, works on python:3.13-slim.
+psycopg[binary]>=3.3,<4
+
 # MCP server (for vault_search, vault_get_chunk, vault_status)
 mcp>=1.0.0
 
