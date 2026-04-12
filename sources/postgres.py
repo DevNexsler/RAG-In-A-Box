@@ -7,6 +7,7 @@ Each scan() uses a server-side cursor to stream rows so large tables
 don't OOM, and yields a SourceRecord per row.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -57,6 +58,13 @@ class TableSpec:
 class PostgresSource:
     def __init__(self, name: str, dsn: str, tables: list[TableSpec]):
         self.name = name
+        if dsn.startswith("${") and dsn.endswith("}"):
+            env_name = dsn[2:-1]
+            dsn = os.environ.get(env_name, "")
+            if not dsn:
+                raise ValueError(
+                    f"DSN env var {env_name!r} not set for postgres source '{name}'"
+                )
         self._dsn = dsn
         self._tables = tables
         self._conn: psycopg.Connection | None = None
