@@ -100,6 +100,33 @@ lancedb:
 logging:
   level: "WARNING"                        # DEBUG, INFO, WARNING, ERROR
 
+# --- Multi-source mode (replaces documents_root: when enabled) ---
+# sources:
+#   - type: filesystem
+#     name: documents
+#     root: /data/documents
+#     scan:
+#       include: ["**/*.md", "**/*.pdf", "**/*.docx", "**/*.xlsx", ...]
+#       exclude: ["99-Archive/**"]
+#
+#   - type: postgres
+#     name: comm_messages
+#     dsn: "${COMM_DATA_STORE_DSN}"
+#     tables:
+#       - source_type: pg_message
+#         query: |
+#           SELECT m.source, m.source_message_id, m.sent_at, m.updated_at,
+#                  m.body AS _text,
+#                  c.name AS channel, p.display_name AS sender
+#           FROM messages m
+#           LEFT JOIN channels c ON c.id = m.channel_id
+#           LEFT JOIN participants p ON p.id = m.sender_participant_id
+#           WHERE m.body IS NOT NULL AND m.body <> ''
+#         id_template: "{source}/{source_message_id}"
+#         text_column: _text
+#         mtime_column: updated_at
+#         metadata_columns: [channel, sender, source, sent_at]
+
 mcp:
   host: "127.0.0.1"
   port: 7788

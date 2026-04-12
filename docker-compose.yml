@@ -17,6 +17,7 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - DEEPINFRA_API_KEY=${DEEPINFRA_API_KEY}
       - API_KEY=${API_KEY}
+      - COMM_DATA_STORE_DSN=${COMM_DATA_STORE_DSN}
       - DOCUMENTS_ROOT=/data/documents
       - INDEX_ROOT=/data/index
 
