@@ -147,6 +147,7 @@ class LanceDBStore:
         self,
         doc_id_prefix: str | None = None,
         source_type: str | None = None,
+        source_name: str | None = None,
         status: str | None = None,
         folder: str | None = None,
         tags: str | None = None,
@@ -163,6 +164,8 @@ class LanceDBStore:
         # Exact match on metadata fields (case-insensitive)
         if source_type:
             parts.append(f"lower(metadata.source_type) = '{self._sql_escape(source_type.lower())}'")
+        if source_name:
+            parts.append(f"lower(metadata.source_name) = '{self._sql_escape(source_name.lower())}'")
         if status:
             parts.append(f"lower(metadata.status) = '{self._sql_escape(status.lower())}'")
         if folder:

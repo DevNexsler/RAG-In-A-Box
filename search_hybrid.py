@@ -537,6 +537,7 @@ def hybrid_search(
     rrf_k: int = 60,
     doc_id_prefix: str | None = None,
     source_type: str | None = None,
+    source_name: str | None = None,
     tags: str | None = None,
     status: str | None = None,
     folder: str | None = None,
@@ -581,6 +582,7 @@ def hybrid_search(
     where = store._build_where_clause(
         doc_id_prefix=doc_id_prefix,
         source_type=source_type,
+        source_name=source_name,
         status=status,
         folder=folder,
         tags=tags,

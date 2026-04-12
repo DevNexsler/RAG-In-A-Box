@@ -919,3 +919,15 @@ def test_upsert_add_failure_reraises_and_recovers():
         store._vs = real_vs
         store.upsert_nodes(nodes)
         assert store.list_doc_ids() == ["a.md"]
+
+
+class TestSourceNameFilter:
+    """Search honors source_name metadata filter."""
+
+    def test_where_clause_includes_source_name(self, tmp_path):
+        from lancedb_store import LanceDBStore
+
+        store = LanceDBStore(str(tmp_path / "idx"), "chunks")
+        where = store._build_where_clause(source_name="comm_messages")
+        assert "source_name" in where
+        assert "comm_messages" in where
