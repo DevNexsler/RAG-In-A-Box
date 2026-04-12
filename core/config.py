@@ -18,9 +18,21 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
     """Load YAML config. Raises if file missing or required keys absent.
 
     Accepts either ``documents_root`` or ``vault_root`` for the source
-    directory.  Internally both are normalised so that either key works
-    everywhere (``config["documents_root"]`` and ``config["vault_root"]``
-    both resolve to the same path).
+    directory (legacy single-source mode), or a top-level ``sources:`` list
+    (new multi-source mode).
+
+    After loading, the returned dict always contains a ``sources`` key
+    (a non-empty list of source dicts).  Legacy keys ``documents_root`` and
+    ``vault_root`` are preserved in the dict so downstream code that hasn't
+    been refactored yet continues to work.
+
+    Env var notes
+    -------------
+    ``DOCUMENTS_ROOT``: only applied when the config uses legacy
+    ``documents_root``/``vault_root`` style.  For new-style ``sources:``
+    configs it is ignored (the variable is ambiguous when multiple filesystem
+    sources are present).
+    ``INDEX_ROOT``: always applied regardless of source style.
     """
     path = Path(config_path)
     if not path.exists():
@@ -32,33 +44,94 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
     if not raw:
         raise ValueError("Config file is empty")
 
-    # Accept either documents_root or vault_root (prefer documents_root)
-    docs_root = raw.get("documents_root") or raw.get("vault_root")
-    if not docs_root:
-        raise ValueError(
-            "Config missing required key: documents_root (or vault_root)"
-        )
-    # Normalise: both keys resolve to the same value
-    raw["documents_root"] = docs_root
-    raw["vault_root"] = docs_root
-
     if "index_root" not in raw:
         raise ValueError("Config missing required key: index_root")
 
-    # --- Env var overrides (for VPS / container deployments) ---
-    env_docs_root = os.environ.get("DOCUMENTS_ROOT")
-    if env_docs_root:
-        raw["documents_root"] = env_docs_root
-        raw["vault_root"] = env_docs_root
+    # --- Determine which shape we're dealing with ---
+    has_legacy_key = bool(raw.get("documents_root") or raw.get("vault_root"))
+    has_sources_key = "sources" in raw
 
+    if has_legacy_key and has_sources_key:
+        raise ValueError(
+            "Cannot use both 'documents_root' and 'sources' in the same config. "
+            "Pick one: either keep 'documents_root' (legacy single-source) or "
+            "switch to 'sources:' (multi-source)."
+        )
+
+    if not has_legacy_key and not has_sources_key:
+        raise ValueError(
+            "Config missing required key: documents_root (or vault_root)"
+        )
+
+    # --- Env var overrides (for VPS / container deployments) ---
+    # INDEX_ROOT always applies.
     env_index_root = os.environ.get("INDEX_ROOT")
     if env_index_root:
         raw["index_root"] = env_index_root
 
-    # Validate documents_root exists (after env var overrides)
-    docs_path = Path(raw["documents_root"])
-    if not docs_path.exists():
-        raise ValueError(f"documents_root does not exist: {docs_path}")
+    if has_legacy_key:
+        # Legacy single-source mode: accept either documents_root or vault_root.
+        docs_root = raw.get("documents_root") or raw.get("vault_root")
+
+        # DOCUMENTS_ROOT env var only applies to legacy mode; for new-style
+        # sources: configs it is ignored because the variable is ambiguous
+        # when multiple filesystem sources exist.
+        env_docs_root = os.environ.get("DOCUMENTS_ROOT")
+        if env_docs_root:
+            docs_root = env_docs_root
+
+        # Normalise: both keys resolve to the same value
+        raw["documents_root"] = docs_root
+        raw["vault_root"] = docs_root
+
+        # Validate that the legacy root exists on disk (fail fast)
+        docs_path = Path(docs_root)
+        if not docs_path.exists():
+            raise ValueError(f"documents_root does not exist: {docs_path}")
+
+        # --- Sources shim: synthesize a single filesystem source ---
+        raw["sources"] = [{
+            "type": "filesystem",
+            "name": "documents",
+            "root": docs_root,
+            "scan": raw.get("scan", {}),
+        }]
+
+    else:
+        # New-style sources: mode.
+        # Note: a top-level 'scan:' key is not forwarded to sources in new-style mode.
+        # Each source in the list should carry its own 'scan' sub-key if needed.
+        if raw["sources"] is None:
+            raise ValueError(
+                "'sources' key is present but has no value — "
+                "provide at least one source entry"
+            )
+        # Validate structural requirements.
+        if not isinstance(raw["sources"], list) or not raw["sources"]:
+            raise ValueError("'sources' must be a non-empty list")
+
+        seen_names: set[str] = set()
+        for i, src in enumerate(raw["sources"]):
+            if not isinstance(src, dict):
+                raise ValueError(f"sources[{i}] must be a mapping")
+            if "type" not in src:
+                raise ValueError(f"sources[{i}] missing required key 'type'")
+            if "name" not in src:
+                raise ValueError(f"sources[{i}] missing required key 'name'")
+            if src["name"] in seen_names:
+                raise ValueError(f"duplicate source name: {src['name']!r}")
+            seen_names.add(src["name"])
+
+            # Validate that filesystem source roots exist on disk (fail fast).
+            # Pure-postgres (or other non-filesystem) configs skip this check.
+            if src["type"] == "filesystem":
+                if "root" not in src:
+                    raise ValueError(f"sources[{i}] (filesystem) missing required key 'root'")
+                root_path = Path(src["root"])
+                if not root_path.exists():
+                    raise ValueError(
+                        f"sources[{i}] (filesystem) root does not exist: {root_path}"
+                    )
 
     # --- Validate chunking parameters ---
     chunk_cfg = raw.get("chunking", {})
