@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from core.config import load_config
+from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
 from lancedb_store import LanceDBStore
 from providers.embed import build_embed_provider
@@ -27,10 +28,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-_VALID_SOURCE_TYPES = {
-    "md", "pdf", "img",
-    "doc", "sheet", "pres", "csv", "html", "epub", "txt", "other",
-}
+_VALID_SOURCE_TYPES = BUILTIN_SOURCE_TYPES
 _MAX_TOP_K = 100
 _MAX_LIMIT = 200
 
@@ -49,11 +47,12 @@ def _error(code: str, message: str, fix: str | None = None) -> dict:
 
 def _validate_source_type(source_type: str | None) -> dict | None:
     """Return an error dict if source_type is invalid, else None."""
-    if source_type and source_type not in _VALID_SOURCE_TYPES:
+    if source_type and not is_safe_source_type(source_type):
         return _error(
             "invalid_parameter",
-            f"source_type must be one of: {', '.join(sorted(_VALID_SOURCE_TYPES))}. Got: '{source_type}'.",
-            "Valid values: md, pdf, img, doc, sheet, pres, csv, html, epub, txt, other.",
+            f"source_type contains unsafe characters. Got: '{source_type}'.",
+            "Use letters, numbers, underscore, or hyphen. Built-in values include: "
+            f"{', '.join(sorted(_VALID_SOURCE_TYPES))}.",
         )
     return None
 
@@ -170,6 +169,8 @@ def _file_search_impl(
     err = _validate_source_type(source_type)
     if err:
         return err
+    if source_type:
+        source_type = canonical_source_type(source_type)
 
     if source_name and _cache is not None:
         store, embed, config = _cache
@@ -357,6 +358,8 @@ def _file_list_documents_impl(
     err = _validate_source_type(source_type)
     if err:
         return err
+    if source_type:
+        source_type = canonical_source_type(source_type)
     offset = max(0, offset)
     limit = max(1, min(limit, _MAX_LIMIT))
 
@@ -472,12 +475,26 @@ def _file_status_impl() -> dict:
         except Exception:
             reranker_responsive = False
 
-    return {
+    # Check if an indexer subprocess is currently running
+    index_root = Path(config["index_root"])
+    pid_file = index_root / "indexer.pid"
+    indexer_running = False
+    indexer_pid = None
+    if pid_file.exists():
+        try:
+            indexer_pid = int(pid_file.read_text().strip())
+            os.kill(indexer_pid, 0)  # Signal 0 = existence check
+            indexer_running = True
+        except (OSError, ValueError):
+            indexer_pid = None
+
+    result: dict = {
         "doc_count": len(doc_ids),
         "chunk_count": chunk_count,
         "last_run_at": last_run_at,
         "embeddings_provider": config.get("embeddings", {}).get("provider"),
         "metadata_fields": sorted(store._metadata_subfields()),
+        "indexer_running": indexer_running,
         "health": {
             "fts_available": fts_ok,
             "reranker_enabled": reranker_enabled,
@@ -486,6 +503,9 @@ def _file_status_impl() -> dict:
             "last_index_warnings": last_index_warnings,
         },
     }
+    if indexer_running and indexer_pid is not None:
+        result["indexer_pid"] = indexer_pid
+    return result
 
 
 def _file_recent_impl(
@@ -496,6 +516,8 @@ def _file_recent_impl(
     err = _validate_source_type(source_type)
     if err:
         return err
+    if source_type:
+        source_type = canonical_source_type(source_type)
     limit = max(1, min(limit, _MAX_TOP_K))
 
     try:
@@ -578,49 +600,71 @@ def _file_folders_impl() -> dict:
 
 
 def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
-    from flow_index_vault import index_vault_flow
+    """Start the indexer in a background subprocess.
 
-    t0 = time.perf_counter()
-    logger.info("file_index_update: starting indexer flow")
-    try:
-        index_vault_flow(config_path)
-    except Exception as exc:
-        elapsed = time.perf_counter() - t0
-        logger.error("file_index_update failed after %.1fs: %s", elapsed, exc)
-        return _error(
-            "index_failed",
-            f"Index update failed after {elapsed:.1f}s: {exc}",
-            "Common causes: cloud API keys not set, configured services unreachable, "
-            "documents_root path incorrect in config.yaml, or disk full. Check logs for details.",
-        )
-    elapsed = time.perf_counter() - t0
+    Returns immediately with status="started" so the MCP server stays
+    responsive while indexing runs.  The subprocess writes results to
+    index_metadata.json when it finishes.  Use file_status to check progress.
+    """
+    import subprocess
+    import sys
 
-    # Invalidate cache so next query rebuilds store/embed with fresh data
+    config = load_config(config_path)
+    index_root = Path(config["index_root"])
+    pid_file = index_root / "indexer.pid"
+
+    # Check if an indexer is already running
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            os.kill(old_pid, 0)  # Signal 0 = existence check; raises OSError if dead
+            logger.info("file_index_update: indexer already running (pid %d)", old_pid)
+            return {
+                "status": "already_running",
+                "pid": old_pid,
+                "message": "An indexer is already running. Use file_status to check progress.",
+            }
+        except (OSError, ValueError):
+            # Process is dead or PID file is corrupt — clean up and proceed
+            pid_file.unlink(missing_ok=True)
+
+    # Ensure index_root exists so the subprocess can write its PID file
+    index_root.mkdir(parents=True, exist_ok=True)
+
+    # Build a self-contained script that:
+    #   1. Writes its own PID to the PID file
+    #   2. Runs index_vault_flow
+    #   3. Cleans up the PID file in a finally block
+    script = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        f"pid_file = Path({str(pid_file)!r})\n"
+        "pid_file.write_text(str(os.getpid()))\n"
+        "try:\n"
+        "    from flow_index_vault import index_vault_flow\n"
+        f"    index_vault_flow({config_path!r})\n"
+        "finally:\n"
+        "    pid_file.unlink(missing_ok=True)\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,  # Detach so the subprocess survives parent restart
+    )
+
+    logger.info("file_index_update: started indexer subprocess (pid %d)", proc.pid)
+
+    # Invalidate cache so the next query picks up fresh data after indexing
     global _cache
     _cache = None
 
-    # Read results from index_metadata.json written by the flow
-    import json
-    config = load_config(config_path)
-    index_root = Path(config["index_root"])
-    meta_path = index_root / "index_metadata.json"
-    result: dict = {"status": "completed", "elapsed_seconds": round(elapsed, 1)}
-    if meta_path.exists():
-        try:
-            with open(meta_path) as f:
-                meta = json.load(f)
-            result["last_run_at"] = meta.get("last_run_at")
-            result["doc_count"] = meta.get("doc_count")
-            result["chunk_count"] = meta.get("chunk_count")
-            failed_count = meta.get("failed_count", 0)
-            if failed_count:
-                result["status"] = "completed_with_errors"
-                result["failed_count"] = failed_count
-                result["failed_docs"] = meta.get("failed_docs", [])
-        except Exception as exc:
-            logger.warning("Failed to read index_metadata.json after indexing: %s", exc)
-    logger.info("file_index_update: completed in %.1fs", elapsed)
-    return result
+    return {
+        "status": "started",
+        "pid": proc.pid,
+        "message": "Indexing started in background. Use file_status to check progress.",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -141,12 +141,33 @@ def test_search_error_empty_query():
 
 
 def test_search_error_invalid_source_type():
-    """Invalid source_type returns structured error."""
-    result = mcp_server._file_search_impl("test query", source_type="docx")
+    """Unsafe source_type returns structured error."""
+    result = mcp_server._file_search_impl("test query", source_type="bad type")
     assert isinstance(result, dict)
     assert result["error"] is True
     assert result["code"] == "invalid_parameter"
     assert "fix" in result
+
+
+def test_search_accepts_custom_source_type():
+    """Custom source types from non-filesystem sources should be filterable."""
+    from search_hybrid import SearchResult
+
+    old_cache = mcp_server._cache
+    mcp_server._cache = None
+    try:
+        fake_store = MagicMock()
+        fake_embed = MagicMock()
+        config = {"search": {"reranker": {"enabled": False}}}
+        with patch.object(mcp_server, "_get_deps", return_value=(fake_store, fake_embed, config)):
+            with patch.object(mcp_server, "hybrid_search", return_value=SearchResult([])) as hybrid:
+                result = mcp_server._file_search_impl("test query", source_type="pg_message")
+
+        assert "error" not in result
+        assert result["results"] == []
+        assert hybrid.call_args.kwargs["source_type"] == "pg_message"
+    finally:
+        mcp_server._cache = old_cache
 
 
 # ---------------------------------------------------------------------------
@@ -330,67 +351,45 @@ def test_get_deps_failure_in_get_doc_chunks():
 # ---------------------------------------------------------------------------
 
 
-def test_index_update_surfaces_failed_docs():
-    """When index_metadata.json contains failed_count, it should surface in response."""
-    import json
+def test_index_update_returns_started_status():
+    """_file_index_update_impl must return immediately with status='started'.
+
+    The indexer now runs in a background subprocess so the MCP server stays
+    responsive. Callers poll file_status to learn when indexing completes and
+    whether it had failures.
+    """
     import tempfile
     from pathlib import Path
-    from unittest.mock import MagicMock
-    from datetime import datetime, timezone
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Write a fake index_metadata.json with failures
-        meta = {
-            "last_run_at": datetime.now(timezone.utc).isoformat(),
-            "doc_count": 10,
-            "chunk_count": 50,
-            "failed_count": 2,
-            "failed_docs": ["bad1.md", "bad2.pdf"],
-        }
-        meta_path = Path(tmpdir) / "index_metadata.json"
-        with open(meta_path, "w") as f:
-            json.dump(meta, f)
-
-        # Mock the flow and config so we can test the impl directly
         old_cache = mcp_server._cache
         try:
-            with patch("flow_index_vault.index_vault_flow"):
-                with patch("mcp_server.load_config", return_value={"index_root": tmpdir}):
-                    mcp_server._cache = None
-                    result = mcp_server._file_index_update_impl(config_path="config.yaml")
+            with patch("mcp_server.load_config", return_value={"index_root": tmpdir}):
+                mcp_server._cache = None
+                result = mcp_server._file_index_update_impl(config_path="config.yaml")
 
-            assert result["status"] == "completed_with_errors"
-            assert result["failed_count"] == 2
-            assert result["failed_docs"] == ["bad1.md", "bad2.pdf"]
+            assert result["status"] == "started", (
+                f"Expected 'started' (non-blocking), got {result!r}"
+            )
+            assert "pid" in result
+            assert isinstance(result["pid"], int)
         finally:
             mcp_server._cache = old_cache
 
 
 def test_index_update_no_failures():
-    """When no failures, status should be 'completed' with no failed_count."""
-    import json
+    """Alias kept for historical coverage: same contract as test_index_update_returns_started_status."""
     import tempfile
-    from pathlib import Path
-    from datetime import datetime, timezone
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        meta = {
-            "last_run_at": datetime.now(timezone.utc).isoformat(),
-            "doc_count": 10,
-            "chunk_count": 50,
-        }
-        meta_path = Path(tmpdir) / "index_metadata.json"
-        with open(meta_path, "w") as f:
-            json.dump(meta, f)
-
         old_cache = mcp_server._cache
         try:
-            with patch("flow_index_vault.index_vault_flow"):
-                with patch("mcp_server.load_config", return_value={"index_root": tmpdir}):
-                    mcp_server._cache = None
-                    result = mcp_server._file_index_update_impl(config_path="config.yaml")
+            with patch("mcp_server.load_config", return_value={"index_root": tmpdir}):
+                mcp_server._cache = None
+                result = mcp_server._file_index_update_impl(config_path="config.yaml")
 
-            assert result["status"] == "completed"
+            # Non-blocking: always returns "started", never "completed"
+            assert result["status"] == "started"
             assert "failed_count" not in result
         finally:
             mcp_server._cache = old_cache
