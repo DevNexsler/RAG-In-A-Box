@@ -2,6 +2,7 @@
 
 import logging
 import re
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -12,18 +13,14 @@ from llama_index.vector_stores.lancedb import LanceDBVectorStore
 from llama_index.vector_stores.lancedb.base import TableNotFoundError
 
 from core.storage import SearchHit
+from doc_enrichment import ENRICHMENT_FIELDS
 
 logger = logging.getLogger(__name__)
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
-_ENRICHMENT_FIELDS = (
-    "enr_summary", "enr_doc_type", "enr_entities_people", "enr_entities_places",
-    "enr_entities_orgs", "enr_entities_dates", "enr_topics", "enr_keywords", "enr_key_facts",
-    "enr_suggested_tags", "enr_suggested_folder",
-)
-
 _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
+_ENRICHMENT_AUX_FIELDS = ("enr_importance_source",)
 
 # All metadata keys that map to explicit SearchHit attributes.
 # Anything NOT in this set goes into SearchHit.extra_metadata.
@@ -31,15 +28,16 @@ _CORE_META_KEYS = {
     "doc_id", "source_type", "mtime", "size", "title", "tags", "folder",
     "status", "created", "loc", "snippet", "rel_path",
     "description", "author", "keywords", "custom_meta",
-    "enr_summary", "enr_doc_type", "enr_entities_people", "enr_entities_places",
-    "enr_entities_orgs", "enr_entities_dates", "enr_topics", "enr_keywords", "enr_key_facts",
-    "enr_suggested_tags", "enr_suggested_folder",
+    *ENRICHMENT_FIELDS,
+    *_ENRICHMENT_AUX_FIELDS,
 }
 
 
 def _extract_enrichment(meta: dict) -> dict[str, str]:
     """Pull enrichment + extra metadata fields from metadata, defaulting to empty strings."""
-    result = {f: meta.get(f, "") or "" for f in _ENRICHMENT_FIELDS}
+    result = {f: meta.get(f, "") or "" for f in ENRICHMENT_FIELDS}
+    for f in _ENRICHMENT_AUX_FIELDS:
+        result[f] = meta.get(f, "") or ""
     for f in _EXTRA_META_FIELDS:
         result[f] = meta.get(f, "") or ""
     return result
@@ -127,10 +125,53 @@ class LanceDBStore:
         col_idx = arrow_table.schema.get_field_index("metadata")
         new_arrow = arrow_table.set_column(col_idx, pa.field("metadata", new_struct.type), new_struct)
 
-        # Drop and recreate the table
         db = ldb.connect(self.index_root)
-        db.drop_table(self.table_name)
-        db.create_table(self.table_name, new_arrow)
+        temp_name = f"{self.table_name}__schema_tmp"
+        backup_name = f"{self.table_name}__schema_backup"
+        temp_path = Path(self.index_root) / f"{temp_name}.lance"
+        table_path = Path(self.index_root) / f"{self.table_name}.lance"
+        backup_path = Path(self.index_root) / f"{backup_name}.lance"
+
+        def _table_names() -> set[str]:
+            try:
+                result = db.list_tables()
+                names = getattr(result, "tables", result)
+                return set(names)
+            except AttributeError:
+                return set(db.table_names())
+
+        for stale in (temp_name, backup_name):
+            if stale in _table_names():
+                db.drop_table(stale)
+        for stale_path in (temp_path, backup_path):
+            if stale_path.exists():
+                shutil.rmtree(stale_path)
+
+        backup_created = False
+        try:
+            try:
+                db.create_table(temp_name, new_arrow)
+            except Exception:
+                if temp_path.exists():
+                    shutil.rmtree(temp_path)
+                raise
+
+            shutil.move(str(table_path), str(backup_path))
+            backup_created = True
+            shutil.move(str(temp_path), str(table_path))
+        except Exception:
+            if backup_created and not table_path.exists() and backup_path.exists():
+                try:
+                    shutil.move(str(backup_path), str(table_path))
+                except Exception:
+                    logger.exception("Failed to restore %s after schema evolution failure", self.table_name)
+            raise
+        else:
+            if backup_path.exists():
+                shutil.rmtree(backup_path)
+        finally:
+            if temp_path.exists():
+                shutil.rmtree(temp_path)
 
         # Reconnect LanceDBVectorStore to the new table
         self._vs = LanceDBVectorStore(

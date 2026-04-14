@@ -13,6 +13,11 @@ services:
     command: ["sh", "-c", "mkdir -p /data/documents /data/index && python server.py"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - rag-net
+      - sor-net
+      - comm-net
+      - mcp-backplane
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - DEEPINFRA_API_KEY=${DEEPINFRA_API_KEY}
@@ -21,6 +26,19 @@ services:
       - SOR_DSN=${SOR_DSN}
       - DOCUMENTS_ROOT=/data/documents
       - INDEX_ROOT=/data/index
+
+networks:
+  rag-net:
+    external: true
+    name: rag-in-a-box_default
+  sor-net:
+    external: true
+    name: sor-network
+  comm-net:
+    external: true
+    name: comm-data-store_default
+  mcp-backplane:
+    external: true
 
 volumes:
   doc-organizer-data:

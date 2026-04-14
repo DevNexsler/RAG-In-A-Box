@@ -392,7 +392,7 @@ class TestMCPHandlers:
             indexed_store["config"],
         )
 
-        result = mcp_server._file_search_impl("test", source_type="docx")
+        result = mcp_server._file_search_impl("test", source_type="bad type")
         assert isinstance(result, dict)
         assert result["error"] is True
         assert result["code"] == "invalid_parameter"

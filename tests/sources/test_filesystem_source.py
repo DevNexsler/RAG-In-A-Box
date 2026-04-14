@@ -51,13 +51,14 @@ def test_scan_yields_same_records_as_legacy(tmp_vault):
 
     # Records are equivalent modulo the exact @XXXXX@ suffix (counters are
     # independent between the two registries). Compare normalized doc_ids.
+    from core.source_types import canonical_source_type
     from doc_id_store import strip_id_from_filename
 
     def normalize(records):
         return sorted([
             (
                 # Legacy dicts have "ext"; SourceRecords have .source_type
-                r.get("source_type", r.get("ext")) if isinstance(r, dict) else r.source_type,
+                canonical_source_type(r.get("source_type", r.get("ext"))) if isinstance(r, dict) else r.source_type,
                 strip_id_from_filename(
                     Path(r["rel_path"] if isinstance(r, dict) else r.natural_key).name
                 ),
@@ -101,3 +102,55 @@ def test_extract_matches_legacy_extract_text(tmp_vault):
     )
 
     assert new_result.full_text == legacy_result.full_text
+
+
+def test_scan_emits_canonical_source_type_and_preserves_extension(tmp_path):
+    """FilesystemSource should expose canonical search source_type, not raw suffix."""
+    from doc_id_store import DocIDStore
+    from sources.filesystem import FilesystemSource
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "report.docx").write_text("not a real docx; scan only needs stat")
+
+    src = FilesystemSource(
+        name="documents",
+        root=vault,
+        scan_config={"include": ["**/*.docx"], "exclude": []},
+        registry=DocIDStore(tmp_path / "reg.db"),
+    )
+
+    [record] = list(src.scan())
+
+    assert record.source_type == "doc"
+    assert record.metadata["ext"] == "docx"
+
+
+def test_scan_does_not_mutate_flow_runtime(tmp_path, monkeypatch):
+    """FilesystemSource.scan should not depend on flow_index_vault._RUNTIME."""
+    from doc_id_store import DocIDStore
+    import flow_index_vault
+    from sources.filesystem import FilesystemSource
+
+    class NoMutationDict(dict):
+        def __setitem__(self, key, value):
+            raise AssertionError(f"_RUNTIME mutated via __setitem__({key!r})")
+
+        def pop(self, key, default=None):
+            raise AssertionError(f"_RUNTIME mutated via pop({key!r})")
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "note.md").write_text("# Note")
+    monkeypatch.setattr(flow_index_vault, "_RUNTIME", NoMutationDict())
+
+    src = FilesystemSource(
+        name="documents",
+        root=vault,
+        scan_config={"include": ["**/*.md"], "exclude": []},
+        registry=DocIDStore(tmp_path / "reg.db"),
+    )
+
+    records = list(src.scan())
+
+    assert len(records) == 1

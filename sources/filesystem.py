@@ -12,6 +12,7 @@ from typing import Iterator
 from sources.base import SourceRecord
 from doc_id_store import DocIDStore
 from extractors import ExtractionResult, extract_text
+from core.source_types import canonical_source_type
 
 
 # Satisfies the Source protocol from sources.base structurally — no explicit
@@ -43,22 +44,15 @@ class FilesystemSource:
         self._ocr_provider = provider
 
     def scan(self) -> Iterator[SourceRecord]:
-        """Delegate to the legacy scan_vault_task which owns the walk +
-        rename + registry logic. Yield SourceRecord per returned dict."""
-        from flow_index_vault import scan_vault_task, _RUNTIME
+        """Scan files without depending on the Prefect task runtime."""
+        from flow_index_vault import scan_filesystem_records
 
-        # scan_vault_task reads _RUNTIME["doc_id_store"] — preserve that
-        # contract for now. Task 8 will change scan_vault_task to accept
-        # the registry as an argument.
-        prev = _RUNTIME.get("doc_id_store")
-        _RUNTIME["doc_id_store"] = self._registry
-        try:
-            records = scan_vault_task(self._root, self._include, self._exclude)
-        finally:
-            if prev is None:
-                _RUNTIME.pop("doc_id_store", None)
-            else:
-                _RUNTIME["doc_id_store"] = prev
+        records = scan_filesystem_records(
+            self._root,
+            self._include,
+            self._exclude,
+            doc_id_store=self._registry,
+        )
 
         # Backfill source_name on rows this scan just registered.
         # register()'s None-sentinel behavior (Task 2) preserves existing
@@ -72,7 +66,7 @@ class FilesystemSource:
         for r in records:
             yield SourceRecord(
                 doc_id=r["doc_id"],
-                source_type=r["ext"],
+                source_type=canonical_source_type(r["ext"]),
                 natural_key=r["rel_path"],
                 mtime=r["mtime"],
                 size=r["size"],

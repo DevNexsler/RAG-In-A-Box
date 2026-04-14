@@ -53,6 +53,7 @@ from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
 from llama_index.core.node_parser import SentenceSplitter
 
 from core.config import load_config
+from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment, ENRICHMENT_FIELDS, failed_enrichment
 from extractors import extract_text, extract_title, derive_folder, normalize_tags
 from providers.embed import build_embed_provider
@@ -73,15 +74,7 @@ _RUNTIME: dict[str, Any] = {}
 # --- Helpers ---
 
 
-_SOURCE_TYPE_MAP = {
-    "md": "md", "pdf": "pdf",
-    "docx": "doc", "doc": "doc", "rtf": "doc",
-    "xlsx": "sheet", "xls": "sheet",
-    "pptx": "pres", "csv": "csv",
-    "html": "html", "htm": "html",
-    "epub": "epub", "txt": "txt",
-    "png": "img", "jpg": "img", "jpeg": "img", "gif": "img", "webp": "img",
-}
+_SOURCE_TYPE_MAP = SOURCE_TYPE_BY_EXTENSION
 
 
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
@@ -222,8 +215,13 @@ def _matches_any(rel_str: str, patterns: list[str]) -> bool:
 # --- Tasks (one responsibility each) ---
 
 
-@task
-def scan_vault_task(vault_root: str | Path, include: list[str], exclude: list[str]) -> list[dict]:
+def scan_filesystem_records(
+    vault_root: str | Path,
+    include: list[str],
+    exclude: list[str],
+    doc_id_store: DocIDStore | None = None,
+    logger=None,
+) -> list[dict]:
     """Scan vault; return list of file records as dicts.
 
     Each file gets a persistent 5-char base-62 doc_id embedded in its filename
@@ -234,8 +232,8 @@ def scan_vault_task(vault_root: str | Path, include: list[str], exclude: list[st
     if not root.exists():
         return []
 
-    doc_id_store: DocIDStore | None = _RUNTIME.get("doc_id_store")
-    logger = _get_logger()
+    if logger is None:
+        logger = _get_logger()
 
     records = []
     # Track IDs seen this scan to detect collisions (two files with same @XXXXX@)
@@ -340,6 +338,18 @@ def scan_vault_task(vault_root: str | Path, include: list[str], exclude: list[st
 
 
 @task
+def scan_vault_task(vault_root: str | Path, include: list[str], exclude: list[str]) -> list[dict]:
+    """Prefect wrapper for filesystem scan."""
+    return scan_filesystem_records(
+        vault_root,
+        include,
+        exclude,
+        doc_id_store=_RUNTIME.get("doc_id_store"),
+        logger=_get_logger(),
+    )
+
+
+@task
 def diff_index_task(
     scanned: list[dict],
     stored_doc_mtimes: dict[str, float],
@@ -396,7 +406,7 @@ def process_doc_task(doc: dict) -> None:
     # --- Determine source_type ---
     # Prefer explicit source_type from the record (set by SourceRecord); fall back
     # to the extension-based map for backward compat.
-    source_type = doc.get("source_type") or _SOURCE_TYPE_MAP.get(ext, "other")
+    source_type = canonical_source_type(doc.get("source_type") or ext)
 
     # --- Extract text via Source dispatch ---
     # Look up the owning Source and original SourceRecord, then call source.extract().
