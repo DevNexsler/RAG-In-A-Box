@@ -37,3 +37,6 @@ test_index/
 # Model weights (large files — download separately)
 models/
 *.gguf
+.gitnexus
+.worktrees/
+.evals/
