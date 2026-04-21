@@ -15,6 +15,8 @@ import time
 
 import httpx
 
+from providers.llm.trace_recorder import LLMTraceRecorder
+
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
@@ -110,10 +112,18 @@ class OpenRouterGenerator:
         model: str = "openai/gpt-4.1-mini",
         api_key: str | None = None,
         timeout: float = 300.0,
+        trace_capture: dict | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.timeout = timeout
+        trace_capture = trace_capture or {}
+        self.trace_recorder = LLMTraceRecorder(
+            provider="openrouter",
+            model=model,
+            enabled=bool(trace_capture.get("enabled", False)),
+            directory=trace_capture.get("directory", ".evals/llm-traces"),
+        )
 
         if not self.api_key:
             raise ValueError(
@@ -159,8 +169,14 @@ class OpenRouterGenerator:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        trace_request = {
+            "url": f"{OPENROUTER_BASE_URL}/chat/completions",
+            "timeout": self.timeout,
+            "payload": payload,
+        }
 
         last_exc: Exception | None = None
+        started = time.perf_counter()
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -172,6 +188,12 @@ class OpenRouterGenerator:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                self.trace_recorder.record(
+                    request=trace_request,
+                    response=data,
+                    success=True,
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                )
                 content = data["choices"][0]["message"]["content"]
                 return content.strip()
 
@@ -191,6 +213,26 @@ class OpenRouterGenerator:
                     exc.response.status_code,
                     exc.response.text[:500],
                 )
+                self.trace_recorder.record(
+                    request=trace_request,
+                    success=False,
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                    error={
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "status_code": exc.response.status_code,
+                        "body": exc.response.text,
+                    },
+                )
                 raise
 
+        self.trace_recorder.record(
+            request=trace_request,
+            success=False,
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            error={
+                "type": type(last_exc).__name__ if last_exc else "UnknownError",
+                "message": str(last_exc) if last_exc else "Unknown OpenRouter error",
+            },
+        )
         raise last_exc  # type: ignore[misc]

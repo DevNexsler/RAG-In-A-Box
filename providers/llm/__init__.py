@@ -42,6 +42,7 @@ def build_llm_provider(config: dict) -> LLMGenerator | None:
                 model=enrichment_cfg.get("model", "minimax/minimax-m2.5"),
                 api_key=enrichment_cfg.get("api_key"),
                 timeout=enrichment_cfg.get("timeout", 300.0),
+                trace_capture=enrichment_cfg.get("trace_capture", {}),
             )
         except Exception as exc:
             logger.warning(
