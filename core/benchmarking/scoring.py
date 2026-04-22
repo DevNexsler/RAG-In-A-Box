@@ -135,7 +135,10 @@ def _score_field(*, field: str, predicted: Any, canonical: Any, alternates: Any)
         return _score_suggested_tags(predicted, canonical, alternates)
     if field in _SET_FIELDS:
         accepted = _canonical_plus_alternates(canonical, alternates)
-        return _score_best_overlap(_to_string_set(predicted), [_to_string_set(value) for value in accepted])
+        return _score_semantic_overlap(
+            _to_string_set(predicted),
+            [_to_string_set(value) for value in accepted],
+        )
     if field == "key_facts":
         return _score_key_facts(predicted, canonical)
     if field == "suggested_folder":
@@ -167,6 +170,40 @@ def _score_best_overlap(predicted: set[str], accepted_sets: list[set[str]]) -> f
         if score > best:
             best = score
     return round(best, 6)
+
+
+def _score_semantic_overlap(predicted: set[str], accepted_sets: list[set[str]]) -> float:
+    if not accepted_sets:
+        return 1.0 if not predicted else 0.0
+    best = 0.0
+    for expected in accepted_sets:
+        score = _score_phrase_collection(sorted(predicted), sorted(expected))
+        if score > best:
+            best = score
+    return round(best, 6)
+
+
+def _score_phrase_collection(predicted: list[str], expected: list[str]) -> float:
+    if not predicted and not expected:
+        return 1.0
+    if not predicted or not expected:
+        return 0.0
+
+    remaining = set(range(len(expected)))
+    matched_score = 0.0
+    for predicted_item in predicted:
+        best_idx = None
+        best_score = 0.0
+        for idx in remaining:
+            score = _fact_similarity(predicted_item, expected[idx])
+            if score > best_score:
+                best_idx = idx
+                best_score = score
+        if best_idx is not None and best_score > 0.0:
+            remaining.remove(best_idx)
+            matched_score += best_score
+
+    return matched_score / max(len(predicted), len(expected))
 
 
 def _score_folder(predicted: Any, canonical: Any, alternates: Any) -> float:

@@ -32,6 +32,30 @@ def test_generate_with_metadata_returns_content_usage_and_latency(tmp_path):
     assert result["latency_ms"] >= 0
 
 
+def test_openrouter_json_schema_includes_importance(tmp_path):
+    response_json = {
+        "id": "chatcmpl-123",
+        "choices": [{"message": {"content": '{"summary":"ok","importance":0.8}'}}],
+        "usage": {"total_tokens": 42},
+    }
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(200, json=response_json, request=request)
+
+    with patch("providers.llm.openrouter_llm.httpx.post", return_value=response) as mock_post:
+        generator = OpenRouterGenerator(
+            model="openai/gpt-4.1-mini",
+            api_key="secret-key",
+            trace_capture={"enabled": True, "directory": str(tmp_path)},
+        )
+        generator.generate_with_metadata("hello", max_tokens=77)
+
+    payload = mock_post.call_args.kwargs["json"]
+    schema = payload["response_format"]["json_schema"]["schema"]
+
+    assert "importance" in schema["properties"]
+    assert "importance" in schema["required"]
+
+
 def test_generate_with_metadata_preserves_timeout_exception(tmp_path):
     with patch(
         "providers.llm.openrouter_llm.httpx.post",

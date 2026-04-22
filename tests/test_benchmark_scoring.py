@@ -86,6 +86,30 @@ def test_score_case_uses_weighted_total_across_fields():
     assert result.total_score == expected
 
 
+def test_score_topics_allows_wording_drift():
+    gold = {
+        "canonical": {"topics": ["lease renewal request"]},
+        "alternates": {},
+    }
+    pred = {"enr_topics": "renewal of lease"}
+
+    score = score_case(pred, gold).field_scores["topics"]
+
+    assert 0.0 < score < 1.0
+
+
+def test_score_keywords_allows_wording_drift():
+    gold = {
+        "canonical": {"keywords": ["parking addendum update"]},
+        "alternates": {},
+    }
+    pred = {"enr_keywords": "parking addendum revised"}
+
+    score = score_case(pred, gold).field_scores["keywords"]
+
+    assert 0.0 < score < 1.0
+
+
 def test_score_suggested_tags_alternates_extend_allowed_tag_set():
     gold = {
         "canonical": {

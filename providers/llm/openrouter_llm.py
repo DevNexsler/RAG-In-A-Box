@@ -92,11 +92,15 @@ _ENRICHMENT_SCHEMA = {
                 "type": "string",
                 "description": "Best folder path for filing this document from the taxonomy, or empty string",
             },
+            "importance": {
+                "type": "number",
+                "description": "Importance score from 0.0 to 1.0",
+            },
         },
         "required": [
             "summary", "doc_type", "entities_people", "entities_places",
             "entities_orgs", "entities_dates", "topics", "keywords", "key_facts",
-            "suggested_tags", "suggested_folder",
+            "suggested_tags", "suggested_folder", "importance",
         ],
         "additionalProperties": False,
     },
