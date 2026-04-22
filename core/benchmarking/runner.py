@@ -69,6 +69,7 @@ def _run_case(*, case: Any, gold: dict[str, Any], client: Any, model: str) -> di
         return {
             "case_id": case.case_id,
             "model": model,
+            "status": "success",
             "raw_output": replay["content"],
             "normalized_output": normalized_output,
             "request": replay.get("request", {}),
@@ -81,6 +82,7 @@ def _run_case(*, case: Any, gold: dict[str, Any], client: Any, model: str) -> di
         return {
             "case_id": case.case_id,
             "model": model,
+            "status": "parse_failed",
             "raw_output": replay.get("content", "") if replay else "",
             "normalized_output": None,
             "request": replay.get("request", {}) if replay else {},
@@ -94,6 +96,7 @@ def _run_case(*, case: Any, gold: dict[str, Any], client: Any, model: str) -> di
         return {
             "case_id": case.case_id,
             "model": model,
+            "status": "transport_failed",
             "raw_output": "",
             "normalized_output": None,
             "request": {},
@@ -107,6 +110,7 @@ def _run_case(*, case: Any, gold: dict[str, Any], client: Any, model: str) -> di
         return {
             "case_id": case.case_id,
             "model": model,
+            "status": "transport_failed",
             "raw_output": "",
             "normalized_output": None,
             "request": {},
@@ -125,16 +129,15 @@ def _load_gold_record(*, bench_path: Path, case_id: str) -> dict[str, Any]:
 def _build_summary(*, results: list[dict[str, Any]], model: str, run_id: str) -> dict[str, Any]:
     case_count = len(results)
     parse_failures = sum(1 for item in results if item["score"]["reliability"].get("parse_failed"))
-    request_failures = sum(
-        1
-        for item in results
-        if item.get("error") and not item["score"]["reliability"].get("parse_failed")
-    )
+    request_failures = sum(1 for item in results if item.get("status") == "transport_failed")
+    successes = sum(1 for item in results if item.get("status") == "success")
     mean_total = (
         round(sum(item["score"]["total_score"] for item in results) / case_count, 6)
         if case_count
         else 0.0
     )
+    latencies = sorted(item["latency_ms"] for item in results if item.get("latency_ms") is not None)
+    token_total = sum(_extract_total_tokens(item) for item in results)
 
     field_scores: dict[str, float] = {}
     if results:
@@ -152,5 +155,33 @@ def _build_summary(*, results: list[dict[str, Any]], model: str, run_id: str) ->
         "average_total_score": mean_total,
         "parse_failures": parse_failures,
         "request_failures": request_failures,
+        "success_rate": round(successes / case_count, 6) if case_count else 0.0,
+        "parse_failure_rate": round(parse_failures / case_count, 6) if case_count else 0.0,
+        "transport_failure_rate": round(request_failures / case_count, 6) if case_count else 0.0,
+        "latency_p50": _percentile(latencies, 0.50),
+        "latency_p95": _percentile(latencies, 0.95),
+        "token_total": token_total,
+        "token_average": round(token_total / case_count, 6) if case_count else 0.0,
         "field_scores": field_scores,
     }
+
+
+def _extract_total_tokens(result: dict[str, Any]) -> int:
+    usage = result.get("response", {}).get("usage", {})
+    value = usage.get("total_tokens")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    index = (len(values) - 1) * quantile
+    lower = int(index)
+    upper = min(lower + 1, len(values) - 1)
+    fraction = index - lower
+    return round(values[lower] + (values[upper] - values[lower]) * fraction, 6)

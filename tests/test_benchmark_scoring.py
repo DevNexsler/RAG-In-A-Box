@@ -13,6 +13,16 @@ def test_score_folder_accepts_configured_alternate():
     assert score_case(pred, gold).field_scores["suggested_folder"] == 1.0
 
 
+def test_score_folder_normalizes_equivalent_trailing_slash():
+    gold = {
+        "canonical": {"suggested_folder": "2-Housing/Applications"},
+        "alternates": {"suggested_folder": []},
+    }
+    pred = {"enr_suggested_folder": "2-Housing/Applications/"}
+
+    assert score_case(pred, gold).field_scores["suggested_folder"] == 1.0
+
+
 def test_score_folder_parent_branch_gets_partial_credit():
     gold = {
         "canonical": {"suggested_folder": "2-Housing/Applications"},
@@ -31,6 +41,16 @@ def test_score_importance_penalizes_numeric_distance():
     pred = {"enr_importance": "0.6"}
 
     assert score_case(pred, gold).field_scores["importance"] == 0.8
+
+
+def test_score_entities_dates_canonicalizes_common_formats():
+    gold = {
+        "canonical": {"entities_dates": ["2026-03-01"]},
+        "alternates": {},
+    }
+    pred = {"enr_entities_dates": "03/01/2026"}
+
+    assert score_case(pred, gold).field_scores["entities_dates"] == 1.0
 
 
 def test_score_case_uses_weighted_total_across_fields():
@@ -64,6 +84,29 @@ def test_score_key_facts_handles_normalized_json_array():
     pred = {"enr_key_facts": json.dumps(["Tenant requested renewal.", "Parking changed."])}
 
     assert score_case(pred, gold).field_scores["key_facts"] == 1.0
+
+
+def test_score_key_facts_awards_partial_credit_for_paraphrase_and_penalizes_extra():
+    gold = {
+        "canonical": {
+            "key_facts": [
+                "Tenant requested renewal.",
+                "Parking addendum changed.",
+            ]
+        },
+        "alternates": {},
+    }
+    pred = {
+        "enr_key_facts": json.dumps(
+            [
+                "Tenant requested lease renewal.",
+                "Invented pet deposit increase.",
+            ]
+        )
+    }
+
+    score = score_case(pred, gold).field_scores["key_facts"]
+    assert 0.2 < score < 0.5
 
 
 def test_parse_failure_scores_zero():

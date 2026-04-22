@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
@@ -26,6 +27,26 @@ DEFAULT_FIELD_WEIGHTS: dict[str, float] = {
 _SET_FIELDS = {"doc_type", "topics", "keywords", "suggested_tags"}
 _ENTITY_FIELDS = {"entities_people", "entities_places", "entities_orgs", "entities_dates"}
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_ORDINAL_RE = re.compile(r"(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+_DATE_EXTRACT_PATTERNS = (
+    re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
+    re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b"),
+    re.compile(r"\b\d{1,2}-\d{1,2}-\d{4}\b"),
+    re.compile(
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+\d{4}\b",
+        re.IGNORECASE,
+    ),
+)
+_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%m/%d/%Y",
+    "%m-%d-%Y",
+    "%B %d %Y",
+    "%b %d %Y",
+    "%d %B %Y",
+    "%d %b %Y",
+)
 
 
 @dataclass(frozen=True)
@@ -88,6 +109,7 @@ def score_case(
 
 def score_failed_case(error: str) -> CaseScore:
     parse_failed = "parse" in error.lower() or "json" in error.lower()
+    transport_failed = not parse_failed
     field_scores = {field: 0.0 for field in DEFAULT_FIELD_WEIGHTS}
     weighted_scores = {field: 0.0 for field in DEFAULT_FIELD_WEIGHTS}
     return CaseScore(
@@ -96,6 +118,7 @@ def score_failed_case(error: str) -> CaseScore:
         weighted_scores=weighted_scores,
         reliability={
             "parse_failed": parse_failed,
+            "transport_failed": transport_failed,
             "error": error,
         },
     )
@@ -106,11 +129,13 @@ def _score_field(*, field: str, predicted: Any, canonical: Any, alternates: Any)
         accepted = _canonical_plus_alternates(canonical, alternates)
         return _score_best_overlap(_to_string_set(predicted), [_to_string_set(value) for value in accepted])
     if field == "key_facts":
-        return _score_best_overlap(_to_string_set(predicted, key_facts=True), [_to_string_set(canonical, key_facts=True)])
+        return _score_key_facts(predicted, canonical)
     if field == "suggested_folder":
         return _score_folder(predicted, canonical, alternates)
     if field == "importance":
         return _score_importance(predicted, canonical)
+    if field == "entities_dates":
+        return _score_best_overlap(_to_string_set(predicted, date_values=True), [_to_string_set(canonical, date_values=True)])
     if field in _ENTITY_FIELDS:
         return _score_best_overlap(_to_string_set(predicted), [_to_string_set(canonical)])
     if field == "summary":
@@ -137,7 +162,7 @@ def _score_best_overlap(predicted: set[str], accepted_sets: list[set[str]]) -> f
 
 
 def _score_folder(predicted: Any, canonical: Any, alternates: Any) -> float:
-    predicted_norm = _normalize_scalar(predicted)
+    predicted_norm = _normalize_folder(predicted)
     if not predicted_norm:
         return 1.0 if not _normalize_scalar(canonical) else 0.0
 
@@ -173,7 +198,49 @@ def _score_summary(predicted: Any, canonical: Any) -> float:
     return round(_jaccard(predicted_tokens, canonical_tokens), 6)
 
 
-def _to_string_set(value: Any, *, key_facts: bool = False) -> set[str]:
+def _score_key_facts(predicted: Any, canonical: Any) -> float:
+    predicted_facts = _to_string_list(predicted, key_facts=True)
+    canonical_facts = _to_string_list(canonical, key_facts=True)
+    if not predicted_facts and not canonical_facts:
+        return 1.0
+    if not predicted_facts or not canonical_facts:
+        return 0.0
+
+    remaining = set(range(len(canonical_facts)))
+    matched_score = 0.0
+    for predicted_fact in predicted_facts:
+        best_idx = None
+        best_score = 0.0
+        for idx in remaining:
+            score = _fact_similarity(predicted_fact, canonical_facts[idx])
+            if score > best_score:
+                best_idx = idx
+                best_score = score
+        if best_idx is not None and best_score > 0.0:
+            remaining.remove(best_idx)
+            matched_score += best_score
+
+    return round(matched_score / max(len(predicted_facts), len(canonical_facts)), 6)
+
+
+def _fact_similarity(left: str, right: str) -> float:
+    left_tokens = _tokenize(left)
+    right_tokens = _tokenize(right)
+    if not left_tokens and not right_tokens:
+        return 1.0
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = len(left_tokens & right_tokens)
+    if overlap == 0:
+        return 0.0
+    return (2 * overlap) / (len(left_tokens) + len(right_tokens))
+
+
+def _to_string_set(value: Any, *, key_facts: bool = False, date_values: bool = False) -> set[str]:
+    return set(_to_string_list(value, key_facts=key_facts, date_values=date_values))
+
+
+def _to_string_list(value: Any, *, key_facts: bool = False, date_values: bool = False) -> list[str]:
     if isinstance(value, list):
         items = value
     elif isinstance(value, str):
@@ -185,6 +252,8 @@ def _to_string_set(value: Any, *, key_facts: bool = False) -> set[str]:
                 items = [part for part in stripped.split("\n") if part.strip()]
             else:
                 items = parsed if isinstance(parsed, list) else [stripped]
+        elif date_values:
+            items = _extract_date_items(stripped)
         elif "," in stripped:
             items = [part.strip() for part in stripped.split(",")]
         elif stripped:
@@ -196,11 +265,12 @@ def _to_string_set(value: Any, *, key_facts: bool = False) -> set[str]:
     else:
         items = []
 
-    return {
-        _normalize_scalar(item)
-        for item in items
-        if _normalize_scalar(item)
-    }
+    normalized_items: list[str] = []
+    for item in items:
+        normalized = _normalize_date_value(item) if date_values else _normalize_scalar(item)
+        if normalized:
+            normalized_items.append(normalized)
+    return normalized_items
 
 
 def _jaccard(left: set[str], right: set[str]) -> float:
@@ -215,6 +285,38 @@ def _normalize_scalar(value: Any) -> str:
     if value is None:
         return ""
     return " ".join(str(value).strip().lower().split())
+
+
+def _normalize_date_value(value: Any) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    cleaned = _ORDINAL_RE.sub(r"\1", text)
+    cleaned = cleaned.replace(",", " ")
+    cleaned = " ".join(cleaned.split())
+    for date_format in _DATE_FORMATS:
+        try:
+            return datetime.strptime(cleaned.title(), date_format).date().isoformat()
+        except ValueError:
+            continue
+    return _normalize_scalar(text)
+
+
+def _extract_date_items(value: str) -> list[str]:
+    if _normalize_date_value(value) != _normalize_scalar(value):
+        return [value]
+
+    for separator in ("\n", ";", "|"):
+        if separator in value:
+            return [part.strip() for part in value.split(separator) if part.strip()]
+
+    matches: list[str] = []
+    for pattern in _DATE_EXTRACT_PATTERNS:
+        matches.extend(match.group(0) for match in pattern.finditer(value))
+    if matches:
+        return matches
+
+    return [value]
 
 
 def _normalize_folder(value: Any) -> str:

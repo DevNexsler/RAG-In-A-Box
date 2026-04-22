@@ -103,55 +103,71 @@ class FakeReplayClient:
         }
 
 
-def test_run_benchmark_persists_per_case_results_and_summary(tmp_path):
-    fixture_bench_dir = tmp_path / "benchmarks"
-    fixture_bench_dir.mkdir(parents=True)
-    case_dir = fixture_bench_dir / "cases"
-    gold_dir = fixture_bench_dir / "gold"
-    case_dir.mkdir()
-    gold_dir.mkdir()
+class SequencedReplayClient:
+    def __init__(self, *responses: object) -> None:
+        self._responses = list(responses)
+        self.calls: list[dict[str, object]] = []
 
-    (case_dir / "case_0001.json").write_text(
-        """{
-  "case_id": "case_0001",
-  "prompt": "Prompt text",
-  "baseline_response": "{}",
+    def generate_with_metadata(self, user_prompt: str, max_tokens: int = 512):
+        self.calls.append({"user_prompt": user_prompt, "max_tokens": max_tokens})
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _write_case_and_gold(bench_dir, *, case_id: str) -> None:
+    case_dir = bench_dir / "cases"
+    gold_dir = bench_dir / "gold"
+    case_dir.mkdir(exist_ok=True)
+    gold_dir.mkdir(exist_ok=True)
+    (case_dir / f"{case_id}.json").write_text(
+        f"""{{
+  "case_id": "{case_id}",
+  "prompt": "Prompt text for {case_id}",
+  "baseline_response": "{{}}",
   "title": "Lease renewal",
   "source_type": "pdf",
   "category": "housing",
   "difficulty": "easy",
   "trace_file": "trace.jsonl",
   "trace_line": 1
-}""",
+}}""",
         encoding="utf-8",
     )
-    (gold_dir / "case_0001.json").write_text(
-        """{
-  "case_id": "case_0001",
-  "canonical": {
+    (gold_dir / f"{case_id}.json").write_text(
+        f"""{{
+  "case_id": "{case_id}",
+  "canonical": {{
     "summary": "Lease renewal request.",
     "doc_type": ["lease"],
     "entities_people": [],
     "entities_places": [],
     "entities_orgs": [],
-    "entities_dates": [],
+    "entities_dates": ["2026-03-01"],
     "topics": ["lease renewal"],
     "keywords": ["renewal terms"],
     "key_facts": ["Tenant requested renewal."],
     "suggested_tags": ["lease"],
     "suggested_folder": "Housing/Leases",
     "importance": "0.8"
-  },
-  "alternates": {
+  }},
+  "alternates": {{
     "suggested_tags": [],
     "suggested_folder": []
-  }
-}""",
+  }}
+}}""",
         encoding="utf-8",
     )
 
+
+def test_run_benchmark_persists_per_case_results_and_summary(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+
     fake_client = FakeReplayClient(
-        content='{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":[],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
+        content='{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
     )
 
     run = run_benchmark(
@@ -165,55 +181,20 @@ def test_run_benchmark_persists_per_case_results_and_summary(tmp_path):
     assert (fixture_bench_dir / "runs" / "baseline" / "summary.json").exists()
     assert run.summary["case_count"] == 1
     assert run.summary["parse_failures"] == 0
-    assert fake_client.calls[0]["user_prompt"] == "Prompt text"
+    assert run.summary["success_rate"] == 1.0
+    assert run.summary["parse_failure_rate"] == 0.0
+    assert run.summary["transport_failure_rate"] == 0.0
+    assert run.summary["latency_p50"] == 12.5
+    assert run.summary["latency_p95"] == 12.5
+    assert run.summary["token_total"] == 42
+    assert run.summary["token_average"] == 42.0
+    assert fake_client.calls[0]["user_prompt"] == "Prompt text for case_0001"
 
 
 def test_run_benchmark_records_parse_failures_per_case(tmp_path):
     fixture_bench_dir = tmp_path / "benchmarks"
     fixture_bench_dir.mkdir(parents=True)
-    case_dir = fixture_bench_dir / "cases"
-    gold_dir = fixture_bench_dir / "gold"
-    case_dir.mkdir()
-    gold_dir.mkdir()
-
-    (case_dir / "case_0001.json").write_text(
-        """{
-  "case_id": "case_0001",
-  "prompt": "Prompt text",
-  "baseline_response": "{}",
-  "title": "Lease renewal",
-  "source_type": "pdf",
-  "category": "housing",
-  "difficulty": "easy",
-  "trace_file": "trace.jsonl",
-  "trace_line": 1
-}""",
-        encoding="utf-8",
-    )
-    (gold_dir / "case_0001.json").write_text(
-        """{
-  "case_id": "case_0001",
-  "canonical": {
-    "summary": "Lease renewal request.",
-    "doc_type": ["lease"],
-    "entities_people": [],
-    "entities_places": [],
-    "entities_orgs": [],
-    "entities_dates": [],
-    "topics": ["lease renewal"],
-    "keywords": ["renewal terms"],
-    "key_facts": ["Tenant requested renewal."],
-    "suggested_tags": ["lease"],
-    "suggested_folder": "Housing/Leases",
-    "importance": "0.8"
-  },
-  "alternates": {
-    "suggested_tags": [],
-    "suggested_folder": []
-  }
-}""",
-        encoding="utf-8",
-    )
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
 
     fake_client = FakeReplayClient(content="not json")
 
@@ -226,5 +207,47 @@ def test_run_benchmark_records_parse_failures_per_case(tmp_path):
 
     assert run.summary["case_count"] == 1
     assert run.summary["parse_failures"] == 1
+    assert run.summary["parse_failure_rate"] == 1.0
+    assert run.summary["success_rate"] == 0.0
     assert run.per_case[0]["score"]["total_score"] == 0.0
     assert run.per_case[0]["score"]["reliability"]["parse_failed"] is True
+
+
+def test_run_benchmark_summary_includes_transport_latency_and_token_aggregates(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0002")
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0003")
+
+    fake_client = SequencedReplayClient(
+        {
+            "content": '{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["03/01/2026"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested lease renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases/","importance":0.8}',
+            "request": {"payload": {"messages": [{"role": "user", "content": "one"}]}},
+            "response": {"usage": {"total_tokens": 20}},
+            "latency_ms": 50.0,
+        },
+        {
+            "content": "not json",
+            "request": {"payload": {"messages": [{"role": "user", "content": "two"}]}},
+            "response": {"usage": {"total_tokens": 10}},
+            "latency_ms": 100.0,
+        },
+        httpx.TimeoutException("timed out"),
+    )
+
+    run = run_benchmark(
+        bench_dir=fixture_bench_dir,
+        model="openai/gpt-4.1-mini",
+        run_id="mixed",
+        replay_client=fake_client,
+    )
+
+    assert run.summary["case_count"] == 3
+    assert run.summary["success_rate"] == pytest.approx(1 / 3)
+    assert run.summary["parse_failure_rate"] == pytest.approx(1 / 3)
+    assert run.summary["transport_failure_rate"] == pytest.approx(1 / 3)
+    assert run.summary["latency_p50"] == 75.0
+    assert run.summary["latency_p95"] == 97.5
+    assert run.summary["token_total"] == 30
+    assert run.summary["token_average"] == 10.0
