@@ -151,6 +151,14 @@ class OpenRouterGenerator:
         Uses OpenAI-compatible chat completions with structured JSON output.
         Returns the raw response string (parsed by doc_enrichment).
         """
+        return self.generate_with_metadata(user_prompt, max_tokens=max_tokens)["content"]
+
+    def generate_with_metadata(self, user_prompt: str, max_tokens: int = 512) -> dict:
+        """Generate structured JSON plus request/response metadata."""
+        return self._request_with_metadata(user_prompt, max_tokens=max_tokens)
+
+    def _request_with_metadata(self, user_prompt: str, max_tokens: int = 512) -> dict:
+        """Send completion request and return content with replay metadata."""
         payload = {
             "model": self.model,
             "messages": [
@@ -188,14 +196,20 @@ class OpenRouterGenerator:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                latency_ms = (time.perf_counter() - started) * 1000.0
                 self.trace_recorder.record(
                     request=trace_request,
                     response=data,
                     success=True,
-                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                    latency_ms=latency_ms,
                 )
                 content = data["choices"][0]["message"]["content"]
-                return content.strip()
+                return {
+                    "content": content.strip(),
+                    "request": trace_request,
+                    "response": data,
+                    "latency_ms": latency_ms,
+                }
 
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
                 last_exc = exc
