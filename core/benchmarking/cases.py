@@ -60,8 +60,9 @@ def prepare_cases(
     out_path = Path(out_dir)
     cases_dir = out_path / "cases"
     cases_dir.mkdir(parents=True, exist_ok=True)
+    _remove_stale_case_files(cases_dir)
 
-    cases: list[dict[str, str | int]] = []
+    cases: list[BenchmarkCase] = []
     for index, row in enumerate(selected_rows, start=1):
         case = BenchmarkCase(
             case_id=f"case_{index:04d}",
@@ -74,10 +75,9 @@ def prepare_cases(
             trace_file=row.trace_file,
             trace_line=row.trace_line,
         )
-        payload = asdict(case)
-        cases.append(payload)
+        cases.append(case)
         (cases_dir / f"{case.case_id}.json").write_text(
-            json.dumps(payload, indent=2),
+            json.dumps(asdict(case), indent=2),
             encoding="utf-8",
         )
 
@@ -85,7 +85,7 @@ def prepare_cases(
         "selected_count": len(cases),
         "limit": limit,
         "seed": seed,
-        "cases": cases,
+        "cases": [asdict(case) for case in cases],
     }
     manifest_path = cases_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -100,6 +100,11 @@ def _iter_trace_paths(path: Path) -> Iterable[Path]:
     if path.is_file():
         return [path]
     return sorted(path.glob("*.jsonl"))
+
+
+def _remove_stale_case_files(cases_dir: Path) -> None:
+    for path in cases_dir.glob("case_*.json"):
+        path.unlink()
 
 
 def _extract_prompt(payload: dict[str, Any]) -> str:

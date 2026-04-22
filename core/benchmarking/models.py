@@ -32,5 +32,5 @@ class BenchmarkCase:
 @dataclass(frozen=True)
 class PreparedCasesResult:
     selected_count: int
-    cases: list[dict[str, str | int]]
+    cases: list[BenchmarkCase]
     manifest_path: Path
