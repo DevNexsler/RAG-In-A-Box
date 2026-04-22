@@ -15,6 +15,7 @@ _REQUIRED_SUMMARY_FIELDS = {
     "latency_p95",
     "field_scores",
 }
+_NULLABLE_SUMMARY_FIELDS = {"latency_p50", "latency_p95"}
 
 
 def write_reports(*, run_dir: str | Path) -> dict[str, Path]:
@@ -216,5 +217,5 @@ def _validate_summary(summary: dict[str, Any]) -> None:
     for field in sorted(_REQUIRED_SUMMARY_FIELDS):
         if field not in summary:
             raise ValueError(f"summary.json missing required field: {field}")
-        if summary[field] is None:
+        if summary[field] is None and field not in _NULLABLE_SUMMARY_FIELDS:
             raise ValueError(f"summary.json missing required field: {field}")

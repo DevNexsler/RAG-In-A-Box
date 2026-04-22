@@ -15,6 +15,7 @@ def _write_run_artifacts(
     *,
     include_costs: bool = False,
     summary_overrides: dict[str, object] | None = None,
+    remove_summary_fields: set[str] | None = None,
 ) -> Path:
     run_dir = bench_dir / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -81,10 +82,10 @@ def _write_run_artifacts(
     }
     if summary_overrides:
         for key, value in summary_overrides.items():
-            if value is None:
-                summary.pop(key, None)
-            else:
-                summary[key] = value
+            summary[key] = value
+    if remove_summary_fields:
+        for key in remove_summary_fields:
+            summary.pop(key, None)
     (run_dir / "per_case.jsonl").write_text(
         "\n".join(json.dumps(row) for row in per_case) + "\n",
         encoding="utf-8",
@@ -137,10 +138,23 @@ def test_build_report_uses_cost_rows_only_for_cost_average_and_adds_optional_col
 
 
 def test_build_report_fails_on_missing_required_summary_fields(tmp_path):
-    fixture_run_dir = _write_run_artifacts(tmp_path, summary_overrides={"model": None})
+    fixture_run_dir = _write_run_artifacts(tmp_path, remove_summary_fields={"model"})
 
     with pytest.raises(ValueError, match="summary.json missing required field: model"):
         write_reports(run_dir=fixture_run_dir)
+
+
+def test_build_report_allows_nullable_latency_summary_fields(tmp_path):
+    fixture_run_dir = _write_run_artifacts(
+        tmp_path,
+        summary_overrides={"latency_p50": None, "latency_p95": None},
+    )
+
+    paths = write_reports(run_dir=fixture_run_dir)
+    report = json.loads(paths["json"].read_text(encoding="utf-8"))
+
+    assert report["leaderboard"][0]["latency_p50"] is None
+    assert report["leaderboard"][0]["latency_p95"] is None
 
 
 def test_build_parser_registers_report_command():
