@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -34,3 +35,18 @@ class PreparedCasesResult:
     selected_count: int
     cases: list[BenchmarkCase]
     manifest_path: Path
+
+
+@dataclass(frozen=True)
+class GoldRecord:
+    case_id: str
+    canonical: dict[str, Any]
+    alternates: dict[str, list[str]]
+
+
+@dataclass(frozen=True)
+class LabelingStatus:
+    total_cases: int
+    labeled: int
+    remaining: int
+    next_case_id: str | None

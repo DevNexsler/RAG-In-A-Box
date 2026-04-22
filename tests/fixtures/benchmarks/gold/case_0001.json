@@ -1,0 +1,42 @@
+{
+  "case_id": "case_0001",
+  "canonical": {
+    "summary": "Lease renewal request for 2026 with updated monthly rent and a parking addendum.",
+    "doc_type": [
+      "lease",
+      "renewal request"
+    ],
+    "entities_people": [],
+    "entities_places": [],
+    "entities_orgs": [],
+    "entities_dates": [
+      "2026-01-01"
+    ],
+    "topics": [
+      "lease renewal",
+      "rent updates"
+    ],
+    "keywords": [
+      "renewal terms",
+      "parking addendum"
+    ],
+    "key_facts": [
+      "Tenant requested 2026 renewal terms.",
+      "Rent and parking terms were updated."
+    ],
+    "suggested_tags": [
+      "lease",
+      "renewal"
+    ],
+    "suggested_folder": "Housing/Leases",
+    "importance": "0.8"
+  },
+  "alternates": {
+    "suggested_tags": [
+      "tenant"
+    ],
+    "suggested_folder": [
+      "Housing/Renewals"
+    ]
+  }
+}

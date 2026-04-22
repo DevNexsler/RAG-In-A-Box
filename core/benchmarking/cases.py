@@ -8,10 +8,31 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from core.benchmarking.models import BenchmarkCase, PreparedCasesResult, TraceRow
+from core.benchmarking.models import (
+    BenchmarkCase,
+    GoldRecord,
+    LabelingStatus,
+    PreparedCasesResult,
+    TraceRow,
+)
 
 _TITLE_RE = re.compile(r"^Document title:\s*(.+)$", re.MULTILINE)
 _SOURCE_TYPE_RE = re.compile(r"^Document type:\s*(.+)$", re.MULTILINE)
+_CANONICAL_FIELD_DEFAULTS: dict[str, Any] = {
+    "summary": "",
+    "doc_type": [],
+    "entities_people": [],
+    "entities_places": [],
+    "entities_orgs": [],
+    "entities_dates": [],
+    "topics": [],
+    "keywords": [],
+    "key_facts": [],
+    "suggested_tags": [],
+    "suggested_folder": "",
+    "importance": "",
+}
+_ALTERNATE_FIELDS = ("suggested_tags", "suggested_folder")
 
 
 def load_trace_rows(trace_path: str | Path) -> list[TraceRow]:
@@ -94,6 +115,47 @@ def prepare_cases(
         cases=cases,
         manifest_path=manifest_path,
     )
+
+
+def load_case(*, bench_dir: str | Path, case_id: str) -> BenchmarkCase:
+    payload = json.loads(_case_path(bench_dir=bench_dir, case_id=case_id).read_text(encoding="utf-8"))
+    return BenchmarkCase(**payload)
+
+
+def write_gold_stub(case: BenchmarkCase, *, bench_dir: str | Path) -> Path:
+    path = _gold_path(bench_dir=bench_dir, case_id=case.case_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        _validate_canonical_fields(payload.get("canonical"))
+        return path
+
+    gold_record = GoldRecord(
+        case_id=case.case_id,
+        canonical=_build_canonical_stub(),
+        alternates={field: [] for field in _ALTERNATE_FIELDS},
+    )
+    path.write_text(json.dumps(asdict(gold_record), indent=2), encoding="utf-8")
+    return path
+
+
+def build_labeling_status(*, bench_dir: str | Path) -> dict[str, Any]:
+    bench_path = Path(bench_dir)
+    case_ids = sorted(path.stem for path in (bench_path / "cases").glob("case_*.json"))
+    labeled_case_ids = [case_id for case_id in case_ids if _is_labeled_gold(bench_dir=bench_path, case_id=case_id)]
+
+    next_case_id = next((case_id for case_id in case_ids if case_id not in set(labeled_case_ids)), None)
+    status = LabelingStatus(
+        total_cases=len(case_ids),
+        labeled=len(labeled_case_ids),
+        remaining=len(case_ids) - len(labeled_case_ids),
+        next_case_id=next_case_id,
+    )
+
+    status_path = bench_path / "status" / "labeling_status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(asdict(status), indent=2), encoding="utf-8")
+    return asdict(status)
 
 
 def _iter_trace_paths(path: Path) -> Iterable[Path]:
@@ -180,3 +242,48 @@ def _select_rows(*, trace_rows: list[TraceRow], limit: int, seed: int) -> list[T
         if not progressed:
             break
     return selected
+
+
+def _case_path(*, bench_dir: str | Path, case_id: str) -> Path:
+    return Path(bench_dir) / "cases" / f"{case_id}.json"
+
+
+def _gold_path(*, bench_dir: str | Path, case_id: str) -> Path:
+    return Path(bench_dir) / "gold" / f"{case_id}.json"
+
+
+def _build_canonical_stub() -> dict[str, Any]:
+    stub: dict[str, Any] = {}
+    for field, default in _CANONICAL_FIELD_DEFAULTS.items():
+        stub[field] = list(default) if isinstance(default, list) else default
+    return stub
+
+
+def _load_gold_record(*, bench_dir: str | Path, case_id: str) -> dict[str, Any] | None:
+    path = _gold_path(bench_dir=bench_dir, case_id=case_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _validate_canonical_fields(canonical: Any) -> None:
+    if not isinstance(canonical, dict):
+        raise ValueError("gold record canonical payload must be an object")
+    missing = [field for field in _CANONICAL_FIELD_DEFAULTS if field not in canonical]
+    if missing:
+        raise ValueError(f"gold record canonical payload missing fields: {', '.join(missing)}")
+
+
+def _is_labeled_gold(*, bench_dir: str | Path, case_id: str) -> bool:
+    payload = _load_gold_record(bench_dir=bench_dir, case_id=case_id)
+    if payload is None:
+        return False
+    try:
+        _validate_canonical_fields(payload.get("canonical"))
+    except ValueError:
+        return False
+
+    canonical = payload["canonical"]
+    if str(canonical.get("summary", "")).strip():
+        return True
+    return any(bool(canonical.get(field)) for field in _CANONICAL_FIELD_DEFAULTS if field != "summary")
