@@ -5,6 +5,17 @@ import json
 from pathlib import Path
 from typing import Any
 
+_REQUIRED_SUMMARY_FIELDS = {
+    "run_id",
+    "model",
+    "average_total_score",
+    "success_rate",
+    "parse_failure_rate",
+    "latency_p50",
+    "latency_p95",
+    "field_scores",
+}
+
 
 def write_reports(*, run_dir: str | Path) -> dict[str, Path]:
     run_path = Path(run_dir)
@@ -29,14 +40,15 @@ def write_reports(*, run_dir: str | Path) -> dict[str, Path]:
 
 
 def _build_report(*, summary: dict[str, Any], per_case: list[dict[str, Any]]) -> dict[str, Any]:
+    _validate_summary(summary)
     leaderboard_row = {
-        "model": summary.get("model", ""),
-        "run_id": summary.get("run_id", ""),
-        "overall_score": summary.get("average_total_score", 0.0),
-        "success_rate": summary.get("success_rate", 0.0),
-        "parse_failure_rate": summary.get("parse_failure_rate", 0.0),
-        "latency_p50": summary.get("latency_p50"),
-        "latency_p95": summary.get("latency_p95"),
+        "model": summary["model"],
+        "run_id": summary["run_id"],
+        "overall_score": summary["average_total_score"],
+        "success_rate": summary["success_rate"],
+        "parse_failure_rate": summary["parse_failure_rate"],
+        "latency_p50": summary["latency_p50"],
+        "latency_p95": summary["latency_p95"],
     }
     token_total = summary.get("token_total")
     token_average = summary.get("token_average")
@@ -52,12 +64,12 @@ def _build_report(*, summary: dict[str, Any], per_case: list[dict[str, Any]]) ->
         leaderboard_row["cost_average"] = costs["cost_average"]
 
     return {
-        "run_id": summary.get("run_id", ""),
-        "model": summary.get("model", ""),
+        "run_id": summary["run_id"],
+        "model": summary["model"],
         "overall_score": leaderboard_row["overall_score"],
         "summary": summary,
         "leaderboard": [leaderboard_row],
-        "field_scores": summary.get("field_scores", {}),
+        "field_scores": summary["field_scores"],
         "worst_cases": _worst_cases(per_case),
     }
 
@@ -184,7 +196,7 @@ def _extract_costs(per_case: list[dict[str, Any]]) -> dict[str, float | None]:
     if not values:
         return {"cost_total": None, "cost_average": None}
     total = round(sum(values), 6)
-    average = round(total / len(per_case), 6) if per_case else 0.0
+    average = round(total / len(values), 6)
     return {"cost_total": total, "cost_average": average}
 
 
@@ -198,3 +210,11 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
         if line.strip():
             rows.append(json.loads(line))
     return rows
+
+
+def _validate_summary(summary: dict[str, Any]) -> None:
+    for field in sorted(_REQUIRED_SUMMARY_FIELDS):
+        if field not in summary:
+            raise ValueError(f"summary.json missing required field: {field}")
+        if summary[field] is None:
+            raise ValueError(f"summary.json missing required field: {field}")
