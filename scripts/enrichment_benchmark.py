@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.benchmarking.cases import build_labeling_status, load_case, prepare_cases, write_gold_stub
+from core.benchmarking.runner import run_benchmark
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +28,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status")
     status.add_argument("--bench-dir", default=".evals/benchmarks")
+
+    run_cmd = subparsers.add_parser("run")
+    run_cmd.add_argument("--bench-dir", default=".evals/benchmarks")
+    run_cmd.add_argument("--model", required=True)
+    run_cmd.add_argument("--run-id", required=True)
+    run_cmd.add_argument("--max-cases", type=int)
 
     return parser
 
@@ -70,6 +77,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Labeled: {result['labeled']}")
         print(f"Remaining: {result['remaining']}")
         print(f"Next Unlabeled Case: {result['next_case_id'] or 'none'}")
+        return 0
+
+    if args.command == "run":
+        result = run_benchmark(
+            bench_dir=args.bench_dir,
+            model=args.model,
+            run_id=args.run_id,
+            max_cases=args.max_cases,
+        )
+        print(f"Run ID: {args.run_id}")
+        print(f"Model: {args.model}")
+        print(f"Cases: {result.summary['case_count']}")
+        print(f"Average Total Score: {result.summary['average_total_score']}")
+        print(f"Parse Failures: {result.summary['parse_failures']}")
+        print(f"Artifacts: {result.run_dir}")
         return 0
 
     parser.error(f"Unsupported command: {args.command}")
