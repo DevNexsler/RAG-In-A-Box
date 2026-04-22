@@ -133,7 +133,7 @@ def write_gold_stub(case: BenchmarkCase, *, bench_dir: str | Path) -> Path:
     gold_record = GoldRecord(
         case_id=case.case_id,
         canonical=_build_canonical_stub(),
-        alternates={field: [] for field in _ALTERNATE_FIELDS},
+        alternates=_build_alternates_from_baseline(case.baseline_response),
     )
     path.write_text(json.dumps(asdict(gold_record), indent=2), encoding="utf-8")
     return path
@@ -257,6 +257,28 @@ def _build_canonical_stub() -> dict[str, Any]:
     for field, default in _CANONICAL_FIELD_DEFAULTS.items():
         stub[field] = list(default) if isinstance(default, list) else default
     return stub
+
+
+def _build_alternates_from_baseline(baseline_response: str) -> dict[str, list[str]]:
+    alternates = {field: [] for field in _ALTERNATE_FIELDS}
+    try:
+        payload = json.loads(baseline_response)
+    except json.JSONDecodeError:
+        return alternates
+    if not isinstance(payload, dict):
+        return alternates
+
+    tags = payload.get("suggested_tags")
+    if isinstance(tags, list):
+        alternates["suggested_tags"] = [str(tag).strip() for tag in tags if str(tag).strip()]
+    elif isinstance(tags, str) and tags.strip():
+        alternates["suggested_tags"] = [tags.strip()]
+
+    folder = payload.get("suggested_folder")
+    if isinstance(folder, str) and folder.strip():
+        alternates["suggested_folder"] = [folder.strip()]
+
+    return alternates
 
 
 def _load_gold_record(*, bench_dir: str | Path, case_id: str) -> dict[str, Any] | None:
