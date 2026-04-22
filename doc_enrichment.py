@@ -227,6 +227,7 @@ def _normalize_enrichment(raw: dict[str, Any]) -> dict[str, str]:
 
 
 def parse_enrichment_response(raw_response: str) -> dict[str, str]:
+    """Parse raw LLM output and normalize it into enrichment fields."""
     parsed = _extract_json(raw_response)
     return _normalize_enrichment(parsed)
 

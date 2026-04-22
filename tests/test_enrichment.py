@@ -160,6 +160,14 @@ def test_parse_enrichment_response_normalizes_valid_json():
     assert parsed["enr_importance"] == "0.7"
 
 
+def test_parse_enrichment_response_handles_fenced_json():
+    raw = '```json\n{"summary":"x","doc_type":["memo"],"topics":["ops"],"importance":0.7}\n```'
+    parsed = parse_enrichment_response(raw)
+    assert parsed["enr_doc_type"] == "memo"
+    assert parsed["enr_topics"] == "ops"
+    assert parsed["enr_importance"] == "0.7"
+
+
 class TestEnrichDocument:
     """Test enrich_document with mocked LLM generator."""
 
