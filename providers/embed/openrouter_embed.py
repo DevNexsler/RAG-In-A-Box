@@ -96,10 +96,23 @@ class OpenRouterEmbedProvider(EmbedProvider):
                 time.sleep(backoff)
 
             except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status == 429 or 500 <= status < 600:
+                    last_exc = exc
+                    retry_after = exc.response.headers.get("retry-after")
+                    try:
+                        backoff = float(retry_after) if retry_after else RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                    except ValueError:
+                        backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                    logger.warning(
+                        "embed attempt %d/%d failed (HTTP %d), retrying in %.0fs...",
+                        attempt + 1, MAX_RETRIES, status, backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
                 logger.error(
                     "OpenRouter embedding API error: %d %s",
-                    exc.response.status_code,
-                    exc.response.text[:500],
+                    status, exc.response.text[:500],
                 )
                 raise
 

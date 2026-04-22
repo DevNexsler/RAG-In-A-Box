@@ -186,11 +186,26 @@ class OpenRouterGenerator:
                 time.sleep(backoff)
 
             except httpx.HTTPStatusError as exc:
+                # 429 (rate limit) and 5xx are retryable; everything else is fatal.
+                status = exc.response.status_code
+                if status == 429 or 500 <= status < 600:
+                    last_exc = exc
+                    # Honor Retry-After header if present, else use exponential backoff.
+                    retry_after = exc.response.headers.get("retry-after")
+                    try:
+                        backoff = float(retry_after) if retry_after else RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                    except ValueError:
+                        backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                    logger.warning(
+                        "generate() attempt %d/%d failed (HTTP %d), retrying in %.0fs...",
+                        attempt + 1, MAX_RETRIES, status, backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
                 logger.error(
                     "OpenRouter API error: %d %s",
-                    exc.response.status_code,
+                    status,
                     exc.response.text[:500],
                 )
                 raise
-
         raise last_exc  # type: ignore[misc]

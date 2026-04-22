@@ -403,7 +403,6 @@ class DocIDStore:
         with self._lock:
             cur = self._conn.execute("SELECT DISTINCT source_name FROM doc_registry")
             return {row[0] for row in cur.fetchall()}
-
     @staticmethod
     def _registry_row_to_dict(row: tuple) -> dict:
         return {

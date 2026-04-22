@@ -626,6 +626,49 @@ def process_doc_task(doc: dict) -> None:
     logger.info(f"Upserted {len(nodes)} chunks: {doc_id}")
 
 
+def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
+    """Process a batch of docs. Return list of failed doc_ids.
+
+    concurrency=1 is the serial baseline (identical to the pre-refactor loop).
+    concurrency>1 uses a ThreadPoolExecutor; exceptions in one worker do not
+    affect others. FTS index rebuild is deliberately NOT done here — it is
+    invoked exactly once by the flow after all docs have been processed.
+    """
+    logger = _get_logger()
+    failed_docs: list[str] = []
+
+    def _run_one(doc: dict) -> str | None:
+        try:
+            process_doc_task(doc)
+            return None
+        except Exception as exc:
+            logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
+            return doc["doc_id"]
+
+    if concurrency <= 1 or len(docs) <= 1:
+        for doc in docs:
+            bad = _run_one(doc)
+            if bad is not None:
+                failed_docs.append(bad)
+        return failed_docs
+
+    # Process the first doc serially to ensure the LanceDB table exists before
+    # concurrent workers start. LanceDBVectorStore.add() creates the table on
+    # first call and that initialization is not thread-safe — racing workers
+    # can hit "Table already exists" errors.
+    first_bad = _run_one(docs[0])
+    if first_bad is not None:
+        failed_docs.append(first_bad)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        for result in ex.map(_run_one, docs[1:]):
+            if result is not None:
+                failed_docs.append(result)
+    return failed_docs
+
+
 @task
 def delete_docs_task(doc_ids: list[str]) -> None:
     """Remove all chunk nodes for the given doc_ids."""
@@ -928,13 +971,10 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     stored_mtimes = store.list_doc_mtimes()
     to_add_or_update, to_delete = diff_index_task(scanned, stored_mtimes)
 
-    failed_docs: list[str] = []
-    for doc in to_add_or_update:
-        try:
-            process_doc_task(doc)
-        except Exception as exc:
-            failed_docs.append(doc["doc_id"])
-            logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
+    concurrency = int(enrichment_cfg.get("concurrency", 1) or 1)
+    if concurrency > 1:
+        logger.info("Processing %d docs with concurrency=%d", len(to_add_or_update), concurrency)
+    failed_docs = _process_docs(to_add_or_update, concurrency=concurrency)
 
     if failed_docs:
         logger.warning("Failed to process %d docs: %s", len(failed_docs), failed_docs[:20])
