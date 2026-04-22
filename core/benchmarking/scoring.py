@@ -103,13 +103,18 @@ def score_case(
         total_score=sum(weighted_scores.values()),
         field_scores=field_scores,
         weighted_scores=weighted_scores,
-        reliability={"parse_failed": False},
+        reliability={
+            "parse_failed": False,
+            "transport_failed": False,
+            "internal_failed": False,
+        },
     )
 
 
 def score_failed_case(error: str) -> CaseScore:
     parse_failed = "parse" in error.lower() or "json" in error.lower()
-    transport_failed = not parse_failed
+    transport_failed = error.lower() in {"timeout", "http_error", "transport_error"}
+    internal_failed = not parse_failed and not transport_failed
     field_scores = {field: 0.0 for field in DEFAULT_FIELD_WEIGHTS}
     weighted_scores = {field: 0.0 for field in DEFAULT_FIELD_WEIGHTS}
     return CaseScore(
@@ -119,12 +124,15 @@ def score_failed_case(error: str) -> CaseScore:
         reliability={
             "parse_failed": parse_failed,
             "transport_failed": transport_failed,
+            "internal_failed": internal_failed,
             "error": error,
         },
     )
 
 
 def _score_field(*, field: str, predicted: Any, canonical: Any, alternates: Any) -> float:
+    if field == "suggested_tags":
+        return _score_suggested_tags(predicted, canonical, alternates)
     if field in _SET_FIELDS:
         accepted = _canonical_plus_alternates(canonical, alternates)
         return _score_best_overlap(_to_string_set(predicted), [_to_string_set(value) for value in accepted])
@@ -179,9 +187,13 @@ def _score_folder(predicted: Any, canonical: Any, alternates: Any) -> float:
         expected_parts = _split_folder(expected)
         if predicted_parts == expected_parts[: len(predicted_parts)]:
             return 0.5
-        if expected_parts == predicted_parts[: len(expected_parts)]:
-            return 0.5
     return 0.0
+
+
+def _score_suggested_tags(predicted: Any, canonical: Any, alternates: Any) -> float:
+    allowed = _to_string_set(canonical)
+    allowed.update(_to_string_set(alternates))
+    return _score_best_overlap(_to_string_set(predicted), [allowed])
 
 
 def _score_importance(predicted: Any, canonical: Any) -> float:

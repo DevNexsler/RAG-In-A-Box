@@ -33,6 +33,16 @@ def test_score_folder_parent_branch_gets_partial_credit():
     assert score_case(pred, gold).field_scores["suggested_folder"] == 0.5
 
 
+def test_score_folder_deeper_child_does_not_get_partial_credit():
+    gold = {
+        "canonical": {"suggested_folder": "Housing/Leases"},
+        "alternates": {"suggested_folder": []},
+    }
+    pred = {"enr_suggested_folder": "Housing/Leases/2026"}
+
+    assert score_case(pred, gold).field_scores["suggested_folder"] == 0.0
+
+
 def test_score_importance_penalizes_numeric_distance():
     gold = {
         "canonical": {"importance": "0.8"},
@@ -74,6 +84,18 @@ def test_score_case_uses_weighted_total_across_fields():
 
     expected = 0.18 + 0.18 + 0.0 + 0.10
     assert result.total_score == expected
+
+
+def test_score_suggested_tags_alternates_extend_allowed_tag_set():
+    gold = {
+        "canonical": {
+            "suggested_tags": ["lease"],
+        },
+        "alternates": {"suggested_tags": ["housing"]},
+    }
+    pred = {"enr_suggested_tags": "lease, housing"}
+
+    assert score_case(pred, gold).field_scores["suggested_tags"] == 1.0
 
 
 def test_score_key_facts_handles_normalized_json_array():

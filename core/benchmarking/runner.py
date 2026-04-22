@@ -77,12 +77,26 @@ def _run_case(*, case: Any, gold: dict[str, Any], client: Any, model: str) -> di
             "latency_ms": replay.get("latency_ms"),
             "score": score.to_dict(),
         }
-    except (json.JSONDecodeError, ValueError) as exc:
+    except json.JSONDecodeError as exc:
         score = score_failed_case(error="json_parse_error")
         return {
             "case_id": case.case_id,
             "model": model,
             "status": "parse_failed",
+            "raw_output": replay.get("content", "") if replay else "",
+            "normalized_output": None,
+            "request": replay.get("request", {}) if replay else {},
+            "response": replay.get("response", {}) if replay else {},
+            "latency_ms": replay.get("latency_ms") if replay else None,
+            "score": score.to_dict(),
+            "error": str(exc),
+        }
+    except ValueError as exc:
+        score = score_failed_case(error="internal_error")
+        return {
+            "case_id": case.case_id,
+            "model": model,
+            "status": "internal_error",
             "raw_output": replay.get("content", "") if replay else "",
             "normalized_output": None,
             "request": replay.get("request", {}) if replay else {},

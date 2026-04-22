@@ -213,6 +213,35 @@ def test_run_benchmark_records_parse_failures_per_case(tmp_path):
     assert run.per_case[0]["score"]["reliability"]["parse_failed"] is True
 
 
+def test_run_benchmark_classifies_internal_value_error_separately(tmp_path, monkeypatch):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+
+    fake_client = FakeReplayClient(
+        content='{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
+    )
+
+    def explode(*args, **kwargs):
+        raise ValueError("gold data mismatch")
+
+    monkeypatch.setattr("core.benchmarking.runner.score_raw_case", explode)
+
+    run = run_benchmark(
+        bench_dir=fixture_bench_dir,
+        model="openai/gpt-4.1-mini",
+        run_id="baseline",
+        replay_client=fake_client,
+    )
+
+    assert run.summary["parse_failure_rate"] == 0.0
+    assert run.summary["transport_failure_rate"] == 0.0
+    assert run.summary["success_rate"] == 0.0
+    assert run.per_case[0]["status"] == "internal_error"
+    assert run.per_case[0]["score"]["reliability"]["parse_failed"] is False
+    assert run.per_case[0]["score"]["reliability"]["internal_failed"] is True
+
+
 def test_run_benchmark_summary_includes_transport_latency_and_token_aggregates(tmp_path):
     fixture_bench_dir = tmp_path / "benchmarks"
     fixture_bench_dir.mkdir(parents=True)
