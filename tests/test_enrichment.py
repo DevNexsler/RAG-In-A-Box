@@ -18,6 +18,7 @@ from doc_enrichment import (
     empty_enrichment,
     failed_enrichment,
     enrich_document,
+    parse_enrichment_response,
 )
 
 
@@ -149,6 +150,14 @@ class TestNormalizeEnrichment:
         raw = {"key_facts": '["already serialized"]'}
         result = _normalize_enrichment(raw)
         assert result["enr_key_facts"] == '["already serialized"]'
+
+
+def test_parse_enrichment_response_normalizes_valid_json():
+    raw = '{"summary":"x","doc_type":["memo"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":[],"topics":["ops"],"keywords":["lease"],"key_facts":["rent due"],"suggested_tags":["housing"],"suggested_folder":"2-Housing","importance":0.7}'
+    parsed = parse_enrichment_response(raw)
+    assert parsed["enr_doc_type"] == "memo"
+    assert parsed["enr_topics"] == "ops"
+    assert parsed["enr_importance"] == "0.7"
 
 
 class TestEnrichDocument:
