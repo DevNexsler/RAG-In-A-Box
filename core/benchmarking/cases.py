@@ -33,6 +33,29 @@ _CANONICAL_FIELD_DEFAULTS: dict[str, Any] = {
     "importance": "",
 }
 _ALTERNATE_FIELDS = ("suggested_tags", "suggested_folder")
+_CANONICAL_STRING_FIELDS = ("summary", "suggested_folder", "importance")
+_CANONICAL_LIST_FIELDS = (
+    "doc_type",
+    "entities_people",
+    "entities_places",
+    "entities_orgs",
+    "entities_dates",
+    "topics",
+    "keywords",
+    "key_facts",
+    "suggested_tags",
+)
+_LABEL_SIGNAL_FIELDS = (
+    "doc_type",
+    "entities_people",
+    "entities_places",
+    "entities_orgs",
+    "entities_dates",
+    "topics",
+    "keywords",
+    "key_facts",
+    "suggested_tags",
+)
 
 
 def load_trace_rows(trace_path: str | Path) -> list[TraceRow]:
@@ -127,7 +150,7 @@ def write_gold_stub(case: BenchmarkCase, *, bench_dir: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         payload = json.loads(path.read_text(encoding="utf-8"))
-        _validate_canonical_fields(payload.get("canonical"))
+        _validate_gold_record(payload, expected_case_id=case.case_id)
         return path
 
     gold_record = GoldRecord(
@@ -294,6 +317,36 @@ def _validate_canonical_fields(canonical: Any) -> None:
     missing = [field for field in _CANONICAL_FIELD_DEFAULTS if field not in canonical]
     if missing:
         raise ValueError(f"gold record canonical payload missing fields: {', '.join(missing)}")
+    for field in _CANONICAL_STRING_FIELDS:
+        if not isinstance(canonical[field], str):
+            raise ValueError(f"gold record canonical field '{field}' must be a string")
+    for field in _CANONICAL_LIST_FIELDS:
+        if not isinstance(canonical[field], list):
+            raise ValueError(f"gold record canonical field '{field}' must be a list")
+
+
+def _validate_alternates_fields(alternates: Any) -> None:
+    if not isinstance(alternates, dict):
+        raise ValueError("gold record alternates payload must be an object")
+    missing = [field for field in _ALTERNATE_FIELDS if field not in alternates]
+    if missing:
+        raise ValueError(f"gold record alternates payload missing fields: {', '.join(missing)}")
+    for field in _ALTERNATE_FIELDS:
+        value = alternates[field]
+        if not isinstance(value, list):
+            raise ValueError(f"gold record alternates field '{field}' must be a list of strings")
+        if any(not isinstance(item, str) for item in value):
+            raise ValueError(f"gold record alternates field '{field}' must be a list of strings")
+
+
+def _validate_gold_record(payload: Any, *, expected_case_id: str) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("gold record payload must be an object")
+    case_id = payload.get("case_id")
+    if case_id != expected_case_id:
+        raise ValueError(f"gold record case_id mismatch: expected {expected_case_id}, got {case_id}")
+    _validate_canonical_fields(payload.get("canonical"))
+    _validate_alternates_fields(payload.get("alternates"))
 
 
 def _is_labeled_gold(*, bench_dir: str | Path, case_id: str) -> bool:
@@ -301,11 +354,11 @@ def _is_labeled_gold(*, bench_dir: str | Path, case_id: str) -> bool:
     if payload is None:
         return False
     try:
-        _validate_canonical_fields(payload.get("canonical"))
+        _validate_gold_record(payload, expected_case_id=case_id)
     except ValueError:
         return False
 
     canonical = payload["canonical"]
     if str(canonical.get("summary", "")).strip():
         return True
-    return any(bool(canonical.get(field)) for field in _CANONICAL_FIELD_DEFAULTS if field != "summary")
+    return any(bool(canonical.get(field)) for field in _LABEL_SIGNAL_FIELDS)

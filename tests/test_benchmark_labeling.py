@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 from core.benchmarking.cases import build_labeling_status, write_gold_stub
@@ -59,8 +60,55 @@ def test_write_gold_stub_rejects_missing_canonical_fields(tmp_path):
         raise AssertionError("expected ValueError for incomplete canonical payload")
 
 
-def test_labeling_status_counts_done_and_remaining():
-    fixture_bench_dir = Path("tests/fixtures/benchmarks")
+def test_write_gold_stub_rejects_invalid_gold_schema_types(tmp_path):
+    case = BenchmarkCase(
+        case_id="case_0001",
+        prompt="Prompt text",
+        baseline_response="{}",
+        title="Lease renewal",
+        source_type="pdf",
+        category="housing",
+        difficulty="easy",
+        trace_file="trace.jsonl",
+        trace_line=1,
+    )
+    gold_path = tmp_path / "gold" / "case_0001.json"
+    gold_path.parent.mkdir(parents=True, exist_ok=True)
+    gold_path.write_text(
+        json.dumps(
+            {
+                "case_id": "wrong_case",
+                "canonical": {
+                    "summary": [],
+                    "doc_type": [],
+                    "entities_people": [],
+                    "entities_places": [],
+                    "entities_orgs": [],
+                    "entities_dates": [],
+                    "topics": [],
+                    "keywords": [],
+                    "key_facts": [],
+                    "suggested_tags": [],
+                    "suggested_folder": "",
+                    "importance": "",
+                },
+                "alternates": {"suggested_tags": ["ok", 3], "suggested_folder": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        write_gold_stub(case, bench_dir=tmp_path)
+    except ValueError as exc:
+        assert "case_id" in str(exc) or "must be a string" in str(exc) or "list of strings" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for invalid gold schema")
+
+
+def test_labeling_status_counts_done_and_remaining(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    shutil.copytree(Path("tests/fixtures/benchmarks"), fixture_bench_dir)
 
     status = build_labeling_status(bench_dir=fixture_bench_dir)
 
@@ -131,3 +179,51 @@ def test_labeling_status_sets_next_case_id_for_unlabeled_case(tmp_path):
     assert status["labeled"] == 1
     assert status["remaining"] == 1
     assert status["next_case_id"] == "case_0002"
+
+
+def test_labeling_status_does_not_count_low_signal_fields_only(tmp_path):
+    cases_dir = tmp_path / "cases"
+    gold_dir = tmp_path / "gold"
+    cases_dir.mkdir(parents=True)
+    gold_dir.mkdir(parents=True)
+    case_payload = {
+        "case_id": "case_0001",
+        "prompt": "Prompt one",
+        "baseline_response": "{}",
+        "title": "Case one",
+        "source_type": "pdf",
+        "category": "housing",
+        "difficulty": "easy",
+        "trace_file": "trace.jsonl",
+        "trace_line": 1,
+    }
+    (cases_dir / "case_0001.json").write_text(json.dumps(case_payload), encoding="utf-8")
+    (gold_dir / "case_0001.json").write_text(
+        json.dumps(
+            {
+                "case_id": "case_0001",
+                "canonical": {
+                    "summary": "",
+                    "doc_type": [],
+                    "entities_people": [],
+                    "entities_places": [],
+                    "entities_orgs": [],
+                    "entities_dates": [],
+                    "topics": [],
+                    "keywords": [],
+                    "key_facts": [],
+                    "suggested_tags": [],
+                    "suggested_folder": "Housing/Leases",
+                    "importance": "0.9",
+                },
+                "alternates": {"suggested_tags": [], "suggested_folder": ["Housing/Leases"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = build_labeling_status(bench_dir=tmp_path)
+
+    assert status["labeled"] == 0
+    assert status["remaining"] == 1
+    assert status["next_case_id"] == "case_0001"
