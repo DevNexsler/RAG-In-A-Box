@@ -9,6 +9,7 @@ No local GPU needed — all inference runs on cloud providers.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -220,8 +221,8 @@ class OpenRouterGenerator:
                 content = data["choices"][0]["message"]["content"]
                 return {
                     "content": content.strip(),
-                    "request": trace_request,
-                    "response": data,
+                    "request": copy.deepcopy(trace_request),
+                    "response": copy.deepcopy(data),
                     "latency_ms": latency_ms,
                 }
 
