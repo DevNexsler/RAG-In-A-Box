@@ -29,6 +29,7 @@ _SYSTEM_PROMPT = (
 
 MAX_RETRIES = 2
 RETRY_BACKOFF = (5.0, 15.0)
+CONNECT_TIMEOUT_CAP = 10.0
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -178,6 +179,7 @@ class OpenRouterGenerator:
         self, user_prompt: str, max_tokens: int = 512
     ) -> OpenRouterReplayMetadata:
         """Send completion request and return content with replay metadata."""
+        request_timeout = self._build_request_timeout()
         payload = {
             "model": self.model,
             "messages": [
@@ -198,7 +200,12 @@ class OpenRouterGenerator:
         }
         trace_request = {
             "url": f"{OPENROUTER_BASE_URL}/chat/completions",
-            "timeout": self.timeout,
+            "timeout": {
+                "connect": request_timeout.connect,
+                "read": request_timeout.read,
+                "write": request_timeout.write,
+                "pool": request_timeout.pool,
+            },
             "payload": payload,
         }
 
@@ -211,7 +218,7 @@ class OpenRouterGenerator:
                     f"{OPENROUTER_BASE_URL}/chat/completions",
                     json=payload,
                     headers=headers,
-                    timeout=self.timeout,
+                    timeout=request_timeout,
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -275,3 +282,10 @@ class OpenRouterGenerator:
                 )
                 raise
         raise last_exc  # type: ignore[misc]
+
+    def _build_request_timeout(self) -> httpx.Timeout:
+        connect_timeout = min(self.timeout, CONNECT_TIMEOUT_CAP)
+        return httpx.Timeout(
+            timeout=self.timeout,
+            connect=connect_timeout,
+        )

@@ -56,6 +56,31 @@ def test_openrouter_json_schema_includes_importance(tmp_path):
     assert "importance" in schema["required"]
 
 
+def test_generate_with_metadata_uses_shorter_connect_timeout(tmp_path):
+    response_json = {
+        "id": "chatcmpl-123",
+        "choices": [{"message": {"content": '{"summary":"ok","importance":0.8}'}}],
+        "usage": {"total_tokens": 42},
+    }
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(200, json=response_json, request=request)
+
+    with patch("providers.llm.openrouter_llm.httpx.post", return_value=response) as mock_post:
+        generator = OpenRouterGenerator(
+            model="google/gemma-4-31b-it",
+            api_key="secret-key",
+            timeout=300.0,
+            trace_capture={"enabled": True, "directory": str(tmp_path)},
+        )
+        generator.generate_with_metadata("hello", max_tokens=77)
+
+    timeout = mock_post.call_args.kwargs["timeout"]
+
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.connect == 10.0
+    assert timeout.read == 300.0
+
+
 def test_generate_with_metadata_preserves_timeout_exception(tmp_path):
     with patch(
         "providers.llm.openrouter_llm.httpx.post",
