@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from typing import Any, TypedDict
 
 import httpx
 
@@ -101,6 +102,15 @@ _ENRICHMENT_SCHEMA = {
 }
 
 
+class OpenRouterReplayMetadata(TypedDict):
+    """Replay payload for benchmark re-runs."""
+
+    content: str
+    request: dict[str, Any]
+    response: dict[str, Any]
+    latency_ms: float
+
+
 class OpenRouterGenerator:
     """Text generation via OpenRouter for document enrichment.
 
@@ -153,11 +163,15 @@ class OpenRouterGenerator:
         """
         return self.generate_with_metadata(user_prompt, max_tokens=max_tokens)["content"]
 
-    def generate_with_metadata(self, user_prompt: str, max_tokens: int = 512) -> dict:
+    def generate_with_metadata(
+        self, user_prompt: str, max_tokens: int = 512
+    ) -> OpenRouterReplayMetadata:
         """Generate structured JSON plus request/response metadata."""
         return self._request_with_metadata(user_prompt, max_tokens=max_tokens)
 
-    def _request_with_metadata(self, user_prompt: str, max_tokens: int = 512) -> dict:
+    def _request_with_metadata(
+        self, user_prompt: str, max_tokens: int = 512
+    ) -> OpenRouterReplayMetadata:
         """Send completion request and return content with replay metadata."""
         payload = {
             "model": self.model,

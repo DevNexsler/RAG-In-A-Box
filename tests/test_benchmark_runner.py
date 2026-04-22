@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from providers.llm.openrouter_llm import OpenRouterGenerator
 
@@ -20,8 +21,26 @@ def test_generate_with_metadata_returns_content_usage_and_latency(tmp_path):
             api_key="secret-key",
             trace_capture={"enabled": True, "directory": str(tmp_path)},
         )
+        generated = generator.generate("hello", max_tokens=77)
         result = generator.generate_with_metadata("hello", max_tokens=77)
 
+    assert isinstance(generated, str)
+    assert generated == '{"summary":"ok"}'
     assert result["content"] == '{"summary":"ok"}'
     assert result["response"]["usage"]["total_tokens"] == 42
     assert result["latency_ms"] >= 0
+
+
+def test_generate_with_metadata_preserves_timeout_exception(tmp_path):
+    with patch(
+        "providers.llm.openrouter_llm.httpx.post",
+        side_effect=httpx.TimeoutException("timed out"),
+    ), patch("providers.llm.openrouter_llm.time.sleep", return_value=None):
+        generator = OpenRouterGenerator(
+            model="openai/gpt-4.1-mini",
+            api_key="secret-key",
+            trace_capture={"enabled": True, "directory": str(tmp_path)},
+        )
+
+        with pytest.raises(httpx.TimeoutException, match="timed out"):
+            generator.generate_with_metadata("hello", max_tokens=77)
