@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.benchmarking.cases import build_labeling_status, load_case, prepare_cases, write_gold_stub
+from core.benchmarking.reporting import write_reports
 from core.benchmarking.runner import run_benchmark
 
 
@@ -34,6 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--model", required=True)
     run_cmd.add_argument("--run-id", required=True)
     run_cmd.add_argument("--max-cases", type=int)
+
+    report_cmd = subparsers.add_parser("report")
+    report_cmd.add_argument("--bench-dir", default=".evals/benchmarks")
+    report_cmd.add_argument("--run-id", required=True)
 
     return parser
 
@@ -92,6 +97,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Average Total Score: {result.summary['average_total_score']}")
         print(f"Parse Failures: {result.summary['parse_failures']}")
         print(f"Artifacts: {result.run_dir}")
+        return 0
+
+    if args.command == "report":
+        run_dir = Path(args.bench_dir) / "runs" / args.run_id
+        paths = write_reports(run_dir=run_dir)
+        print(f"Run ID: {args.run_id}")
+        print(f"Artifacts: {run_dir}")
+        print(f"JSON: {paths['json']}")
+        print(f"CSV: {paths['csv']}")
+        print(f"Markdown: {paths['markdown']}")
         return 0
 
     parser.error(f"Unsupported command: {args.command}")
