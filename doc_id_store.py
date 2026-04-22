@@ -92,8 +92,13 @@ class DocIDStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
-        self._conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False + an internal lock lets worker threads in
+        # the indexer call register/delete concurrently. All writes are still
+        # serialized under self._lock so SQLite never sees cross-thread use.
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        import threading as _threading
+        self._lock = _threading.RLock()
         self._init_schema()
 
     # Event types for the audit log
@@ -158,11 +163,12 @@ class DocIDStore:
 
     def next_id(self) -> str:
         """Atomically increment counter and return the next base-62 5-char ID."""
-        c = self._conn
-        c.execute("UPDATE counter SET value = value + 1 WHERE id = 1")
-        row = c.execute("SELECT value FROM counter WHERE id = 1").fetchone()
-        c.commit()
-        return _int_to_base62(row[0])
+        with self._lock:
+            c = self._conn
+            c.execute("UPDATE counter SET value = value + 1 WHERE id = 1")
+            row = c.execute("SELECT value FROM counter WHERE id = 1").fetchone()
+            c.commit()
+            return _int_to_base62(row[0])
 
     def register(
         self,
@@ -186,63 +192,67 @@ class DocIDStore:
                 explicit string when the caller owns the namespace for this row
                 (e.g. FilesystemSource always passes its own name).
         """
-        old_path = ""
-        if not event:
-            existing = self._conn.execute(
-                "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (doc_id,)
-            ).fetchone()
-            if existing is None:
-                event = self.REGISTERED
-            elif existing[0] != rel_path:
-                event = self.MOVED
-                old_path = existing[0]
-            # else: unchanged — no audit entry needed
+        with self._lock:
+            old_path = ""
+            if not event:
+                existing = self._conn.execute(
+                    "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (doc_id,)
+                ).fetchone()
+                if existing is None:
+                    event = self.REGISTERED
+                elif existing[0] != rel_path:
+                    event = self.MOVED
+                    old_path = existing[0]
+                # else: unchanged — no audit entry needed
 
-        c = self._conn
-        if source_name is None:
-            # Caller didn't specify — insert 'documents' for new rows,
-            # preserve existing source_name on conflict.
-            c.execute(
-                "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
-                "VALUES (?, ?, ?, 'documents') "
-                "ON CONFLICT(doc_id) DO UPDATE SET rel_path=excluded.rel_path",
-                (doc_id, rel_path, time.time()),
-            )
-        else:
-            # Caller specified — insert or overwrite source_name.
-            c.execute(
-                "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(doc_id) DO UPDATE SET "
-                "    rel_path=excluded.rel_path, "
-                "    source_name=excluded.source_name",
-                (doc_id, rel_path, time.time(), source_name),
-            )
-        if event:
-            self._log(event, doc_id, rel_path, old_path=old_path, detail=detail)
-        self._conn.commit()
+            c = self._conn
+            if source_name is None:
+                # Caller didn't specify — insert 'documents' for new rows,
+                # preserve existing source_name on conflict.
+                c.execute(
+                    "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
+                    "VALUES (?, ?, ?, 'documents') "
+                    "ON CONFLICT(doc_id) DO UPDATE SET rel_path=excluded.rel_path",
+                    (doc_id, rel_path, time.time()),
+                )
+            else:
+                # Caller specified — insert or overwrite source_name.
+                c.execute(
+                    "INSERT INTO doc_registry (doc_id, rel_path, created, source_name) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(doc_id) DO UPDATE SET "
+                    "    rel_path=excluded.rel_path, "
+                    "    source_name=excluded.source_name",
+                    (doc_id, rel_path, time.time(), source_name),
+                )
+            if event:
+                self._log(event, doc_id, rel_path, old_path=old_path, detail=detail)
+            self._conn.commit()
 
     def lookup_path(self, doc_id: str) -> str | None:
         """Return the rel_path for a doc_id, or None if not found."""
-        row = self._conn.execute(
-            "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (doc_id,)
-        ).fetchone()
-        return row[0] if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (doc_id,)
+            ).fetchone()
+            return row[0] if row else None
 
     def lookup_id(self, rel_path: str) -> str | None:
         """Return the doc_id for a rel_path, or None if not found."""
-        row = self._conn.execute(
-            "SELECT doc_id FROM doc_registry WHERE rel_path = ?", (rel_path,)
-        ).fetchone()
-        return row[0] if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT doc_id FROM doc_registry WHERE rel_path = ?", (rel_path,)
+            ).fetchone()
+            return row[0] if row else None
 
     def update_path(self, doc_id: str, new_rel_path: str) -> None:
         """Update the rel_path for an existing doc_id."""
-        self._conn.execute(
-            "UPDATE doc_registry SET rel_path = ? WHERE doc_id = ?",
-            (new_rel_path, doc_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE doc_registry SET rel_path = ? WHERE doc_id = ?",
+                (new_rel_path, doc_id),
+            )
+            self._conn.commit()
 
     def set_source_name(self, doc_id: str, source_name: str) -> None:
         """Explicitly set source_name for an already-registered doc_id.
@@ -253,12 +263,13 @@ class DocIDStore:
 
         No-op if doc_id is not present in doc_registry.
         """
-        c = self._conn
-        c.execute(
-            "UPDATE doc_registry SET source_name = ? WHERE doc_id = ?",
-            (source_name, doc_id),
-        )
-        c.commit()
+        with self._lock:
+            c = self._conn
+            c.execute(
+                "UPDATE doc_registry SET source_name = ? WHERE doc_id = ?",
+                (source_name, doc_id),
+            )
+            c.commit()
 
     def delete(self, doc_id: str) -> None:
         """Remove a doc_id entry from the registry, retire it, and log a ``deleted`` event.
@@ -282,29 +293,30 @@ class DocIDStore:
         when writing to ``retired_ids`` and the audit log, so that
         ``is_retired()`` queries remain consistent with ``all_mappings()``.
         """
-        # Step 1: exact match
-        row = self._conn.execute(
-            "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (doc_id,)
-        ).fetchone()
-        # Step 2: bare-suffix fallback for legacy bare IDs accessed via
-        #         all_mappings() keys (e.g. "documents::abc12" → "abc12")
-        stored_key = doc_id
-        if row is None and "::" in doc_id:
-            bare = doc_id.split("::", 1)[-1]
+        with self._lock:
+            # Step 1: exact match
             row = self._conn.execute(
-                "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (bare,)
+                "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (doc_id,)
             ).fetchone()
-            if row is not None:
-                stored_key = bare
-        self._conn.execute("DELETE FROM doc_registry WHERE doc_id = ?", (stored_key,))
-        if row:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO retired_ids (doc_id, retired_at, last_path) "
-                "VALUES (?, ?, ?)",
-                (stored_key, time.time(), row[0]),
-            )
-            self._log(self.DELETED, stored_key, row[0])
-        self._conn.commit()
+            # Step 2: bare-suffix fallback for legacy bare IDs accessed via
+            #         all_mappings() keys (e.g. "documents::abc12" → "abc12")
+            stored_key = doc_id
+            if row is None and "::" in doc_id:
+                bare = doc_id.split("::", 1)[-1]
+                row = self._conn.execute(
+                    "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (bare,)
+                ).fetchone()
+                if row is not None:
+                    stored_key = bare
+            self._conn.execute("DELETE FROM doc_registry WHERE doc_id = ?", (stored_key,))
+            if row:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO retired_ids (doc_id, retired_at, last_path) "
+                    "VALUES (?, ?, ?)",
+                    (stored_key, time.time(), row[0]),
+                )
+                self._log(self.DELETED, stored_key, row[0])
+            self._conn.commit()
 
     def is_retired(self, doc_id: str) -> bool:
         """Return True if this ID was previously used and then deleted.
@@ -312,19 +324,21 @@ class DocIDStore:
         Retired IDs must not be reused — a copy-pasted file carrying a
         retired @XXXXX@ suffix should get a fresh ID instead.
         """
-        row = self._conn.execute(
-            "SELECT 1 FROM retired_ids WHERE doc_id = ?", (doc_id,)
-        ).fetchone()
-        return row is not None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM retired_ids WHERE doc_id = ?", (doc_id,)
+            ).fetchone()
+            return row is not None
 
     def retired_info(self, doc_id: str) -> dict | None:
         """Return retirement details for a doc_id, or None if not retired."""
-        row = self._conn.execute(
-            "SELECT retired_at, last_path FROM retired_ids WHERE doc_id = ?", (doc_id,)
-        ).fetchone()
-        if row:
-            return {"doc_id": doc_id, "retired_at": row[0], "last_path": row[1]}
-        return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT retired_at, last_path FROM retired_ids WHERE doc_id = ?", (doc_id,)
+            ).fetchone()
+            if row:
+                return {"doc_id": doc_id, "retired_at": row[0], "last_path": row[1]}
+            return None
 
     def all_mappings(self) -> dict[str, str]:
         """Return {namespaced_doc_id: rel_path} for all registered documents.
@@ -338,9 +352,10 @@ class DocIDStore:
         Callers that need the raw 5-char ID can split on ``"::"`` and take
         the last part.
         """
-        rows = self._conn.execute(
-            "SELECT doc_id, rel_path, source_name FROM doc_registry"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT doc_id, rel_path, source_name FROM doc_registry"
+            ).fetchall()
         result: dict[str, str] = {}
         for doc_id, rel_path, source_name in rows:
             if "::" in doc_id:
@@ -358,13 +373,15 @@ class DocIDStore:
         Used by mcp_server to validate the `source_name` filter parameter
         on MCP tool calls without hardcoding the valid set.
         """
-        cur = self._conn.execute("SELECT DISTINCT source_name FROM doc_registry")
-        return {row[0] for row in cur.fetchall()}
+        with self._lock:
+            cur = self._conn.execute("SELECT DISTINCT source_name FROM doc_registry")
+            return {row[0] for row in cur.fetchall()}
 
     def count(self) -> int:
         """Return total number of registered documents."""
-        row = self._conn.execute("SELECT COUNT(*) FROM doc_registry").fetchone()
-        return row[0]
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM doc_registry").fetchone()
+            return row[0]
 
     # --- Audit log ---
 
@@ -394,8 +411,9 @@ class DocIDStore:
         detail: str = "",
     ) -> None:
         """Write an audit log entry (public API for callers outside DocIDStore)."""
-        self._log(event, doc_id, rel_path, old_path=old_path, detail=detail)
-        self._conn.commit()
+        with self._lock:
+            self._log(event, doc_id, rel_path, old_path=old_path, detail=detail)
+            self._conn.commit()
 
     def audit_log(
         self,
@@ -424,7 +442,8 @@ class DocIDStore:
         sql += " ORDER BY rowid DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
-        rows = self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
         return [
             {
                 "ts": r[0],
@@ -450,8 +469,10 @@ class DocIDStore:
             params.append(event)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        return self._conn.execute(sql, params).fetchone()[0]
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()[0]
 
     def close(self) -> None:
         """Close the SQLite connection."""
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
