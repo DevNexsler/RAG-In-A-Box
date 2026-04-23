@@ -42,6 +42,8 @@ class GoldRecord:
     case_id: str
     canonical: dict[str, Any]
     alternates: dict[str, list[str]]
+    label_source: str = "baseline_assisted"
+    summary_rubric: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

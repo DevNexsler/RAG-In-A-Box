@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from core.benchmarking.cases import load_trace_rows, prepare_cases
+from core.benchmarking.cases import load_trace_rows, prepare_audit_cases, prepare_cases
 
 
 def test_load_trace_rows_reads_saved_prompt_and_output():
@@ -57,3 +57,69 @@ def test_prepare_cases_rerun_removes_stale_case_files(tmp_path):
     assert rerun.selected_count == 1
     case_files = sorted(path.name for path in (tmp_path / "cases").glob("case_*.json"))
     assert case_files == ["case_0001.json"]
+
+
+def test_prepare_audit_cases_seeds_manual_only_gold_stubs(tmp_path):
+    source_dir = tmp_path / "benchmarks"
+    prepare_cases(trace_dir=Path("tests/fixtures/benchmarks"), out_dir=source_dir, limit=3, seed=7)
+
+    result = prepare_audit_cases(source_bench_dir=source_dir, out_dir=tmp_path / "audit", limit=2, seed=11)
+
+    assert result.selected_count == 2
+    assert (tmp_path / "audit" / "cases" / "manifest.json").is_file()
+    assert (tmp_path / "audit" / "status").is_dir()
+    assert (tmp_path / "audit" / "runs").is_dir()
+    gold_path = tmp_path / "audit" / "gold" / "case_0001.json"
+    assert gold_path.is_file()
+    gold_payload = json.loads(gold_path.read_text(encoding="utf-8"))
+    assert gold_payload["label_source"] == "manual_audit"
+    assert gold_payload["alternates"] == {"suggested_tags": [], "suggested_folder": []}
+    assert gold_payload["summary_rubric"] == {
+        "coverage": [],
+        "brevity": {"max_sentences": 0, "max_words": 0},
+        "hallucination": [],
+    }
+
+
+def test_prepare_audit_cases_does_not_copy_existing_gold_labels(tmp_path):
+    source_dir = tmp_path / "benchmarks"
+    prepare_cases(trace_dir=Path("tests/fixtures/benchmarks"), out_dir=source_dir, limit=2, seed=7)
+    source_gold_dir = source_dir / "gold"
+    source_gold_dir.mkdir(parents=True)
+    (source_gold_dir / "case_0001.json").write_text(
+        json.dumps(
+            {
+                "case_id": "case_0001",
+                "label_source": "baseline_assisted",
+                "canonical": {
+                    "summary": "preexisting",
+                    "doc_type": ["invoice"],
+                    "entities_people": [],
+                    "entities_places": [],
+                    "entities_orgs": [],
+                    "entities_dates": [],
+                    "topics": ["billing"],
+                    "keywords": ["vendor"],
+                    "key_facts": ["fact"],
+                    "suggested_tags": ["finance"],
+                    "suggested_folder": "Finance/Bills",
+                    "importance": "0.6",
+                },
+                "alternates": {"suggested_tags": ["billing"], "suggested_folder": ["Finance"]},
+                "summary_rubric": {
+                    "coverage": ["old"],
+                    "brevity": {"max_sentences": 2, "max_words": 40},
+                    "hallucination": ["none"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prepare_audit_cases(source_bench_dir=source_dir, out_dir=tmp_path / "audit", limit=1, seed=11)
+
+    audit_gold = json.loads((tmp_path / "audit" / "gold" / "case_0001.json").read_text(encoding="utf-8"))
+    assert audit_gold["canonical"]["summary"] == ""
+    assert audit_gold["canonical"]["doc_type"] == []
+    assert audit_gold["alternates"] == {"suggested_tags": [], "suggested_folder": []}
+    assert audit_gold["summary_rubric"]["coverage"] == []

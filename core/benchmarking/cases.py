@@ -56,6 +56,12 @@ _LABEL_SIGNAL_FIELDS = (
     "key_facts",
     "suggested_tags",
 )
+_AUDIT_LABEL_SOURCE = "manual_audit"
+_SUMMARY_RUBRIC_DEFAULT = {
+    "coverage": [],
+    "brevity": {"max_sentences": 0, "max_words": 0},
+    "hallucination": [],
+}
 
 
 def load_trace_rows(trace_path: str | Path) -> list[TraceRow]:
@@ -140,12 +146,79 @@ def prepare_cases(
     )
 
 
+def prepare_audit_cases(
+    *,
+    source_bench_dir: str | Path,
+    out_dir: str | Path,
+    limit: int = 30,
+    seed: int = 42,
+) -> PreparedCasesResult:
+    source_cases_dir = Path(source_bench_dir) / "cases"
+    source_cases = [
+        BenchmarkCase(**json.loads(path.read_text(encoding="utf-8")))
+        for path in sorted(source_cases_dir.glob("case_*.json"))
+    ]
+    selected_cases = _select_benchmark_cases(cases=source_cases, limit=limit, seed=seed)
+
+    out_path = Path(out_dir)
+    cases_dir = out_path / "cases"
+    cases_dir.mkdir(parents=True, exist_ok=True)
+    _remove_stale_case_files(cases_dir)
+
+    gold_dir = out_path / "gold"
+    gold_dir.mkdir(parents=True, exist_ok=True)
+    _remove_stale_gold_files(gold_dir)
+    (out_path / "status").mkdir(parents=True, exist_ok=True)
+    (out_path / "runs").mkdir(parents=True, exist_ok=True)
+
+    cases: list[BenchmarkCase] = []
+    for index, source_case in enumerate(selected_cases, start=1):
+        case = BenchmarkCase(
+            case_id=f"case_{index:04d}",
+            prompt=source_case.prompt,
+            baseline_response=source_case.baseline_response,
+            title=source_case.title,
+            source_type=source_case.source_type,
+            category=source_case.category,
+            difficulty=source_case.difficulty,
+            trace_file=source_case.trace_file,
+            trace_line=source_case.trace_line,
+        )
+        cases.append(case)
+        (cases_dir / f"{case.case_id}.json").write_text(
+            json.dumps(asdict(case), indent=2),
+            encoding="utf-8",
+        )
+        write_gold_stub(case, bench_dir=out_path, label_source=_AUDIT_LABEL_SOURCE)
+
+    manifest = {
+        "selected_count": len(cases),
+        "limit": limit,
+        "seed": seed,
+        "source_bench_dir": str(source_bench_dir),
+        "label_source": _AUDIT_LABEL_SOURCE,
+        "cases": [asdict(case) for case in cases],
+    }
+    manifest_path = cases_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return PreparedCasesResult(
+        selected_count=len(cases),
+        cases=cases,
+        manifest_path=manifest_path,
+    )
+
+
 def load_case(*, bench_dir: str | Path, case_id: str) -> BenchmarkCase:
     payload = json.loads(_case_path(bench_dir=bench_dir, case_id=case_id).read_text(encoding="utf-8"))
     return BenchmarkCase(**payload)
 
 
-def write_gold_stub(case: BenchmarkCase, *, bench_dir: str | Path) -> Path:
+def write_gold_stub(
+    case: BenchmarkCase,
+    *,
+    bench_dir: str | Path,
+    label_source: str = "baseline_assisted",
+) -> Path:
     path = _gold_path(bench_dir=bench_dir, case_id=case.case_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -156,7 +229,15 @@ def write_gold_stub(case: BenchmarkCase, *, bench_dir: str | Path) -> Path:
     gold_record = GoldRecord(
         case_id=case.case_id,
         canonical=_build_canonical_stub(),
-        alternates=_build_alternates_from_baseline(case.baseline_response),
+        alternates=(
+            _build_empty_alternates()
+            if label_source == _AUDIT_LABEL_SOURCE
+            else _build_alternates_from_baseline(case.baseline_response)
+        ),
+        label_source=label_source,
+        summary_rubric=(
+            _build_summary_rubric_stub() if label_source == _AUDIT_LABEL_SOURCE else None
+        ),
     )
     path.write_text(json.dumps(asdict(gold_record), indent=2), encoding="utf-8")
     return path
@@ -189,6 +270,11 @@ def _iter_trace_paths(path: Path) -> Iterable[Path]:
 
 def _remove_stale_case_files(cases_dir: Path) -> None:
     for path in cases_dir.glob("case_*.json"):
+        path.unlink()
+
+
+def _remove_stale_gold_files(gold_dir: Path) -> None:
+    for path in gold_dir.glob("case_*.json"):
         path.unlink()
 
 
@@ -267,6 +353,36 @@ def _select_rows(*, trace_rows: list[TraceRow], limit: int, seed: int) -> list[T
     return selected
 
 
+def _select_benchmark_cases(*, cases: list[BenchmarkCase], limit: int, seed: int) -> list[BenchmarkCase]:
+    eligible_cases = [case for case in cases if case.difficulty != "smoke"]
+    if limit <= 0 or not eligible_cases:
+        return []
+
+    rng = random.Random(seed)
+    grouped: dict[tuple[str, str], list[BenchmarkCase]] = defaultdict(list)
+    for case in eligible_cases:
+        grouped[(case.category, case.difficulty)].append(case)
+
+    for bucket in grouped.values():
+        rng.shuffle(bucket)
+
+    selected: list[BenchmarkCase] = []
+    groups = sorted(grouped)
+    while len(selected) < limit:
+        progressed = False
+        for group in groups:
+            bucket = grouped[group]
+            if not bucket:
+                continue
+            selected.append(bucket.pop(0))
+            progressed = True
+            if len(selected) == limit:
+                break
+        if not progressed:
+            break
+    return selected
+
+
 def _case_path(*, bench_dir: str | Path, case_id: str) -> Path:
     return Path(bench_dir) / "cases" / f"{case_id}.json"
 
@@ -280,6 +396,14 @@ def _build_canonical_stub() -> dict[str, Any]:
     for field, default in _CANONICAL_FIELD_DEFAULTS.items():
         stub[field] = list(default) if isinstance(default, list) else default
     return stub
+
+
+def _build_empty_alternates() -> dict[str, list[str]]:
+    return {field: [] for field in _ALTERNATE_FIELDS}
+
+
+def _build_summary_rubric_stub() -> dict[str, Any]:
+    return json.loads(json.dumps(_SUMMARY_RUBRIC_DEFAULT))
 
 
 def _build_alternates_from_baseline(baseline_response: str) -> dict[str, list[str]]:
@@ -345,8 +469,31 @@ def _validate_gold_record(payload: Any, *, expected_case_id: str) -> None:
     case_id = payload.get("case_id")
     if case_id != expected_case_id:
         raise ValueError(f"gold record case_id mismatch: expected {expected_case_id}, got {case_id}")
+    label_source = payload.get("label_source", "baseline_assisted")
+    if not isinstance(label_source, str):
+        raise ValueError("gold record label_source must be a string")
     _validate_canonical_fields(payload.get("canonical"))
     _validate_alternates_fields(payload.get("alternates"))
+    if label_source == _AUDIT_LABEL_SOURCE:
+        _validate_summary_rubric(payload.get("summary_rubric"))
+
+
+def _validate_summary_rubric(summary_rubric: Any) -> None:
+    if not isinstance(summary_rubric, dict):
+        raise ValueError("gold record summary_rubric payload must be an object")
+    coverage = summary_rubric.get("coverage")
+    hallucination = summary_rubric.get("hallucination")
+    brevity = summary_rubric.get("brevity")
+    if not isinstance(coverage, list) or any(not isinstance(item, str) for item in coverage):
+        raise ValueError("gold record summary_rubric.coverage must be a list of strings")
+    if not isinstance(hallucination, list) or any(not isinstance(item, str) for item in hallucination):
+        raise ValueError("gold record summary_rubric.hallucination must be a list of strings")
+    if not isinstance(brevity, dict):
+        raise ValueError("gold record summary_rubric.brevity must be an object")
+    for field in ("max_sentences", "max_words"):
+        value = brevity.get(field)
+        if not isinstance(value, int):
+            raise ValueError(f"gold record summary_rubric.brevity.{field} must be an integer")
 
 
 def _is_labeled_gold(*, bench_dir: str | Path, case_id: str) -> bool:
@@ -359,6 +506,22 @@ def _is_labeled_gold(*, bench_dir: str | Path, case_id: str) -> bool:
         return False
 
     canonical = payload["canonical"]
+    if payload.get("label_source") == _AUDIT_LABEL_SOURCE:
+        return _is_labeled_audit_gold(payload)
     if str(canonical.get("summary", "")).strip():
         return True
     return any(bool(canonical.get(field)) for field in _LABEL_SIGNAL_FIELDS)
+
+
+def _is_labeled_audit_gold(payload: dict[str, Any]) -> bool:
+    canonical = payload["canonical"]
+    if str(canonical.get("summary", "")).strip():
+        return True
+    if any(bool(canonical.get(field)) for field in _LABEL_SIGNAL_FIELDS):
+        return True
+
+    summary_rubric = payload.get("summary_rubric", {})
+    coverage = summary_rubric.get("coverage", [])
+    hallucination = summary_rubric.get("hallucination", [])
+    brevity = summary_rubric.get("brevity", {})
+    return bool(coverage or hallucination or brevity.get("max_sentences") or brevity.get("max_words"))

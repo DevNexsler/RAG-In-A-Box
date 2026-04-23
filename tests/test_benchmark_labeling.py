@@ -227,3 +227,93 @@ def test_labeling_status_does_not_count_low_signal_fields_only(tmp_path):
     assert status["labeled"] == 0
     assert status["remaining"] == 1
     assert status["next_case_id"] == "case_0001"
+
+
+def test_audit_labeling_status_requires_manual_signal_fields(tmp_path):
+    audit_cases = tmp_path / "audit" / "cases"
+    audit_gold = tmp_path / "audit" / "gold"
+    audit_cases.mkdir(parents=True)
+    audit_gold.mkdir(parents=True)
+    (audit_cases / "case_0001.json").write_text(
+        json.dumps(
+            {
+                "case_id": "case_0001",
+                "prompt": "Prompt one",
+                "baseline_response": "{}",
+                "title": "Case one",
+                "source_type": "pdf",
+                "category": "housing",
+                "difficulty": "easy",
+                "trace_file": "trace.jsonl",
+                "trace_line": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (audit_gold / "case_0001.json").write_text(
+        json.dumps(
+            {
+                "case_id": "case_0001",
+                "label_source": "manual_audit",
+                "canonical": {
+                    "summary": "",
+                    "doc_type": [],
+                    "entities_people": [],
+                    "entities_places": [],
+                    "entities_orgs": [],
+                    "entities_dates": [],
+                    "topics": [],
+                    "keywords": [],
+                    "key_facts": [],
+                    "suggested_tags": [],
+                    "suggested_folder": "",
+                    "importance": "",
+                },
+                "alternates": {"suggested_tags": [], "suggested_folder": []},
+                "summary_rubric": {
+                    "coverage": [],
+                    "brevity": {"max_sentences": 0, "max_words": 0},
+                    "hallucination": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    unlabeled = build_labeling_status(bench_dir=tmp_path / "audit")
+    assert unlabeled["labeled"] == 0
+    assert unlabeled["remaining"] == 1
+
+    (audit_gold / "case_0001.json").write_text(
+        json.dumps(
+            {
+                "case_id": "case_0001",
+                "label_source": "manual_audit",
+                "canonical": {
+                    "summary": "",
+                    "doc_type": ["message"],
+                    "entities_people": [],
+                    "entities_places": [],
+                    "entities_orgs": [],
+                    "entities_dates": [],
+                    "topics": ["follow-up"],
+                    "keywords": [],
+                    "key_facts": [],
+                    "suggested_tags": [],
+                    "suggested_folder": "",
+                    "importance": "",
+                },
+                "alternates": {"suggested_tags": [], "suggested_folder": []},
+                "summary_rubric": {
+                    "coverage": ["sender checks status"],
+                    "brevity": {"max_sentences": 2, "max_words": 40},
+                    "hallucination": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    labeled = build_labeling_status(bench_dir=tmp_path / "audit")
+    assert labeled["labeled"] == 1
+    assert labeled["remaining"] == 0
