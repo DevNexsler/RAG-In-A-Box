@@ -386,7 +386,7 @@ def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
                             with patch("sources.build_source", return_value=_FakeSource()):
                                 with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
                                     with patch("flow_index_vault.diff_index_task", return_value=([], [])):
-                                        with patch("flow_index_vault._process_docs", return_value=[]):
+                                        with patch("flow_index_vault.process_doc_task"):
                                             with patch("flow_index_vault.delete_docs_task"):
                                                 with patch("flow_index_vault.index_stats_task"):
                                                     with patch("flow_index_vault.write_index_metadata_task"):
