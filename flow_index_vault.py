@@ -949,8 +949,14 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
             except Exception:
                 pass
 
-    # Rebuild FTS index for keyword search (BM25/tantivy)
-    if to_add_or_update or to_delete:
+    # Rebuild FTS index for keyword search (BM25/tantivy) after data changes.
+    # Also self-heal no-op runs when the FTS index is missing or unusable.
+    should_rebuild_fts = bool(to_add_or_update or to_delete)
+    if not should_rebuild_fts and not store.fts_available():
+        logger.info("FTS index unavailable after no-op diff — rebuilding FTS index")
+        should_rebuild_fts = True
+
+    if should_rebuild_fts:
         logger.info("Rebuilding FTS index...")
         try:
             store.create_fts_index()
