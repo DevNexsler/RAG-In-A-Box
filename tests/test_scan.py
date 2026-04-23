@@ -104,6 +104,19 @@ def test_scan_record_fields():
         assert Path(r["abs_path"]).exists()
 
 
+def test_scan_skips_zero_byte_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "empty.pdf").write_bytes(b"")
+        (root / "note.md").write_text("content")
+
+        records = scan_vault_task.fn(root, ["**/*.pdf", "**/*.md"], [])
+
+        doc_ids = {r["doc_id"] for r in records}
+        assert doc_ids == {"note.md"}
+        assert (root / "empty.pdf").exists()
+
+
 # --- _split_markdown_by_headings ---
 
 def test_heading_split_no_headings():
