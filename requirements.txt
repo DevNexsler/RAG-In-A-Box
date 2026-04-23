@@ -4,6 +4,7 @@
 # Config
 PyYAML>=6.0
 python-dotenv>=1.0.0
+blake3>=1.0.0
 
 # Orchestration
 prefect>=3.0

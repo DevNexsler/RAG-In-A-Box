@@ -192,4 +192,43 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
             if not isinstance(val, int) or val <= 0:
                 raise ValueError(f"search.{key} must be a positive integer, got {val!r}")
 
+    dedupe_cfg = raw.get("dedupe")
+    if dedupe_cfg is None:
+        dedupe_cfg = {}
+    elif not isinstance(dedupe_cfg, dict):
+        raise ValueError("dedupe must be a mapping")
+
+    dedupe_defaults = {
+        "enabled": False,
+        "mode": "exact",
+        "hash_algo": "blake3",
+        "archive_root": str(Path(raw["index_root"]) / "duplicates"),
+        "archive_duplicates": True,
+        "update_canonical_metadata": True,
+        "skip_duplicate_indexing": True,
+    }
+    dedupe = {**dedupe_defaults, **dedupe_cfg}
+    try:
+        dedupe["archive_root"] = os.fspath(dedupe["archive_root"])
+    except TypeError as exc:
+        raise ValueError("dedupe.archive_root must be a string or path-like value") from exc
+    dedupe["archive_root"] = str(dedupe["archive_root"])
+    if not dedupe["archive_root"].strip():
+        raise ValueError("dedupe.archive_root must not be blank")
+
+    if not isinstance(dedupe["enabled"], bool):
+        raise ValueError("dedupe.enabled must be a boolean")
+    if not isinstance(dedupe["archive_duplicates"], bool):
+        raise ValueError("dedupe.archive_duplicates must be a boolean")
+    if dedupe["mode"] != "exact":
+        raise ValueError("dedupe.mode must be 'exact'")
+    if dedupe["hash_algo"] != "blake3":
+        raise ValueError("dedupe.hash_algo must be 'blake3'")
+    if dedupe["update_canonical_metadata"] is not True:
+        raise ValueError("dedupe.update_canonical_metadata must be true")
+    if dedupe["skip_duplicate_indexing"] is not True:
+        raise ValueError("dedupe.skip_duplicate_indexing must be true")
+
+    raw["dedupe"] = dedupe
+
     return raw

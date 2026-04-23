@@ -1,5 +1,6 @@
 """LanceDB storage via LlamaIndex's LanceDBVectorStore. Implements our StorageInterface."""
 
+import json
 import logging
 import re
 import shutil
@@ -21,6 +22,13 @@ _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
 _ENRICHMENT_AUX_FIELDS = ("enr_importance_source",)
+_DUPLICATE_META_FIELDS = (
+    "dup_count",
+    "dup_sources",
+    "dup_locations",
+    "dup_archive_paths",
+    "dup_natural_keys",
+)
 
 # All metadata keys that map to explicit SearchHit attributes.
 # Anything NOT in this set goes into SearchHit.extra_metadata.
@@ -46,6 +54,48 @@ def _extract_enrichment(meta: dict) -> dict[str, str]:
 def _extract_extra_metadata(meta: dict) -> dict[str, str]:
     """Collect metadata fields not in the hardcoded core set (e.g. section, sentiment)."""
     return {k: str(v) for k, v in meta.items() if k not in _CORE_META_KEYS and v}
+
+
+def _json_string_list(value: Any) -> list[str]:
+    """Decode a JSON list string, preserving plain strings as single-item lists."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return [stripped]
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed if str(item).strip()]
+        return [str(parsed)] if str(parsed).strip() else []
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _append_unique(items: list[str], value: Any) -> None:
+    """Append a non-empty string if it is not already present."""
+    text = str(value).strip()
+    if text and text not in items:
+        items.append(text)
+
+
+def _duplicate_natural_key(duplicate_ref: dict[str, Any]) -> str:
+    """Resolve a natural key from explicit metadata or a source-qualified doc_id."""
+    natural_key = str(duplicate_ref.get("natural_key") or "").strip()
+    if natural_key:
+        return natural_key
+    source_name = str(duplicate_ref.get("source_name") or "").strip().lower()
+    if source_name in {"documents", "filesystem"}:
+        return ""
+    doc_id = str(duplicate_ref.get("doc_id") or "").strip()
+    if "::" not in doc_id:
+        return ""
+    return doc_id.split("::", 1)[1].strip()
 
 
 class LanceDBStore:
@@ -329,6 +379,96 @@ class LanceDBStore:
             )
             raise
 
+    def update_canonical_duplicate_metadata(
+        self,
+        canonical_doc_id: str,
+        duplicate_refs: list[dict[str, Any]],
+    ) -> None:
+        """Merge duplicate provenance into canonical chunk metadata and re-upsert it."""
+        try:
+            table = self._vs.table
+        except TableNotFoundError as exc:
+            raise LookupError(
+                f"Canonical doc {canonical_doc_id} missing in LanceDB; refusing duplicate metadata update"
+            ) from exc
+
+        rows = (
+            table.search(None)
+            .where(f"doc_id = '{self._sql_escape(canonical_doc_id)}'", prefilter=True)
+            .select(["id", "doc_id", "text", "vector", "metadata"])
+            .to_list()
+        )
+        if not rows:
+            raise LookupError(
+                f"Canonical doc {canonical_doc_id} missing in LanceDB; refusing duplicate metadata update"
+            )
+
+        first_meta = rows[0].get("metadata") if isinstance(rows[0].get("metadata"), dict) else {}
+        dup_sources = _json_string_list(first_meta.get("dup_sources"))
+        dup_locations = _json_string_list(first_meta.get("dup_locations"))
+        dup_archive_paths = _json_string_list(first_meta.get("dup_archive_paths"))
+        dup_natural_keys = _json_string_list(first_meta.get("dup_natural_keys"))
+
+        seen_duplicates: set[tuple[str, str, str, str, str]] = set()
+        for duplicate_ref in duplicate_refs:
+            natural_key = _duplicate_natural_key(duplicate_ref)
+            duplicate_key = (
+                str(duplicate_ref.get("doc_id") or "").strip(),
+                str(duplicate_ref.get("source_name") or "").strip(),
+                str(duplicate_ref.get("rel_path") or "").strip(),
+                str(duplicate_ref.get("archive_path") or "").strip(),
+                natural_key,
+            )
+            if duplicate_key in seen_duplicates:
+                continue
+            seen_duplicates.add(duplicate_key)
+            _append_unique(dup_sources, duplicate_ref.get("source_name"))
+            _append_unique(dup_locations, duplicate_ref.get("rel_path"))
+            _append_unique(dup_archive_paths, duplicate_ref.get("archive_path"))
+            _append_unique(dup_natural_keys, natural_key)
+
+        existing_dup_count = str(first_meta.get("dup_count") or "").strip()
+        try:
+            prior_dup_count = int(existing_dup_count)
+        except ValueError:
+            prior_dup_count = 0
+        merged_dup_count = max(
+            prior_dup_count,
+            len(seen_duplicates),
+            len(dup_locations),
+            len(dup_archive_paths),
+            len(dup_natural_keys),
+        )
+        duplicate_metadata = {
+            "dup_count": str(merged_dup_count),
+            "dup_sources": json.dumps(dup_sources),
+            "dup_locations": json.dumps(dup_locations),
+            "dup_archive_paths": json.dumps(dup_archive_paths),
+            "dup_natural_keys": json.dumps(dup_natural_keys),
+        }
+
+        canonical_nodes: list[TextNode] = []
+        for row in rows:
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            vector = row.get("vector")
+            if hasattr(vector, "tolist"):
+                vector = vector.tolist()
+            elif vector is None:
+                vector = []
+            else:
+                vector = list(vector)
+            loc = metadata.get("loc") or ""
+            node = TextNode(
+                text=row.get("text", "") or "",
+                id_=row.get("id") or f"{canonical_doc_id}::{loc}",
+                embedding=vector,
+                metadata={**metadata, **duplicate_metadata},
+            )
+            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=canonical_doc_id)
+            canonical_nodes.append(node)
+
+        self.upsert_nodes(canonical_nodes)
+
     def delete_by_doc_ids(self, doc_ids: list[str]) -> None:
         """Remove all nodes for the given doc_ids."""
         for doc_id in doc_ids:
@@ -444,7 +584,16 @@ class LanceDBStore:
         rows = q.limit(top_k).to_list()
         return [self._row_to_hit(row) for row in rows]
 
-    _RECENT_DOC_FIELDS = ("title", "source_type", "folder", "tags", "status", "created", "keywords")
+    _RECENT_DOC_FIELDS = (
+        "title",
+        "source_type",
+        "folder",
+        "tags",
+        "status",
+        "created",
+        "keywords",
+        *_DUPLICATE_META_FIELDS,
+    )
 
     def list_recent_docs(
         self,
