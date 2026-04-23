@@ -30,6 +30,12 @@ def write_reports(*, run_dir: str | Path) -> dict[str, Path]:
     csv_path = run_path / "field_scores.csv"
     _write_field_scores_csv(path=csv_path, field_scores=report["field_scores"])
 
+    extra_paths: dict[str, Path] = {}
+    if report.get("subscore_averages"):
+        subscores_csv_path = run_path / "subscores.csv"
+        _write_subscores_csv(path=subscores_csv_path, subscores=report["subscore_averages"])
+        extra_paths["subscores_csv"] = subscores_csv_path
+
     markdown_path = run_path / "leaderboard.md"
     markdown_path.write_text(_build_markdown(report=report), encoding="utf-8")
 
@@ -37,11 +43,13 @@ def write_reports(*, run_dir: str | Path) -> dict[str, Path]:
         "json": json_path,
         "csv": csv_path,
         "markdown": markdown_path,
+        **extra_paths,
     }
 
 
 def _build_report(*, summary: dict[str, Any], per_case: list[dict[str, Any]]) -> dict[str, Any]:
     _validate_summary(summary)
+    score_mode = str(summary.get("score_mode", "standard"))
     leaderboard_row = {
         "model": summary["model"],
         "run_id": summary["run_id"],
@@ -57,6 +65,10 @@ def _build_report(*, summary: dict[str, Any], per_case: list[dict[str, Any]]) ->
         leaderboard_row["token_total"] = token_total
     if token_average is not None:
         leaderboard_row["token_average"] = token_average
+    subscore_averages = summary.get("subscore_averages")
+    if isinstance(subscore_averages, dict):
+        for key, value in subscore_averages.items():
+            leaderboard_row[key] = value
 
     costs = _extract_costs(per_case)
     if costs["cost_total"] is not None:
@@ -67,10 +79,12 @@ def _build_report(*, summary: dict[str, Any], per_case: list[dict[str, Any]]) ->
     return {
         "run_id": summary["run_id"],
         "model": summary["model"],
+        "score_mode": score_mode,
         "overall_score": leaderboard_row["overall_score"],
         "summary": summary,
         "leaderboard": [leaderboard_row],
         "field_scores": summary["field_scores"],
+        "subscore_averages": subscore_averages,
         "worst_cases": _worst_cases(per_case),
     }
 
@@ -83,16 +97,32 @@ def _write_field_scores_csv(*, path: Path, field_scores: dict[str, Any]) -> None
             writer.writerow([field, score])
 
 
+def _write_subscores_csv(*, path: Path, subscores: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["subscore", "score"])
+        for field, score in sorted(subscores.items()):
+            writer.writerow([field, score])
+
+
 def _build_markdown(*, report: dict[str, Any]) -> str:
     leaderboard = report["leaderboard"]
     headers = [
         "model",
         "overall_score",
-        "success_rate",
-        "parse_failure_rate",
-        "latency_p50",
-        "latency_p95",
     ]
+    audit_headers = ["extraction_core", "filing_taxonomy", "summary_quality"]
+    for header in audit_headers:
+        if any(header in row for row in leaderboard):
+            headers.append(header)
+    headers.extend(
+        [
+            "success_rate",
+            "parse_failure_rate",
+            "latency_p50",
+            "latency_p95",
+        ]
+    )
     optional_headers = ["token_total", "token_average", "cost_total", "cost_average"]
     for header in optional_headers:
         if any(header in row for row in leaderboard):
@@ -112,6 +142,19 @@ def _build_markdown(*, report: dict[str, Any]) -> str:
     ]
     for field, score in sorted(report["field_scores"].items()):
         lines.append(f"| {field} | {score} |")
+
+    if report.get("subscore_averages"):
+        lines.extend(
+            [
+                "",
+                "## Audit Subscores",
+                "",
+                "| subscore | score |",
+                "| --- | --- |",
+            ]
+        )
+        for field, score in sorted(report["subscore_averages"].items()):
+            lines.append(f"| {field} | {score} |")
 
     lines.extend(
         [
@@ -219,3 +262,5 @@ def _validate_summary(summary: dict[str, Any]) -> None:
             raise ValueError(f"summary.json missing required field: {field}")
         if summary[field] is None and field not in _NULLABLE_SUMMARY_FIELDS:
             raise ValueError(f"summary.json missing required field: {field}")
+    if summary.get("score_mode") == "audit" and not isinstance(summary.get("subscore_averages"), dict):
+        raise ValueError("summary.json missing required field: subscore_averages")

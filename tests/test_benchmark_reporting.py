@@ -14,6 +14,7 @@ def _write_run_artifacts(
     run_id: str = "baseline",
     *,
     include_costs: bool = False,
+    score_mode: str = "standard",
     summary_overrides: dict[str, object] | None = None,
     remove_summary_fields: set[str] | None = None,
 ) -> Path:
@@ -41,6 +42,15 @@ def _write_run_artifacts(
                     "transport_failed": False,
                     "internal_failed": False,
                 },
+                "subscores": (
+                    {
+                        "extraction_core": 0.9,
+                        "filing_taxonomy": 0.7,
+                        "summary_quality": 0.8,
+                    }
+                    if score_mode == "audit"
+                    else None
+                ),
             },
             "raw_output": '{"summary":"Lease renewal request."}',
         },
@@ -60,6 +70,15 @@ def _write_run_artifacts(
                     "transport_failed": False,
                     "internal_failed": False,
                 },
+                "subscores": (
+                    {
+                        "extraction_core": 0.0,
+                        "filing_taxonomy": 0.0,
+                        "summary_quality": 0.0,
+                    }
+                    if score_mode == "audit"
+                    else None
+                ),
             },
             "raw_output": "not json",
         },
@@ -67,6 +86,7 @@ def _write_run_artifacts(
     summary = {
         "run_id": run_id,
         "model": "openai/gpt-4.1-mini",
+        "score_mode": score_mode,
         "case_count": 2,
         "average_total_score": 0.425,
         "parse_failures": 1,
@@ -80,6 +100,12 @@ def _write_run_artifacts(
         "token_average": 70.0,
         "field_scores": {"summary": 0.5, "doc_type": 0.25},
     }
+    if score_mode == "audit":
+        summary["subscore_averages"] = {
+            "extraction_core": 0.45,
+            "filing_taxonomy": 0.35,
+            "summary_quality": 0.4,
+        }
     if summary_overrides:
         for key, value in summary_overrides.items():
             summary[key] = value
@@ -165,3 +191,52 @@ def test_build_parser_registers_report_command():
     assert args.command == "report"
     assert args.bench_dir == ".evals/benchmarks"
     assert args.run_id == "baseline"
+
+
+def test_build_report_includes_audit_subscores_in_json_csv_and_markdown(tmp_path):
+    fixture_run_dir = _write_run_artifacts(tmp_path, run_id="audit-baseline", score_mode="audit")
+
+    paths = write_reports(run_dir=fixture_run_dir)
+    report = json.loads(paths["json"].read_text(encoding="utf-8"))
+    markdown = paths["markdown"].read_text(encoding="utf-8")
+
+    assert report["summary"]["score_mode"] == "audit"
+    assert report["subscore_averages"] == {
+        "extraction_core": 0.45,
+        "filing_taxonomy": 0.35,
+        "summary_quality": 0.4,
+    }
+    assert report["leaderboard"][0]["extraction_core"] == 0.45
+    assert "| model | overall_score | extraction_core | filing_taxonomy | summary_quality | success_rate | parse_failure_rate | latency_p50 | latency_p95 | token_total | token_average |" in markdown
+    assert paths["subscores_csv"].exists()
+
+    with paths["subscores_csv"].open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert rows == [
+        {"subscore": "extraction_core", "score": "0.45"},
+        {"subscore": "filing_taxonomy", "score": "0.35"},
+        {"subscore": "summary_quality", "score": "0.4"},
+    ]
+
+
+def test_build_parser_registers_audit_commands():
+    parser = build_parser()
+
+    prepare_args = parser.parse_args(["prepare-audit"])
+    show_args = parser.parse_args(["show-audit-case", "--case-id", "case_0001"])
+    status_args = parser.parse_args(["audit-status"])
+    run_args = parser.parse_args(["audit-run", "--model", "openai/gpt-4.1-mini", "--run-id", "audit"])
+    report_args = parser.parse_args(["audit-report", "--run-id", "audit"])
+
+    assert prepare_args.command == "prepare-audit"
+    assert prepare_args.source_bench_dir == ".evals/benchmarks"
+    assert prepare_args.bench_dir == ".evals/benchmarks/audit"
+    assert show_args.command == "show-audit-case"
+    assert show_args.bench_dir == ".evals/benchmarks/audit"
+    assert status_args.command == "audit-status"
+    assert status_args.bench_dir == ".evals/benchmarks/audit"
+    assert run_args.command == "audit-run"
+    assert run_args.bench_dir == ".evals/benchmarks/audit"
+    assert report_args.command == "audit-report"
+    assert report_args.bench_dir == ".evals/benchmarks/audit"

@@ -165,7 +165,7 @@ class SequencedReplayClient:
         return response
 
 
-def _write_case_and_gold(bench_dir, *, case_id: str) -> None:
+def _write_case_and_gold(bench_dir, *, case_id: str, audit: bool = False) -> None:
     case_dir = bench_dir / "cases"
     gold_dir = bench_dir / "gold"
     case_dir.mkdir(exist_ok=True)
@@ -184,8 +184,7 @@ def _write_case_and_gold(bench_dir, *, case_id: str) -> None:
 }}""",
         encoding="utf-8",
     )
-    (gold_dir / f"{case_id}.json").write_text(
-        f"""{{
+    gold_payload = f"""{{
   "case_id": "{case_id}",
   "canonical": {{
     "summary": "Lease renewal request.",
@@ -204,10 +203,9 @@ def _write_case_and_gold(bench_dir, *, case_id: str) -> None:
   "alternates": {{
     "suggested_tags": [],
     "suggested_folder": []
-  }}
-}}""",
-        encoding="utf-8",
-    )
+  }}{',\n  "label_source": "manual_audit",\n  "summary_rubric": {\n    "coverage": ["lease renewal request"],\n    "brevity": {"max_sentences": 2, "max_words": 20},\n    "hallucination": ["late fee dispute"]\n  }' if audit else ''}
+}}"""
+    (gold_dir / f"{case_id}.json").write_text(gold_payload, encoding="utf-8")
 
 
 def test_run_benchmark_persists_per_case_results_and_summary(tmp_path):
@@ -233,6 +231,8 @@ def test_run_benchmark_persists_per_case_results_and_summary(tmp_path):
     assert run.summary["success_rate"] == 1.0
     assert run.summary["parse_failure_rate"] == 0.0
     assert run.summary["transport_failure_rate"] == 0.0
+    assert run.summary["score_mode"] == "standard"
+    assert "subscore_averages" not in run.summary
     assert run.summary["latency_p50"] == 12.5
     assert run.summary["latency_p95"] == 12.5
     assert run.summary["token_total"] == 42
@@ -329,3 +329,33 @@ def test_run_benchmark_summary_includes_transport_latency_and_token_aggregates(t
     assert run.summary["latency_p95"] == 97.5
     assert run.summary["token_total"] == 30
     assert run.summary["token_average"] == 10.0
+
+
+def test_run_benchmark_audit_summary_includes_subscores_and_score_mode(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks" / "audit"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001", audit=True)
+
+    fake_client = FakeReplayClient(
+        content='{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
+    )
+
+    run = run_benchmark(
+        bench_dir=fixture_bench_dir,
+        model="openai/gpt-4.1-mini",
+        run_id="audit-baseline",
+        replay_client=fake_client,
+        score_mode="audit",
+    )
+
+    assert run.summary["score_mode"] == "audit"
+    assert run.summary["subscore_averages"] == {
+        "extraction_core": 1.0,
+        "filing_taxonomy": 1.0,
+        "summary_quality": 1.0,
+    }
+    assert run.per_case[0]["score"]["subscores"] == {
+        "extraction_core": 1.0,
+        "filing_taxonomy": 1.0,
+        "summary_quality": 1.0,
+    }

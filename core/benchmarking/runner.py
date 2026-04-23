@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from core.benchmarking.cases import load_case
-from core.benchmarking.scoring import score_failed_case, score_raw_case
+from core.benchmarking.scoring import score_audit_raw_case, score_failed_case, score_raw_case
 from providers.llm.openrouter_llm import OpenRouterGenerator
 
 
@@ -31,11 +31,13 @@ def run_benchmark(
     run_id: str,
     max_cases: int | None = None,
     replay_client: Any | None = None,
+    score_mode: str = "standard",
 ) -> BenchmarkRunResult:
     bench_path = Path(bench_dir)
     run_dir = bench_path / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    _validate_score_mode(score_mode)
     client = replay_client or OpenRouterGenerator(model=model)
     case_ids = sorted(path.stem for path in (bench_path / "cases").glob("case_*.json"))
     if max_cases is not None:
@@ -45,7 +47,7 @@ def run_benchmark(
     for case_id in case_ids:
         case = load_case(bench_dir=bench_path, case_id=case_id)
         gold = _load_gold_record(bench_path=bench_path, case_id=case_id)
-        result = _run_case(case=case, gold=gold, client=client, model=model)
+        result = _run_case(case=case, gold=gold, client=client, model=model, score_mode=score_mode)
         results.append(result)
 
     per_case_path = run_dir / "per_case.jsonl"
@@ -54,18 +56,28 @@ def run_benchmark(
         encoding="utf-8",
     )
 
-    summary = _build_summary(results=results, model=model, run_id=run_id)
+    summary = _build_summary(results=results, model=model, run_id=run_id, score_mode=score_mode)
     summary_path = run_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     return BenchmarkRunResult(run_dir=run_dir, per_case=results, summary=summary)
 
 
-def _run_case(*, case: Any, gold: dict[str, Any], client: Any, model: str) -> dict[str, Any]:
+def _run_case(
+    *,
+    case: Any,
+    gold: dict[str, Any],
+    client: Any,
+    model: str,
+    score_mode: str,
+) -> dict[str, Any]:
     replay: dict[str, Any] | None = None
     try:
         replay = client.generate_with_metadata(case.prompt, max_tokens=512)
-        normalized_output, score = score_raw_case(replay["content"], gold)
+        if score_mode == "audit":
+            normalized_output, score = score_audit_raw_case(replay["content"], gold)
+        else:
+            normalized_output, score = score_raw_case(replay["content"], gold)
         return {
             "case_id": case.case_id,
             "model": model,
@@ -140,7 +152,13 @@ def _load_gold_record(*, bench_path: Path, case_id: str) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _build_summary(*, results: list[dict[str, Any]], model: str, run_id: str) -> dict[str, Any]:
+def _build_summary(
+    *,
+    results: list[dict[str, Any]],
+    model: str,
+    run_id: str,
+    score_mode: str,
+) -> dict[str, Any]:
     case_count = len(results)
     parse_failures = sum(1 for item in results if item["score"]["reliability"].get("parse_failed"))
     request_failures = sum(1 for item in results if item.get("status") == "transport_failed")
@@ -162,9 +180,10 @@ def _build_summary(*, results: list[dict[str, Any]], model: str, run_id: str) ->
                 6,
             )
 
-    return {
+    summary = {
         "run_id": run_id,
         "model": model,
+        "score_mode": score_mode,
         "case_count": case_count,
         "average_total_score": mean_total,
         "parse_failures": parse_failures,
@@ -178,6 +197,34 @@ def _build_summary(*, results: list[dict[str, Any]], model: str, run_id: str) ->
         "token_average": round(token_total / case_count, 6) if case_count else 0.0,
         "field_scores": field_scores,
     }
+    if score_mode == "audit":
+        summary["subscore_averages"] = _average_subscores(results=results, case_count=case_count)
+    return summary
+
+
+def _average_subscores(*, results: list[dict[str, Any]], case_count: int) -> dict[str, float]:
+    if not results or case_count == 0:
+        return {}
+    keys = sorted(
+        {
+            key
+            for item in results
+            for key in (item.get("score", {}).get("subscores") or {})
+        }
+    )
+    return {
+        key: round(
+            sum((item.get("score", {}).get("subscores") or {}).get(key, 0.0) for item in results)
+            / case_count,
+            6,
+        )
+        for key in keys
+    }
+
+
+def _validate_score_mode(score_mode: str) -> None:
+    if score_mode not in {"standard", "audit"}:
+        raise ValueError(f"unsupported benchmark score_mode: {score_mode}")
 
 
 def _extract_total_tokens(result: dict[str, Any]) -> int:
