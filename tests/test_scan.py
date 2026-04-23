@@ -3,7 +3,7 @@
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -326,6 +326,73 @@ def test_runtime_cleared_at_flow_start():
 
     assert "stale_key" not in _RUNTIME
     assert "_warnings" not in _RUNTIME
+
+
+def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
+    """No-op index updates should rebuild FTS if the index health check is red."""
+    from sources.base import SourceRecord
+    from flow_index_vault import index_vault_flow
+
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = ["documents::doc-1"]
+    fake_store.list_doc_mtimes.return_value = {"documents::doc-1": 1.0}
+    fake_store.count_chunks.return_value = 1
+    fake_store.fts_available.return_value = False
+
+    fake_registry = MagicMock()
+    fake_registry.count.return_value = 1
+
+    fake_taxonomy = MagicMock()
+    fake_taxonomy.count.return_value = 0
+
+    class _FakeSource:
+        name = "documents"
+
+        def scan(self):
+            return iter([
+                SourceRecord(
+                    doc_id="doc-1",
+                    natural_key="doc-1.txt",
+                    source_type="txt",
+                    mtime=1.0,
+                    size=4,
+                    metadata={"abs_path": str(tmp_path / "doc-1.txt"), "ext": "txt"},
+                )
+            ])
+
+        def set_ocr_provider(self, provider):
+            return None
+
+        def close(self):
+            return None
+
+    config = {
+        "index_root": str(tmp_path / "index"),
+        "sources": [{"type": "filesystem", "name": "documents", "root": str(tmp_path)}],
+        "chunking": {"max_chars": 1800, "overlap": 200, "semantic": {"enabled": False}},
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+
+    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+        with patch("flow_index_vault.load_config", return_value=config):
+            with patch("flow_index_vault.LanceDBStore", return_value=fake_store):
+                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                            with patch("sources.build_source", return_value=_FakeSource()):
+                                with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                    with patch("flow_index_vault.diff_index_task", return_value=([], [])):
+                                        with patch("flow_index_vault.process_doc_task"):
+                                            with patch("flow_index_vault.delete_docs_task"):
+                                                with patch("flow_index_vault.index_stats_task"):
+                                                    with patch("flow_index_vault.write_index_metadata_task"):
+                                                        index_vault_flow.fn("dummy.yaml")
+
+    fake_store.create_fts_index.assert_called_once_with()
 
 
 # --- zip strict=True catches length mismatch (Fix 4) ---
