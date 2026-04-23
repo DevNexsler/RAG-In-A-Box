@@ -55,9 +55,29 @@ class CaseScore:
     field_scores: dict[str, float]
     weighted_scores: dict[str, float]
     reliability: dict[str, Any]
+    subscores: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+AUDIT_COMPOSITE_WEIGHTS: dict[str, float] = {
+    "extraction_core": 0.7,
+    "filing_taxonomy": 0.2,
+    "summary_quality": 0.1,
+}
+_AUDIT_EXTRACTION_FIELDS = (
+    "doc_type",
+    "topics",
+    "keywords",
+    "key_facts",
+    "importance",
+    "entities_people",
+    "entities_places",
+    "entities_orgs",
+    "entities_dates",
+)
+_AUDIT_FILING_FIELDS = ("suggested_tags", "suggested_folder")
 
 
 def normalize_prediction(raw_output: str) -> dict[str, str]:
@@ -72,6 +92,14 @@ def score_raw_case(
 ) -> tuple[dict[str, str], CaseScore]:
     normalized = normalize_prediction(raw_output)
     return normalized, score_case(normalized, gold, field_weights=field_weights)
+
+
+def score_audit_raw_case(
+    raw_output: str,
+    gold: Mapping[str, Any],
+) -> tuple[dict[str, str], CaseScore]:
+    normalized = normalize_prediction(raw_output)
+    return normalized, score_audit_case(normalized, gold)
 
 
 def score_case(
@@ -111,6 +139,59 @@ def score_case(
     )
 
 
+def score_audit_case(
+    prediction: Mapping[str, Any],
+    gold: Mapping[str, Any],
+) -> CaseScore:
+    summary_rubric = gold.get("summary_rubric")
+    if not isinstance(summary_rubric, Mapping):
+        raise ValueError("audit gold record missing summary_rubric")
+
+    field_result = score_case(prediction, gold)
+    summary_quality = _score_summary_rubric(
+        predicted_summary=prediction.get("enr_summary", ""),
+        summary_rubric=summary_rubric,
+    )
+    extraction_core = _weighted_subset_score(
+        field_scores=field_result.field_scores,
+        fields=_AUDIT_EXTRACTION_FIELDS,
+    )
+    canonical = gold.get("canonical", {})
+    alternates = gold.get("alternates", {})
+    filing_taxonomy = round(
+        (
+            _score_audit_suggested_tags(
+                predicted=prediction.get("enr_suggested_tags", ""),
+                canonical=canonical.get("suggested_tags", []),
+                alternates=alternates.get("suggested_tags", []),
+            )
+            + _score_folder(
+                prediction.get("enr_suggested_folder", ""),
+                canonical.get("suggested_folder", ""),
+                alternates.get("suggested_folder", []),
+            )
+        )
+        / 2,
+        6,
+    )
+    subscores = {
+        "extraction_core": extraction_core,
+        "filing_taxonomy": filing_taxonomy,
+        "summary_quality": summary_quality,
+    }
+    total_score = round(
+        sum(subscores[key] * AUDIT_COMPOSITE_WEIGHTS[key] for key in AUDIT_COMPOSITE_WEIGHTS),
+        6,
+    )
+    return CaseScore(
+        total_score=total_score,
+        field_scores=field_result.field_scores,
+        weighted_scores=field_result.weighted_scores,
+        reliability=field_result.reliability,
+        subscores=subscores,
+    )
+
+
 def score_failed_case(error: str) -> CaseScore:
     parse_failed = "parse" in error.lower() or "json" in error.lower()
     transport_failed = error.lower() in {"timeout", "http_error", "transport_error"}
@@ -127,7 +208,97 @@ def score_failed_case(error: str) -> CaseScore:
             "internal_failed": internal_failed,
             "error": error,
         },
+        subscores={
+            "extraction_core": 0.0,
+            "filing_taxonomy": 0.0,
+            "summary_quality": 0.0,
+        },
     )
+
+
+def _weighted_subset_score(*, field_scores: Mapping[str, float], fields: tuple[str, ...]) -> float:
+    total_weight = sum(DEFAULT_FIELD_WEIGHTS[field] for field in fields)
+    if total_weight == 0:
+        return 0.0
+    score = sum(field_scores[field] * DEFAULT_FIELD_WEIGHTS[field] for field in fields) / total_weight
+    return round(score, 6)
+
+
+def _score_summary_rubric(*, predicted_summary: Any, summary_rubric: Mapping[str, Any]) -> float:
+    coverage = summary_rubric.get("coverage")
+    brevity = summary_rubric.get("brevity")
+    hallucination = summary_rubric.get("hallucination")
+    if not isinstance(coverage, list) or not isinstance(brevity, Mapping) or not isinstance(hallucination, list):
+        raise ValueError("audit summary_rubric is invalid")
+
+    coverage_score = _score_summary_coverage(str(predicted_summary), coverage)
+    brevity_score = _score_summary_brevity(str(predicted_summary), brevity)
+    hallucination_score = _score_summary_hallucination(str(predicted_summary), hallucination)
+    return round((coverage_score * 0.5) + (brevity_score * 0.25) + (hallucination_score * 0.25), 6)
+
+
+def _score_summary_coverage(predicted_summary: str, coverage_points: list[Any]) -> float:
+    points = [str(point).strip() for point in coverage_points if str(point).strip()]
+    if not points:
+        return 1.0
+    summary_tokens = _tokenize(predicted_summary)
+    scores = []
+    for point in points:
+        point_tokens = _tokenize(point)
+        if not point_tokens:
+            scores.append(1.0)
+            continue
+        scores.append(len(summary_tokens & point_tokens) / len(point_tokens))
+    return round(sum(scores) / len(scores), 6)
+
+
+def _score_summary_brevity(predicted_summary: str, brevity: Mapping[str, Any]) -> float:
+    max_sentences = brevity.get("max_sentences", 0)
+    max_words = brevity.get("max_words", 0)
+    if not isinstance(max_sentences, int) or not isinstance(max_words, int):
+        raise ValueError("audit summary_rubric brevity values must be integers")
+
+    if max_sentences <= 0 and max_words <= 0:
+        return 1.0
+
+    sentence_count = max(1, len([part for part in re.split(r"[.!?]+", predicted_summary) if part.strip()])) if predicted_summary.strip() else 0
+    word_count = len(_tokenize(predicted_summary))
+    sentence_score = _length_limit_score(actual=sentence_count, maximum=max_sentences)
+    word_score = _length_limit_score(actual=word_count, maximum=max_words)
+    return round((sentence_score + word_score) / 2, 6)
+
+
+def _score_summary_hallucination(predicted_summary: str, forbidden_points: list[Any]) -> float:
+    points = [str(point).strip() for point in forbidden_points if str(point).strip()]
+    if not points:
+        return 1.0
+    penalty = max(_fact_similarity(predicted_summary, point) for point in points)
+    return round(max(0.0, 1.0 - penalty), 6)
+
+
+def _length_limit_score(*, actual: int, maximum: int) -> float:
+    if maximum <= 0:
+        return 1.0
+    if actual <= maximum:
+        return 1.0
+    overflow_ratio = (actual - maximum) / maximum
+    return round(max(0.0, 1.0 - overflow_ratio), 6)
+
+
+def _score_audit_suggested_tags(*, predicted: Any, canonical: Any, alternates: Any) -> float:
+    predicted_tags = _to_string_set(predicted)
+    canonical_tags = _to_string_set(canonical)
+    alternate_tags = _to_string_set(alternates)
+    allowed_tags = canonical_tags | alternate_tags
+
+    if not predicted_tags and not canonical_tags:
+        return 1.0
+    if not predicted_tags:
+        return 0.0
+
+    precision = len(predicted_tags & allowed_tags) / len(predicted_tags) if predicted_tags else 0.0
+    recall = len(predicted_tags & canonical_tags) / len(canonical_tags) if canonical_tags else 1.0
+    return round((precision + recall) / 2, 6)
 
 
 def _score_field(*, field: str, predicted: Any, canonical: Any, alternates: Any) -> float:
@@ -391,7 +562,7 @@ def _parse_importance(value: Any) -> float | None:
 
 
 def _tokenize(value: str) -> set[str]:
-    return set(_TOKEN_RE.findall(value))
+    return set(_TOKEN_RE.findall(_normalize_scalar(value)))
 
 
 def _list_like_fields() -> set[str]:
