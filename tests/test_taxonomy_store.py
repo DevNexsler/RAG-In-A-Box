@@ -327,3 +327,25 @@ class TestStaleConnectionRecovery:
         store._table = None
         assert store.count() == 1
         assert store.count("folder") == 1
+
+
+class TestFolderSync:
+    def test_sync_folder_taxonomy_from_filesystem_seeds_real_paths(self, tmp_path):
+        from core.taxonomy import sync_folder_taxonomy_from_filesystem
+
+        (tmp_path / "1-Projects" / "Alpha").mkdir(parents=True)
+        (tmp_path / "2-Areas" / "Property-Management" / "Inbox").mkdir(parents=True)
+        (tmp_path / "email-attachments" / "joycelyn-smith" / "2026-04").mkdir(parents=True)
+
+        store = TaxonomyStore(str(tmp_path / "index"), table_name="taxonomy", embed_fn=_fake_embed)
+        stats = sync_folder_taxonomy_from_filesystem(store, tmp_path)
+
+        assert stats["added"] >= 6
+        names = {row["name"] for row in store.list_by_kind("folder")}
+        assert "1-Projects/" in names
+        assert "1-Projects/Alpha/" in names
+        assert "2-Areas/Property-Management/" in names
+        assert "2-Areas/Property-Management/Inbox/" in names
+        assert "email-attachments/" in names
+        assert "email-attachments/joycelyn-smith/" in names
+        assert "email-attachments/joycelyn-smith/2026-04/" not in names

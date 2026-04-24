@@ -270,3 +270,51 @@ class TestFTSRebuildDeferred:
             )
         finally:
             _teardown_runtime()
+
+
+class TestConcurrencyDebugLogging:
+    def test_debug_logging_reports_peak_active_workers(
+        self,
+        index_dir,
+        monkeypatch,
+        caplog,
+    ):
+        from flow_index_vault import _process_docs
+
+        _setup_runtime(index_dir)
+        monkeypatch.setenv("INDEXER_DEBUG_CONCURRENCY", "1")
+        docs = [_fake_record(f"id{i:02d}", f"body text for doc {i}") for i in range(5)]
+        first_doc_id = docs[0]["doc_id"]
+        ready = threading.Barrier(5)
+        release = threading.Event()
+        outcome: dict[str, object] = {}
+
+        def _blocking_process_doc_task(doc: dict) -> None:
+            if doc["doc_id"] != first_doc_id:
+                ready.wait(timeout=5)
+                release.wait(timeout=5)
+
+        def _run() -> None:
+            try:
+                outcome["failed"] = _process_docs(docs, concurrency=4)
+            except Exception as exc:  # pragma: no cover - failure path asserted below
+                outcome["exc"] = exc
+
+        try:
+            with patch("flow_index_vault.process_doc_task", side_effect=_blocking_process_doc_task):
+                with caplog.at_level(logging.INFO, logger="concurrency-test"):
+                    runner = threading.Thread(target=_run)
+                    runner.start()
+                    ready.wait(timeout=5)
+                    release.set()
+                    runner.join(timeout=5)
+
+            assert runner.is_alive() is False
+            assert outcome.get("exc") is None
+            assert outcome.get("failed") == []
+            assert any(
+                "concurrency-debug summary" in rec.getMessage() and "peak_active=4" in rec.getMessage()
+                for rec in caplog.records
+            ), [rec.getMessage() for rec in caplog.records]
+        finally:
+            _teardown_runtime()

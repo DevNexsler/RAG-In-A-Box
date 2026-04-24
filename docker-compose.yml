@@ -4,12 +4,18 @@ services:
     image: doc-organizer:latest
     container_name: doc-organizer
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     ports:
       - "7788:7788"
     volumes:
       - /home/danpark/documents/doc-organizer:/data/documents
       - doc-organizer-data:/data/index
       - ./config.yaml:/app/config.yaml:ro
+      - ./.evals:/app/.evals
     command: ["sh", "-c", "mkdir -p /data/documents /data/index && python server.py"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -26,6 +32,7 @@ services:
       - SOR_DSN=${SOR_DSN}
       - DOCUMENTS_ROOT=/data/documents
       - INDEX_ROOT=/data/index
+      - INDEXER_DEBUG_CONCURRENCY=${INDEXER_DEBUG_CONCURRENCY:-}
 
 networks:
   rag-net:

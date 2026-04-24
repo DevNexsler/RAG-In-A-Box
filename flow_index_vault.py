@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -636,20 +637,64 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
     """
     logger = _get_logger()
     failed_docs: list[str] = []
+    debug_concurrency = os.environ.get("INDEXER_DEBUG_CONCURRENCY", "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+    }
+    active_workers = 0
+    peak_active_workers = 0
+    active_lock = threading.Lock()
 
     def _run_one(doc: dict) -> str | None:
+        nonlocal active_workers, peak_active_workers
+        if debug_concurrency:
+            with active_lock:
+                active_workers += 1
+                current_active = active_workers
+                peak_active_workers = max(peak_active_workers, current_active)
+                current_peak = peak_active_workers
+            logger.info(
+                "concurrency-debug start doc_id=%s thread=%s active=%d peak_active=%d",
+                doc["doc_id"],
+                threading.current_thread().name,
+                current_active,
+                current_peak,
+            )
         try:
             process_doc_task(doc)
             return None
         except Exception as exc:
             logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
             return doc["doc_id"]
+        finally:
+            if debug_concurrency:
+                with active_lock:
+                    active_workers -= 1
+                    current_active = active_workers
+                    current_peak = peak_active_workers
+                logger.info(
+                    "concurrency-debug finish doc_id=%s thread=%s active=%d peak_active=%d",
+                    doc["doc_id"],
+                    threading.current_thread().name,
+                    current_active,
+                    current_peak,
+                )
 
     if concurrency <= 1 or len(docs) <= 1:
         for doc in docs:
             bad = _run_one(doc)
             if bad is not None:
                 failed_docs.append(bad)
+        if debug_concurrency:
+            logger.info(
+                "concurrency-debug summary docs=%d concurrency=%d peak_active=%d failed=%d",
+                len(docs),
+                concurrency,
+                peak_active_workers,
+                len(failed_docs),
+            )
         return failed_docs
 
     # Process the first doc serially to ensure the LanceDB table exists before
@@ -666,6 +711,14 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
         for result in ex.map(_run_one, docs[1:]):
             if result is not None:
                 failed_docs.append(result)
+    if debug_concurrency:
+        logger.info(
+            "concurrency-debug summary docs=%d concurrency=%d peak_active=%d failed=%d",
+            len(docs),
+            concurrency,
+            peak_active_workers,
+            len(failed_docs),
+        )
     return failed_docs
 
 
@@ -883,11 +936,20 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     # Taxonomy store (optional — provides controlled vocabulary for enrichment)
     taxonomy_store = None
     try:
-        from core.taxonomy import load_taxonomy_store
+        from core.taxonomy import load_taxonomy_store, sync_folder_taxonomy_from_sources
         taxonomy_store = load_taxonomy_store(config)
+        sync_stats = sync_folder_taxonomy_from_sources(taxonomy_store, all_sources)
         tax_count = taxonomy_store.count()
         if tax_count > 0:
             logger.info("Taxonomy store loaded (%d entries)", tax_count)
+            if sync_stats.get("added", 0):
+                logger.info(
+                    "Taxonomy folder sync added=%d existing=%d discovered=%d sources=%d",
+                    sync_stats.get("added", 0),
+                    sync_stats.get("existing", 0),
+                    sync_stats.get("discovered", 0),
+                    sync_stats.get("sources", 0),
+                )
         else:
             taxonomy_store = None
             logger.info("Taxonomy store empty, skipping taxonomy-guided enrichment")
