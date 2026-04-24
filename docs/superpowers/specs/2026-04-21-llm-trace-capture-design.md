@@ -77,4 +77,3 @@ Add regression tests for:
 - `config*.yaml.example`
 - `.gitignore`
 - `tests/test_openrouter_trace_capture.py`
-
