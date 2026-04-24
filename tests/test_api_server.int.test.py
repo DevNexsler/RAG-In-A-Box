@@ -129,6 +129,20 @@ async def test_upload_rejects_disallowed_extension(api_client):
 
 
 @pytest.mark.anyio
+async def test_upload_rejects_empty_file(api_client, tmp_docs_root):
+    """AC-REST-1: Upload empty file returns 400 and writes nothing."""
+    files = {"file": ("empty.pdf", b"", "application/pdf")}
+
+    resp = await api_client.post("/upload", files=files)
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"] is True
+    assert body["code"] == "empty_file"
+    assert not (tmp_docs_root / "empty.pdf").exists()
+
+
+@pytest.mark.anyio
 async def test_upload_rejects_path_traversal_in_directory(api_client):
     """AC-REST-1: Directory field with ../../ returns 400 with invalid_directory."""
     files = {"file": ("ok.md", b"# OK", "text/markdown")}

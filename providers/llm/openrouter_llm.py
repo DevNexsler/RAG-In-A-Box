@@ -9,11 +9,15 @@ No local GPU needed — all inference runs on cloud providers.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
+from typing import Any, TypedDict
 
 import httpx
+
+from providers.llm.trace_recorder import LLMTraceRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,7 @@ _SYSTEM_PROMPT = (
 
 MAX_RETRIES = 2
 RETRY_BACKOFF = (5.0, 15.0)
+CONNECT_TIMEOUT_CAP = 10.0
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -88,15 +93,28 @@ _ENRICHMENT_SCHEMA = {
                 "type": "string",
                 "description": "Best folder path for filing this document from the taxonomy, or empty string",
             },
+            "importance": {
+                "type": "number",
+                "description": "Importance score from 0.0 to 1.0",
+            },
         },
         "required": [
             "summary", "doc_type", "entities_people", "entities_places",
             "entities_orgs", "entities_dates", "topics", "keywords", "key_facts",
-            "suggested_tags", "suggested_folder",
+            "suggested_tags", "suggested_folder", "importance",
         ],
         "additionalProperties": False,
     },
 }
+
+
+class OpenRouterReplayMetadata(TypedDict):
+    """Replay payload for benchmark re-runs."""
+
+    content: str
+    request: dict[str, Any]
+    response: dict[str, Any]
+    latency_ms: float
 
 
 class OpenRouterGenerator:
@@ -110,10 +128,18 @@ class OpenRouterGenerator:
         model: str = "openai/gpt-4.1-mini",
         api_key: str | None = None,
         timeout: float = 300.0,
+        trace_capture: dict | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.timeout = timeout
+        trace_capture = trace_capture or {}
+        self.trace_recorder = LLMTraceRecorder(
+            provider="openrouter",
+            model=model,
+            enabled=bool(trace_capture.get("enabled", False)),
+            directory=trace_capture.get("directory", ".evals/llm-traces"),
+        )
 
         if not self.api_key:
             raise ValueError(
@@ -141,6 +167,19 @@ class OpenRouterGenerator:
         Uses OpenAI-compatible chat completions with structured JSON output.
         Returns the raw response string (parsed by doc_enrichment).
         """
+        return self.generate_with_metadata(user_prompt, max_tokens=max_tokens)["content"]
+
+    def generate_with_metadata(
+        self, user_prompt: str, max_tokens: int = 512
+    ) -> OpenRouterReplayMetadata:
+        """Generate structured JSON plus request/response metadata."""
+        return self._request_with_metadata(user_prompt, max_tokens=max_tokens)
+
+    def _request_with_metadata(
+        self, user_prompt: str, max_tokens: int = 512
+    ) -> OpenRouterReplayMetadata:
+        """Send completion request and return content with replay metadata."""
+        request_timeout = self._build_request_timeout()
         payload = {
             "model": self.model,
             "messages": [
@@ -159,8 +198,19 @@ class OpenRouterGenerator:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        trace_request = {
+            "url": f"{OPENROUTER_BASE_URL}/chat/completions",
+            "timeout": {
+                "connect": request_timeout.connect,
+                "read": request_timeout.read,
+                "write": request_timeout.write,
+                "pool": request_timeout.pool,
+            },
+            "payload": payload,
+        }
 
         last_exc: Exception | None = None
+        started = time.perf_counter()
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -168,15 +218,29 @@ class OpenRouterGenerator:
                     f"{OPENROUTER_BASE_URL}/chat/completions",
                     json=payload,
                     headers=headers,
-                    timeout=self.timeout,
+                    timeout=request_timeout,
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                self.trace_recorder.record(
+                    request=trace_request,
+                    response=data,
+                    success=True,
+                    latency_ms=latency_ms,
+                )
                 content = data["choices"][0]["message"]["content"]
-                return content.strip()
+                return {
+                    "content": content.strip(),
+                    "request": copy.deepcopy(trace_request),
+                    "response": copy.deepcopy(data),
+                    "latency_ms": latency_ms,
+                }
 
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
                 last_exc = exc
+                if attempt == MAX_RETRIES - 1:
+                    break
                 backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
                 logger.warning(
                     "generate() attempt %d/%d failed (%s: %s), retrying in %.0fs...",
@@ -190,6 +254,8 @@ class OpenRouterGenerator:
                 status = exc.response.status_code
                 if status == 429 or 500 <= status < 600:
                     last_exc = exc
+                    if attempt == MAX_RETRIES - 1:
+                        break
                     # Honor Retry-After header if present, else use exponential backoff.
                     retry_after = exc.response.headers.get("retry-after")
                     try:
@@ -207,5 +273,48 @@ class OpenRouterGenerator:
                     status,
                     exc.response.text[:500],
                 )
+                self.trace_recorder.record(
+                    request=trace_request,
+                    success=False,
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                    error={
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "status_code": exc.response.status_code,
+                        "body": exc.response.text,
+                    },
+                )
                 raise
+        self._record_retry_failure(trace_request, started, last_exc)
         raise last_exc  # type: ignore[misc]
+
+    def _record_retry_failure(
+        self,
+        trace_request: dict[str, Any],
+        started: float,
+        exc: Exception | None,
+    ) -> None:
+        error: dict[str, Any] = {
+            "type": type(exc).__name__ if exc else "UnknownError",
+            "message": str(exc) if exc else "Unknown OpenRouter error",
+        }
+        if isinstance(exc, httpx.HTTPStatusError):
+            error.update(
+                {
+                    "status_code": exc.response.status_code,
+                    "body": exc.response.text,
+                }
+            )
+        self.trace_recorder.record(
+            request=trace_request,
+            success=False,
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            error=error,
+        )
+
+    def _build_request_timeout(self) -> httpx.Timeout:
+        connect_timeout = min(self.timeout, CONNECT_TIMEOUT_CAP)
+        return httpx.Timeout(
+            timeout=self.timeout,
+            connect=connect_timeout,
+        )

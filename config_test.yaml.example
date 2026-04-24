@@ -64,6 +64,9 @@ enrichment:
   model: "openai/gpt-4.1-mini"
   max_input_chars: 10000
   max_output_tokens: 768
+  trace_capture:
+    enabled: false
+    directory: ".evals/llm-traces"
 
 search:
   mode: "hybrid"

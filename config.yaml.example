@@ -74,6 +74,9 @@ enrichment:
   max_input_chars: 20000                  # head+tail sampling: 10000 chars from start + 10000 from end
   max_output_tokens: 5000
   concurrency: 1                          # docs processed in parallel; 1=serial, 4-8 recommended on paid OpenRouter
+  trace_capture:
+    enabled: false
+    directory: ".evals/llm-traces"
   # Alternatives: "baseten", "ollama" (local) — see config.local.yaml.example
 
 search:

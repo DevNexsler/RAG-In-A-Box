@@ -100,13 +100,15 @@ async def upload(request: Request) -> JSONResponse:
     else:
         target_dir = docs_root
 
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / safe_name
-
     # Read file with size enforcement
     content = await file.read()
     if len(content) > _MAX_UPLOAD_BYTES:
         return _api_error("file_too_large", f"File exceeds {_MAX_UPLOAD_BYTES // (1024*1024)} MB limit", 413)
+    if len(content) == 0:
+        return _api_error("empty_file", "Uploaded file is empty")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / safe_name
 
     target_path.write_bytes(content)
 

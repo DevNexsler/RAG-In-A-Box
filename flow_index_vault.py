@@ -260,6 +260,9 @@ def scan_filesystem_records(
                 stat = full_path.stat()
             except OSError:
                 continue
+            if stat.st_size == 0:
+                logger.warning("Skipping empty file: %s", rel_str)
+                continue
 
             # --- Persistent doc_id assignment ---
             existing_id = extract_id_from_filename(fname)

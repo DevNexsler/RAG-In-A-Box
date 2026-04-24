@@ -695,3 +695,29 @@ class TestRetiredIdReuse:
             assert original_id in retired_collision[0]["doc_id"]
         finally:
             _teardown_runtime()
+
+
+class TestZeroByteFiles:
+    def test_zero_byte_file_is_ignored_and_does_not_burn_doc_id(self, vault_and_index):
+        vault, index = vault_and_index
+
+        store, doc_id_store, embed = _setup_runtime(index, vault)
+        try:
+            empty_pdf = vault / "empty.pdf"
+            empty_pdf.write_bytes(b"")
+
+            empty_records = scan_vault_task.fn(vault, ["**/*.pdf"], [])
+
+            assert empty_records == []
+            assert empty_pdf.exists()
+            assert empty_pdf.name == "empty.pdf"
+
+            (vault / "recipe.md").write_text(_MD_RECIPE)
+            valid_records = scan_vault_task.fn(vault, ["**/*.pdf", "**/*.md"], [])
+
+            assert len(valid_records) == 1
+            assert valid_records[0]["doc_id"] == "00001"
+            assert valid_records[0]["rel_path"] == "recipe@00001@.md"
+            assert (vault / "recipe@00001@.md").exists()
+        finally:
+            _teardown_runtime()

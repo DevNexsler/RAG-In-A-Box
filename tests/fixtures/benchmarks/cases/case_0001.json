@@ -1,0 +1,11 @@
+{
+  "case_id": "case_0001",
+  "prompt": "Extract metadata from this document. Respond with ONLY valid JSON, no other text.\n\nDocument title: Lease renewal\nDocument type: pdf\n\nDocument text:\nTenant requests renewal terms for 2026 with updated monthly rent and parking addendum.",
+  "baseline_response": "{\"summary\": \"Lease renewal request with updated rent and parking terms.\", \"suggested_tags\": [\"lease\", \"renewal\"], \"suggested_folder\": \"Housing/Leases\"}",
+  "title": "Lease renewal",
+  "source_type": "pdf",
+  "category": "housing",
+  "difficulty": "easy",
+  "trace_file": "sample_traces.jsonl",
+  "trace_line": 1
+}
