@@ -631,13 +631,19 @@ def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
     # Ensure index_root exists so the subprocess can write its PID file
     index_root.mkdir(parents=True, exist_ok=True)
 
-    # Build a self-contained script that:
-    #   1. Writes its own PID to the PID file
-    #   2. Runs index_vault_flow
-    #   3. Cleans up the PID file in a finally block
+    # Rotate previous log (keep one .prev) so each run is diagnosable
+    log_path = index_root / "indexer.log"
+    prev_log_path = index_root / "indexer.log.prev"
+    if log_path.exists():
+        try:
+            log_path.replace(prev_log_path)
+        except OSError:
+            pass
+
     script = (
-        "import os, sys\n"
+        "import os, sys, logging\n"
         "from pathlib import Path\n"
+        "logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')\n"
         f"pid_file = Path({str(pid_file)!r})\n"
         "pid_file.write_text(str(os.getpid()))\n"
         "try:\n"
@@ -647,12 +653,14 @@ def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
         "    pid_file.unlink(missing_ok=True)\n"
     )
 
+    log_fh = open(log_path, "a", buffering=1)
     proc = subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        [sys.executable, "-u", "-c", script],
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
         start_new_session=True,  # Detach so the subprocess survives parent restart
     )
+    log_fh.close()  # Child inherited the fd; parent doesn't need it
 
     logger.info("file_index_update: started indexer subprocess (pid %d)", proc.pid)
 
