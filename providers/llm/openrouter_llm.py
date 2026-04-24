@@ -239,6 +239,8 @@ class OpenRouterGenerator:
 
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
                 last_exc = exc
+                if attempt == MAX_RETRIES - 1:
+                    break
                 backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
                 logger.warning(
                     "generate() attempt %d/%d failed (%s: %s), retrying in %.0fs...",
@@ -252,6 +254,8 @@ class OpenRouterGenerator:
                 status = exc.response.status_code
                 if status == 429 or 500 <= status < 600:
                     last_exc = exc
+                    if attempt == MAX_RETRIES - 1:
+                        break
                     # Honor Retry-After header if present, else use exponential backoff.
                     retry_after = exc.response.headers.get("retry-after")
                     try:
@@ -281,7 +285,32 @@ class OpenRouterGenerator:
                     },
                 )
                 raise
+        self._record_retry_failure(trace_request, started, last_exc)
         raise last_exc  # type: ignore[misc]
+
+    def _record_retry_failure(
+        self,
+        trace_request: dict[str, Any],
+        started: float,
+        exc: Exception | None,
+    ) -> None:
+        error: dict[str, Any] = {
+            "type": type(exc).__name__ if exc else "UnknownError",
+            "message": str(exc) if exc else "Unknown OpenRouter error",
+        }
+        if isinstance(exc, httpx.HTTPStatusError):
+            error.update(
+                {
+                    "status_code": exc.response.status_code,
+                    "body": exc.response.text,
+                }
+            )
+        self.trace_recorder.record(
+            request=trace_request,
+            success=False,
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            error=error,
+        )
 
     def _build_request_timeout(self) -> httpx.Timeout:
         connect_timeout = min(self.timeout, CONNECT_TIMEOUT_CAP)
