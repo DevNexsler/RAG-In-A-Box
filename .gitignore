@@ -4,6 +4,8 @@
 # Config (contains local paths — use config.yaml.example as template)
 config.yaml
 config_test.yaml
+*.bak
+*.bak-*
 
 # Claude Code
 .claude/
