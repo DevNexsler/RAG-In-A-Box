@@ -360,6 +360,35 @@ def test_diagnostics_keyword_failure():
         assert len(result) >= 1
 
 
+def test_diagnostics_keyword_failure_recovers_on_retry(monkeypatch):
+    """Transient keyword search failures should retry once before degrading."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [1.0] + [0.0] * 767
+        nodes = [_make_node("a.md", "c:0", "roof insurance claim damage", vec)]
+        store = _build_store_with_fts(tmpdir, nodes)
+        embed = MockEmbedProvider(vec)
+
+        original_keyword_search = store.keyword_search
+        calls = {"count": 0}
+
+        def flaky_keyword_search(query: str, top_k: int = 50, where: str | None = None):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError(
+                    "Added column's length must match table's length. Expected length 49 but got length 50"
+                )
+            return original_keyword_search(query, top_k=top_k, where=where)
+
+        monkeypatch.setattr(store, "keyword_search", flaky_keyword_search)
+
+        result = hybrid_search(store, embed, "roof claim", vector_top_k=10, final_top_k=5)
+        assert isinstance(result, SearchResult)
+        assert result.diagnostics["keyword_search_active"] is True
+        assert result.diagnostics["degraded"] is False
+        assert calls["count"] == 2
+        assert len(result) >= 1
+
+
 class FailingReranker(Reranker):
     """Reranker that always raises (simulates server down)."""
     def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:

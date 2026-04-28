@@ -598,17 +598,36 @@ def hybrid_search(
     with ThreadPoolExecutor(max_workers=2) as executor:
         vec_future = executor.submit(store.vector_search, query_vector, vector_top_k, where)
         kw_future = executor.submit(store.keyword_search, query, keyword_top_k, where)
+        vector_error = None
+        keyword_error = None
         try:
             vector_hits = vec_future.result()
         except Exception as e:
-            logger.warning("Vector search failed (degraded to keyword-only): %s", e)
             vector_hits = []
-            diagnostics["vector_search_active"] = False
+            vector_error = e
         try:
             keyword_hits = kw_future.result()
         except Exception as e:
-            logger.warning("Keyword/FTS search failed (degraded to vector-only): %s", e)
             keyword_hits = []
+            keyword_error = e
+
+    # LanceDB can intermittently fail one side of concurrent retrieval even
+    # though the underlying index is healthy. Retry once serially before
+    # declaring a degraded search path.
+    if vector_error is not None:
+        try:
+            vector_hits = store.vector_search(query_vector, vector_top_k, where)
+            logger.info("Vector search recovered on retry after transient failure: %s", vector_error)
+        except Exception as retry_error:
+            logger.warning("Vector search failed (degraded to keyword-only): %s", retry_error)
+            diagnostics["vector_search_active"] = False
+
+    if keyword_error is not None:
+        try:
+            keyword_hits = store.keyword_search(query, keyword_top_k, where)
+            logger.info("Keyword/FTS search recovered on retry after transient failure: %s", keyword_error)
+        except Exception as retry_error:
+            logger.warning("Keyword/FTS search failed (degraded to vector-only): %s", retry_error)
             diagnostics["keyword_search_active"] = False
 
     logger.info(
