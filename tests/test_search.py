@@ -389,6 +389,42 @@ def test_diagnostics_keyword_failure_recovers_on_retry(monkeypatch):
         assert len(result) >= 1
 
 
+def test_diagnostics_keyword_failure_recovers_after_rebuild_window(monkeypatch):
+    """Repeated transient FTS shape errors should back off and retry until rebuild finishes."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [1.0] + [0.0] * 767
+        nodes = [_make_node("a.md", "c:0", "roof insurance claim damage", vec)]
+        store = _build_store_with_fts(tmpdir, nodes)
+        embed = MockEmbedProvider(vec)
+
+        original_keyword_search = store.keyword_search
+        calls = {"count": 0}
+        sleep_calls: list[float] = []
+
+        def flaky_keyword_search(query: str, top_k: int = 50, where: str | None = None):
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise RuntimeError(
+                    "Added column's length must match table's length. Expected length 49 but got length 50"
+                )
+            return original_keyword_search(query, top_k=top_k, where=where)
+
+        monkeypatch.setattr(store, "keyword_search", flaky_keyword_search)
+        monkeypatch.setattr(
+            hybrid_search.__globals__["time"],
+            "sleep",
+            lambda seconds: sleep_calls.append(seconds),
+        )
+
+        result = hybrid_search(store, embed, "roof claim", vector_top_k=10, final_top_k=5)
+        assert isinstance(result, SearchResult)
+        assert result.diagnostics["keyword_search_active"] is True
+        assert result.diagnostics["degraded"] is False
+        assert calls["count"] == 3
+        assert sleep_calls == [0.25, 0.5]
+        assert len(result) >= 1
+
+
 class FailingReranker(Reranker):
     """Reranker that always raises (simulates server down)."""
     def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
