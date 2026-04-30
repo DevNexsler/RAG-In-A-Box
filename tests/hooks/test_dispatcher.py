@@ -45,6 +45,33 @@ def test_dispatch_event_posts_json_to_http_hook():
     assert event["event"] == "document.indexed"
 
 
+def test_dispatch_event_returns_warning_when_sender_raises():
+    def sender(_hook, _event):
+        raise RuntimeError("sender broke")
+
+    config = {"enabled": True, "hooks": [{"name": "h", "type": "http", "url": "http://hook"}]}
+
+    warnings = dispatch_event(config, _event(), sender=sender)
+
+    assert warnings == ["hook h failed: sender broke"]
+
+
+def test_dispatch_event_continues_after_one_hook_fails():
+    sender = Mock(side_effect=["first failed", None])
+    config = {
+        "enabled": True,
+        "hooks": [
+            {"name": "first", "type": "http", "url": "http://first"},
+            {"name": "second", "type": "http", "url": "http://second"},
+        ],
+    }
+
+    warnings = dispatch_event(config, _event(), sender=sender)
+
+    assert warnings == ["first failed"]
+    assert sender.call_count == 2
+
+
 def test_send_http_event_sends_json_and_secret_header():
     from hooks.http import send_http_event
 

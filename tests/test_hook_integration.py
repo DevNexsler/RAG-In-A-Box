@@ -77,6 +77,20 @@ def test_process_doc_task_dispatches_document_indexed_after_successful_upsert():
     assert event["chunks"][0]["loc"] == "img:c:0"
 
 
+def test_process_doc_task_records_hook_warnings_without_failing_index():
+    store = MagicMock()
+    logger = MagicMock()
+    _setup_runtime(store)
+
+    with patch("flow_index_vault.get_run_logger", return_value=logger):
+        with patch("flow_index_vault.dispatch_event", create=True, return_value=["hook h failed: boom"]):
+            process_doc_task.fn(_doc())
+
+    store.upsert_nodes.assert_called_once()
+    assert _RUNTIME["_warnings"] == ["hook h failed: boom"]
+    logger.warning.assert_called_once_with("hook h failed: boom")
+
+
 def test_process_doc_task_does_not_dispatch_when_upsert_fails():
     store = MagicMock()
     store.upsert_nodes.side_effect = RuntimeError("upsert failed")

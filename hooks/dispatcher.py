@@ -48,7 +48,10 @@ def dispatch_event(
             continue
         if not _event_matches(hook, event_name):
             continue
-        warning = sender(hook, event)
+        try:
+            warning = sender(hook, event)
+        except Exception as exc:
+            warning = f"hook {hook.get('name') or 'unnamed'} failed: {exc}"
         if warning:
             warnings.append(warning)
     return warnings
