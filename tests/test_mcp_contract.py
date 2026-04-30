@@ -175,6 +175,46 @@ def test_search_accepts_custom_source_type():
 # ---------------------------------------------------------------------------
 
 
+def test_get_deps_refreshes_cache_when_index_metadata_changes(tmp_path):
+    """A completed background index run should refresh the cached LanceDB store."""
+    import json
+    import os
+
+    meta_path = tmp_path / "index_metadata.json"
+    meta_path.write_text(json.dumps({"last_run_at": "2026-04-30T00:00:00Z"}))
+    os.utime(meta_path, ns=(1_000_000_000, 1_000_000_000))
+
+    old_cache = mcp_server._cache
+    old_signature = getattr(mcp_server, "_cache_index_signature", None)
+    old_identity = getattr(mcp_server, "_cache_identity", None)
+    mcp_server._cache = None
+    mcp_server._cache_index_signature = None
+    mcp_server._cache_identity = None
+    try:
+        config = {"index_root": str(tmp_path)}
+        first_store = MagicMock(name="first_store")
+        second_store = MagicMock(name="second_store")
+
+        with patch.object(
+            mcp_server,
+            "_build_store_and_embed",
+            side_effect=[
+                (first_store, MagicMock(), config),
+                (second_store, MagicMock(), config),
+            ],
+        ) as build:
+            assert mcp_server._get_deps()[0] is first_store
+            meta_path.write_text(json.dumps({"last_run_at": "2026-04-30T00:01:00Z"}))
+            os.utime(meta_path, ns=(2_000_000_000, 2_000_000_000))
+
+            assert mcp_server._get_deps()[0] is second_store
+            assert build.call_count == 2
+    finally:
+        mcp_server._cache = old_cache
+        mcp_server._cache_index_signature = old_signature
+        mcp_server._cache_identity = old_identity
+
+
 def test_get_deps_failure_returns_structured_error():
     """When _build_store_and_embed raises, _file_search_impl returns structured error."""
     old_cache = mcp_server._cache

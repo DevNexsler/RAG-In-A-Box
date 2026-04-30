@@ -41,6 +41,38 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_TRANSIENT_FTS_ERROR_MARKERS = (
+    "Added column's length must match table's length",
+)
+
+
+def _is_transient_fts_error(error: Exception) -> bool:
+    """Detect known transient LanceDB FTS errors during index rebuild windows."""
+    text = str(error)
+    return any(marker in text for marker in _TRANSIENT_FTS_ERROR_MARKERS)
+
+
+def _retry_keyword_search(
+    store: "LanceDBStore",
+    query: str,
+    top_k: int,
+    where: str | None,
+    error: Exception,
+) -> tuple[list[SearchHit], Exception | None]:
+    """Retry keyword search with backoff for transient FTS rebuild races."""
+    retry_delays = [0.25, 0.5] if _is_transient_fts_error(error) else [0.0]
+    last_error: Exception = error
+
+    for delay in retry_delays:
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            return store.keyword_search(query, top_k, where), None
+        except Exception as exc:  # pragma: no cover - exercised via caller behavior
+            last_error = exc
+
+    return [], last_error
+
 
 # ---------------------------------------------------------------------------
 # Search result with diagnostics
@@ -598,17 +630,42 @@ def hybrid_search(
     with ThreadPoolExecutor(max_workers=2) as executor:
         vec_future = executor.submit(store.vector_search, query_vector, vector_top_k, where)
         kw_future = executor.submit(store.keyword_search, query, keyword_top_k, where)
+        vector_error = None
+        keyword_error = None
         try:
             vector_hits = vec_future.result()
         except Exception as e:
-            logger.warning("Vector search failed (degraded to keyword-only): %s", e)
             vector_hits = []
-            diagnostics["vector_search_active"] = False
+            vector_error = e
         try:
             keyword_hits = kw_future.result()
         except Exception as e:
-            logger.warning("Keyword/FTS search failed (degraded to vector-only): %s", e)
             keyword_hits = []
+            keyword_error = e
+
+    # LanceDB can intermittently fail one side of concurrent retrieval even
+    # though the underlying index is healthy. Retry once serially before
+    # declaring a degraded search path.
+    if vector_error is not None:
+        try:
+            vector_hits = store.vector_search(query_vector, vector_top_k, where)
+            logger.info("Vector search recovered on retry after transient failure: %s", vector_error)
+        except Exception as retry_error:
+            logger.warning("Vector search failed (degraded to keyword-only): %s", retry_error)
+            diagnostics["vector_search_active"] = False
+
+    if keyword_error is not None:
+        keyword_hits, retry_error = _retry_keyword_search(
+            store,
+            query,
+            keyword_top_k,
+            where,
+            keyword_error,
+        )
+        if retry_error is None:
+            logger.info("Keyword/FTS search recovered on retry after transient failure: %s", keyword_error)
+        else:
+            logger.warning("Keyword/FTS search failed (degraded to vector-only): %s", retry_error)
             diagnostics["keyword_search_active"] = False
 
     logger.info(
