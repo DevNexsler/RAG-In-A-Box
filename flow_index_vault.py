@@ -64,6 +64,8 @@ from doc_id_store import (
     DocIDStore, extract_id_from_filename, inject_id_into_filename,
     strip_id_from_filename as _strip_id_from_filename,
 )
+from hooks.dispatcher import dispatch_event
+from hooks.events import build_document_indexed_event
 from lancedb_store import LanceDBStore
 
 
@@ -628,6 +630,31 @@ def process_doc_task(doc: dict) -> None:
     # --- Upsert into store ---
     store.upsert_nodes(nodes)
     logger.info(f"Upserted {len(nodes)} chunks: {doc_id}")
+
+    chunks = []
+    for node in nodes:
+        node_meta = getattr(node, "metadata", {}) or {}
+        chunks.append({
+            "loc": str(node_meta.get("loc") or ""),
+            "snippet": str(node_meta.get("snippet") or ""),
+            "text": getattr(node, "text", "") or "",
+        })
+
+    event = build_document_indexed_event(
+        doc_id=doc_id,
+        source_name=source_name,
+        source_type=source_type,
+        rel_path=rel_path,
+        abs_path=str(doc.get("abs_path", "")),
+        text=result.full_text,
+        metadata=doc_meta,
+        chunks=chunks,
+    )
+    warnings = dispatch_event(config.get("event_hooks"), event)
+    if warnings:
+        _RUNTIME.setdefault("_warnings", []).extend(warnings)
+        for warning in warnings:
+            logger.warning(warning)
 
 
 def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:

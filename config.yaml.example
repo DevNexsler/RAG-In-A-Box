@@ -104,6 +104,16 @@ lancedb:
 logging:
   level: "WARNING"                        # DEBUG, INFO, WARNING, ERROR
 
+event_hooks:
+  enabled: false                          # emit document.indexed events after successful upserts
+  hooks:
+    # - name: "comm-data-store"
+    #   type: "http"
+    #   url: "http://comm-data-store-hooks:8090/hooks/doc-indexed"
+    #   events: ["document.indexed"]
+    #   timeout_seconds: 5
+    #   secret_env: "COMM_DATA_STORE_HOOK_SECRET"
+
 # --- Multi-source mode (replaces documents_root: when enabled) ---
 # sources:
 #   - type: filesystem

@@ -109,6 +109,16 @@ lancedb:
 logging:
   level: "WARNING"
 
+event_hooks:
+  enabled: false
+  hooks:
+    # - name: "comm-data-store"
+    #   type: "http"
+    #   url: "http://comm-data-store-hooks:8090/hooks/doc-indexed"
+    #   events: ["document.indexed"]
+    #   timeout_seconds: 5
+    #   secret_env: "COMM_DATA_STORE_HOOK_SECRET"
+
 mcp:
   host: "127.0.0.1"
   port: 7788

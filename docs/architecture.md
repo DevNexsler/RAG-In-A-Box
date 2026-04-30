@@ -29,6 +29,7 @@ Store these in a `.env` file in the project root. The MCP server and indexer loa
 | PDF metadata      | PyMuPDF (title, author, dates, page count)                    |
 | Reranking         | Qwen3-Reranker-8B via DeepInfra (cloud, always-on, batch scoring, 30s timeout) |
 | Orchestration     | Prefect 3.x — flow/task logging, retry, dashboard at `http://127.0.0.1:4200` |
+| Event hooks       | Optional HTTP `document.indexed` webhooks after successful LanceDB upsert |
 
 ## Search pipeline
 
@@ -114,3 +115,27 @@ The taxonomy is managed exclusively via MCP tools (`file_taxonomy_add`, `file_ta
 | `vector` | float[] | Embedding vector (2560-dim for Qwen3, 768-dim for Gemini) |
 
 Metadata fields (`title`, `tags`, `status`, `created`, `description`, `author`, `keywords`, `folder`) are automatically enriched during indexing from YAML frontmatter and file path. LLM enrichment fields (prefixed `enr_`) are extracted by GPT-4.1 Mini via OpenRouter during indexing when `enrichment.enabled` is true. The `enr_` prefix avoids collisions with user frontmatter fields. All metadata is returned in search results and can be used as filters. Dynamic metadata fields from frontmatter (e.g. `priority`, `category`) are automatically promoted to LanceDB columns and appear in search results, facets, and filters.
+
+## Event hooks
+
+`event_hooks` can emit HTTP events after documents are successfully upserted to
+LanceDB. The first event type is `document.indexed`; payloads include the
+document id, source fields, relative and absolute paths, extracted OCR/VL text,
+public metadata, and chunk snippets. Hook failures are logged as warnings and do
+not fail indexing.
+
+Example:
+
+```yaml
+event_hooks:
+  enabled: true
+  hooks:
+    - name: "comm-data-store"
+      type: "http"
+      url: "http://comm-data-store-hooks:8090/hooks/doc-indexed"
+      events: ["document.indexed"]
+      timeout_seconds: 5
+      secret_env: "COMM_DATA_STORE_HOOK_SECRET"
+```
+
+When `secret_env` is set, the value is sent as `X-RAG-Hook-Secret`.
