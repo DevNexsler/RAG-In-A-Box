@@ -130,12 +130,37 @@ def _build_store_and_embed(config_path: str = "config.yaml"):
 
 
 _cache: tuple | None = None
+_cache_index_signature: tuple[int, int] | None = None
+_cache_identity: int | None = None
+
+
+def _index_metadata_signature(config: dict) -> tuple[int, int] | None:
+    index_root = config.get("index_root")
+    if not index_root:
+        return None
+    meta_path = Path(index_root) / "index_metadata.json"
+    try:
+        stat = meta_path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
 
 
 def _get_deps(config_path: str = "config.yaml"):
-    global _cache
+    global _cache, _cache_index_signature, _cache_identity
     if _cache is None:
         _cache = _build_store_and_embed(config_path)
+        _cache_index_signature = _index_metadata_signature(_cache[2])
+        _cache_identity = id(_cache)
+    else:
+        current_signature = _index_metadata_signature(_cache[2])
+        if _cache_identity != id(_cache):
+            _cache_index_signature = current_signature
+            _cache_identity = id(_cache)
+        elif current_signature != _cache_index_signature:
+            _cache = _build_store_and_embed(config_path)
+            _cache_index_signature = _index_metadata_signature(_cache[2])
+            _cache_identity = id(_cache)
     return _cache[0], _cache[1], _cache[2]
 
 
