@@ -38,7 +38,7 @@ def test_build_media_provider_uses_whisper_then_fallbacks(monkeypatch):
         "mistralai/voxtral-small-24b-2507",
         "google/gemini-2.5-flash-lite",
     ]
-    assert provider.video_model == "google/gemini-2.5-flash-lite"
+    assert provider.video_model == "qwen/qwen3.5-397b-a17b"
 
 
 @pytest.mark.parametrize(
@@ -60,7 +60,7 @@ def test_example_configs_include_media_scan_and_provider(config_path: str):
         "mistralai/voxtral-small-24b-2507",
         "google/gemini-2.5-flash-lite",
     ]
-    assert media["video_model"] == "google/gemini-2.5-flash-lite"
+    assert media["video_model"] == "qwen/qwen3.5-397b-a17b"
 
 
 def test_openrouter_media_provider_sends_audio_input_payload(tmp_path: Path):
@@ -136,6 +136,10 @@ def test_openrouter_media_provider_sends_video_data_url(tmp_path: Path):
     payload = post.call_args.kwargs["json"]
     assert payload["model"] == "google/gemini-2.5-flash-lite"
     content = payload["messages"][0]["content"]
+    prompt = content[0]["text"]
+    assert "Chronological walkthrough" in prompt
+    assert "Condition evaluation" in prompt
+    assert "Must fix before turnover/rent/closeout" in prompt
     assert content[1]["type"] == "video_url"
     assert content[1]["video_url"]["url"] == (
         "data:video/mp4;base64," + base64.b64encode(b"fake-video").decode("ascii")

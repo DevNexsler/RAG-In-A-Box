@@ -2,7 +2,9 @@
 
 from providers.media.base import MediaProvider
 
-__all__ = ["MediaProvider", "build_media_provider"]
+__all__ = ["MediaProvider", "build_media_provider", "DEFAULT_VIDEO_MODEL"]
+
+DEFAULT_VIDEO_MODEL = "qwen/qwen3.5-397b-a17b"
 
 
 def _dedupe_models(models: list[str]) -> list[str]:
@@ -55,7 +57,7 @@ def build_media_provider(config: dict) -> MediaProvider | None:
         api_key=media_cfg.get("api_key"),
         base_url=media_cfg.get("base_url", "https://openrouter.ai/api/v1"),
         audio_models=_dedupe_models(list(audio_models)),
-        video_model=media_cfg.get("video_model", "google/gemini-2.5-flash-lite"),
+        video_model=media_cfg.get("video_model", DEFAULT_VIDEO_MODEL),
         timeout=media_cfg.get("timeout", 300.0),
         max_file_size_mb=media_cfg.get("max_file_size_mb", 50.0),
     )

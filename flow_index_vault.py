@@ -60,7 +60,7 @@ from doc_enrichment import enrich_document, empty_enrichment, ENRICHMENT_FIELDS,
 from extractors import extract_text, extract_title, derive_folder, normalize_tags
 from providers.embed import build_embed_provider
 from providers.embed.base import EmbedProvider
-from providers.media import build_media_provider
+from providers.media import DEFAULT_VIDEO_MODEL, build_media_provider
 from providers.ocr import build_ocr_provider
 from doc_id_store import (
     DocIDStore, extract_id_from_filename, inject_id_into_filename,
@@ -916,7 +916,7 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
         logger.info(
             "Media extraction enabled: audio=%s video=%s",
             media_cfg.get("audio_models") or media_cfg.get("audio_model", "openai/whisper-1"),
-            media_cfg.get("video_model", "google/gemini-2.5-flash-lite"),
+            media_cfg.get("video_model", DEFAULT_VIDEO_MODEL),
         )
     else:
         logger.info("Media extraction disabled (set media.enabled=true in config to enable)")

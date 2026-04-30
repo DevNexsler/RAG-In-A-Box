@@ -71,7 +71,7 @@ media:
   fallback_audio_models:
     - "mistralai/voxtral-small-24b-2507"
     - "google/gemini-2.5-flash-lite"
-  video_model: "google/gemini-2.5-flash-lite"
+  video_model: "qwen/qwen3.5-397b-a17b"
   max_file_size_mb: 50
   timeout: 300
 

@@ -18,9 +18,29 @@ _AUDIO_TRANSCRIBE_PROMPT = (
     "identity. Return plain text only."
 )
 _VIDEO_ANALYZE_PROMPT = (
-    "Analyze this local video for document search. Return plain text notes with: "
-    "overview, visible text, important objects/actions, notable timestamps if clear, "
-    "and any spoken transcript you can infer."
+    "You are reviewing a residential/property walkthrough video for maintenance, "
+    "turnover, and owner-facing documentation. Use only visible/audible evidence. "
+    "Do not invent defects. If uncertain, say unknown/unclear.\n\n"
+    "Return plain text in this exact structure:\n\n"
+    "1. Chronological walkthrough\n"
+    "- Timestamp range: what is visible or happening, including rooms/areas, "
+    "fixtures, appliances, cabinets, floors, walls, lighting, doors/windows.\n\n"
+    "2. Condition evaluation\n"
+    "- Cleanliness: clean / light cleaning / deep cleaning / unknown, with evidence.\n"
+    "- Damage/defects: visible broken, missing, stained, cracked, leaking, loose, "
+    "worn, unfinished, scuffed, damaged, or malfunctioning items. Say none clearly "
+    "visible if none.\n"
+    "- Quality/state: good/fair/poor/dated/new-looking for fixtures, cabinets, "
+    "appliances, flooring, walls, storage.\n\n"
+    "3. Action list\n"
+    "- Must fix before turnover/rent/closeout.\n"
+    "- Should clean.\n"
+    "- Optional update/cosmetic.\n"
+    "- Items needing human confirmation because view is unclear.\n\n"
+    "4. Spoken audio and visible text\n"
+    "- Transcript if audible; visible text if legible; otherwise none.\n\n"
+    "5. Confidence and limitations\n"
+    "- Note camera shake, lighting, blur, blocked view, or model uncertainty."
 )
 
 _AUDIO_FORMAT_BY_EXT = {
