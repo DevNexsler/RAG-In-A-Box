@@ -28,6 +28,61 @@ _SET_FIELDS = {"doc_type", "topics", "keywords", "suggested_tags"}
 _ENTITY_FIELDS = {"entities_people", "entities_places", "entities_orgs", "entities_dates"}
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _ORDINAL_RE = re.compile(r"(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "this",
+    "to",
+    "with",
+}
+_TOKEN_EQUIVALENTS = {
+    "billing": {"bill", "bills", "payment", "payments", "finance", "invoice", "invoices"},
+    "bill": {"billing", "bills", "payment", "payments", "finance", "invoice"},
+    "bills": {"bill", "billing", "payment", "payments", "finance", "invoice"},
+    "communication": {"communications", "correspondence", "inquiry", "inquiries", "message", "messages"},
+    "communications": {"communication", "correspondence", "inquiry", "inquiries", "message", "messages"},
+    "delivery": {"deliveries", "pickup", "order", "orders"},
+    "deliveries": {"delivery", "pickup", "order", "orders"},
+    "estate": {"property", "housing", "rental"},
+    "finance": {"billing", "bill", "bills", "payment", "payments", "invoice", "invoices", "receipt", "receipts"},
+    "housing": {"property", "real", "estate", "rental", "rentals", "tenant"},
+    "inquiry": {"inquiries", "communication", "communications", "message", "messages", "lead", "leads"},
+    "inquiries": {"inquiry", "communication", "communications", "message", "messages", "lead", "leads"},
+    "invoice": {"invoices", "billing", "bill", "payment", "payments", "receipt"},
+    "invoices": {"invoice", "billing", "bill", "payment", "payments", "receipt"},
+    "lead": {"leads", "inquiry", "inquiries", "prospect", "tenant"},
+    "leads": {"lead", "inquiry", "inquiries", "prospect", "tenant"},
+    "message": {"messages", "communication", "communications", "inquiry", "inquiries"},
+    "messages": {"message", "communication", "communications", "inquiry", "inquiries"},
+    "notification": {"notice", "email"},
+    "orders": {"order", "delivery", "deliveries", "pickup"},
+    "order": {"orders", "delivery", "deliveries", "pickup"},
+    "payment": {"payments", "billing", "bill", "bills", "finance", "invoice", "receipt"},
+    "payments": {"payment", "billing", "bill", "bills", "finance", "invoice", "receipt"},
+    "pickup": {"pick", "up", "order", "orders", "delivery"},
+    "property": {"real", "estate", "housing", "rental", "rentals"},
+    "real": {"estate", "property", "housing", "rental"},
+    "receipt": {"receipts", "billing", "bill", "bills", "finance", "invoice", "payment"},
+    "receipts": {"receipt", "billing", "bill", "bills", "finance", "invoice", "payment"},
+    "rent": {"rental", "rentals", "renter", "tenant", "lease", "leasing"},
+    "rental": {"rent", "rentals", "renter", "tenant", "lease", "leasing", "housing", "property"},
+    "rentals": {"rent", "rental", "renter", "tenant", "lease", "leasing", "housing", "property"},
+    "renter": {"rent", "rental", "rentals", "tenant", "prospect", "inquiry"},
+    "tenant": {"renter", "rental", "rent", "lease", "leasing", "housing"},
+}
 _DATE_EXTRACT_PATTERNS = (
     re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
     re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b"),
@@ -374,7 +429,16 @@ def _score_phrase_collection(predicted: list[str], expected: list[str]) -> float
             remaining.remove(best_idx)
             matched_score += best_score
 
-    return matched_score / max(len(predicted), len(expected))
+    phrase_score = matched_score / max(len(predicted), len(expected))
+    raw_token_score = _token_f1(
+        _tokens_for_phrases(predicted),
+        _tokens_for_phrases(expected),
+    )
+    expanded_token_score = _token_f1(
+        _tokens_for_phrases(predicted, expand=True),
+        _tokens_for_phrases(expected, expand=True),
+    )
+    return max(phrase_score, raw_token_score, expanded_token_score)
 
 
 def _score_folder(predicted: Any, canonical: Any, alternates: Any) -> float:
@@ -395,13 +459,16 @@ def _score_folder(predicted: Any, canonical: Any, alternates: Any) -> float:
         expected_parts = _split_folder(expected)
         if predicted_parts == expected_parts[: len(predicted_parts)]:
             return 0.5
-    return 0.0
+        if expected_parts == predicted_parts[: len(expected_parts)]:
+            extra_depth = len(predicted_parts) - len(expected_parts)
+            return round(max(0.8, 1.0 - (0.1 * extra_depth)), 6)
+    return round(max(_score_folder_tokens(predicted_norm, expected) for expected in accepted), 6)
 
 
 def _score_suggested_tags(predicted: Any, canonical: Any, alternates: Any) -> float:
     allowed = _to_string_set(canonical)
     allowed.update(_to_string_set(alternates))
-    return _score_best_overlap(_to_string_set(predicted), [allowed])
+    return _score_semantic_overlap(_to_string_set(predicted), [allowed])
 
 
 def _score_importance(predicted: Any, canonical: Any) -> float:
@@ -413,9 +480,15 @@ def _score_importance(predicted: Any, canonical: Any) -> float:
 
 
 def _score_summary(predicted: Any, canonical: Any) -> float:
-    predicted_tokens = _tokenize(_normalize_scalar(predicted))
-    canonical_tokens = _tokenize(_normalize_scalar(canonical))
-    return round(_jaccard(predicted_tokens, canonical_tokens), 6)
+    predicted_tokens = _tokenize(_normalize_scalar(predicted), expand=True)
+    canonical_tokens = _tokenize(_normalize_scalar(canonical), expand=True)
+    if not predicted_tokens and not canonical_tokens:
+        return 1.0
+    if not predicted_tokens or not canonical_tokens:
+        return 0.0
+    f1 = _token_f1(predicted_tokens, canonical_tokens)
+    gold_recall = len(predicted_tokens & canonical_tokens) / len(canonical_tokens)
+    return round(max(f1, gold_recall), 6)
 
 
 def _score_key_facts(predicted: Any, canonical: Any) -> float:
@@ -504,7 +577,8 @@ def _jaccard(left: set[str], right: set[str]) -> float:
 def _normalize_scalar(value: Any) -> str:
     if value is None:
         return ""
-    return " ".join(str(value).strip().lower().split())
+    normalized = str(value).strip().lower().replace("_", " ").replace("-", " ")
+    return " ".join(normalized.split())
 
 
 def _normalize_date_value(value: Any) -> str:
@@ -561,8 +635,61 @@ def _parse_importance(value: Any) -> float | None:
     return max(0.0, min(1.0, parsed))
 
 
-def _tokenize(value: str) -> set[str]:
-    return set(_TOKEN_RE.findall(_normalize_scalar(value)))
+def _tokenize(value: str, *, expand: bool = False) -> set[str]:
+    tokens = {_stem_token(token) for token in _TOKEN_RE.findall(_normalize_scalar(value))}
+    tokens = {token for token in tokens if token and token not in _STOPWORDS}
+    if expand:
+        tokens = _expand_tokens(tokens)
+    return tokens
+
+
+def _stem_token(token: str) -> str:
+    if len(token) > 4 and token.endswith("ies"):
+        return f"{token[:-3]}y"
+    if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _expand_tokens(tokens: set[str]) -> set[str]:
+    expanded = set(tokens)
+    for token in list(tokens):
+        expanded.update(_TOKEN_EQUIVALENTS.get(token, set()))
+    return expanded
+
+
+def _tokens_for_phrases(values: list[str], *, expand: bool = False) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        tokens.update(_tokenize(value, expand=expand))
+    return tokens
+
+
+def _token_f1(predicted: set[str], expected: set[str]) -> float:
+    if not predicted and not expected:
+        return 1.0
+    if not predicted or not expected:
+        return 0.0
+    overlap = len(predicted & expected)
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(predicted)
+    recall = overlap / len(expected)
+    return (2 * precision * recall) / (precision + recall)
+
+
+def _score_folder_tokens(predicted: str, expected: str) -> float:
+    predicted_parts = _split_folder(predicted)
+    expected_parts = _split_folder(expected)
+    predicted_tokens = _tokens_for_phrases(predicted_parts, expand=True)
+    expected_tokens = _tokens_for_phrases(expected_parts, expand=True)
+    full_score = _token_f1(predicted_tokens, expected_tokens)
+
+    predicted_leaf = _tokens_for_phrases(predicted_parts[-1:], expand=True)
+    expected_leaf = _tokens_for_phrases(expected_parts[-1:], expand=True)
+    leaf_score = _token_f1(predicted_leaf, expected_leaf)
+
+    return (full_score * 0.65) + (leaf_score * 0.35)
 
 
 def _list_like_fields() -> set[str]:

@@ -35,14 +35,44 @@ def test_score_folder_parent_branch_gets_partial_credit():
     assert score_case(pred, gold).field_scores["suggested_folder"] == 0.5
 
 
-def test_score_folder_deeper_child_does_not_get_partial_credit():
+def test_score_folder_deeper_child_gets_strong_partial_credit():
     gold = {
         "canonical": {"suggested_folder": "Housing/Leases"},
         "alternates": {"suggested_folder": []},
     }
     pred = {"enr_suggested_folder": "Housing/Leases/2026"}
 
-    assert score_case(pred, gold).field_scores["suggested_folder"] == 0.0
+    assert score_case(pred, gold).field_scores["suggested_folder"] >= 0.8
+
+
+def test_score_folder_awards_semantic_credit_for_real_estate_rental_branch():
+    gold = {
+        "canonical": {"suggested_folder": "Housing/Rental Inquiries"},
+        "alternates": {"suggested_folder": []},
+    }
+    pred = {"enr_suggested_folder": "Real Estate/Rental Communications"}
+
+    assert score_case(pred, gold).field_scores["suggested_folder"] >= 0.6
+
+
+def test_score_folder_awards_leaf_credit_for_receipts_in_different_branch():
+    gold = {
+        "canonical": {"suggested_folder": "Finance/Bills and Receipts"},
+        "alternates": {"suggested_folder": []},
+    }
+    pred = {"enr_suggested_folder": "Retail/The Home Depot/Receipts"}
+
+    assert score_case(pred, gold).field_scores["suggested_folder"] >= 0.5
+
+
+def test_score_folder_keeps_unrelated_paths_low():
+    gold = {
+        "canonical": {"suggested_folder": "Legal/Eviction Cases"},
+        "alternates": {"suggested_folder": []},
+    }
+    pred = {"enr_suggested_folder": "Retail/Home Depot/Receipts"}
+
+    assert score_case(pred, gold).field_scores["suggested_folder"] <= 0.25
 
 
 def test_score_importance_penalizes_numeric_distance():
@@ -122,6 +152,61 @@ def test_score_suggested_tags_alternates_extend_allowed_tag_set():
     pred = {"enr_suggested_tags": "lease, housing"}
 
     assert score_case(pred, gold).field_scores["suggested_tags"] == 1.0
+
+
+def test_score_suggested_tags_normalizes_hyphenated_equivalents():
+    gold = {
+        "canonical": {
+            "suggested_tags": ["tenant communication", "harassment report", "tenant dispute"],
+        },
+        "alternates": {"suggested_tags": []},
+    }
+    pred = {"enr_suggested_tags": "tenant-communication, harassment-report, tenant-dispute"}
+
+    assert score_case(pred, gold).field_scores["suggested_tags"] >= 0.95
+
+
+def test_score_doc_type_and_tags_credit_renter_rental_synonyms():
+    gold = {
+        "canonical": {
+            "doc_type": ["rental inquiry", "email notification"],
+            "suggested_tags": ["renter inquiry", "showing", "zillow"],
+        },
+        "alternates": {"suggested_tags": []},
+    }
+    pred = {
+        "enr_doc_type": "email, notification",
+        "enr_suggested_tags": "rental inquiry, tenant communication, Zillow, rental safety",
+    }
+
+    result = score_case(pred, gold)
+    assert result.field_scores["doc_type"] >= 0.65
+    assert result.field_scores["suggested_tags"] >= 0.5
+
+
+def test_score_summary_credits_good_paraphrase():
+    gold = {
+        "canonical": {
+            "summary": (
+                "Zillow Rental Manager forwarded a renter message about the listing at "
+                "138 Bullman St #B in Phillipsburg, New Jersey. Lashawn Shipman asked "
+                "whether 11:30 am works, and the email includes standard scam-safety "
+                "guidance for landlords."
+            )
+        },
+        "alternates": {},
+    }
+    pred = {
+        "enr_summary": (
+            "This document is an email notification from Zillow Rental Manager informing "
+            "a landlord about a new message from a renter regarding a property listing at "
+            "138 Bullman St #B, Phillipsburg, NJ. The renter, Lashawn Shipman, is proposing "
+            "a meeting time of 11:30 am. The email also includes safety advice about avoiding "
+            "scams and protecting personal information."
+        )
+    }
+
+    assert score_case(pred, gold).field_scores["summary"] >= 0.75
 
 
 def test_score_key_facts_handles_normalized_json_array():
