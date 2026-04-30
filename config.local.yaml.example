@@ -26,6 +26,18 @@ scan:
     - "**/*.txt"
     - "**/*.xlsx"
     - "**/*.xls"
+    - "**/*.mp3"
+    - "**/*.wav"
+    - "**/*.m4a"
+    - "**/*.flac"
+    - "**/*.ogg"
+    - "**/*.aac"
+    - "**/*.mp4"
+    - "**/*.mov"
+    - "**/*.mkv"
+    - "**/*.webm"
+    - "**/*.avi"
+    - "**/*.m4v"
   exclude:
     - ".obsidian/**"
     - ".trash/**"
@@ -49,6 +61,17 @@ ocr:
     model: "qwen3-vl:8b"
     base_url: "http://localhost:11434"
     timeout: 120
+
+media:
+  enabled: true
+  provider: "openrouter"                  # cloud media transcription/analysis
+  audio_model: "openai/whisper-1"
+  fallback_audio_models:
+    - "mistralai/voxtral-small-24b-2507"
+    - "google/gemini-2.5-flash-lite"
+  video_model: "google/gemini-2.5-flash-lite"
+  max_file_size_mb: 50
+  timeout: 300
 
 embeddings:
   provider: "ollama"                      # local Ollama embeddings

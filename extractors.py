@@ -1,4 +1,4 @@
-"""Text extraction from Markdown, PDF, images, and document files.
+"""Text extraction from Markdown, PDF, images, media, and document files.
 
 Supported formats:
 - Markdown (.md): YAML frontmatter parsed and stripped from indexed content.
@@ -6,6 +6,8 @@ Supported formats:
   Metadata (title, author, dates) stored in frontmatter.
 - Images (.png, .jpg, .jpeg, .gif, .webp): OCR provider's describe() for
   rich text + visual description. EXIF metadata extracted via Pillow.
+- Audio (.mp3, .wav, .m4a, .flac, .ogg, .aac): media provider transcription.
+- Video (.mp4, .mov, .mkv, .webm, .avi, .m4v): media provider analysis.
 - Documents (.docx, .doc, .pptx, .html, .htm, .epub, .rtf, .csv):
   MarkItDown converts to Markdown for heading-aware chunking.
 - Spreadsheets (.xlsx, .xls): openpyxl extracts headers + text-only cells.
@@ -18,9 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from providers.media.base import MediaProvider
 from providers.ocr.base import OCRProvider
 
 logger = logging.getLogger(__name__)
+
+AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "flac", "ogg", "aac", "aiff"}
+VIDEO_EXTENSIONS = {"mp4", "mov", "mkv", "webm", "avi", "m4v"}
 
 
 @dataclass
@@ -449,6 +455,55 @@ def extract_image(
 
 
 # ---------------------------------------------------------------------------
+# Audio/video
+# ---------------------------------------------------------------------------
+
+def _media_frontmatter(file_path: str | Path, media_type: str) -> dict:
+    path = Path(file_path)
+    fm = {
+        "media_type": media_type,
+        "format": path.suffix.lower().lstrip("."),
+    }
+    try:
+        fm["file_size_bytes"] = path.stat().st_size
+    except OSError:
+        pass
+    return fm
+
+
+def extract_audio(
+    file_path: str | Path,
+    media_provider: Optional[MediaProvider] = None,
+) -> ExtractionResult:
+    """Extract searchable text from an audio file."""
+    fm = _media_frontmatter(file_path, "audio")
+    if media_provider is None:
+        return ExtractionResult.from_text("", frontmatter=fm)
+    try:
+        transcript = media_provider.transcribe_audio(file_path)
+    except Exception as e:
+        logger.warning("Audio extraction failed for %s: %s", file_path, e)
+        transcript = ""
+    return ExtractionResult.from_text(transcript, frontmatter=fm)
+
+
+def extract_video(
+    file_path: str | Path,
+    media_provider: Optional[MediaProvider] = None,
+) -> ExtractionResult:
+    """Extract searchable text from a video file."""
+    fm = _media_frontmatter(file_path, "video")
+    if media_provider is None:
+        return ExtractionResult.from_text("", frontmatter=fm)
+    try:
+        notes = media_provider.analyze_video(file_path)
+    except Exception as e:
+        logger.warning("Video extraction failed for %s: %s", file_path, e)
+        notes = ""
+    return ExtractionResult.from_text(notes, frontmatter=fm)
+
+
+# ---------------------------------------------------------------------------
 # MarkItDown (docx, doc, pptx, html, epub, rtf, csv)
 # ---------------------------------------------------------------------------
 
@@ -561,11 +616,13 @@ def extract_text(
     file_path: str | Path,
     ext: str,
     ocr_provider: Optional[OCRProvider] = None,
+    media_provider: Optional[MediaProvider] = None,
     pdf_strategy: str = "text_then_ocr",
     min_text_chars: int = 200,
     ocr_page_limit: int = 200,
 ) -> ExtractionResult:
     """Route to the right extractor based on file extension."""
+    ext = ext.lower().lstrip(".")
     if ext == "md":
         return extract_markdown(file_path)
     elif ext == "pdf":
@@ -578,6 +635,10 @@ def extract_text(
         )
     elif ext in ("png", "jpg", "jpeg", "gif", "webp"):
         return extract_image(file_path, ocr_provider=ocr_provider)
+    elif ext in AUDIO_EXTENSIONS:
+        return extract_audio(file_path, media_provider=media_provider)
+    elif ext in VIDEO_EXTENSIONS:
+        return extract_video(file_path, media_provider=media_provider)
     elif ext == "txt":
         return extract_plaintext(file_path)
     elif ext in ("xlsx", "xls"):

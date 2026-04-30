@@ -480,6 +480,72 @@ def test_index_flow_syncs_folder_taxonomy_from_sources(tmp_path):
     sync_mock.assert_called_once()
 
 
+def test_index_flow_injects_media_provider_into_sources(tmp_path):
+    """Index flow should inject optional media provider into filesystem sources."""
+    from flow_index_vault import index_vault_flow
+
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = []
+    fake_store.list_doc_mtimes.return_value = {}
+    fake_store.count_chunks.return_value = 0
+    fake_store.fts_available.return_value = True
+
+    fake_registry = MagicMock()
+    fake_registry.count.return_value = 1
+
+    fake_taxonomy = MagicMock()
+    fake_taxonomy.count.return_value = 0
+    fake_media_provider = object()
+
+    class _FakeSource:
+        name = "documents"
+
+        def __init__(self):
+            self.media_provider = None
+
+        def scan(self):
+            return iter([])
+
+        def set_ocr_provider(self, provider):
+            return None
+
+        def set_media_provider(self, provider):
+            self.media_provider = provider
+
+        def close(self):
+            return None
+
+    fake_source = _FakeSource()
+    config = {
+        "index_root": str(tmp_path / "index"),
+        "sources": [{"type": "filesystem", "name": "documents", "root": str(tmp_path)}],
+        "chunking": {"max_chars": 1800, "overlap": 200, "semantic": {"enabled": False}},
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "media": {"enabled": True},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+
+    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+        with patch("flow_index_vault.load_config", return_value=config):
+            with patch("flow_index_vault.LanceDBStore", return_value=fake_store):
+                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                            with patch("flow_index_vault.build_media_provider", return_value=fake_media_provider):
+                                with patch("sources.build_source", return_value=fake_source):
+                                    with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                        with patch("flow_index_vault.diff_index_task", return_value=([], [])):
+                                            with patch("flow_index_vault.delete_docs_task"):
+                                                with patch("flow_index_vault.index_stats_task"):
+                                                    with patch("flow_index_vault.write_index_metadata_task"):
+                                                        index_vault_flow.fn("dummy.yaml")
+
+    assert fake_source.media_provider is fake_media_provider
+
+
 # --- zip strict=True catches length mismatch (Fix 4) ---
 
 

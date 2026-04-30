@@ -2,7 +2,8 @@
 
 Uses LlamaIndex for chunking (SentenceSplitter) and embeddings.
 Storage via our LanceDBStore (which wraps LlamaIndex's LanceDBVectorStore).
-Extraction via extractors.py (Markdown, PDF, images, documents, spreadsheets, plain text).
+Extraction via extractors.py (Markdown, PDF, images, audio/video, documents,
+spreadsheets, plain text).
 
 Chunking enhancements:
 - Contextual headers: each chunk is prepended with document metadata
@@ -25,7 +26,7 @@ Auto-recovery:
   it walks versions backward, exports data from the last clean version,
   and recreates the table automatically.
 
-Complex objects (store, embed_provider, splitter, ocr_provider) are built inside
+Complex objects (store, embed_provider, splitter, ocr_provider, media_provider) are built inside
 the flow and passed to tasks via a shared module-level dict (_RUNTIME) rather
 than as task arguments.  This avoids Prefect 3's input-serialisation warnings
 while keeping the flow easy to read.
@@ -59,6 +60,7 @@ from doc_enrichment import enrich_document, empty_enrichment, ENRICHMENT_FIELDS,
 from extractors import extract_text, extract_title, derive_folder, normalize_tags
 from providers.embed import build_embed_provider
 from providers.embed.base import EmbedProvider
+from providers.media import build_media_provider
 from providers.ocr import build_ocr_provider
 from doc_id_store import (
     DocIDStore, extract_id_from_filename, inject_id_into_filename,
@@ -398,6 +400,7 @@ def process_doc_task(doc: dict) -> None:
     semantic_splitter = _RUNTIME.get("semantic_splitter")
     semantic_threshold: int = _RUNTIME.get("semantic_threshold", 0)
     ocr_provider = _RUNTIME.get("ocr_provider")  # may be None
+    media_provider = _RUNTIME.get("media_provider")  # may be None
     config: dict = _RUNTIME.get("config", {})
 
     logger = get_run_logger()
@@ -434,6 +437,7 @@ def process_doc_task(doc: dict) -> None:
             file_path=abs_path,
             ext=ext,
             ocr_provider=ocr_provider,
+            media_provider=media_provider,
             pdf_strategy=pdf_cfg.get("strategy", "text_then_ocr"),
             min_text_chars=pdf_cfg.get("min_text_chars_before_ocr", 200),
             ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
@@ -603,8 +607,8 @@ def process_doc_task(doc: dict) -> None:
             nodes.append(node)
 
     else:
-        # Images or single-page PDFs
-        loc_prefix = "img" if source_type == "img" else ""
+        # Images, media, or single-page PDFs
+        loc_prefix = source_type if source_type in ("img", "audio", "video") else ""
         raw_chunks = _split_section(
             result.full_text, splitter, semantic_splitter, semantic_threshold
         )
@@ -906,6 +910,17 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     else:
         logger.info("OCR disabled (set ocr.enabled=true in config to enable)")
 
+    media_provider = build_media_provider(config)
+    if media_provider:
+        media_cfg = config.get("media", {})
+        logger.info(
+            "Media extraction enabled: audio=%s video=%s",
+            media_cfg.get("audio_models") or media_cfg.get("audio_model", "openai/whisper-1"),
+            media_cfg.get("video_model", "google/gemini-2.5-flash-lite"),
+        )
+    else:
+        logger.info("Media extraction disabled (set media.enabled=true in config to enable)")
+
     # --- Build Sources from config (always has a 'sources' key via Task 3 shim) ---
     from sources import build_source
 
@@ -923,6 +938,8 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     for src in all_sources:
         if hasattr(src, "set_ocr_provider"):
             src.set_ocr_provider(ocr_provider)
+        if hasattr(src, "set_media_provider"):
+            src.set_media_provider(media_provider)
 
     # Semantic splitter (optional — for large sections that need topic-boundary detection)
     semantic_cfg = chunk_cfg.get("semantic", {})
@@ -1008,6 +1025,7 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     _RUNTIME["semantic_splitter"] = semantic_splitter
     _RUNTIME["semantic_threshold"] = semantic_threshold
     _RUNTIME["ocr_provider"] = ocr_provider
+    _RUNTIME["media_provider"] = media_provider
     _RUNTIME["llm_generator"] = llm_generator
     _RUNTIME["taxonomy_store"] = taxonomy_store
     _RUNTIME["config"] = config

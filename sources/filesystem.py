@@ -36,12 +36,17 @@ class FilesystemSource:
         self._registry = registry
         self._pdf_config = pdf_config or {}
         self._ocr_provider = None  # Set by flow after instantiation; see Task 8
+        self._media_provider = None
 
     def set_ocr_provider(self, provider):
         """Injected by flow_index_vault after config is loaded. OCR is a
         flow-level concern, not a source-level one — filesystem doesn't
         know how to build an OCR provider and shouldn't have to."""
         self._ocr_provider = provider
+
+    def set_media_provider(self, provider):
+        """Injected by flow_index_vault for local audio/video extraction."""
+        self._media_provider = provider
 
     def scan(self) -> Iterator[SourceRecord]:
         """Scan files without depending on the Prefect task runtime."""
@@ -82,6 +87,7 @@ class FilesystemSource:
             file_path=record.metadata["abs_path"],
             ext=record.metadata["ext"],
             ocr_provider=self._ocr_provider,
+            media_provider=self._media_provider,
             pdf_strategy=self._pdf_config.get("strategy", "text_then_ocr"),
             min_text_chars=self._pdf_config.get("min_text_chars_before_ocr", 200),
             ocr_page_limit=self._pdf_config.get("ocr_page_limit", 200),

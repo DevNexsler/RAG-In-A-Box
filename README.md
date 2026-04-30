@@ -6,7 +6,7 @@ No infrastructure to manage. No GPU required. Works with **cloud APIs** out of t
 
 ## Use cases
 
-- **Personal knowledge base** — Index your notes, PDFs, and documents. Ask your AI assistant questions and get answers grounded in your own files.
+- **Personal knowledge base** — Index your notes, PDFs, documents, images, audio, and video. Ask your AI assistant questions and get answers grounded in your own files.
 - **Company document search** — Drop legal contracts, reports, SOPs into a folder. Employees search via any MCP-compatible assistant with metadata filters (by department, doc type, date, tags).
 - **Research assistant** — Index papers, datasets, and notes. Search by meaning, not just keywords. LLM enrichment auto-extracts entities, topics, and key facts.
 - **Obsidian / Markdown vault** — Works with any markdown source (Obsidian, HackMD, Notion exports, GitBook). Extracts YAML frontmatter for rich filtering.
@@ -83,7 +83,7 @@ DEEPINFRA_API_KEY=...            # reranker — https://deepinfra.com/dash/api_k
 python run_index.py
 ```
 
-This scans your documents, extracts text (Markdown, PDFs, images), generates embeddings, and writes everything to a LanceDB index. Prefect auto-starts a temporary server for flow/task logging — dashboard at `http://127.0.0.1:4200`.
+This scans your documents, extracts text (Markdown, PDFs, images, audio, video), generates embeddings, and writes everything to a LanceDB index. Prefect auto-starts a temporary server for flow/task logging — dashboard at `http://127.0.0.1:4200`.
 
 ### 5. Connect your AI assistant
 
@@ -245,7 +245,7 @@ Document Collection                    AI Assistants
 
 **Hybrid search** — Every query runs vector (semantic) and keyword (BM25) search in parallel, fuses results with Reciprocal Rank Fusion, applies length normalization, importance weighting, optional recency boost with time decay floor, cross-encoder reranking (60/40 blend with cosine fallback), MMR diversity filtering, and minimum score thresholding. Pre-filters (tags, folders, doc type, topics) apply at the database level before retrieval so every result matches.
 
-**Multi-format extraction** — Indexes Markdown, PDFs, and images. PDFs use text extraction first, falling back to OCR for scanned pages. Images get OCR text plus visual descriptions. EXIF metadata (camera, GPS, dates) is extracted automatically.
+**Multi-format extraction** — Indexes Markdown, PDFs, images, audio, and video. PDFs use text extraction first, falling back to OCR for scanned pages. Images get OCR text plus visual descriptions. Audio/video files are base64-sent to OpenRouter-compatible media models for transcript/search notes. EXIF metadata (camera, GPS, dates) is extracted automatically.
 
 **LLM enrichment** — Each document is analyzed by an LLM to extract structured metadata: summary, document type, entities (people, places, orgs, dates), topics, keywords, key facts, suggested tags, and suggested folder. All fields are searchable and filterable.
 
@@ -300,7 +300,7 @@ providers/llm/               LLM providers (OpenRouter, Ollama)
 providers/ocr/               OCR providers (Gemini Vision, DeepSeek OCR2)
 taxonomy_store.py            Taxonomy LanceDB store (CRUD, vector search, FTS)
 doc_enrichment.py            LLM metadata extraction (with taxonomy integration)
-extractors.py                Text extraction (MD, PDF, images)
+extractors.py                Text extraction (MD, PDF, images, audio/video)
 flow_index_vault.py          Prefect indexing flow
 lancedb_store.py             LanceDB storage + search
 search_hybrid.py             10-step hybrid search pipeline
