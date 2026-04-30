@@ -161,6 +161,49 @@ class TestDeepSeekOCR2Unit:
         assert provider.base_url == "http://localhost:8790"
         assert provider.timeout == 60.0
 
+    def test_build_ocr_provider_routes_images_to_ollama_describe(self, tmp_path):
+        """Split OCR config keeps PDF OCR on DeepSeek and routes images to Ollama VL."""
+        from providers.ocr import build_ocr_provider
+        from providers.ocr.composite import CompositeOCRProvider
+
+        img = tmp_path / "photo.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        config = {
+            "ocr": {
+                "enabled": True,
+                "provider": "deepseek_ocr2",
+                "base_url": "http://deepseek:8790",
+                "timeout": 60.0,
+                "describe": {
+                    "provider": "ollama_vision",
+                    "base_url": "http://ollama:11434",
+                    "model": "qwen3-vl:8b",
+                    "timeout": 90.0,
+                },
+            }
+        }
+
+        provider = build_ocr_provider(config)
+
+        assert isinstance(provider, CompositeOCRProvider)
+        with patch("providers.ocr.deepseek_ocr2_local.httpx.post") as deepseek_post:
+            deepseek_resp = MagicMock()
+            deepseek_resp.json.return_value = {"text": "pdf page text"}
+            deepseek_resp.raise_for_status = MagicMock()
+            deepseek_post.return_value = deepseek_resp
+            assert provider.extract(img) == "pdf page text"
+
+        with patch("providers.ocr.ollama_vision.httpx.post") as ollama_post:
+            ollama_resp = MagicMock()
+            ollama_resp.json.return_value = {"message": {"content": "image description"}}
+            ollama_resp.raise_for_status = MagicMock()
+            ollama_post.return_value = ollama_resp
+            assert provider.describe(img) == "image description"
+
+        assert deepseek_post.call_args.args[0] == "http://deepseek:8790/extract"
+        assert ollama_post.call_args.args[0] == "http://ollama:11434/api/chat"
+        assert ollama_post.call_args.kwargs["json"]["model"] == "qwen3-vl:8b"
+
 
 # -----------------------------------------------------------------------
 # Live integration tests (require DeepSeek-OCR2 reachable at its configured
