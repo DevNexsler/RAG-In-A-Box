@@ -12,6 +12,27 @@ import mcp_server
 
 
 # ---------------------------------------------------------------------------
+# MCP tool schema contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_file_search_tool_schema_includes_complex_filter():
+    """FastMCP-published file_search schema should expose the complex filter argument."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tools = await mcp_server.mcp.list_tools()
+    file_search = next(tool for tool in tools if tool.name == "file_search")
+
+    assert "filter" in file_search.inputSchema["properties"]
+    assert file_search.inputSchema["properties"]["filter"]["title"] == "Filter"
+    assert "Supported operators: eq, ne, contains, prefix, in, and, or, not" in (
+        file_search.description or ""
+    )
+
+
+# ---------------------------------------------------------------------------
 # _hit_to_dict contract
 # ---------------------------------------------------------------------------
 

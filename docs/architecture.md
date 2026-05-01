@@ -33,7 +33,7 @@ Store these in a `.env` file in the project root. The MCP server and indexer loa
 
 ## Search pipeline
 
-1. **Pre-filter:** Build SQL WHERE clause from filters (source_type, folder, tags, enr_doc_type, enr_topics, etc.) and apply at LanceDB level via `.where(clause, prefilter=True)` — filters run before ANN/FTS scoring so full `top_k` results match the criteria
+1. **Pre-filter:** Build SQL WHERE clause from filters (source_type, folder, tags, enr_doc_type, enr_topics, metadata_filters, and complex JSON filter ASTs) and apply at LanceDB level via `.where(clause, prefilter=True)` — filters run before ANN/FTS scoring so full `top_k` results match the criteria
 2. **Parallel retrieval:** vector search (semantic) + BM25/FTS (keyword) — run concurrently, both with pre-filters applied
 3. **RRF fusion:** Reciprocal Rank Fusion merges both ranked lists (k=60)
 4. **Length normalization:** Log-based penalty for long chunks — `score *= 1 / (1 + 0.5 * log2(len/anchor))` with anchor=800 chars. Chunks at or below anchor are unaffected.
@@ -114,7 +114,7 @@ The taxonomy is managed exclusively via MCP tools (`file_taxonomy_add`, `file_ta
 | `enr_importance_source` | string | Origin of importance value: `"llm"`, `"frontmatter"`, or `"default"` |
 | `vector` | float[] | Embedding vector (2560-dim for Qwen3, 768-dim for Gemini) |
 
-Metadata fields (`title`, `tags`, `status`, `created`, `description`, `author`, `keywords`, `folder`) are automatically enriched during indexing from YAML frontmatter and file path. LLM enrichment fields (prefixed `enr_`) are extracted by GPT-4.1 Mini via OpenRouter during indexing when `enrichment.enabled` is true. The `enr_` prefix avoids collisions with user frontmatter fields. All metadata is returned in search results and can be used as filters. Dynamic metadata fields from frontmatter (e.g. `priority`, `category`) are automatically promoted to LanceDB columns and appear in search results, facets, and filters.
+Metadata fields (`title`, `tags`, `status`, `created`, `description`, `author`, `keywords`, `folder`) are automatically enriched during indexing from YAML frontmatter and file path. LLM enrichment fields (prefixed `enr_`) are extracted by GPT-4.1 Mini via OpenRouter during indexing when `enrichment.enabled` is true. The `enr_` prefix avoids collisions with user frontmatter fields. All metadata is returned in search results and can be used as filters. Dynamic metadata fields from frontmatter (e.g. `priority`, `category`) are automatically promoted to LanceDB columns and appear in search results, facets, and filters. Complex `file_search` filters support `eq`, `ne`, `contains`, `prefix`, `in`, `and`, `or`, and `not` over any safe metadata field name.
 
 ## Event hooks
 

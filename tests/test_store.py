@@ -658,6 +658,63 @@ def test_build_where_clause_metadata_filters():
         assert "lower(metadata.priority) = 'high'" in clause
 
 
+def test_build_where_clause_filter_ast_nested_boolean():
+    """filter_ast should support nested boolean logic for any metadata field."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        clause = store._build_where_clause(
+            filter_ast={
+                "and": [
+                    {"eq": {"source_name": "sor"}},
+                    {"or": [
+                        {"eq": {"status": "active"}},
+                        {"eq": {"status": "pending"}},
+                    ]},
+                    {"not": {"contains": {"owner": "dan"}}},
+                ]
+            },
+        )
+
+        assert "lower(metadata.source_name) = 'sor'" in clause
+        assert "lower(metadata.status) = 'active'" in clause
+        assert " OR " in clause
+        assert "NOT (lower(metadata.owner) LIKE '%dan%')" in clause
+        assert " AND " in clause
+
+
+def test_build_where_clause_filter_ast_in_and_prefix():
+    """filter_ast should support IN lists and rel_path prefix filters."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        clause = store._build_where_clause(
+            filter_ast={
+                "and": [
+                    {"in": {"status": ["active", "pending"]}},
+                    {"prefix": {"rel_path": "Projects/"}},
+                ]
+            },
+        )
+
+        assert "lower(metadata.status) IN ('active', 'pending')" in clause
+        assert "metadata.rel_path LIKE 'Projects/%'" in clause
+
+
+def test_build_where_clause_filter_ast_rejects_unknown_operator():
+    """filter_ast should reject unsupported operators instead of emitting SQL."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        with pytest.raises(ValueError, match="Unsupported filter operator"):
+            store._build_where_clause(filter_ast={"gt": {"priority": "high"}})
+
+
+def test_build_where_clause_filter_ast_rejects_unsafe_key():
+    """filter_ast should reject unsafe metadata field names."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        with pytest.raises(ValueError, match="Unsafe metadata filter key"):
+            store._build_where_clause(filter_ast={"eq": {"status; DROP TABLE chunks": "active"}})
+
+
 # --- _row_to_hit tests ---
 
 

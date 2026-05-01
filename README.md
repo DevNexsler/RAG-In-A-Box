@@ -243,7 +243,7 @@ Document Collection                    AI Assistants
                                             file_recent ...
 ```
 
-**Hybrid search** — Every query runs vector (semantic) and keyword (BM25) search in parallel, fuses results with Reciprocal Rank Fusion, applies length normalization, importance weighting, optional recency boost with time decay floor, cross-encoder reranking (60/40 blend with cosine fallback), MMR diversity filtering, and minimum score thresholding. Pre-filters (tags, folders, doc type, topics) apply at the database level before retrieval so every result matches.
+**Hybrid search** — Every query runs vector (semantic) and keyword (BM25) search in parallel, fuses results with Reciprocal Rank Fusion, applies length normalization, importance weighting, optional recency boost with time decay floor, cross-encoder reranking (60/40 blend with cosine fallback), MMR diversity filtering, and minimum score thresholding. Pre-filters (tags, folders, doc type, topics, and complex JSON filters) apply at the database level before retrieval so every result matches.
 
 **Multi-format extraction** — Indexes Markdown, PDFs, images, audio, and video. PDFs use text extraction first, falling back to OCR for scanned pages. Images get OCR text plus visual descriptions. Audio/video files are base64-sent to OpenRouter-compatible media models for transcript/search notes. EXIF metadata (camera, GPS, dates) is extracted automatically.
 
@@ -253,7 +253,7 @@ Document Collection                    AI Assistants
 
 **Smart chunking** — Markdown is split by headings, PDFs by pages. Large sections get semantic chunking (topic-boundary detection via sentence embeddings). Every chunk gets a contextual header prepended with its title, path, and topics — so each chunk is self-describing for better retrieval.
 
-**Rich metadata & filtering** — YAML frontmatter (tags, status, author, dates, custom fields) is automatically extracted and promoted to filterable columns. Custom frontmatter keys are auto-promoted — no schema changes needed.
+**Rich metadata & filtering** — YAML frontmatter (tags, status, author, dates, custom fields) is automatically extracted and promoted to filterable columns. Custom frontmatter keys are auto-promoted — no schema changes needed. `file_search` supports exact filters plus complex JSON filters with `eq`, `ne`, `contains`, `prefix`, `in`, `and`, `or`, and `not`.
 
 **MCP server** — Exposes 16 tools over the Model Context Protocol. Any MCP-compatible assistant can search, browse, filter your documents, and manage taxonomy entries. Works over stdio (launched automatically by the assistant) or HTTP.
 
@@ -267,7 +267,7 @@ Document Collection                    AI Assistants
 
 | Tool | Description |
 |------|-------------|
-| `file_search` | Hybrid semantic + keyword search with filters (tags, folder, source_type, doc_type, topics, etc.) |
+| `file_search` | Hybrid semantic + keyword search with exact filters plus complex JSON filters (`and`/`or`/`not`, `in`, `contains`, etc.) |
 | `file_get_chunk` | Get full text + metadata for one chunk by doc_id and loc |
 | `file_get_doc_chunks` | Get all chunks for a document, sorted by position |
 | `file_list_documents` | Browse all indexed documents with pagination and filters |

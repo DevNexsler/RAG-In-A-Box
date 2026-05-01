@@ -578,6 +578,7 @@ def hybrid_search(
     recency_half_life_days: float = 90.0,
     recency_weight: float = 0.3,
     metadata_filters: dict[str, str] | None = None,
+    filter_ast: dict | None = None,
     enr_doc_type: str | None = None,
     enr_topics: str | None = None,
     importance_field: str = "enr_importance",
@@ -621,6 +622,7 @@ def hybrid_search(
         enr_doc_type=enr_doc_type,
         enr_topics=enr_topics,
         metadata_filters=metadata_filters,
+        filter_ast=filter_ast,
     )
 
     # 1. Embed query

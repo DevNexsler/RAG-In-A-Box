@@ -131,6 +131,61 @@ class LanceDBStore:
         if not _SAFE_IDENTIFIER_RE.match(key):
             raise ValueError(f"Unsafe metadata filter key: {key!r}")
 
+    def _metadata_field_sql(self, key: str) -> str:
+        """Return SQL reference for a metadata field after identifier validation."""
+        self._validate_identifier(key)
+        return f"metadata.{key}"
+
+    def _build_filter_ast_clause(self, node: dict) -> str:
+        """Compile a structured filter AST to a LanceDB SQL WHERE fragment."""
+        if not isinstance(node, dict) or len(node) != 1:
+            raise ValueError("filter must be an object with exactly one operator")
+
+        op, payload = next(iter(node.items()))
+        if op in {"and", "or"}:
+            if not isinstance(payload, list) or not payload:
+                raise ValueError(f"{op} filter must be a non-empty list")
+            joiner = f" {op.upper()} "
+            return "(" + joiner.join(self._build_filter_ast_clause(item) for item in payload) + ")"
+
+        if op == "not":
+            if not isinstance(payload, dict):
+                raise ValueError("not filter must contain one nested filter object")
+            return f"NOT ({self._build_filter_ast_clause(payload)})"
+
+        if op not in {"eq", "ne", "contains", "prefix", "in"}:
+            raise ValueError(f"Unsupported filter operator: {op}")
+        if not isinstance(payload, dict) or len(payload) != 1:
+            raise ValueError(f"{op} filter must be an object with exactly one field")
+
+        key, value = next(iter(payload.items()))
+        field = self._metadata_field_sql(key)
+
+        if op == "in":
+            if not isinstance(value, list) or not value:
+                raise ValueError("in filter value must be a non-empty list")
+            values = ", ".join(
+                f"'{self._sql_escape(str(item).lower())}'"
+                for item in value
+            )
+            return f"lower({field}) IN ({values})"
+
+        escaped = self._sql_escape(str(value))
+        escaped_lower = self._sql_escape(str(value).lower())
+
+        if op == "eq":
+            return f"lower({field}) = '{escaped_lower}'"
+        if op == "ne":
+            return f"lower({field}) != '{escaped_lower}'"
+        if op == "contains":
+            return f"lower({field}) LIKE '%{escaped_lower}%'"
+        if op == "prefix":
+            if key == "rel_path":
+                return f"{field} LIKE '{escaped}%'"
+            return f"lower({field}) LIKE '{escaped_lower}%'"
+
+        raise ValueError(f"Unsupported filter operator: {op}")
+
     def _metadata_subfields(self) -> set[str]:
         """Return the set of sub-field names inside the metadata struct column."""
         try:
@@ -245,6 +300,7 @@ class LanceDBStore:
         enr_doc_type: str | None = None,
         enr_topics: str | None = None,
         metadata_filters: dict[str, str] | None = None,
+        filter_ast: dict | None = None,
     ) -> str | None:
         """Build a SQL WHERE clause from filter parameters for LanceDB prefilter.
 
@@ -287,6 +343,9 @@ class LanceDBStore:
             for key, val in metadata_filters.items():
                 self._validate_identifier(key)
                 parts.append(f"lower(metadata.{key}) = '{self._sql_escape(str(val).lower())}'")
+
+        if filter_ast is not None:
+            parts.append(self._build_filter_ast_clause(filter_ast))
 
         return " AND ".join(parts) if parts else None
 

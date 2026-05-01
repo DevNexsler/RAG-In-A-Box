@@ -656,6 +656,49 @@ def test_prefilter_combined_source_and_folder():
         assert result[0].doc_id == "b.pdf"
 
 
+def test_prefilter_complex_filter_ast():
+    """Complex filter AST should restrict results before search scoring."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [1.0] + [0.0] * 767
+        nodes = [
+            _make_node(
+                "task-active.md", "c:0", "roof repair task", vec,
+                source_name="sor", status="active", owner="alex",
+            ),
+            _make_node(
+                "task-pending.md", "c:0", "roof repair task", vec,
+                source_name="sor", status="pending", owner="casey",
+            ),
+            _make_node(
+                "task-closed.md", "c:0", "roof repair task", vec,
+                source_name="sor", status="closed", owner="alex",
+            ),
+            _make_node(
+                "docs-active.md", "c:0", "roof repair task", vec,
+                source_name="documents", status="active", owner="alex",
+            ),
+        ]
+        store = _build_store_with_fts(tmpdir, nodes)
+        embed = MockEmbedProvider(vec)
+
+        result = hybrid_search(
+            store,
+            embed,
+            "roof repair",
+            vector_top_k=10,
+            final_top_k=10,
+            filter_ast={
+                "and": [
+                    {"eq": {"source_name": "sor"}},
+                    {"in": {"status": ["active", "pending"]}},
+                    {"not": {"contains": {"owner": "casey"}}},
+                ]
+            },
+        )
+
+        assert [hit.doc_id for hit in result] == ["task-active.md"]
+
+
 def test_diagnostics_vector_search_failure():
     """When vector search fails, vector_search_active should be False and degraded True."""
     with tempfile.TemporaryDirectory() as tmpdir:

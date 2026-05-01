@@ -182,6 +182,7 @@ def _file_search_impl(
     metadata_filters: str | None = None,
     enr_doc_type: str | None = None,
     enr_topics: str | None = None,
+    filter: str | None = None,
 ) -> dict:
     # Validate
     if not query or not query.strip():
@@ -230,6 +231,24 @@ def _file_search_impl(
                 'Provide a JSON object string, e.g. \'{"section": "Introduction"}\'.',
             )
 
+    # Parse complex filter JSON string
+    parsed_filter: dict | None = None
+    if filter:
+        import json
+        try:
+            parsed_filter = json.loads(filter)
+            if not isinstance(parsed_filter, dict):
+                return _error(
+                    "invalid_parameter",
+                    "filter must be a JSON object (e.g. '{\"eq\": {\"status\": \"active\"}}').",
+                )
+        except (json.JSONDecodeError, TypeError):
+            return _error(
+                "invalid_parameter",
+                "filter is not valid JSON.",
+                'Provide a JSON object string, e.g. \'{"eq": {"status": "active"}}\'.',
+            )
+
     try:
         store, embed_provider, config = _get_deps()
     except Exception as exc:
@@ -262,11 +281,20 @@ def _file_search_impl(
             recency_half_life_days=recency_cfg.get("half_life_days", 90.0),
             recency_weight=recency_cfg.get("weight", 0.3),
             metadata_filters=parsed_filters,
+            filter_ast=parsed_filter,
             enr_doc_type=enr_doc_type,
             enr_topics=enr_topics,
             importance_field=importance_cfg.get("field", "enr_importance"),
             importance_weight=importance_cfg.get("weight", 0.3),
             min_score_threshold=search_cfg.get("min_score_threshold", 0.0),
+        )
+    except ValueError as exc:
+        return _error(
+            "invalid_parameter",
+            str(exc),
+            "Use filter as a JSON object with one supported operator: eq, ne, contains, "
+            "prefix, in, and, or, not. Example: "
+            '\'{"and":[{"eq":{"source_name":"sor"}},{"in":{"status":["active","pending"]}}]}\'.',
         )
     except Exception as exc:
         return _error("search_failed", f"Search operation failed: {exc}",
@@ -844,6 +872,7 @@ if HAS_MCP and FastMCP is not None:
         folder: str | None = None,
         prefer_recent: bool = False,
         metadata_filters: str | None = None,
+        filter: str | None = None,
         enr_doc_type: str | None = None,
         enr_topics: str | None = None,
     ) -> dict:
@@ -874,6 +903,10 @@ if HAS_MCP and FastMCP is not None:
                 any metadata field, including dynamic fields added by the indexer.
                 Example: '{"section": "Introduction"}'. Use file_facets or
                 file_status to discover available fields. Combined with AND logic.
+            filter: JSON string for complex metadata filters with boolean logic.
+                Supported operators: eq, ne, contains, prefix, in, and, or, not.
+                Example: '{"and":[{"eq":{"source_name":"sor"}},{"in":{"status":["active","pending"]}}]}'.
+                Combined with existing filter params using AND logic.
             enr_doc_type: Filter by LLM-enriched document type (e.g.,
                 "Geotechnical Report", "Recipe"). Comma-separated for OR logic.
                 Values come from file_facets doc_types. Uses LIKE matching.
@@ -906,8 +939,9 @@ if HAS_MCP and FastMCP is not None:
                   results are still returned but may be lower quality (e.g., vector-only
                   without keyword boost, or RRF order without reranking).
 
-        Filters are combined with AND logic (e.g., source_type="md" AND folder="Projects").
-        Only the tags filter uses OR logic within its values.
+        Built-in filters are combined with AND logic (e.g., source_type="md" AND
+        folder="Projects"). The complex filter parameter supports explicit AND,
+        OR, and NOT logic.
 
         To get the full text of a result, call file_get_chunk with the doc_id and loc.
         To see all available filter values, call file_facets first.
@@ -915,8 +949,19 @@ if HAS_MCP and FastMCP is not None:
         On error, returns {"error": true, "code": "...", "message": "...", "fix": "..."}.
         """
         return _file_search_impl(
-            query, top_k, doc_id_prefix, source_type, source_name, tags, status, folder,
-            prefer_recent, metadata_filters, enr_doc_type, enr_topics,
+            query=query,
+            top_k=top_k,
+            doc_id_prefix=doc_id_prefix,
+            source_type=source_type,
+            source_name=source_name,
+            tags=tags,
+            status=status,
+            folder=folder,
+            prefer_recent=prefer_recent,
+            metadata_filters=metadata_filters,
+            enr_doc_type=enr_doc_type,
+            enr_topics=enr_topics,
+            filter=filter,
         )
 
     @mcp.tool()

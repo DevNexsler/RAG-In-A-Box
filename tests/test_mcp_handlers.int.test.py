@@ -358,3 +358,32 @@ def test_file_search_source_name_valid_with_registry(wired_mcp, tmp_path):
     # Validation passed — must not get invalid_source_name error
     assert result.get("code") != "invalid_source_name"
     assert isinstance(result, dict)
+
+
+def test_file_search_filter_invalid_json_returns_invalid_parameter(wired_mcp):
+    """Invalid complex filter JSON should return a structured validation error."""
+    result = mcp_server._file_search_impl("anything", filter="{not-json")
+
+    assert result.get("error") is True
+    assert result.get("code") == "invalid_parameter"
+    assert "filter" in result.get("message", "")
+
+
+def test_file_search_filter_invalid_operator_returns_invalid_parameter(wired_mcp):
+    """Unsupported complex filter operators should not surface as search_failed."""
+    result = mcp_server._file_search_impl("anything", filter='{"gt": {"status": "active"}}')
+
+    assert result.get("error") is True
+    assert result.get("code") == "invalid_parameter"
+    assert "Unsupported filter operator" in result.get("message", "")
+    assert "eq, ne, contains, prefix, in, and, or, not" in result.get("fix", "")
+
+
+def test_file_search_filter_empty_object_returns_invalid_parameter(wired_mcp):
+    """Empty complex filter objects should not silently become no-ops."""
+    result = mcp_server._file_search_impl("anything", filter="{}")
+
+    assert result.get("error") is True
+    assert result.get("code") == "invalid_parameter"
+    assert "exactly one operator" in result.get("message", "")
+    assert "Example:" in result.get("fix", "")

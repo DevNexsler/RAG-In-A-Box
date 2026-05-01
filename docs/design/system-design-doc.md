@@ -107,7 +107,7 @@ Query
 ### 3.2 MCP Server (`mcp_server.py`)
 
 #### AC-MCP-1: file_search
-- Parameters: query (required), top_k, doc_id_prefix, source_type, tags, status, folder, prefer_recent, metadata_filters (JSON), enr_doc_type, enr_topics
+- Parameters: query (required), top_k, doc_id_prefix, source_type, source_name, tags, status, folder, prefer_recent, metadata_filters (JSON), filter (complex JSON), enr_doc_type, enr_topics
 - Returns: `{results: [{doc_id, loc, snippet, score, title, tags, folder, status, source_type, description, author, keywords, custom_meta, enr_summary, enr_doc_type, enr_topics, enr_keywords, enr_entities_*, enr_key_facts, enr_suggested_tags, enr_suggested_folder, enr_importance, enr_importance_source, ...extra_metadata}], diagnostics: {vector_search_active, keyword_search_active, reranker_applied, degraded}}`
 - Error on empty query with code "empty_query"
 
@@ -176,9 +176,10 @@ Query
 - Any failure → diagnostics.degraded=true
 
 #### AC-SEARCH-3: Pre-filtering
-- SQL WHERE clause built from: source_type, folder, tags, status, doc_id_prefix, enr_doc_type, enr_topics, metadata_filters
+- SQL WHERE clause built from: source_type, source_name, folder, tags, status, doc_id_prefix, enr_doc_type, enr_topics, metadata_filters, and complex JSON `filter`
 - Applied at LanceDB level before ANN/FTS scoring (prefilter=True)
 - Comma-separated fields use LIKE '%value%' matching
+- Complex `filter` supports `eq`, `ne`, `contains`, `prefix`, `in`, `and`, `or`, and `not` over safe metadata field names
 
 #### AC-SEARCH-4: Length Normalization
 - Formula: `score *= 1 / (1 + 0.5 * log2(len/anchor))` where anchor=800 chars
