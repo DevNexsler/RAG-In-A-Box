@@ -369,6 +369,17 @@ def test_file_search_filter_invalid_json_returns_invalid_parameter(wired_mcp):
     assert "filter" in result.get("message", "")
 
 
+def test_file_search_filter_accepts_decoded_object(wired_mcp):
+    """mcporter may decode JSON-looking filter strings before MCP validation."""
+    result = mcp_server._file_search_impl(
+        "anything",
+        filter={"in": {"status": ["active", "pending"]}},
+    )
+
+    assert isinstance(result, dict)
+    assert result.get("code") != "invalid_parameter"
+
+
 def test_file_search_filter_invalid_operator_returns_invalid_parameter(wired_mcp):
     """Unsupported complex filter operators should not surface as search_failed."""
     result = mcp_server._file_search_impl("anything", filter='{"gt": {"status": "active"}}')

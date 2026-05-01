@@ -182,7 +182,7 @@ def _file_search_impl(
     metadata_filters: str | None = None,
     enr_doc_type: str | None = None,
     enr_topics: str | None = None,
-    filter: str | None = None,
+    filter: str | dict | None = None,
 ) -> dict:
     # Validate
     if not query or not query.strip():
@@ -234,19 +234,28 @@ def _file_search_impl(
     # Parse complex filter JSON string
     parsed_filter: dict | None = None
     if filter:
-        import json
-        try:
-            parsed_filter = json.loads(filter)
-            if not isinstance(parsed_filter, dict):
+        if isinstance(filter, dict):
+            parsed_filter = filter
+        elif isinstance(filter, str):
+            import json
+            try:
+                parsed_filter = json.loads(filter)
+                if not isinstance(parsed_filter, dict):
+                    return _error(
+                        "invalid_parameter",
+                        "filter must be a JSON object (e.g. '{\"eq\": {\"status\": \"active\"}}').",
+                    )
+            except (json.JSONDecodeError, TypeError):
                 return _error(
                     "invalid_parameter",
-                    "filter must be a JSON object (e.g. '{\"eq\": {\"status\": \"active\"}}').",
+                    "filter is not valid JSON.",
+                    'Provide a JSON object string, e.g. \'{"eq": {"status": "active"}}\'.',
                 )
-        except (json.JSONDecodeError, TypeError):
+        else:
             return _error(
                 "invalid_parameter",
-                "filter is not valid JSON.",
-                'Provide a JSON object string, e.g. \'{"eq": {"status": "active"}}\'.',
+                "filter must be a JSON object or JSON object string.",
+                'Provide {"eq": {"status": "active"}} or the same value encoded as a JSON string.',
             )
 
     try:
@@ -872,7 +881,7 @@ if HAS_MCP and FastMCP is not None:
         folder: str | None = None,
         prefer_recent: bool = False,
         metadata_filters: str | None = None,
-        filter: str | None = None,
+        filter: str | dict | None = None,
         enr_doc_type: str | None = None,
         enr_topics: str | None = None,
     ) -> dict:
@@ -903,7 +912,7 @@ if HAS_MCP and FastMCP is not None:
                 any metadata field, including dynamic fields added by the indexer.
                 Example: '{"section": "Introduction"}'. Use file_facets or
                 file_status to discover available fields. Combined with AND logic.
-            filter: JSON string for complex metadata filters with boolean logic.
+            filter: JSON object or JSON string for complex metadata filters with boolean logic.
                 Supported operators: eq, ne, contains, prefix, in, and, or, not.
                 Example: '{"and":[{"eq":{"source_name":"sor"}},{"in":{"status":["active","pending"]}}]}'.
                 Combined with existing filter params using AND logic.
