@@ -1000,7 +1000,7 @@ if HAS_MCP and FastMCP is not None:
         filter: str | dict | None = None,
         enr_doc_type: str | None = None,
         enr_topics: str | None = None,
-        return_mode: Annotated[str, Field(alias="return")] = "compact",
+        return_mode: Annotated[str, Field(validation_alias="return")] = "compact",
         content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
     ) -> dict:
         """Hybrid semantic + keyword search over the indexed documents.

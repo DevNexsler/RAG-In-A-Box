@@ -36,6 +36,22 @@ async def test_file_search_tool_schema_includes_complex_filter():
     )
 
 
+@pytest.mark.anyio
+async def test_file_search_tool_dispatch_maps_return_alias():
+    """FastMCP should accept MCP arg 'return' and call implementation with return_mode."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    with patch("mcp_server._file_search_impl", return_value={"results": [], "diagnostics": {}}) as mock:
+        await mcp_server.mcp.call_tool(
+            "file_search",
+            {"query": "lease application", "return": "full", "content_max_character": 123},
+        )
+
+    assert mock.call_args.kwargs["return_mode"] == "full"
+    assert mock.call_args.kwargs["content_max_character"] == 123
+
+
 # ---------------------------------------------------------------------------
 # _hit_to_dict contract
 # ---------------------------------------------------------------------------
