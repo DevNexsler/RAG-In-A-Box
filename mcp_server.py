@@ -31,6 +31,25 @@ except ImportError:
 _VALID_SOURCE_TYPES = BUILTIN_SOURCE_TYPES
 _MAX_TOP_K = 100
 _MAX_LIMIT = 200
+_DEFAULT_CONTENT_MAX_CHARACTER = 10_000
+_VALID_SEARCH_RETURN_MODES = {"compact", "full"}
+_COMPACT_EXCLUDED_METADATA_KEYS = {
+    "_node_content",
+    "_node_type",
+    "embedding",
+    "relationships",
+    "excluded_embed_metadata_keys",
+    "excluded_llm_metadata_keys",
+    "metadata",
+    "metadata_separator",
+    "metadata_template",
+    "text_template",
+    "mimetype",
+    "class_name",
+    "start_char_idx",
+    "end_char_idx",
+    "enr_suggested_folder",
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -94,6 +113,75 @@ def _hit_to_dict(h: SearchHit, include_text: bool = False) -> dict:
             d[k] = v
     if include_text:
         d["text"] = h.text
+    return d
+
+
+def _hit_content(h: SearchHit) -> str:
+    """Return source chunk text without serializing the raw LlamaIndex node."""
+    if h.text:
+        return h.text
+    node = _hit_node(h)
+    text = node.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def _hit_node(h: SearchHit) -> dict:
+    """Parse the raw node wrapper when needed for compact source fields."""
+    raw_node = (h.extra_metadata or {}).get("_node_content")
+    if not isinstance(raw_node, str):
+        return {}
+    try:
+        import json
+        parsed = json.loads(raw_node)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _compact_hit_to_dict(h: SearchHit, content_max_character: int) -> dict:
+    """Convert a SearchHit to compact search output with capped source content."""
+    content = _hit_content(h)
+    node_metadata = _hit_node(h).get("metadata") or {}
+    if not isinstance(node_metadata, dict):
+        node_metadata = {}
+    truncated = len(content) > content_max_character
+    d: dict = {
+        "doc_id": h.doc_id,
+        "rel_path": h.rel_path,
+        "loc": h.loc,
+        "snippet": h.snippet,
+        "score": h.score,
+        "title": h.title,
+        "tags": h.tags.split(",") if h.tags else [],
+        "folder": h.folder,
+        "status": h.status,
+        "source_type": h.source_type,
+        "created": h.created or node_metadata.get("created", ""),
+        "mtime": h.mtime or node_metadata.get("mtime", 0.0),
+        "size": (h.extra_metadata or {}).get("size", node_metadata.get("size", "")),
+        "section": (h.extra_metadata or {}).get("section", node_metadata.get("section", "")),
+        "description": h.description,
+        "author": h.author,
+        "keywords": h.keywords.split(",") if h.keywords else [],
+        "custom_meta": h.custom_meta,
+        "content": content[:content_max_character],
+        "content_truncated": truncated,
+        "enr_summary": h.enr_summary,
+        "enr_doc_type": h.enr_doc_type,
+        "enr_topics": h.enr_topics,
+        "enr_keywords": h.enr_keywords,
+        "enr_entities_people": h.enr_entities_people,
+        "enr_entities_places": h.enr_entities_places,
+        "enr_entities_orgs": h.enr_entities_orgs,
+        "enr_entities_dates": h.enr_entities_dates,
+        "enr_key_facts": h.enr_key_facts,
+        "enr_suggested_tags": h.enr_suggested_tags,
+        "enr_importance": h.enr_importance,
+        "enr_importance_source": h.enr_importance_source,
+    }
+    for k, v in (h.extra_metadata or {}).items():
+        if k not in d and k not in _COMPACT_EXCLUDED_METADATA_KEYS:
+            d[k] = v
     return d
 
 
@@ -183,6 +271,8 @@ def _file_search_impl(
     enr_doc_type: str | None = None,
     enr_topics: str | None = None,
     filter: str | dict | None = None,
+    return_mode: str = "compact",
+    content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
 ) -> dict:
     # Validate
     if not query or not query.strip():
@@ -192,6 +282,27 @@ def _file_search_impl(
             "Provide a natural-language search query (e.g., 'machine learning papers').",
         )
     top_k = max(1, min(top_k, _MAX_TOP_K))
+    return_mode = (return_mode or "compact").strip().lower()
+    if return_mode not in _VALID_SEARCH_RETURN_MODES:
+        return _error(
+            "invalid_parameter",
+            "return must be either 'compact' or 'full'.",
+            "Use return='compact' for capped source content or return='full' for the legacy verbose response.",
+        )
+    try:
+        content_max_character = int(content_max_character)
+    except (TypeError, ValueError):
+        return _error(
+            "invalid_parameter",
+            "content_max_character must be an integer.",
+            "Use a non-negative character limit, e.g. 10000.",
+        )
+    if content_max_character < 0:
+        return _error(
+            "invalid_parameter",
+            "content_max_character must not be negative.",
+            "Use 0 to omit content or a positive character limit, e.g. 10000.",
+        )
     err = _validate_source_type(source_type)
     if err:
         return err
@@ -308,10 +419,11 @@ def _file_search_impl(
     except Exception as exc:
         return _error("search_failed", f"Search operation failed: {exc}",
                        "Check that the index exists (run file_index_update) and configured services are running.")
-    return {
-        "results": [_hit_to_dict(h) for h in result.hits],
-        "diagnostics": result.diagnostics,
-    }
+    if return_mode == "full":
+        results = [_hit_to_dict(h) for h in result.hits]
+    else:
+        results = [_compact_hit_to_dict(h, content_max_character) for h in result.hits]
+    return {"results": results, "diagnostics": result.diagnostics}
 
 
 def _file_get_chunk_impl(doc_id: str, loc: str) -> dict:
@@ -867,6 +979,10 @@ def _file_taxonomy_import_impl() -> dict:
 # ---------------------------------------------------------------------------
 
 if HAS_MCP and FastMCP is not None:
+    from typing import Annotated
+
+    from pydantic import Field
+
     mcp = FastMCP("file-index-mcp", json_response=True)
 
     @mcp.tool()
@@ -884,6 +1000,8 @@ if HAS_MCP and FastMCP is not None:
         filter: str | dict | None = None,
         enr_doc_type: str | None = None,
         enr_topics: str | None = None,
+        return_mode: Annotated[str, Field(alias="return")] = "compact",
+        content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
     ) -> dict:
         """Hybrid semantic + keyword search over the indexed documents.
 
@@ -922,6 +1040,11 @@ if HAS_MCP and FastMCP is not None:
             enr_topics: Filter by LLM-enriched topic (e.g., "machine learning",
                 "Korean cooking"). Comma-separated for OR logic. Values come
                 from file_facets topics. Uses LIKE matching.
+            return: Response shape. "compact" (default) returns capped source
+                content and omits raw node internals; "full" returns the legacy
+                verbose response.
+            content_max_character: Max source-content characters in compact
+                results (default 10000). Ignored when return="full".
 
         Returns a dict with:
             - results: List of result dicts, each containing:
@@ -939,6 +1062,9 @@ if HAS_MCP and FastMCP is not None:
                   enr_entities_dates: Named entities extracted by LLM (comma-separated).
                 - enr_key_facts: Key facts from the document (comma-separated string).
                 - description, author, custom_meta: Additional frontmatter fields.
+                - content: Source chunk text capped by content_max_character
+                  when return="compact".
+                - content_truncated: True if compact content was capped.
                 - Any dynamic metadata fields (e.g., section) are also included.
             - diagnostics: Search pipeline health signals:
                 - vector_search_active: true if vector (semantic) search ran successfully.
@@ -971,6 +1097,8 @@ if HAS_MCP and FastMCP is not None:
             enr_doc_type=enr_doc_type,
             enr_topics=enr_topics,
             filter=filter,
+            return_mode=return_mode,
+            content_max_character=content_max_character,
         )
 
     @mcp.tool()

@@ -27,6 +27,10 @@ async def test_file_search_tool_schema_includes_complex_filter():
 
     assert "filter" in file_search.inputSchema["properties"]
     assert file_search.inputSchema["properties"]["filter"]["title"] == "Filter"
+    assert "return" in file_search.inputSchema["properties"]
+    assert "return_mode" not in file_search.inputSchema["properties"]
+    assert file_search.inputSchema["properties"]["return"]["default"] == "compact"
+    assert "content_max_character" in file_search.inputSchema["properties"]
     assert "Supported operators: eq, ne, contains, prefix, in, and, or, not" in (
         file_search.description or ""
     )
@@ -540,6 +544,111 @@ def test_search_response_degraded_flag():
         assert result["diagnostics"]["keyword_search_active"] is False
     finally:
         mcp_server._cache = old_cache
+
+
+def test_file_search_compact_default_keeps_source_content_and_excludes_bloat():
+    """Default compact search response should keep source content without raw node bloat."""
+    from search_hybrid import SearchResult
+
+    hit = SearchHit(
+        doc_id="sor::task/400",
+        loc="c:0",
+        snippet="Lease switch: Erika Pruitt...",
+        text="",
+        score=0.9,
+        source_type="sor_task",
+        title="Lease switch: Erika Pruitt",
+        tags="lease,zillow",
+        folder="task",
+        status="Active-High Priority",
+        custom_meta='{"source_id":"zillow-123"}',
+        enr_summary="Lease switch summary.",
+        enr_key_facts="Fee paid, lease pending",
+        enr_suggested_folder="Real Estate/Applications/" * 200,
+        extra_metadata={
+            "_node_content": (
+                '{"embedding": null, "metadata": {"created": "2026-05-06", '
+                '"mtime": 1778092369.0, "size": 980, "section": "Node Section"}, '
+                '"text": "Details:\\nsource line item source line item source line item"}'
+            ),
+            "embedding": None,
+            "relationships": {"source": "previous"},
+            "source_name": "sor",
+            "document_id": "task/400",
+            "owner": "Dan",
+            "section": "Details",
+        },
+    )
+    mock_result = SearchResult(hits=[hit], diagnostics={"degraded": False})
+
+    old_cache = mcp_server._cache
+    try:
+        mcp_server._cache = (MagicMock(), MagicMock(), {"search": {"recency": {}}})
+        with patch("mcp_server.hybrid_search", return_value=mock_result):
+            with patch("mcp_server.build_reranker", return_value=None):
+                result = mcp_server._file_search_impl("lease", content_max_character=25)
+    finally:
+        mcp_server._cache = old_cache
+
+    row = result["results"][0]
+    assert row["doc_id"] == "sor::task/400"
+    assert row["source_name"] == "sor"
+    assert row["document_id"] == "task/400"
+    assert row["owner"] == "Dan"
+    assert row["section"] == "Details"
+    assert row["created"] == "2026-05-06"
+    assert row["mtime"] == 1778092369.0
+    assert row["size"] == 980
+    assert row["content"] == "Details:\nsource line item"
+    assert row["content_truncated"] is True
+    assert row["enr_summary"] == "Lease switch summary."
+    assert row["enr_key_facts"] == "Fee paid, lease pending"
+    assert "enr_suggested_folder" not in row
+    assert "_node_content" not in row
+    assert "embedding" not in row
+    assert "relationships" not in row
+
+
+def test_file_search_full_return_preserves_existing_verbose_fields():
+    """Full search response should preserve current verbose field behavior."""
+    from search_hybrid import SearchResult
+
+    hit = SearchHit(
+        doc_id="sor::task/400",
+        loc="c:0",
+        snippet="Lease switch: Erika Pruitt...",
+        text="Details: full source line item",
+        score=0.9,
+        enr_suggested_folder="Real Estate/Applications/",
+        extra_metadata={
+            "_node_content": '{"embedding": null, "text": "wrapped source"}',
+            "source_name": "sor",
+        },
+    )
+    mock_result = SearchResult(hits=[hit], diagnostics={"degraded": False})
+
+    old_cache = mcp_server._cache
+    try:
+        mcp_server._cache = (MagicMock(), MagicMock(), {"search": {"recency": {}}})
+        with patch("mcp_server.hybrid_search", return_value=mock_result):
+            with patch("mcp_server.build_reranker", return_value=None):
+                result = mcp_server._file_search_impl("lease", return_mode="full")
+    finally:
+        mcp_server._cache = old_cache
+
+    row = result["results"][0]
+    assert row["_node_content"] == '{"embedding": null, "text": "wrapped source"}'
+    assert row["enr_suggested_folder"] == "Real Estate/Applications/"
+    assert row["source_name"] == "sor"
+    assert "content" not in row
+
+
+def test_file_search_invalid_return_mode_is_structured_error():
+    """Unknown return mode should fail before search runs."""
+    result = mcp_server._file_search_impl("lease", return_mode="verbose")
+
+    assert result["error"] is True
+    assert result["code"] == "invalid_parameter"
 
 
 # ---------------------------------------------------------------------------

@@ -81,7 +81,7 @@ search:
     enabled: true
     provider: "deepinfra"
     model: "Qwen/Qwen3-Reranker-8B"
-    timeout: 30
+    timeout: 120
 
 lancedb:
   table: "chunks"

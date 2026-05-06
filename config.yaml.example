@@ -119,7 +119,7 @@ search:
     enabled: true
     provider: "deepinfra"                 # Qwen3-Reranker-8B via DeepInfra (always-on, no cold start)
     model: "Qwen/Qwen3-Reranker-8B"
-    timeout: 30
+    timeout: 120
 
 lancedb:
   table: "chunks"
