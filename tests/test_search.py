@@ -656,6 +656,31 @@ def test_prefilter_combined_source_and_folder():
         assert result[0].doc_id == "b.pdf"
 
 
+def test_keyword_search_escapes_time_like_tokens():
+    """FTS keyword search should handle time-like natural-language tokens."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [1.0] + [0.0] * 767
+        nodes = [
+            _make_node(
+                "appt.md",
+                "c:0",
+                "Appointment at 10:00 for the unit showing",
+                vec,
+                source_name="comm_messages",
+                status="active",
+            ),
+        ]
+        store = _build_store_with_fts(tmpdir, nodes)
+
+        hits = store.keyword_search(
+            "10:00 showing",
+            top_k=10,
+            where="lower(metadata.source_name) = 'comm_messages'",
+        )
+
+        assert [hit.doc_id for hit in hits] == ["appt.md"]
+
+
 def test_prefilter_complex_filter_ast():
     """Complex filter AST should restrict results before search scoring."""
     with tempfile.TemporaryDirectory() as tmpdir:
