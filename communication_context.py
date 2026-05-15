@@ -348,9 +348,11 @@ def _sender_from_metadata(metadata: dict[str, Any]) -> str:
             continue
         value = metadata.get(key)
         if isinstance(value, dict):
-            sender = _text(value.get("name")) or _text(value.get("display_name"))
+            sender = _scalar_metadata_text(value.get("name")) or _scalar_metadata_text(
+                value.get("display_name")
+            )
         else:
-            sender = _text(value)
+            sender = _scalar_metadata_text(value)
         if sender:
             return sender
     return ""

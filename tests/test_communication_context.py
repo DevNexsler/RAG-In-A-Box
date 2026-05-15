@@ -126,6 +126,34 @@ def test_record_message_alias_accepts_scalar_message_id():
     assert item.message_id == "msg-1"
 
 
+def test_record_non_scalar_sender_alone_is_not_communication_item():
+    item = communication_item_from_record(
+        {"doc_id": "documents::metadata"},
+        {"sender": ["x"]},
+    )
+
+    assert item is None
+
+
+def test_record_dict_sender_accepts_scalar_name():
+    item = communication_item_from_record(
+        {"doc_id": "documents::metadata"},
+        {"sender": {"name": "Joycelyn"}},
+    )
+
+    assert item is not None
+    assert item.sender == "Joycelyn"
+
+
+def test_record_dict_sender_rejects_non_scalar_name():
+    item = communication_item_from_record(
+        {"doc_id": "documents::metadata"},
+        {"sender": {"name": ["Joycelyn"]}},
+    )
+
+    assert item is None
+
+
 def test_envelope_metadata_preserves_message_and_source_ids():
     envelope = ContextEnvelope(
         primary_item=CommunicationItem(doc_id="documents::photo"),
