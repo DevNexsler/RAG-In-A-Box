@@ -346,6 +346,23 @@ class TestEnrichDocument:
         assert "NEARBY SAME-CHANNEL CONTEXT CANDIDATES" in prompt
         assert "may or may not describe the primary item" in prompt
 
+    def test_none_context_text_uses_no_context_prompt(self):
+        gen = self._make_generator('{"summary": "test"}')
+
+        result = enrich_document(
+            "Some text",
+            "doc.md",
+            "md",
+            gen,
+            context_text=None,
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert result["enr_summary"] == "test"
+        assert "PRIMARY ITEM" not in prompt
+        assert "NEARBY SAME-CHANNEL CONTEXT CANDIDATES" not in prompt
+        gen.generate.assert_called_once()
+
 
 class TestFailedEnrichment:
     """Test the failed_enrichment() helper."""

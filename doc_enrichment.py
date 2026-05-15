@@ -369,13 +369,14 @@ def enrich_document(
         except Exception as exc:
             logger.warning("Failed to load taxonomy for prompt: %s", exc)
 
-    template = _CONTEXT_PROMPT_TEMPLATE if context_text.strip() else _PROMPT_TEMPLATE
+    normalized_context_text = (context_text or "").strip()
+    template = _CONTEXT_PROMPT_TEMPLATE if normalized_context_text else _PROMPT_TEMPLATE
     prompt = template.format(
         title=title,
         source_type=source_type,
         text=truncated,
         taxonomy_block=taxonomy_block,
-        context_text=context_text.strip(),
+        context_text=normalized_context_text,
     )
 
     try:

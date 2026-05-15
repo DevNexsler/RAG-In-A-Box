@@ -730,6 +730,18 @@ class LanceDBStore:
 
     # Metadata fields that should NOT be faceted (structural/numeric, not categorical)
     _NON_FACET_FIELDS = {"doc_id", "loc", "snippet", "mtime", "size", "title", "created"}
+    _SAFE_CONTEXT_FACET_FIELDS = {"enr_context_confidence"}
+
+    @classmethod
+    def _dynamic_facet_fields(cls, available: set[str]) -> set[str]:
+        """Return dynamic metadata fields safe to comma-split into facets."""
+        all_facet_fields = set(cls._FACET_KEY_MAP.keys())
+        candidates = available - all_facet_fields - cls._NON_FACET_FIELDS - {"tags"}
+        return {
+            field
+            for field in candidates
+            if not field.startswith("enr_context_") or field in cls._SAFE_CONTEXT_FACET_FIELDS
+        }
 
     def facets(self) -> dict:
         """Return distinct values and doc counts for all filterable fields.
@@ -755,10 +767,9 @@ class LanceDBStore:
 
         available = self._metadata_subfields()
 
-        # Discover dynamic fields: anything in schema but not in the hardcoded
-        # facet map and not in the non-facet exclusion set
-        all_facet_fields = set(self._FACET_KEY_MAP.keys())
-        dynamic_fields = available - all_facet_fields - self._NON_FACET_FIELDS - {"tags"}
+        # Discover dynamic fields, excluding context narratives/JSON that
+        # would be corrupted by the comma-splitting facet logic.
+        dynamic_fields = self._dynamic_facet_fields(available)
 
         projection = {"doc_id": "doc_id"}
         for field in self._FACET_KEY_MAP:

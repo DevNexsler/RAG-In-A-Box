@@ -449,6 +449,31 @@ def test_context_metadata_filter_and_passthrough():
         assert "enr_context_entities_places" not in hits[0].__dict__
 
 
+def test_context_narrative_metadata_excluded_from_dynamic_facets():
+    """Narrative/JSON context fields should not be comma-split into facets."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.1] * 768
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "photo.jpg",
+                "img:c:0",
+                "photo of garage",
+                vec,
+                source_type="img",
+                enr_context_confidence="high",
+                enr_context_key_facts='["Unit E has bins, shelves, and tools."]',
+                enr_context_warning="Nearby messages mention Unit E, but one reply is unrelated.",
+            )
+        ])
+
+        facets = store.facets()
+
+        assert facets["enr_context_confidence"] == [{"value": "high", "count": 1}]
+        assert "enr_context_key_facts" not in facets
+        assert "enr_context_warning" not in facets
+
+
 def test_extra_metadata_in_get_chunk():
     """Dynamic fields should be visible in get_chunk results."""
     with tempfile.TemporaryDirectory() as tmpdir:
