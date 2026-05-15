@@ -416,6 +416,39 @@ def test_extra_metadata_in_vector_search():
         assert hits[0].section == "Introduction"
 
 
+def test_context_metadata_filter_and_passthrough():
+    """Context enrichment fields stay filterable and pass through extra_metadata."""
+    from doc_enrichment import ENRICHMENT_FIELDS
+
+    assert "enr_context_confidence" in ENRICHMENT_FIELDS
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.1] * 768
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "photo.jpg",
+                "img:c:0",
+                "photo of garage",
+                vec,
+                source_type="img",
+                enr_context_entities_places="54 S Broad Main Unit E",
+                enr_context_confidence="high",
+            )
+        ])
+
+        hits = store.vector_search(
+            vec,
+            top_k=5,
+            where="lower(metadata.enr_context_confidence) = 'high'",
+        )
+
+        assert hits
+        assert hits[0].extra_metadata["enr_context_entities_places"] == "54 S Broad Main Unit E"
+        assert hits[0].extra_metadata["enr_context_confidence"] == "high"
+        assert "enr_context_entities_places" not in hits[0].__dict__
+
+
 def test_extra_metadata_in_get_chunk():
     """Dynamic fields should be visible in get_chunk results."""
     with tempfile.TemporaryDirectory() as tmpdir:

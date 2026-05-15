@@ -168,6 +168,40 @@ def test_parse_enrichment_response_handles_fenced_json():
     assert parsed["enr_importance"] == "0.7"
 
 
+def test_parse_context_enrichment_fields():
+    parsed = parse_enrichment_response(
+        """
+        {
+          "summary": "Photo of vehicle parts.",
+          "doc_type": ["image"],
+          "entities_people": [],
+          "entities_places": [],
+          "entities_orgs": [],
+          "entities_dates": [],
+          "topics": ["vehicle"],
+          "keywords": ["car parts"],
+          "key_facts": [],
+          "suggested_tags": ["maintenance"],
+          "suggested_folder": "Housing/Maintenance",
+          "importance": 0.5,
+          "atomic_entities_places": [],
+          "context_entities_places": ["54 S Broad Main Unit E"],
+          "context_topics": ["basement storage"],
+          "context_key_facts": ["Nearby message says the photos are from Unit E."],
+          "context_relationship": "batch_label",
+          "context_confidence": "high",
+          "context_source_message_ids": ["4434"],
+          "context_warning": ""
+        }
+        """
+    )
+
+    assert parsed["enr_context_entities_places"] == "54 S Broad Main Unit E"
+    assert parsed["enr_context_relationship"] == "batch_label"
+    assert parsed["enr_context_confidence"] == "high"
+    assert parsed["enr_context_source_message_ids"] == "4434"
+
+
 class TestEnrichDocument:
     """Test enrich_document with mocked LLM generator."""
 
@@ -279,6 +313,38 @@ class TestEnrichDocument:
         enrich_document("Some text", "doc.md", "md", gen, taxonomy_store=None)
         call_args = gen.generate.call_args[0][0]
         assert "## Available Tags" not in call_args
+
+    def test_context_prompt_labels_nearby_candidates(self):
+        response = json.dumps({
+            "summary": "Photo context.",
+            "doc_type": ["image"],
+            "entities_people": [],
+            "entities_places": [],
+            "entities_orgs": [],
+            "entities_dates": [],
+            "topics": [],
+            "keywords": [],
+            "key_facts": [],
+            "suggested_tags": [],
+            "suggested_folder": "",
+            "importance": 0.5,
+            "context_relationship": "nearby_ambiguous",
+            "context_confidence": "ambiguous",
+        })
+        gen = self._make_generator(response)
+
+        enrich_document(
+            "image notes",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[before] Unit E",
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert "PRIMARY ITEM" in prompt
+        assert "NEARBY SAME-CHANNEL CONTEXT CANDIDATES" in prompt
+        assert "may or may not describe the primary item" in prompt
 
 
 class TestFailedEnrichment:

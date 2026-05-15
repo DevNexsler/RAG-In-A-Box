@@ -40,7 +40,22 @@ Extract metadata from this document. Respond with ONLY valid JSON, no other text
   "key_facts": ["most important facts, conclusions, or action items"],
   "suggested_tags": ["classification tags for this document"],
   "suggested_folder": "best folder path for filing this document",
-  "importance": 0.5
+  "importance": 0.5,
+  "atomic_entities_people": ["people mentioned in the primary item only"],
+  "atomic_entities_places": ["places mentioned in the primary item only"],
+  "atomic_entities_orgs": ["organizations mentioned in the primary item only"],
+  "atomic_entities_dates": ["dates mentioned in the primary item only"],
+  "atomic_topics": ["topics from the primary item only"],
+  "context_entities_people": ["people inferred from relevant nearby context"],
+  "context_entities_places": ["places inferred from relevant nearby context"],
+  "context_entities_orgs": ["organizations inferred from relevant nearby context"],
+  "context_entities_dates": ["dates inferred from relevant nearby context"],
+  "context_topics": ["topics inferred from relevant nearby context"],
+  "context_key_facts": ["facts inferred from relevant nearby context"],
+  "context_relationship": "why the nearby context is relevant",
+  "context_confidence": "high|medium|low|ambiguous",
+  "context_source_message_ids": ["nearby message ids used"],
+  "context_warning": "ambiguity or unrelated nearby context warning"
 }}
 
 For "importance": rate the document's overall importance/usefulness on a 0.0-1.0 scale:
@@ -49,12 +64,71 @@ For "importance": rate the document's overall importance/usefulness on a 0.0-1.0
 - 0.4-0.6 = average utility, general notes or routine content
 - 0.1-0.3 = low importance, ephemeral, or narrowly relevant
 - 0.0 = trivial, outdated, or noise
+Use atomic_* fields for facts visible in the primary item itself.
+If no nearby context section is provided, leave all context_* fields empty.
 {taxonomy_block}
 Document title: {title}
 Document type: {source_type}
 
 Document text:
 {text}"""
+
+_CONTEXT_PROMPT_TEMPLATE = """\
+Extract metadata from this document. Respond with ONLY valid JSON, no other text.
+
+{{
+  "summary": "2-3 sentence summary of the primary item's purpose and key content",
+  "doc_type": ["type1", "type2"],
+  "entities_people": ["full names of people mentioned"],
+  "entities_places": ["addresses, cities, locations"],
+  "entities_orgs": ["company and organization names"],
+  "entities_dates": ["YYYY-MM-DD format dates mentioned"],
+  "topics": ["5-10 high-level topics"],
+  "keywords": ["10-20 specific terms and phrases"],
+  "key_facts": ["most important facts, conclusions, or action items"],
+  "suggested_tags": ["classification tags for this document"],
+  "suggested_folder": "best folder path for filing this document",
+  "importance": 0.5,
+  "atomic_entities_people": ["people mentioned in the PRIMARY ITEM only"],
+  "atomic_entities_places": ["places mentioned in the PRIMARY ITEM only"],
+  "atomic_entities_orgs": ["organizations mentioned in the PRIMARY ITEM only"],
+  "atomic_entities_dates": ["dates mentioned in the PRIMARY ITEM only"],
+  "atomic_topics": ["topics from the PRIMARY ITEM only"],
+  "context_entities_people": ["people inferred from relevant nearby context"],
+  "context_entities_places": ["places inferred from relevant nearby context"],
+  "context_entities_orgs": ["organizations inferred from relevant nearby context"],
+  "context_entities_dates": ["dates inferred from relevant nearby context"],
+  "context_topics": ["topics inferred from relevant nearby context"],
+  "context_key_facts": ["facts inferred from relevant nearby context"],
+  "context_relationship": "why the nearby context is relevant",
+  "context_confidence": "high|medium|low|ambiguous",
+  "context_source_message_ids": ["nearby message ids used"],
+  "context_warning": "ambiguity or unrelated nearby context warning"
+}}
+
+For "importance": rate the primary item's overall importance/usefulness on a 0.0-1.0 scale:
+- 1.0 = critical reference, frequently needed, high-value knowledge
+- 0.7-0.9 = important, actionable, or broadly useful
+- 0.4-0.6 = average utility, general notes or routine content
+- 0.1-0.3 = low importance, ephemeral, or narrowly relevant
+- 0.0 = trivial, outdated, or noise
+
+Nearby same-channel context candidates may or may not describe the primary item.
+Treat nearby messages as candidates only. Judge relevance before using them.
+Avoid adding unrelated nearby conversation to any field.
+Fill context_* fields only when nearby context is relevant to the PRIMARY ITEM.
+When using nearby context, set context_confidence, context_relationship, and
+context_source_message_ids. Use context_warning for ambiguity or rejected context.
+{taxonomy_block}
+PRIMARY ITEM
+Document title: {title}
+Document type: {source_type}
+
+Document text:
+{text}
+
+NEARBY SAME-CHANNEL CONTEXT CANDIDATES
+{context_text}"""
 
 _TAXONOMY_INSTRUCTION = """
 For "suggested_tags" and "suggested_folder": use the taxonomy below.
@@ -78,8 +152,27 @@ _ENRICHMENT_KEYS_RAW = (
     "importance",
 )
 
+_CONTEXT_KEYS_RAW = (
+    "atomic_entities_people",
+    "atomic_entities_places",
+    "atomic_entities_orgs",
+    "atomic_entities_dates",
+    "atomic_topics",
+    "context_entities_people",
+    "context_entities_places",
+    "context_entities_orgs",
+    "context_entities_dates",
+    "context_topics",
+    "context_key_facts",
+    "context_relationship",
+    "context_confidence",
+    "context_source_message_ids",
+    "context_warning",
+)
+
 # Prefixed field names stored in LanceDB metadata (prevent collision with frontmatter)
-ENRICHMENT_FIELDS = tuple(f"enr_{k}" for k in _ENRICHMENT_KEYS_RAW)
+CORE_ENRICHMENT_FIELDS = tuple(f"enr_{k}" for k in _ENRICHMENT_KEYS_RAW)
+ENRICHMENT_FIELDS = tuple(f"enr_{k}" for k in (*_ENRICHMENT_KEYS_RAW, *_CONTEXT_KEYS_RAW))
 
 
 def empty_enrichment() -> dict[str, str]:
@@ -199,7 +292,8 @@ def _normalize_list(value: Any) -> str:
 def _normalize_enrichment(raw: dict[str, Any]) -> dict[str, str]:
     """Normalize raw LLM JSON into consistent prefixed string fields."""
     result: dict[str, str] = {}
-    for raw_key, enr_key in zip(_ENRICHMENT_KEYS_RAW, ENRICHMENT_FIELDS):
+    for raw_key in (*_ENRICHMENT_KEYS_RAW, *_CONTEXT_KEYS_RAW):
+        enr_key = f"enr_{raw_key}"
         value = raw.get(raw_key)
         if value is None:
             result[enr_key] = ""
@@ -210,9 +304,15 @@ def _normalize_enrichment(raw: dict[str, Any]) -> dict[str, str]:
             except (TypeError, ValueError):
                 imp = 0.5
             result[enr_key] = str(imp)
-        elif raw_key in ("summary", "suggested_folder"):
+        elif raw_key in (
+            "summary",
+            "suggested_folder",
+            "context_relationship",
+            "context_confidence",
+            "context_warning",
+        ):
             result[enr_key] = str(value).strip()
-        elif raw_key == "key_facts":
+        elif raw_key in ("key_facts", "context_key_facts"):
             if isinstance(value, list):
                 result[enr_key] = json.dumps(
                     [str(v).strip() for v in value if str(v).strip()]
@@ -240,6 +340,7 @@ def enrich_document(
     max_input_chars: int = 4000,
     max_output_tokens: int = 512,
     taxonomy_store: "TaxonomyStore | None" = None,
+    context_text: str = "",
 ) -> dict[str, str]:
     """Extract structured metadata from document text using an LLM.
 
@@ -268,11 +369,13 @@ def enrich_document(
         except Exception as exc:
             logger.warning("Failed to load taxonomy for prompt: %s", exc)
 
-    prompt = _PROMPT_TEMPLATE.format(
+    template = _CONTEXT_PROMPT_TEMPLATE if context_text.strip() else _PROMPT_TEMPLATE
+    prompt = template.format(
         title=title,
         source_type=source_type,
         text=truncated,
         taxonomy_block=taxonomy_block,
+        context_text=context_text.strip(),
     )
 
     try:

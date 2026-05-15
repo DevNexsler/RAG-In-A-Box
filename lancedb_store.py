@@ -14,7 +14,7 @@ from llama_index.vector_stores.lancedb import LanceDBVectorStore
 from llama_index.vector_stores.lancedb.base import TableNotFoundError
 
 from core.storage import SearchHit
-from doc_enrichment import ENRICHMENT_FIELDS
+from doc_enrichment import CORE_ENRICHMENT_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +36,14 @@ _CORE_META_KEYS = {
     "doc_id", "source_type", "mtime", "size", "title", "tags", "folder",
     "status", "created", "loc", "snippet", "rel_path",
     "description", "author", "keywords", "custom_meta",
-    *ENRICHMENT_FIELDS,
+    *CORE_ENRICHMENT_FIELDS,
     *_ENRICHMENT_AUX_FIELDS,
 }
 
 
 def _extract_enrichment(meta: dict) -> dict[str, str]:
     """Pull enrichment + extra metadata fields from metadata, defaulting to empty strings."""
-    result = {f: meta.get(f, "") or "" for f in ENRICHMENT_FIELDS}
+    result = {f: meta.get(f, "") or "" for f in CORE_ENRICHMENT_FIELDS}
     for f in _ENRICHMENT_AUX_FIELDS:
         result[f] = meta.get(f, "") or ""
     for f in _EXTRA_META_FIELDS:
