@@ -288,6 +288,75 @@ def test_split_section_above_threshold():
 # --- process_doc_task communication context ---
 
 
+def test_index_flow_builds_context_provider_from_scanned_records():
+    from communication_context import (
+        build_context_provider_from_records,
+        communication_item_from_record,
+    )
+    from sources.base import SourceRecord
+
+    records = [
+        {
+            "doc_id": "comm::1",
+            "source_name": "comm",
+            "source_type": "pg_message",
+            "rel_path": "zoho/1",
+        },
+        {
+            "doc_id": "comm::2",
+            "source_name": "comm",
+            "source_type": "pg_message",
+            "rel_path": "zoho/2",
+        },
+    ]
+    source_records = {
+        "comm::1": SourceRecord(
+            doc_id="1",
+            source_type="pg_message",
+            natural_key="zoho/1",
+            mtime=1.0,
+            size=6,
+            metadata={
+                "_text": "Unit E",
+                "source": "zoho_cliq",
+                "source_message_id": "s1",
+                "message_id": "1",
+                "channel_id": "chan",
+                "sent_at": "2026-01-01T10:00:00Z",
+                "sender": "A",
+            },
+        ),
+        "comm::2": SourceRecord(
+            doc_id="2",
+            source_type="pg_message",
+            natural_key="zoho/2",
+            mtime=2.0,
+            size=9,
+            metadata={
+                "_text": "Also this",
+                "source": "zoho_cliq",
+                "source_message_id": "s2",
+                "message_id": "2",
+                "channel_id": "chan",
+                "sent_at": "2026-01-01T10:00:10Z",
+                "sender": "A",
+            },
+        ),
+    }
+
+    provider = build_context_provider_from_records(records, source_records, {})
+    assert provider is not None
+
+    item = communication_item_from_record(
+        records[1],
+        source_records["comm::2"].metadata,
+    )
+    assert item is not None
+    envelope = provider.get_context_envelope(item)
+
+    assert envelope.nearest_nonempty_before.text == "Unit E"
+
+
 def test_process_doc_task_passes_context_to_enrichment(monkeypatch):
     """Communication context reaches enrichment and stored metadata."""
     from communication_context import (

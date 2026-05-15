@@ -55,6 +55,7 @@ from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
 from llama_index.core.node_parser import SentenceSplitter
 
 from communication_context import (
+    build_context_provider_from_records,
     communication_item_from_record,
     envelope_metadata,
     format_context_envelope_for_prompt,
@@ -1104,6 +1105,11 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
 
     _RUNTIME["source_records_by_ns_doc_id"] = source_records_by_ns_doc_id
     scanned = all_records
+    _RUNTIME["communication_context_provider"] = build_context_provider_from_records(
+        scanned,
+        source_records_by_ns_doc_id,
+        config.get("communication_context", {}),
+    )
 
     stored_mtimes = store.list_doc_mtimes()
     to_add_or_update, to_delete = diff_index_task(scanned, stored_mtimes)

@@ -455,3 +455,91 @@ def test_provider_does_not_cross_source_or_thread_boundaries():
 
     assert [m.message_id for m in envelope.same_channel_before] == ["1"]
     assert [m.message_id for m in envelope.same_channel_after] == ["3"]
+
+
+def test_build_context_provider_disabled_config_returns_none():
+    from communication_context import build_context_provider_from_records
+    from sources.base import SourceRecord
+
+    provider = build_context_provider_from_records(
+        [
+            {
+                "doc_id": "comm::1",
+                "source_name": "comm",
+                "source_type": "pg_message",
+            }
+        ],
+        {
+            "comm::1": SourceRecord(
+                doc_id="1",
+                source_type="pg_message",
+                natural_key="zoho/1",
+                mtime=1.0,
+                size=6,
+                metadata={
+                    "_text": "Unit E",
+                    "source_message_id": "s1",
+                    "channel_id": "chan",
+                },
+            )
+        },
+        {"enabled": False},
+    )
+
+    assert provider is None
+
+
+def test_build_context_provider_supports_source_message_id_only_records():
+    from communication_context import (
+        build_context_provider_from_records,
+        communication_item_from_record,
+    )
+    from sources.base import SourceRecord
+
+    records = [
+        {"doc_id": "comm::s1", "source_name": "comm", "source_type": "pg_message"},
+        {"doc_id": "comm::s2", "source_name": "comm", "source_type": "pg_message"},
+    ]
+    source_records = {
+        "comm::s1": SourceRecord(
+            doc_id="s1",
+            source_type="pg_message",
+            natural_key="zoho/s1",
+            mtime=1.0,
+            size=6,
+            metadata={
+                "_text": "Unit E",
+                "source": "zoho_cliq",
+                "source_message_id": "s1",
+                "channel_id": "chan",
+                "sent_at": "2026-01-01T10:00:00Z",
+            },
+        ),
+        "comm::s2": SourceRecord(
+            doc_id="s2",
+            source_type="pg_message",
+            natural_key="zoho/s2",
+            mtime=2.0,
+            size=9,
+            metadata={
+                "_text": "Also this",
+                "source": "zoho_cliq",
+                "source_message_id": "s2",
+                "channel_id": "chan",
+                "sent_at": "2026-01-01T10:00:10Z",
+            },
+        ),
+    }
+
+    provider = build_context_provider_from_records(records, source_records, {})
+    assert provider is not None
+    item = communication_item_from_record(
+        records[1],
+        source_records["comm::s2"].metadata,
+    )
+    assert item is not None
+
+    envelope = provider.get_context_envelope(item)
+
+    assert envelope.nearest_nonempty_before.text == "Unit E"
+    assert [m.source_message_id for m in envelope.same_channel_before] == ["s1"]

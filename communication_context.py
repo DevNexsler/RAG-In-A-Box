@@ -74,12 +74,13 @@ class SourceWindowContextProvider:
         window_after: int = 5,
     ) -> SourceWindowContextProvider:
         messages_by_scope: dict[tuple[str, str, str], list[CommunicationMessage]] = {}
+        message_sources = message_sources or {}
+        message_threads = message_threads or {}
         for message in messages:
-            message_key = message.message_id
             scope = (
-                _text((message_sources or {}).get(message_key)),
-                _text(message_channels.get(message_key)),
-                _text((message_threads or {}).get(message_key)),
+                _lookup_message_map_value(message_sources, message),
+                _lookup_message_map_value(message_channels, message),
+                _lookup_message_map_value(message_threads, message),
             )
             messages_by_scope.setdefault(scope, []).append(message)
 
@@ -222,6 +223,67 @@ def communication_item_from_record(
         attachment_index=attachment_index,
         sidecar_path=sidecar_path,
         primary_text=primary_text,
+    )
+
+
+def build_context_provider_from_records(
+    records: Iterable[dict[str, Any]],
+    source_records_by_ns_doc_id: dict[str, Any],
+    config: dict[str, Any] | None,
+) -> SourceWindowContextProvider | None:
+    """Build an in-memory communication context provider from scanned records."""
+    config = config if isinstance(config, dict) else {}
+    if config.get("enabled") is False:
+        return None
+
+    messages: list[CommunicationMessage] = []
+    message_channels: dict[str, str] = {}
+    message_sources: dict[str, str] = {}
+    message_threads: dict[str, str] = {}
+
+    for doc in records:
+        if not isinstance(doc, dict):
+            continue
+        doc_id = _text(doc.get("doc_id"))
+        if not doc_id:
+            continue
+        record = source_records_by_ns_doc_id.get(doc_id)
+        if record is None:
+            continue
+        metadata = getattr(record, "metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+
+        primary_text = _record_primary_text(doc, metadata)
+        item = communication_item_from_record(doc, metadata, primary_text)
+        if item is None:
+            continue
+
+        message = CommunicationMessage(
+            message_id=item.message_id,
+            source_message_id=item.source_message_id,
+            sender=item.sender,
+            sent_at=item.sent_at,
+            text=_text(metadata.get("_text")) or _text(item.primary_text),
+        )
+        if not _record_message_has_context_scope(item, message):
+            continue
+
+        messages.append(message)
+        for key in _message_map_keys(message):
+            message_channels[key] = item.channel_id
+            message_sources[key] = item.origin_source
+            message_threads[key] = item.thread_id
+
+    if not messages:
+        return None
+
+    return SourceWindowContextProvider.from_messages(
+        messages,
+        message_channels=message_channels,
+        message_sources=message_sources,
+        message_threads=message_threads,
+        window_before=_configured_window(config, "window_before", 5),
+        window_after=_configured_window(config, "window_after", 5),
     )
 
 
@@ -440,6 +502,53 @@ def _source_message_id(message: CommunicationMessage | None) -> str:
     if message is None:
         return ""
     return message.source_message_id
+
+
+def _record_primary_text(doc: dict[str, Any], metadata: dict[str, Any]) -> str:
+    return (
+        _text(metadata.get("_text"))
+        or _text(doc.get("primary_text"))
+        or _text(doc.get("text"))
+    )
+
+
+def _record_message_has_context_scope(
+    item: CommunicationItem,
+    message: CommunicationMessage,
+) -> bool:
+    return bool(
+        _message_map_keys(message)
+        and _text(message.text)
+        and (_text(item.channel_id) or _text(item.thread_id))
+    )
+
+
+def _configured_window(config: dict[str, Any], key: str, default: int) -> int:
+    try:
+        value = int(config.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return max(0, value)
+
+
+def _lookup_message_map_value(
+    values: dict[str, str],
+    message: CommunicationMessage,
+) -> str:
+    for key in _message_map_keys(message):
+        value = _text(values.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _message_map_keys(message: CommunicationMessage) -> list[str]:
+    keys: list[str] = []
+    for key in (message.source_message_id, message.message_id):
+        key = _text(key)
+        if key and key not in keys:
+            keys.append(key)
+    return keys
 
 
 def _text(value: Any, default: str = "") -> str:
