@@ -143,6 +143,92 @@ def communication_item_from_sidecar(
     )
 
 
+def communication_item_from_record(
+    doc: dict,
+    metadata: dict,
+    primary_text: str = "",
+) -> CommunicationItem | None:
+    """Build a communication item from generic source metadata aliases."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    origin_source = _first_metadata_text(metadata, ("source", "origin_source"))
+    channel_id = _first_metadata_text(
+        metadata, ("channel_id", "source_channel_id", "channel")
+    )
+    sent_at = _first_metadata_text(metadata, ("sent_at", "created_at", "timestamp"))
+    message_id = _first_metadata_text(metadata, ("message_id",))
+    source_message_id = _first_metadata_text(metadata, ("source_message_id",))
+    thread_id = _first_metadata_text(metadata, ("thread_id", "source_thread_id"))
+    sender = _sender_from_metadata(metadata)
+    batch_key = _first_metadata_text(metadata, ("batch_key",))
+    attachment_index = _first_metadata_text(metadata, ("attachment_index",))
+    sidecar_path = _first_metadata_text(metadata, ("sidecar_path",))
+
+    identity_values = (
+        origin_source,
+        channel_id,
+        sent_at,
+        message_id,
+        source_message_id,
+        thread_id,
+        sender,
+        batch_key,
+        attachment_index,
+        sidecar_path,
+    )
+    if not any(identity_values):
+        return None
+
+    return CommunicationItem(
+        doc_id=_text(doc.get("doc_id")),
+        rel_path=_text(doc.get("rel_path")),
+        source_name=_text(doc.get("source_name")),
+        source_type=_text(doc.get("source_type")),
+        origin_source=origin_source,
+        message_id=message_id,
+        source_message_id=source_message_id,
+        channel_id=channel_id,
+        channel_name=_first_metadata_text(metadata, ("channel_name",)),
+        thread_id=thread_id,
+        sender=sender,
+        sent_at=sent_at,
+        batch_key=batch_key,
+        attachment_index=attachment_index,
+        sidecar_path=sidecar_path,
+        primary_text=primary_text,
+    )
+
+
+def format_context_envelope_for_prompt(envelope: ContextEnvelope) -> str:
+    """Format nonempty nearby messages for the enrichment prompt."""
+    sections: list[str] = []
+    for label, messages in (
+        ("BEFORE", envelope.same_channel_before),
+        ("AFTER", envelope.same_channel_after),
+    ):
+        lines = [_format_context_message(label, message) for message in messages]
+        lines = [line for line in lines if line]
+        if lines:
+            sections.append(f"{label} MESSAGES")
+            sections.extend(lines)
+    return "\n".join(sections)
+
+
+def envelope_metadata(envelope: ContextEnvelope) -> dict[str, str]:
+    """Return raw provenance fields for stored metadata."""
+    nearest_before = envelope.nearest_nonempty_before or _nearest_nonempty(
+        reversed(envelope.same_channel_before)
+    )
+    nearest_after = envelope.nearest_nonempty_after or _nearest_nonempty(
+        envelope.same_channel_after
+    )
+    return {
+        "context_before_message_ids": _message_ids(envelope.same_channel_before),
+        "context_after_message_ids": _message_ids(envelope.same_channel_after),
+        "context_nearest_before_message_id": _message_identifier(nearest_before),
+        "context_nearest_after_message_id": _message_identifier(nearest_after),
+    }
+
+
 def _batch_key(origin_source: str, channel_id: str, sent_at: str) -> str:
     rounded_sent_at = _round_timestamp_to_utc_second(sent_at)
     if not (origin_source or channel_id or rounded_sent_at):
@@ -216,6 +302,61 @@ def _sender_name(message: dict[str, Any]) -> str:
     if not isinstance(sender, dict):
         return ""
     return _text(sender.get("name"))
+
+
+def _sender_from_metadata(metadata: dict[str, Any]) -> str:
+    for key in ("sender", "sender_name", "from"):
+        if key not in metadata:
+            continue
+        value = metadata.get(key)
+        if isinstance(value, dict):
+            sender = _text(value.get("name")) or _text(value.get("display_name"))
+        else:
+            sender = _text(value)
+        if sender:
+            return sender
+    return ""
+
+
+def _first_metadata_text(metadata: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = _text(metadata.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _format_context_message(label: str, message: CommunicationMessage) -> str:
+    text = _text(message.text)
+    if not text:
+        return ""
+    attrs = [
+        _text(message.sent_at),
+        f"message_id={message.message_id}" if message.message_id else "",
+        (
+            f"source_message_id={message.source_message_id}"
+            if message.source_message_id
+            else ""
+        ),
+        f"sender={message.sender}" if message.sender else "",
+    ]
+    rendered_attrs = " ".join(attr for attr in attrs if attr)
+    prefix = f"[{label} {rendered_attrs}]" if rendered_attrs else f"[{label}]"
+    return f"{prefix} {text}"
+
+
+def _message_ids(messages: list[CommunicationMessage]) -> str:
+    return ",".join(
+        identifier
+        for identifier in (_message_identifier(message) for message in messages)
+        if identifier
+    )
+
+
+def _message_identifier(message: CommunicationMessage | None) -> str:
+    if message is None:
+        return ""
+    return message.message_id or message.source_message_id
 
 
 def _text(value: Any, default: str = "") -> str:

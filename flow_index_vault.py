@@ -54,6 +54,11 @@ def _get_logger():
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
 from llama_index.core.node_parser import SentenceSplitter
 
+from communication_context import (
+    communication_item_from_record,
+    envelope_metadata,
+    format_context_envelope_for_prompt,
+)
 from core.config import load_config
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment, ENRICHMENT_FIELDS, failed_enrichment
@@ -447,6 +452,24 @@ def process_doc_task(doc: dict) -> None:
         logger.warning(f"No text extracted: {doc_id}")
         return
 
+    source_metadata = (
+        getattr(source_record, "metadata", {}) if source_record is not None else {}
+    )
+    context_text = ""
+    context_meta: dict[str, str] = {}
+    communication_context_provider = _RUNTIME.get("communication_context_provider")
+    comm_item = communication_item_from_record(doc, source_metadata, result.full_text)
+    if comm_item is not None and communication_context_provider is not None:
+        try:
+            envelope = communication_context_provider.get_context_envelope(comm_item)
+            context_text = format_context_envelope_for_prompt(envelope)
+            context_meta = envelope_metadata(envelope)
+        except Exception as exc:
+            logger.warning("Communication context failed for '%s': %s", doc_id, exc)
+            _RUNTIME.setdefault("_warnings", []).append(
+                f"communication_context_failed:{doc_id}:{exc}"
+            )
+
     # --- Extract document-level metadata ---
     fm = result.frontmatter  # from Markdown frontmatter; empty dict for PDF/images
     title = fm.get("title") or extract_title(result.full_text, doc_id)
@@ -487,6 +510,9 @@ def process_doc_task(doc: dict) -> None:
     for k, v in extra_fm.items():
         if k not in doc_meta:
             doc_meta[k] = v
+    for k, v in context_meta.items():
+        if k not in doc_meta:
+            doc_meta[k] = v
 
     # --- LLM document enrichment (summary, entities, topics, etc.) ---
     llm_generator = _RUNTIME.get("llm_generator")
@@ -501,6 +527,7 @@ def process_doc_task(doc: dict) -> None:
             max_input_chars=enrichment_cfg.get("max_input_chars", 4000),
             max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
             taxonomy_store=taxonomy_store,
+            context_text=context_text,
         )
         if enrichment.get("_enrichment_failed"):
             reason = enrichment.pop("_enrichment_failed")

@@ -285,6 +285,141 @@ def test_split_section_above_threshold():
     assert any("machines" in c for c in chunks)
 
 
+# --- process_doc_task communication context ---
+
+
+def test_process_doc_task_passes_context_to_enrichment(monkeypatch):
+    """Communication context reaches enrichment and stored metadata."""
+    from communication_context import (
+        CommunicationMessage,
+        ContextEnvelope,
+    )
+    from extractors import ExtractionResult
+    from flow_index_vault import process_doc_task
+    from sources.base import SourceRecord
+
+    captured = {}
+
+    class FakeSource:
+        name = "documents"
+
+        def extract(self, record):
+            return ExtractionResult.from_text("image description", frontmatter={})
+
+    class FakeProvider:
+        def get_context_envelope(self, item):
+            captured["item"] = item
+            return ContextEnvelope(
+                primary_item=item,
+                same_channel_before=[
+                    CommunicationMessage(
+                        message_id="m1",
+                        source_message_id="src-m1",
+                        sender="Joycelyn",
+                        sent_at="2026-01-01T10:00:00Z",
+                        text="This is for Unit E",
+                    )
+                ],
+                same_channel_after=[
+                    CommunicationMessage(
+                        message_id="m3",
+                        sent_at="2026-01-01T10:00:03Z",
+                        text="",
+                    )
+                ],
+            )
+
+    class FakeStore:
+        def upsert_nodes(self, nodes):
+            captured["metadata"] = nodes[0].metadata
+
+    class FakeEmbed:
+        def embed_texts(self, texts):
+            return [[0.1] * 768 for _ in texts]
+
+    def fake_enrich_document(*args, **kwargs):
+        captured["context_text"] = kwargs.get("context_text", "")
+        return {
+            "enr_summary": "summary",
+            "enr_doc_type": "image",
+            "enr_entities_people": "",
+            "enr_entities_places": "",
+            "enr_entities_orgs": "",
+            "enr_entities_dates": "",
+            "enr_topics": "",
+            "enr_keywords": "",
+            "enr_key_facts": "",
+            "enr_suggested_tags": "",
+            "enr_suggested_folder": "",
+            "enr_importance": "0.5",
+            "enr_atomic_entities_people": "",
+            "enr_atomic_entities_places": "",
+            "enr_atomic_entities_orgs": "",
+            "enr_atomic_entities_dates": "",
+            "enr_atomic_topics": "",
+            "enr_context_entities_people": "",
+            "enr_context_entities_places": "Unit E",
+            "enr_context_entities_orgs": "",
+            "enr_context_entities_dates": "",
+            "enr_context_topics": "",
+            "enr_context_key_facts": "",
+            "enr_context_relationship": "batch_label",
+            "enr_context_confidence": "high",
+            "enr_context_source_message_ids": "m1",
+            "enr_context_warning": "",
+        }
+
+    monkeypatch.setattr("flow_index_vault.enrich_document", fake_enrich_document)
+    monkeypatch.setattr("flow_index_vault.get_run_logger", lambda: MagicMock())
+    _RUNTIME.clear()
+    _RUNTIME.update(
+        {
+            "store": FakeStore(),
+            "embed_provider": FakeEmbed(),
+            "splitter": _FakeSplitter(),
+            "config": {},
+            "sources_by_name": {"documents": FakeSource()},
+            "source_records_by_ns_doc_id": {
+                "documents::photo": SourceRecord(
+                    doc_id="photo",
+                    source_type="img",
+                    natural_key="photo.jpg",
+                    mtime=1.0,
+                    size=10,
+                    metadata={
+                        "source": "zoho_cliq",
+                        "channel_id": "chan",
+                        "sent_at": "2026-01-01T10:00:01Z",
+                        "message_id": "m2",
+                    },
+                )
+            },
+            "communication_context_provider": FakeProvider(),
+            "llm_generator": object(),
+        }
+    )
+
+    process_doc_task.fn(
+        {
+            "doc_id": "documents::photo",
+            "rel_path": "photo.jpg",
+            "mtime": 1.0,
+            "size": 10,
+            "source_type": "img",
+            "source_name": "documents",
+        }
+    )
+
+    assert captured["item"].origin_source == "zoho_cliq"
+    assert "BEFORE" in captured["context_text"]
+    assert "This is for Unit E" in captured["context_text"]
+    assert "message_id=m1" in captured["context_text"]
+    assert captured["metadata"]["enr_context_entities_places"] == "Unit E"
+    assert captured["metadata"]["enr_context_confidence"] == "high"
+    assert captured["metadata"]["context_before_message_ids"] == "m1"
+    assert captured["metadata"]["context_nearest_before_message_id"] == "m1"
+
+
 # --- Symlink cycle guard ---
 
 
