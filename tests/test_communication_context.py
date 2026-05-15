@@ -154,3 +154,176 @@ def test_provider_tracks_nearest_nonempty_messages():
 
     assert envelope.nearest_nonempty_before.message_id == "1"
     assert envelope.nearest_nonempty_after.message_id == "4"
+
+
+def test_provider_orders_same_timestamp_messages_around_target_id():
+    target = CommunicationItem(
+        doc_id="attachment-2",
+        message_id="2",
+        source_message_id="src-2",
+        channel_id="chan-a",
+        sent_at="2026-04-22T14:56:22Z",
+    )
+    messages = [
+        CommunicationMessage(
+            message_id="1",
+            source_message_id="src-1",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Before same second",
+        ),
+        CommunicationMessage(
+            message_id="2",
+            source_message_id="src-2",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Target message",
+        ),
+        CommunicationMessage(
+            message_id="3",
+            source_message_id="src-3",
+            sent_at="2026-04-22T14:56:22Z",
+            text="After same second",
+        ),
+    ]
+
+    provider = SourceWindowContextProvider.from_messages(
+        messages,
+        message_channels={m.message_id: "chan-a" for m in messages},
+    )
+
+    envelope = provider.get_context_envelope(target)
+
+    assert [m.message_id for m in envelope.same_channel_before] == ["1"]
+    assert [m.message_id for m in envelope.same_channel_after] == ["3"]
+
+
+def test_provider_anchors_same_timestamp_target_by_source_message_id():
+    target = CommunicationItem(
+        doc_id="attachment-3",
+        source_message_id="src-2",
+        channel_id="chan-a",
+        sent_at="2026-04-22T14:56:22Z",
+    )
+    messages = [
+        CommunicationMessage(
+            message_id="1",
+            source_message_id="src-1",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Before same second",
+        ),
+        CommunicationMessage(
+            message_id="2",
+            source_message_id="src-2",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Target source",
+        ),
+        CommunicationMessage(
+            message_id="3",
+            source_message_id="src-3",
+            sent_at="2026-04-22T14:56:22Z",
+            text="After same second",
+        ),
+    ]
+
+    provider = SourceWindowContextProvider.from_messages(
+        messages,
+        message_channels={m.message_id: "chan-a" for m in messages},
+    )
+
+    envelope = provider.get_context_envelope(target)
+
+    assert [m.message_id for m in envelope.same_channel_before] == ["1"]
+    assert [m.message_id for m in envelope.same_channel_after] == ["3"]
+
+
+def test_provider_uses_deterministic_insertion_when_target_has_no_message_ids():
+    target = CommunicationItem(
+        doc_id="attachment-4",
+        channel_id="chan-a",
+        sent_at="2026-04-22T14:56:22Z",
+    )
+    messages = [
+        CommunicationMessage(
+            message_id="1",
+            source_message_id="src-1",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Same second first",
+        ),
+        CommunicationMessage(
+            message_id="2",
+            source_message_id="src-2",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Same second second",
+        ),
+    ]
+
+    provider = SourceWindowContextProvider.from_messages(
+        messages,
+        message_channels={m.message_id: "chan-a" for m in messages},
+    )
+
+    envelope = provider.get_context_envelope(target)
+
+    assert envelope.same_channel_before == []
+    assert [m.message_id for m in envelope.same_channel_after] == ["1", "2"]
+
+
+def test_provider_does_not_cross_source_or_thread_boundaries():
+    target = CommunicationItem(
+        doc_id="attachment-5",
+        origin_source="zoho_cliq",
+        message_id="2",
+        channel_id="chan-a",
+        thread_id="thread-a",
+        sent_at="2026-04-22T14:56:22Z",
+    )
+    messages = [
+        CommunicationMessage(
+            message_id="1",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Same source and thread before",
+        ),
+        CommunicationMessage(
+            message_id="2",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Target message",
+        ),
+        CommunicationMessage(
+            message_id="3",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Same source and thread after",
+        ),
+        CommunicationMessage(
+            message_id="4",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Other source",
+        ),
+        CommunicationMessage(
+            message_id="5",
+            sent_at="2026-04-22T14:56:22Z",
+            text="Other thread",
+        ),
+    ]
+
+    provider = SourceWindowContextProvider.from_messages(
+        messages,
+        message_channels={m.message_id: "chan-a" for m in messages},
+        message_sources={
+            "1": "zoho_cliq",
+            "2": "zoho_cliq",
+            "3": "zoho_cliq",
+            "4": "slack",
+            "5": "zoho_cliq",
+        },
+        message_threads={
+            "1": "thread-a",
+            "2": "thread-a",
+            "3": "thread-a",
+            "4": "thread-a",
+            "5": "thread-b",
+        },
+    )
+
+    envelope = provider.get_context_envelope(target)
+
+    assert [m.message_id for m in envelope.same_channel_before] == ["1"]
+    assert [m.message_id for m in envelope.same_channel_after] == ["3"]

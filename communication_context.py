@@ -92,16 +92,16 @@ class SourceWindowContextProvider:
     def get_context_envelope(self, item: CommunicationItem) -> ContextEnvelope:
         scope = (_text(item.origin_source), _text(item.channel_id), _text(item.thread_id))
         messages = self._messages_by_scope.get(scope, [])
-        item_key = _sent_at_sort_key(item.sent_at)
+        item_key = _context_item_sort_key(item, messages)
         before = [
             message
             for message in messages
-            if _sent_at_sort_key(message.sent_at) < item_key
+            if _message_sort_key(message) < item_key and not _is_context_target(message, item)
         ]
         after = [
             message
             for message in messages
-            if _sent_at_sort_key(message.sent_at) > item_key
+            if _message_sort_key(message) > item_key and not _is_context_target(message, item)
         ]
         before_window = before[-self._window_before :] if self._window_before > 0 else []
         after_window = after[: self._window_after] if self._window_after > 0 else []
@@ -165,6 +165,26 @@ def _round_timestamp_to_utc_second(value: str) -> str:
 
 def _message_sort_key(message: CommunicationMessage) -> tuple[str, str, str, str]:
     return (*_sent_at_sort_key(message.sent_at), message.message_id, message.source_message_id)
+
+
+def _context_item_sort_key(
+    item: CommunicationItem,
+    messages: list[CommunicationMessage],
+) -> tuple[str, str, str, str]:
+    for message in messages:
+        if _is_context_target(message, item):
+            return _message_sort_key(message)
+    return (*_sent_at_sort_key(item.sent_at), item.message_id, item.source_message_id)
+
+
+def _is_context_target(message: CommunicationMessage, item: CommunicationItem) -> bool:
+    if item.message_id and message.message_id == item.message_id:
+        return True
+    return bool(
+        item.source_message_id
+        and message.source_message_id
+        and message.source_message_id == item.source_message_id
+    )
 
 
 def _sent_at_sort_key(value: str) -> tuple[str, str]:
