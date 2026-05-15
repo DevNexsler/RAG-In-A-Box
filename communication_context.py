@@ -150,18 +150,45 @@ def communication_item_from_record(
 ) -> CommunicationItem | None:
     """Build a communication item from generic source metadata aliases."""
     metadata = metadata if isinstance(metadata, dict) else {}
-    origin_source = _first_metadata_text(metadata, ("source", "origin_source"))
+    origin_source = _first_metadata_text(
+        metadata,
+        ("source", "origin_source"),
+        nested_keys=("source", "origin_source", "id"),
+    )
     channel_id = _first_metadata_text(
-        metadata, ("channel_id", "source_channel_id", "channel")
+        metadata,
+        ("channel_id", "source_channel_id", "channel"),
+        nested_keys=("channel_id", "source_channel_id", "id"),
     )
     sent_at = _first_metadata_text(metadata, ("sent_at", "created_at", "timestamp"))
-    message_id = _first_metadata_text(metadata, ("message_id",))
-    source_message_id = _first_metadata_text(metadata, ("source_message_id",))
-    thread_id = _first_metadata_text(metadata, ("thread_id", "source_thread_id"))
+    message_id = _first_metadata_text(
+        metadata,
+        ("message_id", "message"),
+        nested_keys=("message_id", "id"),
+    )
+    source_message_id = _first_metadata_text(
+        metadata,
+        ("source_message_id", "message"),
+        nested_keys=("source_message_id",),
+        scalar_keys=("source_message_id",),
+    )
+    thread_id = _first_metadata_text(
+        metadata,
+        ("thread_id", "source_thread_id", "thread"),
+        nested_keys=("thread_id", "source_thread_id", "id"),
+    )
     sender = _sender_from_metadata(metadata)
-    batch_key = _first_metadata_text(metadata, ("batch_key",))
-    attachment_index = _first_metadata_text(metadata, ("attachment_index",))
-    sidecar_path = _first_metadata_text(metadata, ("sidecar_path",))
+    batch_key = _first_metadata_text(
+        metadata, ("batch_key", "batch"), nested_keys=("batch_key", "id")
+    )
+    attachment_index = _first_metadata_text(
+        metadata,
+        ("attachment_index", "attachment"),
+        nested_keys=("attachment_index", "index", "id"),
+    )
+    sidecar_path = _first_metadata_text(
+        metadata, ("sidecar_path", "sidecar"), nested_keys=("sidecar_path", "path")
+    )
 
     identity_values = (
         origin_source,
@@ -221,12 +248,23 @@ def envelope_metadata(envelope: ContextEnvelope) -> dict[str, str]:
     nearest_after = envelope.nearest_nonempty_after or _nearest_nonempty(
         envelope.same_channel_after
     )
-    return {
+    metadata = {
         "context_before_message_ids": _message_ids(envelope.same_channel_before),
+        "context_before_source_message_ids": _source_message_ids(
+            envelope.same_channel_before
+        ),
         "context_after_message_ids": _message_ids(envelope.same_channel_after),
-        "context_nearest_before_message_id": _message_identifier(nearest_before),
-        "context_nearest_after_message_id": _message_identifier(nearest_after),
+        "context_after_source_message_ids": _source_message_ids(
+            envelope.same_channel_after
+        ),
+        "context_nearest_before_message_id": _message_id(nearest_before),
+        "context_nearest_before_source_message_id": _source_message_id(
+            nearest_before
+        ),
+        "context_nearest_after_message_id": _message_id(nearest_after),
+        "context_nearest_after_source_message_id": _source_message_id(nearest_after),
     }
+    return {key: value for key, value in metadata.items() if value}
 
 
 def _batch_key(origin_source: str, channel_id: str, sent_at: str) -> str:
@@ -318,12 +356,41 @@ def _sender_from_metadata(metadata: dict[str, Any]) -> str:
     return ""
 
 
-def _first_metadata_text(metadata: dict[str, Any], keys: tuple[str, ...]) -> str:
+def _first_metadata_text(
+    metadata: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    nested_keys: tuple[str, ...] = (),
+    scalar_keys: tuple[str, ...] | None = None,
+) -> str:
+    scalar_keys = keys if scalar_keys is None else scalar_keys
     for key in keys:
-        value = _text(metadata.get(key))
+        if key not in metadata:
+            continue
+        raw_value = metadata.get(key)
+        value = _nested_metadata_text(raw_value, nested_keys)
+        if not value and key in scalar_keys:
+            value = _scalar_metadata_text(raw_value)
         if value:
             return value
     return ""
+
+
+def _nested_metadata_text(value: Any, nested_keys: tuple[str, ...]) -> str:
+    if not isinstance(value, dict):
+        return ""
+    for key in nested_keys:
+        if key in value:
+            nested_value = _scalar_metadata_text(value.get(key))
+            if nested_value:
+                return nested_value
+    return ""
+
+
+def _scalar_metadata_text(value: Any) -> str:
+    if isinstance(value, (dict, list, tuple, set)):
+        return ""
+    return _text(value)
 
 
 def _format_context_message(label: str, message: CommunicationMessage) -> str:
@@ -347,16 +414,30 @@ def _format_context_message(label: str, message: CommunicationMessage) -> str:
 
 def _message_ids(messages: list[CommunicationMessage]) -> str:
     return ",".join(
-        identifier
-        for identifier in (_message_identifier(message) for message in messages)
-        if identifier
+        message_id
+        for message_id in (_message_id(message) for message in messages)
+        if message_id
     )
 
 
-def _message_identifier(message: CommunicationMessage | None) -> str:
+def _source_message_ids(messages: list[CommunicationMessage]) -> str:
+    return ",".join(
+        source_message_id
+        for source_message_id in (_source_message_id(message) for message in messages)
+        if source_message_id
+    )
+
+
+def _message_id(message: CommunicationMessage | None) -> str:
     if message is None:
         return ""
-    return message.message_id or message.source_message_id
+    return message.message_id
+
+
+def _source_message_id(message: CommunicationMessage | None) -> str:
+    if message is None:
+        return ""
+    return message.source_message_id
 
 
 def _text(value: Any, default: str = "") -> str:

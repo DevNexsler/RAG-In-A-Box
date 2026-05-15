@@ -3,8 +3,11 @@ from pathlib import Path
 from communication_context import (
     CommunicationItem,
     CommunicationMessage,
+    ContextEnvelope,
     SourceWindowContextProvider,
+    communication_item_from_record,
     communication_item_from_sidecar,
+    envelope_metadata,
 )
 
 
@@ -72,6 +75,103 @@ def test_sidecar_attachment_handles_malformed_sender(tmp_path: Path):
     item = communication_item_from_sidecar(media, sidecar)
 
     assert item.sender == ""
+
+
+def test_record_aliases_become_communication_item():
+    item = communication_item_from_record(
+        {
+            "doc_id": "documents::photo",
+            "rel_path": "photo.jpg",
+            "source_name": "documents",
+            "source_type": "img",
+        },
+        {
+            "origin_source": "chat",
+            "source_channel_id": "chan-1",
+            "timestamp": "2026-01-01T10:00:01Z",
+            "message": {
+                "id": "msg-2",
+                "source_message_id": "src-msg-2",
+            },
+            "thread": "thread-1",
+            "sender_name": "Joycelyn",
+            "batch": "batch-1",
+            "attachment": 2,
+            "sidecar": "photo.json",
+        },
+        primary_text="image description",
+    )
+
+    assert item is not None
+    assert item.origin_source == "chat"
+    assert item.channel_id == "chan-1"
+    assert item.sent_at == "2026-01-01T10:00:01Z"
+    assert item.message_id == "msg-2"
+    assert item.source_message_id == "src-msg-2"
+    assert item.thread_id == "thread-1"
+    assert item.sender == "Joycelyn"
+    assert item.batch_key == "batch-1"
+    assert item.attachment_index == "2"
+    assert item.sidecar_path == "photo.json"
+    assert item.primary_text == "image description"
+
+
+def test_record_message_alias_accepts_scalar_message_id():
+    item = communication_item_from_record(
+        {"doc_id": "documents::message"},
+        {"message": "msg-1"},
+    )
+
+    assert item is not None
+    assert item.message_id == "msg-1"
+
+
+def test_envelope_metadata_preserves_message_and_source_ids():
+    envelope = ContextEnvelope(
+        primary_item=CommunicationItem(doc_id="documents::photo"),
+        same_channel_before=[
+            CommunicationMessage(
+                message_id="m1",
+                source_message_id="src-m1",
+                text="Before one",
+            ),
+            CommunicationMessage(
+                message_id="m2",
+                source_message_id="src-m2",
+                text="Before two",
+            ),
+        ],
+        same_channel_after=[
+            CommunicationMessage(
+                message_id="m3",
+                source_message_id="src-m3",
+                text="After one",
+            )
+        ],
+        nearest_nonempty_before=CommunicationMessage(
+            message_id="m2",
+            source_message_id="src-m2",
+            text="Before two",
+        ),
+        nearest_nonempty_after=CommunicationMessage(
+            message_id="m3",
+            source_message_id="src-m3",
+            text="After one",
+        ),
+    )
+
+    metadata = envelope_metadata(envelope)
+
+    assert metadata == {
+        "context_before_message_ids": "m1,m2",
+        "context_before_source_message_ids": "src-m1,src-m2",
+        "context_after_message_ids": "m3",
+        "context_after_source_message_ids": "src-m3",
+        "context_nearest_before_message_id": "m2",
+        "context_nearest_before_source_message_id": "src-m2",
+        "context_nearest_after_message_id": "m3",
+        "context_nearest_after_source_message_id": "src-m3",
+    }
 
 
 def test_provider_uses_same_channel_only():
