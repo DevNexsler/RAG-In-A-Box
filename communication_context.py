@@ -81,14 +81,32 @@ class SourceWindowContextProvider:
         message_threads = message_threads or {}
         for message in messages:
             origin_source = (
-                _lookup_message_map_value(message_sources, message, message.origin_source)
+                _lookup_message_map_value(
+                    message_sources,
+                    message,
+                    message.origin_source,
+                    message.channel_id,
+                    message.thread_id,
+                )
                 or message.origin_source
             )
             scope = (
                 _text(origin_source),
-                _lookup_message_map_value(message_channels, message, origin_source)
+                _lookup_message_map_value(
+                    message_channels,
+                    message,
+                    origin_source,
+                    message.channel_id,
+                    message.thread_id,
+                )
                 or _text(message.channel_id),
-                _lookup_message_map_value(message_threads, message, origin_source)
+                _lookup_message_map_value(
+                    message_threads,
+                    message,
+                    origin_source,
+                    message.channel_id,
+                    message.thread_id,
+                )
                 or _text(message.thread_id),
             )
             messages_by_scope.setdefault(scope, []).append(message)
@@ -281,7 +299,12 @@ def build_context_provider_from_records(
             continue
 
         messages.append(message)
-        for key in _scoped_message_map_keys(message, item.origin_source):
+        for key in _scoped_message_map_keys(
+            message,
+            item.origin_source,
+            item.channel_id,
+            item.thread_id,
+        ):
             message_channels[key] = item.channel_id
             message_sources[key] = item.origin_source
             message_threads[key] = item.thread_id
@@ -529,7 +552,7 @@ def _record_message_has_context_scope(
     message: CommunicationMessage,
 ) -> bool:
     return bool(
-        _message_identity_keys(message)
+        any(_text(key) for key in _message_identity_keys(message))
         and _text(message.text)
         and (_text(item.channel_id) or _text(item.thread_id))
     )
@@ -547,9 +570,11 @@ def _lookup_message_map_value(
     values: dict[str, str],
     message: CommunicationMessage,
     origin_source: str = "",
+    channel_id: str = "",
+    thread_id: str = "",
 ) -> str:
     for key in (
-        _scoped_message_map_keys(message, origin_source)
+        _scoped_message_map_keys(message, origin_source, channel_id, thread_id)
         + _legacy_message_map_keys(message)
     ):
         value = _text(values.get(key))
@@ -561,8 +586,12 @@ def _lookup_message_map_value(
 def _scoped_message_map_keys(
     message: CommunicationMessage,
     origin_source: str = "",
+    channel_id: str = "",
+    thread_id: str = "",
 ) -> list[str]:
     origin_source = _text(origin_source)
+    channel_id = _text(channel_id)
+    thread_id = _text(thread_id)
     if not origin_source:
         return []
     keys: list[str] = []
@@ -572,7 +601,12 @@ def _scoped_message_map_keys(
     ):
         value = _text(value)
         if value:
-            keys.append(f"{kind}:{origin_source}:{value}")
+            keys.append(
+                json.dumps(
+                    [kind, origin_source, channel_id, thread_id, value],
+                    separators=(",", ":"),
+                )
+            )
     return keys
 
 
