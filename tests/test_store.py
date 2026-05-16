@@ -77,6 +77,63 @@ def test_list_empty():
         assert store.list_doc_ids() == []
 
 
+def test_init_retries_after_corruption_recovery(monkeypatch):
+    """Constructor should retry once after auto-recovering a corrupt Lance table."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        seed = LanceDBStore(tmpdir, "test_chunks")
+        seed.upsert_nodes([_make_node("a.md", "c:0", "hello world", [0.1] * 768)])
+
+        real_probe = LanceDBStore._probe_table_read
+        probe_calls = {"count": 0}
+        recovery_calls = {"count": 0}
+
+        def flaky_probe(self):
+            probe_calls["count"] += 1
+            if probe_calls["count"] == 1:
+                raise RuntimeError(
+                    "lance error: LanceError(IO): Generic memory error: "
+                    "Invalid range 0..0 for object of size 0 bytes"
+                )
+            return real_probe(self)
+
+        def fake_recover(self):
+            recovery_calls["count"] += 1
+            return True
+
+        monkeypatch.setattr(LanceDBStore, "_probe_table_read", flaky_probe)
+        monkeypatch.setattr(LanceDBStore, "_recover_corrupt_table", fake_recover)
+
+        recovered = LanceDBStore(tmpdir, "test_chunks")
+
+        assert recovery_calls["count"] == 1
+        assert probe_calls["count"] == 2
+        assert recovered.list_doc_ids() == ["a.md"]
+
+
+def test_init_reraises_non_corruption_probe_error(monkeypatch):
+    """Constructor should not hide unrelated probe failures."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        seed = LanceDBStore(tmpdir, "test_chunks")
+        seed.upsert_nodes([_make_node("a.md", "c:0", "hello world", [0.1] * 768)])
+
+        recovery_calls = {"count": 0}
+
+        def bad_probe(self):
+            raise RuntimeError("boom")
+
+        def fake_recover(self):
+            recovery_calls["count"] += 1
+            return True
+
+        monkeypatch.setattr(LanceDBStore, "_probe_table_read", bad_probe)
+        monkeypatch.setattr(LanceDBStore, "_recover_corrupt_table", fake_recover)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            LanceDBStore(tmpdir, "test_chunks")
+
+        assert recovery_calls["count"] == 0
+
+
 def test_vector_search():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")

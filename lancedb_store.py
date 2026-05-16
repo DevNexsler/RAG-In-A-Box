@@ -19,6 +19,10 @@ from doc_enrichment import ENRICHMENT_FIELDS
 logger = logging.getLogger(__name__)
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_LANCE_CORRUPTION_MARKERS = (
+    "invalid range 0..0 for object of size 0 bytes",
+    "lanceerror(io)",
+)
 
 _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
 _ENRICHMENT_AUX_FIELDS = ("enr_importance_source",)
@@ -104,12 +108,77 @@ class LanceDBStore:
     def __init__(self, index_root: str | Path, table_name: str = "chunks") -> None:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
-        self._vs = LanceDBVectorStore(
+        self._vs = self._build_vector_store()
+        self._ensure_scalar_index()
+        try:
+            self._probe_table_read()
+        except Exception as exc:
+            if not self._is_probable_corruption_error(exc) or not self._recover_corrupt_table():
+                raise
+            logger.warning(
+                "Recovered probable LanceDB corruption while opening %s: %s",
+                self.table_name,
+                exc,
+            )
+            self._vs = self._build_vector_store()
+            self._ensure_scalar_index()
+            self._probe_table_read()
+
+    def _build_vector_store(self) -> LanceDBVectorStore:
+        return LanceDBVectorStore(
             uri=self.index_root,
-            table_name=table_name,
+            table_name=self.table_name,
             mode="create",  # "create" lets LanceDB create the table if missing, or open if exists
         )
-        self._ensure_scalar_index()
+
+    @staticmethod
+    def _is_probable_corruption_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return all(marker in text for marker in _LANCE_CORRUPTION_MARKERS) or "corrupt" in text
+
+    def _probe_table_read(self) -> None:
+        """Cheap read probe so init fails fast on unreadable tables, not first user query."""
+        try:
+            self._vs.table.to_lance().to_table(limit=1)
+        except TableNotFoundError:
+            return
+
+    def _recover_corrupt_table(self) -> bool:
+        """Rollback to the newest readable Lance version and rewrite the dataset."""
+        import lance
+
+        lance_path = Path(self.index_root) / f"{self.table_name}.lance"
+        if not lance_path.exists():
+            return False
+
+        try:
+            ds = lance.dataset(str(lance_path))
+            versions = sorted(ds.versions(), key=lambda item: item["version"], reverse=True)
+        except Exception as exc:
+            logger.warning("Cannot inspect Lance versions for recovery: %s", exc)
+            return False
+
+        clean_version = None
+        for version_info in versions:
+            version = version_info["version"]
+            try:
+                lance.dataset(str(lance_path), version=version).to_table(limit=1)
+                clean_version = version
+                break
+            except Exception:
+                continue
+
+        if clean_version is None:
+            logger.warning("No readable Lance version found for %s", lance_path)
+            return False
+
+        clean_table = lance.dataset(str(lance_path), version=clean_version).to_table()
+        corrupt_path = Path(f"{lance_path}.corrupt")
+        if corrupt_path.exists():
+            shutil.rmtree(corrupt_path)
+        shutil.move(str(lance_path), str(corrupt_path))
+        lance.write_dataset(clean_table, str(lance_path))
+        return True
 
     def _ensure_scalar_index(self) -> None:
         """Create a BTREE scalar index on doc_id for O(log n) filtered lookups."""
