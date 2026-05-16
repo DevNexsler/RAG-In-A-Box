@@ -57,6 +57,8 @@ class SourceWindowContextProvider:
         *,
         window_before: int = 5,
         window_after: int = 5,
+        max_relative_gap: float = 3.0,
+        max_extra_gap_seconds: int = 60,
     ) -> None:
         self._messages_by_scope = {
             scope: sorted(messages, key=_message_sort_key)
@@ -64,6 +66,8 @@ class SourceWindowContextProvider:
         }
         self._window_before = window_before
         self._window_after = window_after
+        self._max_relative_gap = max(1.0, float(max_relative_gap or 1.0))
+        self._max_extra_gap_seconds = max(0, int(max_extra_gap_seconds or 0))
 
     @classmethod
     def from_messages(
@@ -75,6 +79,8 @@ class SourceWindowContextProvider:
         message_threads: dict[str, str] | None = None,
         window_before: int = 5,
         window_after: int = 5,
+        max_relative_gap: float = 3.0,
+        max_extra_gap_seconds: int = 60,
     ) -> SourceWindowContextProvider:
         messages_by_scope: dict[tuple[str, str, str], list[CommunicationMessage]] = {}
         message_sources = message_sources or {}
@@ -115,6 +121,8 @@ class SourceWindowContextProvider:
             messages_by_scope,
             window_before=window_before,
             window_after=window_after,
+            max_relative_gap=max_relative_gap,
+            max_extra_gap_seconds=max_extra_gap_seconds,
         )
 
     def get_context_envelope(self, item: CommunicationItem) -> ContextEnvelope:
@@ -133,6 +141,13 @@ class SourceWindowContextProvider:
         ]
         before_window = before[-self._window_before :] if self._window_before > 0 else []
         after_window = after[: self._window_after] if self._window_after > 0 else []
+        before_window, after_window = _prune_by_time_distance(
+            item,
+            before_window,
+            after_window,
+            max_relative_gap=self._max_relative_gap,
+            max_extra_gap_seconds=self._max_extra_gap_seconds,
+        )
 
         return ContextEnvelope(
             primary_item=item,
@@ -147,6 +162,42 @@ def communication_item_from_sidecar(
     media_path: Path, sidecar_path: Path
 ) -> CommunicationItem:
     payload: dict[str, Any] = json.loads(sidecar_path.read_text())
+    return _communication_item_from_sidecar_payload(media_path, sidecar_path, payload)
+
+
+def communication_metadata_from_sidecar(
+    media_path: Path, sidecar_path: Path
+) -> dict[str, str]:
+    """Return index metadata aliases extracted from a communication sidecar."""
+    payload: dict[str, Any] = json.loads(sidecar_path.read_text())
+    item = _communication_item_from_sidecar_payload(media_path, sidecar_path, payload)
+    message = payload.get("message") or {}
+    media = payload.get("media") or {}
+
+    metadata = {
+        "source": item.origin_source,
+        "origin_source": item.origin_source,
+        "message_id": item.message_id,
+        "source_message_id": item.source_message_id,
+        "channel_id": item.channel_id,
+        "thread_id": item.thread_id,
+        "sender": item.sender,
+        "sent_at": item.sent_at,
+        "batch_key": item.batch_key,
+        "attachment_index": item.attachment_index,
+        "sidecar_path": item.sidecar_path,
+        "message_body": _text(message.get("body")),
+        "media_type": _text(media.get("media_type")),
+        "original_filename": _text(media.get("original_filename")),
+    }
+    return {key: value for key, value in metadata.items() if value}
+
+
+def _communication_item_from_sidecar_payload(
+    media_path: Path,
+    sidecar_path: Path,
+    payload: dict[str, Any],
+) -> CommunicationItem:
     message = payload.get("message") or {}
     channel = payload.get("channel") or {}
     media = payload.get("media") or {}
@@ -319,6 +370,10 @@ def build_context_provider_from_records(
         message_threads=message_threads,
         window_before=_configured_window(config, "window_before", 5),
         window_after=_configured_window(config, "window_after", 5),
+        max_relative_gap=_configured_float(config, "max_relative_gap", 3.0),
+        max_extra_gap_seconds=_configured_window(
+            config, "max_extra_gap_seconds", 60
+        ),
     )
 
 
@@ -410,6 +465,64 @@ def _is_context_target(message: CommunicationMessage, item: CommunicationItem) -
 
 def _sent_at_sort_key(value: str) -> tuple[str, str]:
     return (_normalize_timestamp_for_sort(value), _text(value))
+
+
+def _prune_by_time_distance(
+    item: CommunicationItem,
+    before: list[CommunicationMessage],
+    after: list[CommunicationMessage],
+    *,
+    max_relative_gap: float,
+    max_extra_gap_seconds: int,
+) -> tuple[list[CommunicationMessage], list[CommunicationMessage]]:
+    item_time = _parse_timestamp(item.sent_at)
+    if item_time is None:
+        return before, after
+
+    candidates: list[tuple[str, CommunicationMessage, float | None]] = []
+    for message in before:
+        candidates.append(("before", message, _distance_seconds(item_time, message)))
+    for message in after:
+        candidates.append(("after", message, _distance_seconds(item_time, message)))
+
+    distances = [distance for _, _, distance in candidates if distance is not None]
+    if not distances:
+        return before, after
+
+    nearest = min(distances)
+    threshold = max(nearest * max_relative_gap, nearest + max_extra_gap_seconds)
+    keep = {
+        id(message)
+        for _, message, distance in candidates
+        if distance is None or distance <= threshold
+    }
+    return (
+        [message for message in before if id(message) in keep],
+        [message for message in after if id(message) in keep],
+    )
+
+
+def _distance_seconds(
+    item_time: datetime,
+    message: CommunicationMessage,
+) -> float | None:
+    message_time = _parse_timestamp(message.sent_at)
+    if message_time is None:
+        return None
+    return abs((item_time - message_time).total_seconds())
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    value = _text(value)
+    if not value:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
 
 
 def _normalize_timestamp_for_sort(value: str) -> str:
@@ -564,6 +677,14 @@ def _configured_window(config: dict[str, Any], key: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(0, value)
+
+
+def _configured_float(config: dict[str, Any], key: str, default: float) -> float:
+    try:
+        value = float(config.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return max(1.0, value)
 
 
 def _lookup_message_map_value(

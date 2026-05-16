@@ -89,6 +89,22 @@ _SOURCE_TYPE_MAP = SOURCE_TYPE_BY_EXTENSION
 
 
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
+_COMMUNICATION_METADATA_KEYS = (
+    "source",
+    "origin_source",
+    "message_id",
+    "source_message_id",
+    "channel_id",
+    "thread_id",
+    "sender",
+    "sent_at",
+    "batch_key",
+    "attachment_index",
+    "sidecar_path",
+    "message_body",
+    "media_type",
+    "original_filename",
+)
 
 
 def _split_markdown_by_headings(text: str) -> list[tuple[str, str]]:
@@ -127,6 +143,19 @@ def _split_markdown_by_headings(text: str) -> list[tuple[str, str]]:
             sections.append((breadcrumb, section_text))
 
     return sections
+
+
+def _communication_caption_text(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("message_body") or "").strip()
+
+
+def _with_communication_caption(text: str, metadata: dict[str, Any]) -> str:
+    caption = _communication_caption_text(metadata)
+    if not caption:
+        return text
+    if text.strip():
+        return f"Communication message/caption: {caption}\n\nAttachment content:\n{text}"
+    return f"Communication message/caption: {caption}"
 
 
 def _build_chunk_context(
@@ -449,17 +478,19 @@ def process_doc_task(doc: dict) -> None:
             ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
         )
 
-    if not result.full_text.strip():
-        logger.warning(f"No text extracted: {doc_id}")
-        return
-
     source_metadata = (
         getattr(source_record, "metadata", {}) if source_record is not None else {}
     )
+    full_text = _with_communication_caption(result.full_text, source_metadata)
+
+    if not full_text.strip():
+        logger.warning(f"No text extracted: {doc_id}")
+        return
+
     context_text = ""
     context_meta: dict[str, str] = {}
     communication_context_provider = _RUNTIME.get("communication_context_provider")
-    comm_item = communication_item_from_record(doc, source_metadata, result.full_text)
+    comm_item = communication_item_from_record(doc, source_metadata, full_text)
     if comm_item is not None and communication_context_provider is not None:
         try:
             envelope = communication_context_provider.get_context_envelope(comm_item)
@@ -473,7 +504,7 @@ def process_doc_task(doc: dict) -> None:
 
     # --- Extract document-level metadata ---
     fm = result.frontmatter  # from Markdown frontmatter; empty dict for PDF/images
-    title = fm.get("title") or extract_title(result.full_text, doc_id)
+    title = fm.get("title") or extract_title(full_text, doc_id)
     tags = normalize_tags(fm.get("tags"))
     folder = derive_folder(rel_path)
     status = fm.get("status", "archived" if folder.lower() in ("archive", "archived") else "active")
@@ -511,6 +542,10 @@ def process_doc_task(doc: dict) -> None:
     for k, v in extra_fm.items():
         if k not in doc_meta:
             doc_meta[k] = v
+    for k in _COMMUNICATION_METADATA_KEYS:
+        v = source_metadata.get(k)
+        if v and k not in doc_meta:
+            doc_meta[k] = str(v)
     for k, v in context_meta.items():
         if k not in doc_meta:
             doc_meta[k] = v
@@ -521,7 +556,7 @@ def process_doc_task(doc: dict) -> None:
     enrichment_cfg = _RUNTIME.get("config", {}).get("enrichment", {})
     if llm_generator:
         enrichment = enrich_document(
-            text=result.full_text,
+            text=full_text,
             title=title,
             source_type=source_type,
             generator=llm_generator,
@@ -574,8 +609,11 @@ def process_doc_task(doc: dict) -> None:
         for page_text in result.pages:
             if not page_text.text.strip():
                 continue
+            page_body = page_text.text
+            if page_text.page == 0:
+                page_body = _with_communication_caption(page_body, source_metadata)
             raw_chunks = _split_section(
-                page_text.text, splitter, semantic_splitter, semantic_threshold
+                page_body, splitter, semantic_splitter, semantic_threshold
             )
             ctx = _build_chunk_context(doc_meta, page=page_text.page)
             contextualized = [ctx + c for c in raw_chunks]
@@ -598,7 +636,7 @@ def process_doc_task(doc: dict) -> None:
 
     elif source_type in ("md", "doc", "pres", "html", "epub", "csv"):
         # Heading-aware: split at h1-h3 boundaries, then SentenceSplitter within.
-        sections = _split_markdown_by_headings(result.full_text)
+        sections = _split_markdown_by_headings(full_text)
         all_raw: list[str] = []
         all_ctx: list[str] = []
         all_sections: list[str] = []
@@ -638,7 +676,7 @@ def process_doc_task(doc: dict) -> None:
         # Images, media, or single-page PDFs
         loc_prefix = source_type if source_type in ("img", "audio", "video") else ""
         raw_chunks = _split_section(
-            result.full_text, splitter, semantic_splitter, semantic_threshold
+            full_text, splitter, semantic_splitter, semantic_threshold
         )
         ctx = _build_chunk_context(doc_meta)
         contextualized = [ctx + c for c in raw_chunks]
