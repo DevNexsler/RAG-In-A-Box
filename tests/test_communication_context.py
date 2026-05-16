@@ -284,6 +284,89 @@ def test_provider_tracks_nearest_nonempty_messages():
     assert envelope.nearest_nonempty_after.message_id == "4"
 
 
+def test_provider_prunes_farther_context_candidates_by_time_distance():
+    target = CommunicationItem(
+        doc_id="photo",
+        origin_source="zoho_cliq",
+        channel_id="renovations",
+        sent_at="2026-05-08T19:00:56Z",
+    )
+    messages = [
+        CommunicationMessage(
+            message_id="old",
+            origin_source="zoho_cliq",
+            channel_id="renovations",
+            sent_at="2026-05-05T19:33:06Z",
+            text="665 sayre",
+        ),
+        CommunicationMessage(
+            message_id="before",
+            origin_source="zoho_cliq",
+            channel_id="renovations",
+            sent_at="2026-05-08T19:00:09Z",
+            text="482 # 6 as follow.....",
+        ),
+        CommunicationMessage(
+            message_id="after",
+            origin_source="zoho_cliq",
+            channel_id="renovations",
+            sent_at="2026-05-08T19:04:16Z",
+            text="163 washington as follow....",
+        ),
+    ]
+
+    provider = SourceWindowContextProvider.from_messages(
+        messages,
+        message_channels={m.message_id: "renovations" for m in messages},
+        message_sources={m.message_id: "zoho_cliq" for m in messages},
+        window_before=5,
+        window_after=5,
+    )
+
+    envelope = provider.get_context_envelope(target)
+
+    assert [m.message_id for m in envelope.same_channel_before] == ["before"]
+    assert envelope.same_channel_after == []
+
+
+def test_provider_keeps_balanced_before_and_after_candidates():
+    target = CommunicationItem(
+        doc_id="photo",
+        origin_source="zoho_cliq",
+        channel_id="renovations",
+        sent_at="2026-05-08T19:00:56Z",
+    )
+    messages = [
+        CommunicationMessage(
+            message_id="before",
+            origin_source="zoho_cliq",
+            channel_id="renovations",
+            sent_at="2026-05-08T19:00:50Z",
+            text="Building A",
+        ),
+        CommunicationMessage(
+            message_id="after",
+            origin_source="zoho_cliq",
+            channel_id="renovations",
+            sent_at="2026-05-08T19:01:03Z",
+            text="Unit 2",
+        ),
+    ]
+
+    provider = SourceWindowContextProvider.from_messages(
+        messages,
+        message_channels={m.message_id: "renovations" for m in messages},
+        message_sources={m.message_id: "zoho_cliq" for m in messages},
+        window_before=5,
+        window_after=5,
+    )
+
+    envelope = provider.get_context_envelope(target)
+
+    assert [m.message_id for m in envelope.same_channel_before] == ["before"]
+    assert [m.message_id for m in envelope.same_channel_after] == ["after"]
+
+
 def test_provider_orders_same_timestamp_messages_around_target_id():
     target = CommunicationItem(
         doc_id="attachment-2",
@@ -543,6 +626,56 @@ def test_build_context_provider_supports_source_message_id_only_records():
 
     assert envelope.nearest_nonempty_before.text == "Unit E"
     assert [m.source_message_id for m in envelope.same_channel_before] == ["s1"]
+
+
+def test_build_context_provider_matches_postgres_channel_source_id_to_sidecar():
+    from communication_context import (
+        build_context_provider_from_records,
+        communication_item_from_record,
+    )
+    from sources.base import SourceRecord
+
+    records = [
+        {
+            "doc_id": "comm_messages::zoho_cliq/label-1",
+            "source_name": "comm_messages",
+            "source_type": "pg_message",
+        }
+    ]
+    source_records = {
+        "comm_messages::zoho_cliq/label-1": SourceRecord(
+            doc_id="zoho_cliq/label-1",
+            source_type="pg_message",
+            natural_key="zoho_cliq/label-1",
+            mtime=1.0,
+            size=10,
+            metadata={
+                "source": "zoho_cliq",
+                "source_message_id": "label-1",
+                "source_channel_id": "CT_renovations",
+                "channel_name": "#Renovations",
+                "sent_at": "2026-05-08T19:00:09Z",
+                "sender": "Cesar",
+                "_text": "482 # 6 as follow.....",
+            },
+        )
+    }
+
+    provider = build_context_provider_from_records(records, source_records, {})
+    item = communication_item_from_record(
+        {"doc_id": "documents::photo", "source_type": "img"},
+        {
+            "source": "zoho_cliq",
+            "source_message_id": "photo-1",
+            "source_channel_id": "CT_renovations",
+            "sent_at": "2026-05-08T19:00:56Z",
+        },
+    )
+
+    envelope = provider.get_context_envelope(item)
+
+    assert [m.source_message_id for m in envelope.same_channel_before] == ["label-1"]
+    assert envelope.same_channel_before[0].text == "482 # 6 as follow....."
 
 
 def test_build_context_provider_distinguishes_source_and_message_id_collisions():

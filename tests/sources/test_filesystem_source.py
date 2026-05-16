@@ -126,6 +126,61 @@ def test_scan_emits_canonical_source_type_and_preserves_extension(tmp_path):
     assert record.metadata["ext"] == "docx"
 
 
+def test_scan_adds_communication_sidecar_metadata_to_attachment(tmp_path):
+    """Attachment sidecars use a different @id@ suffix than the media file."""
+    from doc_id_store import DocIDStore
+    from sources.filesystem import FilesystemSource
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    media = vault / "2026-05-08T19-00-56Z__msg15729__mm0@000QB@.jpg"
+    sidecar = vault / "2026-05-08T19-00-56Z__msg15729__mm0@000QL@.json"
+    media.write_bytes(b"fake image")
+    sidecar.write_text(
+        """
+        {
+          "schema_version": 2,
+          "source": "zoho_cliq",
+          "message": {
+            "message_id": "15729",
+            "source_message_id": "1778266856652_3479073905868",
+            "sent_at": "2026-05-08T19:00:56.652Z",
+            "body": "",
+            "from": {"name": "Cesar"}
+          },
+          "channel": {
+            "source_channel_id": "CT_2242282033243122287_721156495",
+            "channel_type": "conversation"
+          },
+          "media": {
+            "media_index": 0,
+            "media_type": "image/jpeg",
+            "original_filename": "20260508_145742.jpg",
+            "storage_path": "cesar/2026-05/2026-05-08T19-00-56Z__msg15729__mm0.jpg"
+          }
+        }
+        """
+    )
+
+    src = FilesystemSource(
+        name="documents",
+        root=vault,
+        scan_config={"include": ["**/*.jpg"], "exclude": []},
+        registry=DocIDStore(tmp_path / "reg.db"),
+    )
+
+    [record] = list(src.scan())
+
+    assert record.metadata["origin_source"] == "zoho_cliq"
+    assert record.metadata["message_id"] == "15729"
+    assert record.metadata["source_message_id"] == "1778266856652_3479073905868"
+    assert record.metadata["channel_id"] == "CT_2242282033243122287_721156495"
+    assert record.metadata["sender"] == "Cesar"
+    assert record.metadata["attachment_index"] == "0"
+    assert record.metadata["original_filename"] == "20260508_145742.jpg"
+    assert record.metadata["sidecar_path"].endswith("__msg15729__mm0@000QL@.json")
+
+
 def test_scan_does_not_mutate_flow_runtime(tmp_path, monkeypatch):
     """FilesystemSource.scan should not depend on flow_index_vault._RUNTIME."""
     from doc_id_store import DocIDStore

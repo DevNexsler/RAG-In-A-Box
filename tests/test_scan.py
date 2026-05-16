@@ -489,6 +489,109 @@ def test_process_doc_task_passes_context_to_enrichment(monkeypatch):
     assert captured["metadata"]["context_nearest_before_message_id"] == "m1"
 
 
+def test_process_doc_task_includes_attachment_message_body_in_enrichment(monkeypatch):
+    """Same-message attachment captions become primary enrichment text."""
+    from extractors import ExtractionResult
+    from flow_index_vault import process_doc_task
+    from sources.base import SourceRecord
+
+    captured = {}
+
+    class FakeSource:
+        name = "documents"
+
+        def extract(self, record):
+            return ExtractionResult.from_text("image shows a kitchen wall", frontmatter={})
+
+    class FakeStore:
+        def upsert_nodes(self, nodes):
+            captured["metadata"] = nodes[0].metadata
+
+    class FakeEmbed:
+        def embed_texts(self, texts):
+            captured["embedded_text"] = texts[0]
+            return [[0.1] * 768 for _ in texts]
+
+    def fake_enrich_document(*args, **kwargs):
+        captured["enrichment_text"] = kwargs["text"] if "text" in kwargs else args[0]
+        return {
+            "enr_summary": "summary",
+            "enr_doc_type": "image",
+            "enr_entities_people": "",
+            "enr_entities_places": "",
+            "enr_entities_orgs": "",
+            "enr_entities_dates": "",
+            "enr_topics": "",
+            "enr_keywords": "",
+            "enr_key_facts": "",
+            "enr_suggested_tags": "",
+            "enr_suggested_folder": "",
+            "enr_importance": "0.5",
+            "enr_atomic_entities_people": "",
+            "enr_atomic_entities_places": "",
+            "enr_atomic_entities_orgs": "",
+            "enr_atomic_entities_dates": "",
+            "enr_atomic_topics": "",
+            "enr_context_entities_people": "",
+            "enr_context_entities_places": "",
+            "enr_context_entities_orgs": "",
+            "enr_context_entities_dates": "",
+            "enr_context_topics": "",
+            "enr_context_key_facts": "",
+            "enr_context_relationship": "",
+            "enr_context_confidence": "",
+            "enr_context_source_message_ids": "",
+            "enr_context_warning": "",
+        }
+
+    monkeypatch.setattr("flow_index_vault.enrich_document", fake_enrich_document)
+    monkeypatch.setattr("flow_index_vault.get_run_logger", lambda: MagicMock())
+    _RUNTIME.clear()
+    _RUNTIME.update(
+        {
+            "store": FakeStore(),
+            "embed_provider": FakeEmbed(),
+            "splitter": _FakeSplitter(),
+            "config": {},
+            "sources_by_name": {"documents": FakeSource()},
+            "source_records_by_ns_doc_id": {
+                "documents::photo": SourceRecord(
+                    doc_id="photo",
+                    source_type="img",
+                    natural_key="photo.jpg",
+                    mtime=1.0,
+                    size=10,
+                    metadata={
+                        "message_body": "163 washington # 2",
+                        "source": "zoho_cliq",
+                        "channel_id": "chan",
+                        "sent_at": "2026-05-05T19:30:00Z",
+                        "message_id": "13579",
+                    },
+                )
+            },
+            "llm_generator": object(),
+        }
+    )
+
+    process_doc_task.fn(
+        {
+            "doc_id": "documents::photo",
+            "rel_path": "photo.jpg",
+            "mtime": 1.0,
+            "size": 10,
+            "source_type": "img",
+            "source_name": "documents",
+        }
+    )
+
+    assert "Communication message/caption: 163 washington # 2" in captured["enrichment_text"]
+    assert "Attachment content:" in captured["enrichment_text"]
+    assert "image shows a kitchen wall" in captured["enrichment_text"]
+    assert captured["metadata"]["message_body"] == "163 washington # 2"
+    assert "163 washington # 2" in captured["embedded_text"]
+
+
 # --- Symlink cycle guard ---
 
 

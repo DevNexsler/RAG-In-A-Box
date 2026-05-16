@@ -162,7 +162,8 @@ event_hooks:
 #         query: |
 #           SELECT m.source, m.source_message_id, m.sent_at, m.updated_at,
 #                  m.body AS _text,
-#                  c.name AS channel, p.display_name AS sender
+#                  c.source_channel_id, c.name AS channel_name,
+#                  p.display_name AS sender
 #           FROM messages m
 #           LEFT JOIN channels c ON c.id = m.channel_id
 #           LEFT JOIN participants p ON p.id = m.sender_participant_id
@@ -170,7 +171,15 @@ event_hooks:
 #         id_template: "{source}/{source_message_id}"
 #         text_column: _text
 #         mtime_column: updated_at
-#         metadata_columns: [channel, sender, source, sent_at]
+#         metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, sent_at]
+#
+# communication_context:
+#   enabled: true
+#   window_before: 5
+#   window_after: 5
+#   # Prune candidates much farther from the attachment than the nearest message.
+#   max_relative_gap: 3.0
+#   max_extra_gap_seconds: 60
 
 mcp:
   host: "127.0.0.1"

@@ -7,12 +7,19 @@ proven by tests/sources/test_filesystem_source.py.
 """
 
 from pathlib import Path
+from glob import escape as glob_escape
+import logging
+import re
 from typing import Iterator
 
+from communication_context import communication_metadata_from_sidecar
 from sources.base import SourceRecord
 from doc_id_store import DocIDStore
 from extractors import ExtractionResult, extract_text
 from core.source_types import canonical_source_type
+
+logger = logging.getLogger(__name__)
+_INJECTED_ID_SUFFIX_RE = re.compile(r"^(?P<prefix>.+)@[^@]+@$")
 
 
 # Satisfies the Source protocol from sources.base structurally — no explicit
@@ -69,17 +76,20 @@ class FilesystemSource:
             self._registry.set_source_name(r["doc_id"], self.name)
 
         for r in records:
+            abs_path = Path(r["abs_path"])
+            metadata = {
+                "ext": r["ext"],
+                "abs_path": r["abs_path"],
+                "rel_path": r["rel_path"],
+            }
+            metadata.update(_communication_sidecar_metadata(abs_path))
             yield SourceRecord(
                 doc_id=r["doc_id"],
                 source_type=canonical_source_type(r["ext"]),
                 natural_key=r["rel_path"],
                 mtime=r["mtime"],
                 size=r["size"],
-                metadata={
-                    "ext": r["ext"],
-                    "abs_path": r["abs_path"],
-                    "rel_path": r["rel_path"],
-                },
+                metadata=metadata,
             )
 
     def extract(self, record: SourceRecord) -> ExtractionResult:
@@ -95,3 +105,30 @@ class FilesystemSource:
 
     def close(self) -> None:
         pass  # Filesystem has no handle to close
+
+
+def _communication_sidecar_metadata(media_path: Path) -> dict[str, str]:
+    if media_path.suffix.lower() == ".json":
+        return {}
+    sidecar_path = _find_communication_sidecar(media_path)
+    if sidecar_path is None:
+        return {}
+    try:
+        return communication_metadata_from_sidecar(media_path, sidecar_path)
+    except Exception as exc:
+        logger.debug("Could not read communication sidecar %s: %s", sidecar_path, exc)
+        return {}
+
+
+def _find_communication_sidecar(media_path: Path) -> Path | None:
+    exact = media_path.with_suffix(".json")
+    if exact.exists():
+        return exact
+
+    match = _INJECTED_ID_SUFFIX_RE.match(media_path.stem)
+    if not match:
+        return None
+
+    prefix = match.group("prefix")
+    candidates = sorted(media_path.parent.glob(f"{glob_escape(prefix)}@*.json"))
+    return candidates[0] if candidates else None
