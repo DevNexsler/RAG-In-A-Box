@@ -15,6 +15,9 @@ class CommunicationMessage:
     sender: str = ""
     sent_at: str = ""
     text: str = ""
+    origin_source: str = ""
+    channel_id: str = ""
+    thread_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -77,10 +80,16 @@ class SourceWindowContextProvider:
         message_sources = message_sources or {}
         message_threads = message_threads or {}
         for message in messages:
+            origin_source = (
+                _lookup_message_map_value(message_sources, message, message.origin_source)
+                or message.origin_source
+            )
             scope = (
-                _lookup_message_map_value(message_sources, message),
-                _lookup_message_map_value(message_channels, message),
-                _lookup_message_map_value(message_threads, message),
+                _text(origin_source),
+                _lookup_message_map_value(message_channels, message, origin_source)
+                or _text(message.channel_id),
+                _lookup_message_map_value(message_threads, message, origin_source)
+                or _text(message.thread_id),
             )
             messages_by_scope.setdefault(scope, []).append(message)
 
@@ -264,12 +273,15 @@ def build_context_provider_from_records(
             sender=item.sender,
             sent_at=item.sent_at,
             text=_text(metadata.get("_text")) or _text(item.primary_text),
+            origin_source=item.origin_source,
+            channel_id=item.channel_id,
+            thread_id=item.thread_id,
         )
         if not _record_message_has_context_scope(item, message):
             continue
 
         messages.append(message)
-        for key in _message_map_keys(message):
+        for key in _scoped_message_map_keys(message, item.origin_source):
             message_channels[key] = item.channel_id
             message_sources[key] = item.origin_source
             message_threads[key] = item.thread_id
@@ -517,7 +529,7 @@ def _record_message_has_context_scope(
     message: CommunicationMessage,
 ) -> bool:
     return bool(
-        _message_map_keys(message)
+        _message_identity_keys(message)
         and _text(message.text)
         and (_text(item.channel_id) or _text(item.thread_id))
     )
@@ -534,21 +546,47 @@ def _configured_window(config: dict[str, Any], key: str, default: int) -> int:
 def _lookup_message_map_value(
     values: dict[str, str],
     message: CommunicationMessage,
+    origin_source: str = "",
 ) -> str:
-    for key in _message_map_keys(message):
+    for key in (
+        _scoped_message_map_keys(message, origin_source)
+        + _legacy_message_map_keys(message)
+    ):
         value = _text(values.get(key))
         if value:
             return value
     return ""
 
 
-def _message_map_keys(message: CommunicationMessage) -> list[str]:
+def _scoped_message_map_keys(
+    message: CommunicationMessage,
+    origin_source: str = "",
+) -> list[str]:
+    origin_source = _text(origin_source)
+    if not origin_source:
+        return []
     keys: list[str] = []
-    for key in (message.source_message_id, message.message_id):
+    for kind, value in (
+        ("source_message_id", message.source_message_id),
+        ("message_id", message.message_id),
+    ):
+        value = _text(value)
+        if value:
+            keys.append(f"{kind}:{origin_source}:{value}")
+    return keys
+
+
+def _legacy_message_map_keys(message: CommunicationMessage) -> list[str]:
+    keys: list[str] = []
+    for key in _message_identity_keys(message):
         key = _text(key)
         if key and key not in keys:
             keys.append(key)
     return keys
+
+
+def _message_identity_keys(message: CommunicationMessage) -> tuple[str, str]:
+    return (message.source_message_id, message.message_id)
 
 
 def _text(value: Any, default: str = "") -> str:

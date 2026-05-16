@@ -543,3 +543,134 @@ def test_build_context_provider_supports_source_message_id_only_records():
 
     assert envelope.nearest_nonempty_before.text == "Unit E"
     assert [m.source_message_id for m in envelope.same_channel_before] == ["s1"]
+
+
+def test_build_context_provider_distinguishes_source_and_message_id_collisions():
+    from communication_context import (
+        build_context_provider_from_records,
+        communication_item_from_record,
+    )
+    from sources.base import SourceRecord
+
+    records = [
+        {"doc_id": "comm::a", "source_name": "comm", "source_type": "pg_message"},
+        {"doc_id": "comm::b", "source_name": "comm", "source_type": "pg_message"},
+    ]
+    source_records = {
+        "comm::a": SourceRecord(
+            doc_id="a",
+            source_type="pg_message",
+            natural_key="a",
+            mtime=1.0,
+            size=9,
+            metadata={
+                "_text": "Channel A",
+                "source": "origin-a",
+                "source_message_id": "same",
+                "message_id": "a-id",
+                "channel_id": "chan-a",
+                "sent_at": "2026-01-01T10:00:00Z",
+            },
+        ),
+        "comm::b": SourceRecord(
+            doc_id="b",
+            source_type="pg_message",
+            natural_key="b",
+            mtime=2.0,
+            size=9,
+            metadata={
+                "_text": "Channel B",
+                "source": "origin-b",
+                "source_message_id": "b-src",
+                "message_id": "same",
+                "channel_id": "chan-b",
+                "sent_at": "2026-01-01T10:00:10Z",
+            },
+        ),
+    }
+
+    provider = build_context_provider_from_records(records, source_records, {})
+    assert provider is not None
+    item = communication_item_from_record(
+        records[1],
+        source_records["comm::b"].metadata,
+    )
+    assert item is not None
+
+    envelope = provider.get_context_envelope(item)
+
+    assert envelope.same_channel_before == []
+    assert envelope.nearest_nonempty_before is None
+
+
+def test_build_context_provider_distinguishes_source_message_ids_by_origin():
+    from communication_context import (
+        build_context_provider_from_records,
+        communication_item_from_record,
+    )
+    from sources.base import SourceRecord
+
+    records = [
+        {"doc_id": "comm::a", "source_name": "comm", "source_type": "pg_message"},
+        {"doc_id": "comm::b", "source_name": "comm", "source_type": "pg_message"},
+        {"doc_id": "comm::target", "source_name": "comm", "source_type": "pg_message"},
+    ]
+    source_records = {
+        "comm::a": SourceRecord(
+            doc_id="a",
+            source_type="pg_message",
+            natural_key="a",
+            mtime=1.0,
+            size=9,
+            metadata={
+                "_text": "Origin A",
+                "source": "origin-a",
+                "source_message_id": "same",
+                "message_id": "a-id",
+                "channel_id": "chan-a",
+                "sent_at": "2026-01-01T10:00:00Z",
+            },
+        ),
+        "comm::b": SourceRecord(
+            doc_id="b",
+            source_type="pg_message",
+            natural_key="b",
+            mtime=2.0,
+            size=9,
+            metadata={
+                "_text": "Origin B",
+                "source": "origin-b",
+                "source_message_id": "same",
+                "message_id": "b-id",
+                "channel_id": "chan-b",
+                "sent_at": "2026-01-01T10:00:10Z",
+            },
+        ),
+        "comm::target": SourceRecord(
+            doc_id="target",
+            source_type="pg_message",
+            natural_key="target",
+            mtime=3.0,
+            size=6,
+            metadata={
+                "_text": "Target",
+                "source": "origin-b",
+                "source_message_id": "target-src",
+                "message_id": "target-id",
+                "channel_id": "chan-b",
+                "sent_at": "2026-01-01T10:00:20Z",
+            },
+        ),
+    }
+
+    provider = build_context_provider_from_records(records, source_records, {})
+    assert provider is not None
+    item = communication_item_from_record(
+        records[2],
+        source_records["comm::target"].metadata,
+    )
+    assert item is not None
+
+    envelope = provider.get_context_envelope(item)
+
+    assert [m.text for m in envelope.same_channel_before] == ["Origin B"]
