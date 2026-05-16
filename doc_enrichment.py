@@ -75,8 +75,24 @@ Document text:
 
 _CONTEXT_PROMPT_TEMPLATE = """\
 Extract metadata from this document. Respond with ONLY valid JSON, no other text.
+The context_* fields are required output keys; never omit them.
 
 {{
+  "context_entities_people": ["people inferred from relevant nearby context"],
+  "context_entities_places": ["places inferred from relevant nearby context"],
+  "context_entities_orgs": ["organizations inferred from relevant nearby context"],
+  "context_entities_dates": ["dates inferred from relevant nearby context"],
+  "context_topics": ["topics inferred from relevant nearby context"],
+  "context_key_facts": ["facts inferred from relevant nearby context"],
+  "context_relationship": "why the nearby context is relevant, or empty string",
+  "context_confidence": "high|medium|low|ambiguous, or empty string",
+  "context_source_message_ids": ["nearby message ids used"],
+  "context_warning": "ambiguity or unrelated nearby context warning",
+  "atomic_entities_people": ["people mentioned in the PRIMARY ITEM only"],
+  "atomic_entities_places": ["places mentioned in the PRIMARY ITEM only"],
+  "atomic_entities_orgs": ["organizations mentioned in the PRIMARY ITEM only"],
+  "atomic_entities_dates": ["dates mentioned in the PRIMARY ITEM only"],
+  "atomic_topics": ["topics from the PRIMARY ITEM only"],
   "summary": "2-3 sentence summary of the primary item's purpose and key content",
   "doc_type": ["type1", "type2"],
   "entities_people": ["full names of people mentioned"],
@@ -88,22 +104,7 @@ Extract metadata from this document. Respond with ONLY valid JSON, no other text
   "key_facts": ["most important facts, conclusions, or action items"],
   "suggested_tags": ["classification tags for this document"],
   "suggested_folder": "best folder path for filing this document",
-  "importance": 0.5,
-  "atomic_entities_people": ["people mentioned in the PRIMARY ITEM only"],
-  "atomic_entities_places": ["places mentioned in the PRIMARY ITEM only"],
-  "atomic_entities_orgs": ["organizations mentioned in the PRIMARY ITEM only"],
-  "atomic_entities_dates": ["dates mentioned in the PRIMARY ITEM only"],
-  "atomic_topics": ["topics from the PRIMARY ITEM only"],
-  "context_entities_people": ["people inferred from relevant nearby context"],
-  "context_entities_places": ["places inferred from relevant nearby context"],
-  "context_entities_orgs": ["organizations inferred from relevant nearby context"],
-  "context_entities_dates": ["dates inferred from relevant nearby context"],
-  "context_topics": ["topics inferred from relevant nearby context"],
-  "context_key_facts": ["facts inferred from relevant nearby context"],
-  "context_relationship": "why the nearby context is relevant",
-  "context_confidence": "high|medium|low|ambiguous",
-  "context_source_message_ids": ["nearby message ids used"],
-  "context_warning": "ambiguity or unrelated nearby context warning"
+  "importance": 0.5
 }}
 
 For "importance": rate the primary item's overall importance/usefulness on a 0.0-1.0 scale:
@@ -116,6 +117,8 @@ For "importance": rate the primary item's overall importance/usefulness on a 0.0
 Nearby same-channel context candidates may or may not describe the primary item.
 Treat nearby messages as candidates only. Judge relevance before using them.
 Avoid adding unrelated nearby conversation to any field.
+If you use nearby context in summary, entities, topics, keywords, key_facts, tags, folder, or importance, you MUST also fill the matching context_* fields.
+Do not place context-derived facts only in non-context fields.
 Fill context_* fields only when nearby context is relevant to the PRIMARY ITEM.
 When using nearby context, set context_confidence, context_relationship, and
 context_source_message_ids. Use context_warning for ambiguity or rejected context.
@@ -332,6 +335,126 @@ def parse_enrichment_response(raw_response: str) -> dict[str, str]:
     return _normalize_enrichment(parsed)
 
 
+def _repair_context_omissions(
+    enrichment: dict[str, str],
+    primary_text: str,
+    context_text: str,
+) -> dict[str, str]:
+    """Preserve provenance when a model uses context but omits context_* fields."""
+    context_text = (context_text or "").strip()
+    if not context_text:
+        return enrichment
+
+    repaired = dict(enrichment)
+    copied_values: list[str] = []
+    primary_lower = primary_text.lower()
+    context_lower = context_text.lower()
+
+    for suffix in ("people", "places", "orgs", "dates"):
+        source_key = f"enr_entities_{suffix}"
+        context_key = f"enr_context_entities_{suffix}"
+        if repaired.get(context_key):
+            continue
+        values = [
+            value
+            for value in _metadata_values(repaired.get(source_key, ""))
+            if value.lower() in context_lower and value.lower() not in primary_lower
+        ]
+        if values:
+            repaired[context_key] = ", ".join(values)
+            copied_values.extend(values)
+
+    context_used = bool(copied_values) or _mentions_nearby_context(repaired)
+    if not context_used:
+        return repaired
+
+    if not repaired.get("enr_context_confidence"):
+        repaired["enr_context_confidence"] = "medium"
+    if not repaired.get("enr_context_relationship"):
+        repaired["enr_context_relationship"] = "llm_used_nearby_context"
+    if not repaired.get("enr_context_source_message_ids"):
+        ids = _context_source_ids_for_values(context_text, copied_values)
+        repaired["enr_context_source_message_ids"] = ", ".join(ids)
+    if not repaired.get("enr_context_warning"):
+        repaired["enr_context_warning"] = (
+            "LLM used nearby context in non-context fields but omitted "
+            "structured context fields; provenance inferred from prompt context."
+        )
+    return repaired
+
+
+def _metadata_values(value: str) -> list[str]:
+    value = (value or "").strip()
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _mentions_nearby_context(enrichment: dict[str, str]) -> bool:
+    text = " ".join(
+        enrichment.get(key, "")
+        for key in (
+            "enr_summary",
+            "enr_key_facts",
+            "enr_entities_people",
+            "enr_entities_places",
+            "enr_entities_orgs",
+            "enr_entities_dates",
+            "enr_topics",
+            "enr_keywords",
+            "enr_suggested_tags",
+            "enr_suggested_folder",
+        )
+    ).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "nearby context",
+            "provided context",
+            "nearby message",
+            "nearby messages",
+            "context identifies",
+            "as indicated by context",
+            "as indicated by nearby",
+            "based on context",
+            "from context",
+        )
+    )
+
+
+def _context_source_ids_for_values(context_text: str, values: list[str]) -> list[str]:
+    matching_ids: list[str] = []
+    lowered_values = [value.lower() for value in values if value]
+    for line in context_text.splitlines():
+        if lowered_values and not any(value in line.lower() for value in lowered_values):
+            continue
+        for message_id in _context_message_ids(line):
+            if message_id not in matching_ids:
+                matching_ids.append(message_id)
+    if matching_ids:
+        return matching_ids
+
+    ids: list[str] = []
+    for message_id in _context_message_ids(context_text):
+        if message_id not in ids:
+            ids.append(message_id)
+    return ids
+
+
+def _context_message_ids(text: str) -> list[str]:
+    return [
+        match.group(1).strip()
+        for match in re.finditer(r"\b(?:source_message_id|message_id)=([^\]\s]+)", text)
+        if match.group(1).strip()
+    ]
+
+
 def enrich_document(
     text: str,
     title: str,
@@ -384,6 +507,7 @@ def enrich_document(
         logger.debug("LLM enrichment raw response for '%s': %s", title, raw_response[:200])
 
         enrichment = parse_enrichment_response(raw_response)
+        enrichment = _repair_context_omissions(enrichment, truncated, context_text)
 
         if not enrichment.get("enr_summary"):
             logger.warning(

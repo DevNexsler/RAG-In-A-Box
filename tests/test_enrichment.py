@@ -346,6 +346,92 @@ class TestEnrichDocument:
         assert "NEARBY SAME-CHANNEL CONTEXT CANDIDATES" in prompt
         assert "may or may not describe the primary item" in prompt
 
+    def test_context_prompt_requires_context_fields_when_context_is_used(self):
+        response = json.dumps({
+            "summary": "Photo context.",
+            "doc_type": ["image"],
+        })
+        gen = self._make_generator(response)
+
+        enrich_document(
+            "image notes",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[BEFORE source_message_id=m1] Unit E",
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert (
+            "If you use nearby context in summary, entities, topics, keywords, "
+            "key_facts, tags, folder, or importance, you MUST also fill the "
+            "matching context_* fields"
+        ) in prompt
+        assert "Do not place context-derived facts only in non-context fields" in prompt
+
+    def test_context_prompt_prioritizes_context_fields_before_summary(self):
+        gen = self._make_generator('{"summary": "test"}')
+
+        enrich_document(
+            "image notes",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[BEFORE source_message_id=m1] Unit E",
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert "The context_* fields are required output keys; never omit them." in prompt
+        assert prompt.index('"context_entities_places"') < prompt.index('"summary"')
+
+    def test_repairs_context_used_when_model_omits_context_fields(self):
+        response = json.dumps({
+            "summary": "Photo is related to Unit E, as indicated by nearby context.",
+            "doc_type": ["image"],
+            "entities_places": ["54 S Broad Main Unit E"],
+            "topics": ["storage"],
+            "key_facts": ["Nearby context identifies this photo as Unit E."],
+            "importance": 0.5,
+        })
+        gen = self._make_generator(response)
+
+        result = enrich_document(
+            "Blurry photo of shelves. No address visible.",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text=(
+                "[BEFORE source_message_id=m-unit-e] "
+                "These next photos are for 54 S Broad Main Unit E."
+            ),
+        )
+
+        assert result["enr_context_entities_places"] == "54 S Broad Main Unit E"
+        assert result["enr_context_confidence"] == "medium"
+        assert result["enr_context_relationship"] == "llm_used_nearby_context"
+        assert result["enr_context_source_message_ids"] == "m-unit-e"
+        assert "omitted structured context fields" in result["enr_context_warning"]
+
+    def test_context_repair_does_not_copy_primary_item_entities(self):
+        response = json.dumps({
+            "summary": "Photo of 54 S Broad Main Unit E.",
+            "doc_type": ["image"],
+            "entities_places": ["54 S Broad Main Unit E"],
+            "importance": 0.5,
+        })
+        gen = self._make_generator(response)
+
+        result = enrich_document(
+            "Photo label says 54 S Broad Main Unit E.",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[BEFORE source_message_id=m1] Lunch tomorrow?",
+        )
+
+        assert result["enr_context_entities_places"] == ""
+        assert result["enr_context_confidence"] == ""
+
     def test_none_context_text_uses_no_context_prompt(self):
         gen = self._make_generator('{"summary": "test"}')
 
