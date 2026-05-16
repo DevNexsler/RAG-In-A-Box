@@ -202,6 +202,23 @@ def test_parse_context_enrichment_fields():
     assert parsed["enr_context_source_message_ids"] == "4434"
 
 
+def test_parse_context_placeholder_values_as_empty():
+    parsed = parse_enrichment_response(
+        json.dumps(
+            {
+                "summary": "Photo of a receipt.",
+                "doc_type": ["image"],
+                "context_entities_places": ["places inferred from relevant nearby context"],
+                "context_topics": ["topics inferred from relevant nearby context"],
+                "context_source_message_ids": [],
+            }
+        )
+    )
+
+    assert parsed["enr_context_entities_places"] == ""
+    assert parsed["enr_context_topics"] == ""
+
+
 class TestEnrichDocument:
     """Test enrich_document with mocked LLM generator."""
 
@@ -384,6 +401,21 @@ class TestEnrichDocument:
         assert "The context_* fields are required output keys; never omit them." in prompt
         assert prompt.index('"context_entities_places"') < prompt.index('"summary"')
 
+    def test_context_prompt_rejects_placeholders_and_conflict_confidence(self):
+        gen = self._make_generator('{"summary": "test"}')
+
+        enrich_document(
+            "image notes",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[BEFORE source_message_id=m1] Unit E",
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert "Never copy placeholder/example/schema description text into values" in prompt
+        assert "If candidates conflict, set context_confidence to ambiguous" in prompt
+
     def test_repairs_context_used_when_model_omits_context_fields(self):
         response = json.dumps({
             "summary": "Photo is related to Unit E, as indicated by nearby context.",
@@ -411,6 +443,65 @@ class TestEnrichDocument:
         assert result["enr_context_relationship"] == "llm_used_nearby_context"
         assert result["enr_context_source_message_ids"] == "m-unit-e"
         assert "omitted structured context fields" in result["enr_context_warning"]
+
+    def test_context_repair_does_not_warn_when_context_fields_present(self):
+        response = json.dumps({
+            "summary": "Photo location comes from nearby context.",
+            "doc_type": ["image"],
+            "entities_places": ["12 Oak Ave"],
+            "context_entities_places": ["12 Oak Ave"],
+            "context_confidence": "high",
+            "context_relationship": (
+                "Nearby context provides the specific location shown in the photo."
+            ),
+            "context_source_message_ids": ["m-after-b"],
+            "importance": 0.5,
+        })
+        gen = self._make_generator(response)
+
+        result = enrich_document(
+            "Photo of exterior brick wall. No readable address.",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text=(
+                "[AFTER source_message_id=m-after-b] "
+                "That exterior stairwell photo is 12 Oak Ave rear entrance."
+            ),
+        )
+
+        assert result["enr_context_entities_places"] == "12 Oak Ave"
+        assert result["enr_context_confidence"] == "high"
+        assert result["enr_context_source_message_ids"] == "m-after-b"
+        assert result["enr_context_warning"] == ""
+
+    def test_context_conflict_downgrades_high_confidence_to_ambiguous(self):
+        response = json.dumps({
+            "summary": "Closet photo may be Unit E or Unit F.",
+            "doc_type": ["image"],
+            "context_entities_places": ["Unit E", "Unit F"],
+            "context_confidence": "high",
+            "context_relationship": (
+                "Nearby messages provide conflicting information about the unit."
+            ),
+            "context_source_message_ids": ["m-before-e", "m-after-f"],
+            "importance": 0.5,
+        })
+        gen = self._make_generator(response)
+
+        result = enrich_document(
+            "Photo of a closet with no visible label.",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text=(
+                "[BEFORE source_message_id=m-before-e] These photos are for Unit E.\n"
+                "[AFTER source_message_id=m-after-f] Correction: might be Unit F."
+            ),
+        )
+
+        assert result["enr_context_confidence"] == "ambiguous"
+        assert "conflicting" in result["enr_context_warning"]
 
     def test_context_repair_does_not_copy_primary_item_entities(self):
         response = json.dumps({

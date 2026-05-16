@@ -67,6 +67,8 @@ For "importance": rate the document's overall importance/usefulness on a 0.0-1.0
 - 0.0 = trivial, outdated, or noise
 Use atomic_* fields for facts visible in the primary item itself.
 If no nearby context section is provided, leave all context_* fields empty.
+Never copy placeholder/example/schema description text into values. If a field
+has no evidence, use [] for arrays and "" for strings.
 {taxonomy_block}
 Document title: {title}
 Document type: {source_type}
@@ -123,6 +125,10 @@ Do not place context-derived facts only in non-context fields.
 Fill context_* fields only when nearby context is relevant to the PRIMARY ITEM.
 When using nearby context, set context_confidence, context_relationship, and
 context_source_message_ids. Use context_warning for ambiguity or rejected context.
+Never copy placeholder/example/schema description text into values. If a field
+has no evidence, use [] for arrays and "" for strings.
+If candidates conflict, set context_confidence to ambiguous and explain the
+conflict in context_warning.
 {taxonomy_block}
 PRIMARY ITEM
 Document title: {title}
@@ -215,6 +221,23 @@ _SCHEMA_FIELD_DESCRIPTIONS = {
     "context_source_message_ids": "Nearby message ids used",
     "context_warning": "Ambiguity or unrelated nearby context warning",
 }
+
+_SCHEMA_PLACEHOLDER_VALUES = {
+    description.lower() for description in _SCHEMA_FIELD_DESCRIPTIONS.values()
+}
+_SCHEMA_PLACEHOLDER_VALUES.update({"type1", "type2"})
+
+_CONTEXT_AMBIGUITY_TERMS = (
+    "ambiguous",
+    "ambiguity",
+    "conflict",
+    "conflicting",
+    "correction",
+    "might",
+    "not sure",
+    "possibly",
+    "uncertain",
+)
 
 
 def _schema_property_for(raw_key: str) -> dict[str, Any]:
@@ -360,6 +383,30 @@ def _normalize_list(value: Any) -> str:
     return str(value).strip() if value else ""
 
 
+def _normalize_metadata_list(raw_key: str, value: Any) -> str:
+    """Normalize list-like metadata and drop prompt/schema placeholder values."""
+    if isinstance(value, list):
+        values = [str(v).strip() for v in value if str(v).strip()]
+    elif isinstance(value, str):
+        values = [value.strip()] if value.strip() else []
+    elif value:
+        values = [str(value).strip()]
+    else:
+        values = []
+
+    values = [item for item in values if not _is_placeholder_value(raw_key, item)]
+    return ", ".join(values)
+
+
+def _is_placeholder_value(raw_key: str, value: str) -> bool:
+    normalized = value.strip().lower()
+    if not normalized:
+        return True
+    if normalized == _SCHEMA_FIELD_DESCRIPTIONS.get(raw_key, "").lower():
+        return True
+    return normalized in _SCHEMA_PLACEHOLDER_VALUES
+
+
 def _normalize_enrichment(raw: dict[str, Any]) -> dict[str, str]:
     """Normalize raw LLM JSON into consistent prefixed string fields."""
     result: dict[str, str] = {}
@@ -386,14 +433,21 @@ def _normalize_enrichment(raw: dict[str, Any]) -> dict[str, str]:
         elif raw_key in ("key_facts", "context_key_facts"):
             if isinstance(value, list):
                 result[enr_key] = json.dumps(
-                    [str(v).strip() for v in value if str(v).strip()]
+                    [
+                        str(v).strip()
+                        for v in value
+                        if str(v).strip()
+                        and not _is_placeholder_value(raw_key, str(v).strip())
+                    ]
                 )
             elif isinstance(value, str):
-                result[enr_key] = value.strip()
+                result[enr_key] = (
+                    "" if _is_placeholder_value(raw_key, value) else value.strip()
+                )
             else:
                 result[enr_key] = ""
         else:
-            result[enr_key] = _normalize_list(value)
+            result[enr_key] = _normalize_metadata_list(raw_key, value)
     return result
 
 
@@ -415,6 +469,7 @@ def _repair_context_omissions(
 
     repaired = dict(enrichment)
     copied_values: list[str] = []
+    had_context_fields = _has_context_fields(repaired)
     primary_lower = primary_text.lower()
     context_lower = context_text.lower()
 
@@ -434,7 +489,10 @@ def _repair_context_omissions(
 
     context_used = bool(copied_values) or _mentions_nearby_context(repaired)
     if not context_used:
-        return repaired
+        return _normalize_context_consistency(repaired)
+
+    if had_context_fields and not copied_values:
+        return _normalize_context_consistency(repaired)
 
     if not repaired.get("enr_context_confidence"):
         repaired["enr_context_confidence"] = "medium"
@@ -448,7 +506,35 @@ def _repair_context_omissions(
             "LLM used nearby context in non-context fields but omitted "
             "structured context fields; provenance inferred from prompt context."
         )
-    return repaired
+    return _normalize_context_consistency(repaired)
+
+
+def _has_context_fields(enrichment: dict[str, str]) -> bool:
+    return any(
+        enrichment.get(f"enr_{raw_key}")
+        for raw_key in _CONTEXT_KEYS_RAW
+        if raw_key.startswith("context_")
+    )
+
+
+def _normalize_context_consistency(enrichment: dict[str, str]) -> dict[str, str]:
+    context_text = " ".join(
+        enrichment.get(key, "")
+        for key in (
+            "enr_context_relationship",
+            "enr_context_warning",
+        )
+    ).lower()
+    if enrichment.get("enr_context_confidence", "").lower() == "high" and any(
+        term in context_text for term in _CONTEXT_AMBIGUITY_TERMS
+    ):
+        enrichment = dict(enrichment)
+        enrichment["enr_context_confidence"] = "ambiguous"
+        if not enrichment.get("enr_context_warning"):
+            enrichment["enr_context_warning"] = (
+                "Nearby context is ambiguous or conflicting; verify before relying on it."
+            )
+    return enrichment
 
 
 def _metadata_values(value: str) -> list[str]:
