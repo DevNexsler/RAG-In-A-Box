@@ -90,6 +90,14 @@ chunking:
     enabled: false                        # disabled — requires local Ollama server
     # Enable with local Ollama: see config.local.yaml.example
 
+communication_context:
+  enabled: true
+  window_before: 5
+  window_after: 5
+  max_time_window_minutes: 15
+  same_channel_only: true
+  include_batch: true
+
 enrichment:
   enabled: true
   provider: "openrouter"                  # GPT-4.1 Mini via OpenRouter

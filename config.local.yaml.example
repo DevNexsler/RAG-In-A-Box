@@ -94,6 +94,14 @@ chunking:
     breakpoint_percentile: 95             # sensitivity: higher = fewer splits (range: 50-99)
     buffer_size: 1                        # sentences grouped per similarity comparison
 
+communication_context:
+  enabled: true
+  window_before: 5
+  window_after: 5
+  max_time_window_minutes: 15
+  same_channel_only: true
+  include_batch: true
+
 enrichment:
   enabled: true
   provider: "ollama"                      # local Ollama LLM

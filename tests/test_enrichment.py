@@ -168,6 +168,57 @@ def test_parse_enrichment_response_handles_fenced_json():
     assert parsed["enr_importance"] == "0.7"
 
 
+def test_parse_context_enrichment_fields():
+    parsed = parse_enrichment_response(
+        """
+        {
+          "summary": "Photo of vehicle parts.",
+          "doc_type": ["image"],
+          "entities_people": [],
+          "entities_places": [],
+          "entities_orgs": [],
+          "entities_dates": [],
+          "topics": ["vehicle"],
+          "keywords": ["car parts"],
+          "key_facts": [],
+          "suggested_tags": ["maintenance"],
+          "suggested_folder": "Housing/Maintenance",
+          "importance": 0.5,
+          "atomic_entities_places": [],
+          "context_entities_places": ["54 S Broad Main Unit E"],
+          "context_topics": ["basement storage"],
+          "context_key_facts": ["Nearby message says the photos are from Unit E."],
+          "context_relationship": "batch_label",
+          "context_confidence": "high",
+          "context_source_message_ids": ["4434"],
+          "context_warning": ""
+        }
+        """
+    )
+
+    assert parsed["enr_context_entities_places"] == "54 S Broad Main Unit E"
+    assert parsed["enr_context_relationship"] == "batch_label"
+    assert parsed["enr_context_confidence"] == "high"
+    assert parsed["enr_context_source_message_ids"] == "4434"
+
+
+def test_parse_context_placeholder_values_as_empty():
+    parsed = parse_enrichment_response(
+        json.dumps(
+            {
+                "summary": "Photo of a receipt.",
+                "doc_type": ["image"],
+                "context_entities_places": ["places inferred from relevant nearby context"],
+                "context_topics": ["topics inferred from relevant nearby context"],
+                "context_source_message_ids": [],
+            }
+        )
+    )
+
+    assert parsed["enr_context_entities_places"] == ""
+    assert parsed["enr_context_topics"] == ""
+
+
 class TestEnrichDocument:
     """Test enrich_document with mocked LLM generator."""
 
@@ -279,6 +330,215 @@ class TestEnrichDocument:
         enrich_document("Some text", "doc.md", "md", gen, taxonomy_store=None)
         call_args = gen.generate.call_args[0][0]
         assert "## Available Tags" not in call_args
+
+    def test_context_prompt_labels_nearby_candidates(self):
+        response = json.dumps({
+            "summary": "Photo context.",
+            "doc_type": ["image"],
+            "entities_people": [],
+            "entities_places": [],
+            "entities_orgs": [],
+            "entities_dates": [],
+            "topics": [],
+            "keywords": [],
+            "key_facts": [],
+            "suggested_tags": [],
+            "suggested_folder": "",
+            "importance": 0.5,
+            "context_relationship": "nearby_ambiguous",
+            "context_confidence": "ambiguous",
+        })
+        gen = self._make_generator(response)
+
+        enrich_document(
+            "image notes",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[before] Unit E",
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert "PRIMARY ITEM" in prompt
+        assert "NEARBY SAME-CHANNEL CONTEXT CANDIDATES" in prompt
+        assert "may or may not describe the primary item" in prompt
+
+    def test_context_prompt_requires_context_fields_when_context_is_used(self):
+        response = json.dumps({
+            "summary": "Photo context.",
+            "doc_type": ["image"],
+        })
+        gen = self._make_generator(response)
+
+        enrich_document(
+            "image notes",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[BEFORE source_message_id=m1] Unit E",
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert (
+            "If you use nearby context in summary, entities, topics, keywords, "
+            "key_facts, tags, folder, or importance, you MUST also fill the "
+            "matching context_* fields"
+        ) in prompt
+        assert "Do not place context-derived facts only in non-context fields" in prompt
+
+    def test_context_prompt_prioritizes_context_fields_before_summary(self):
+        gen = self._make_generator('{"summary": "test"}')
+
+        enrich_document(
+            "image notes",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[BEFORE source_message_id=m1] Unit E",
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert "The context_* fields are required output keys; never omit them." in prompt
+        assert prompt.index('"context_entities_places"') < prompt.index('"summary"')
+
+    def test_context_prompt_rejects_placeholders_and_conflict_confidence(self):
+        gen = self._make_generator('{"summary": "test"}')
+
+        enrich_document(
+            "image notes",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[BEFORE source_message_id=m1] Unit E",
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert "Never copy placeholder/example/schema description text into values" in prompt
+        assert "If candidates conflict, set context_confidence to ambiguous" in prompt
+
+    def test_repairs_context_used_when_model_omits_context_fields(self):
+        response = json.dumps({
+            "summary": "Photo is related to Unit E, as indicated by nearby context.",
+            "doc_type": ["image"],
+            "entities_places": ["54 S Broad Main Unit E"],
+            "topics": ["storage"],
+            "key_facts": ["Nearby context identifies this photo as Unit E."],
+            "importance": 0.5,
+        })
+        gen = self._make_generator(response)
+
+        result = enrich_document(
+            "Blurry photo of shelves. No address visible.",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text=(
+                "[BEFORE source_message_id=m-unit-e] "
+                "These next photos are for 54 S Broad Main Unit E."
+            ),
+        )
+
+        assert result["enr_context_entities_places"] == "54 S Broad Main Unit E"
+        assert result["enr_context_confidence"] == "medium"
+        assert result["enr_context_relationship"] == "llm_used_nearby_context"
+        assert result["enr_context_source_message_ids"] == "m-unit-e"
+        assert "omitted structured context fields" in result["enr_context_warning"]
+
+    def test_context_repair_does_not_warn_when_context_fields_present(self):
+        response = json.dumps({
+            "summary": "Photo location comes from nearby context.",
+            "doc_type": ["image"],
+            "entities_places": ["12 Oak Ave"],
+            "context_entities_places": ["12 Oak Ave"],
+            "context_confidence": "high",
+            "context_relationship": (
+                "Nearby context provides the specific location shown in the photo."
+            ),
+            "context_source_message_ids": ["m-after-b"],
+            "importance": 0.5,
+        })
+        gen = self._make_generator(response)
+
+        result = enrich_document(
+            "Photo of exterior brick wall. No readable address.",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text=(
+                "[AFTER source_message_id=m-after-b] "
+                "That exterior stairwell photo is 12 Oak Ave rear entrance."
+            ),
+        )
+
+        assert result["enr_context_entities_places"] == "12 Oak Ave"
+        assert result["enr_context_confidence"] == "high"
+        assert result["enr_context_source_message_ids"] == "m-after-b"
+        assert result["enr_context_warning"] == ""
+
+    def test_context_conflict_downgrades_high_confidence_to_ambiguous(self):
+        response = json.dumps({
+            "summary": "Closet photo may be Unit E or Unit F.",
+            "doc_type": ["image"],
+            "context_entities_places": ["Unit E", "Unit F"],
+            "context_confidence": "high",
+            "context_relationship": (
+                "Nearby messages provide conflicting information about the unit."
+            ),
+            "context_source_message_ids": ["m-before-e", "m-after-f"],
+            "importance": 0.5,
+        })
+        gen = self._make_generator(response)
+
+        result = enrich_document(
+            "Photo of a closet with no visible label.",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text=(
+                "[BEFORE source_message_id=m-before-e] These photos are for Unit E.\n"
+                "[AFTER source_message_id=m-after-f] Correction: might be Unit F."
+            ),
+        )
+
+        assert result["enr_context_confidence"] == "ambiguous"
+        assert "conflicting" in result["enr_context_warning"]
+
+    def test_context_repair_does_not_copy_primary_item_entities(self):
+        response = json.dumps({
+            "summary": "Photo of 54 S Broad Main Unit E.",
+            "doc_type": ["image"],
+            "entities_places": ["54 S Broad Main Unit E"],
+            "importance": 0.5,
+        })
+        gen = self._make_generator(response)
+
+        result = enrich_document(
+            "Photo label says 54 S Broad Main Unit E.",
+            "photo.jpg",
+            "img",
+            gen,
+            context_text="[BEFORE source_message_id=m1] Lunch tomorrow?",
+        )
+
+        assert result["enr_context_entities_places"] == ""
+        assert result["enr_context_confidence"] == ""
+
+    def test_none_context_text_uses_no_context_prompt(self):
+        gen = self._make_generator('{"summary": "test"}')
+
+        result = enrich_document(
+            "Some text",
+            "doc.md",
+            "md",
+            gen,
+            context_text=None,
+        )
+
+        prompt = gen.generate.call_args[0][0]
+        assert result["enr_summary"] == "test"
+        assert "PRIMARY ITEM" not in prompt
+        assert "NEARBY SAME-CHANNEL CONTEXT CANDIDATES" not in prompt
+        gen.generate.assert_called_once()
 
 
 class TestFailedEnrichment:

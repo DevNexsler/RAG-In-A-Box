@@ -14,7 +14,7 @@ from llama_index.vector_stores.lancedb import LanceDBVectorStore
 from llama_index.vector_stores.lancedb.base import TableNotFoundError
 
 from core.storage import SearchHit
-from doc_enrichment import ENRICHMENT_FIELDS
+from doc_enrichment import CORE_ENRICHMENT_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -40,14 +40,14 @@ _CORE_META_KEYS = {
     "doc_id", "source_type", "mtime", "size", "title", "tags", "folder",
     "status", "created", "loc", "snippet", "rel_path",
     "description", "author", "keywords", "custom_meta",
-    *ENRICHMENT_FIELDS,
+    *CORE_ENRICHMENT_FIELDS,
     *_ENRICHMENT_AUX_FIELDS,
 }
 
 
 def _extract_enrichment(meta: dict) -> dict[str, str]:
     """Pull enrichment + extra metadata fields from metadata, defaulting to empty strings."""
-    result = {f: meta.get(f, "") or "" for f in ENRICHMENT_FIELDS}
+    result = {f: meta.get(f, "") or "" for f in CORE_ENRICHMENT_FIELDS}
     for f in _ENRICHMENT_AUX_FIELDS:
         result[f] = meta.get(f, "") or ""
     for f in _EXTRA_META_FIELDS:
@@ -799,6 +799,18 @@ class LanceDBStore:
 
     # Metadata fields that should NOT be faceted (structural/numeric, not categorical)
     _NON_FACET_FIELDS = {"doc_id", "loc", "snippet", "mtime", "size", "title", "created"}
+    _SAFE_CONTEXT_FACET_FIELDS = {"enr_context_confidence"}
+
+    @classmethod
+    def _dynamic_facet_fields(cls, available: set[str]) -> set[str]:
+        """Return dynamic metadata fields safe to comma-split into facets."""
+        all_facet_fields = set(cls._FACET_KEY_MAP.keys())
+        candidates = available - all_facet_fields - cls._NON_FACET_FIELDS - {"tags"}
+        return {
+            field
+            for field in candidates
+            if not field.startswith("enr_context_") or field in cls._SAFE_CONTEXT_FACET_FIELDS
+        }
 
     def facets(self) -> dict:
         """Return distinct values and doc counts for all filterable fields.
@@ -824,10 +836,9 @@ class LanceDBStore:
 
         available = self._metadata_subfields()
 
-        # Discover dynamic fields: anything in schema but not in the hardcoded
-        # facet map and not in the non-facet exclusion set
-        all_facet_fields = set(self._FACET_KEY_MAP.keys())
-        dynamic_fields = available - all_facet_fields - self._NON_FACET_FIELDS - {"tags"}
+        # Discover dynamic fields, excluding context narratives/JSON that
+        # would be corrupted by the comma-splitting facet logic.
+        dynamic_fields = self._dynamic_facet_fields(available)
 
         projection = {"doc_id": "doc_id"}
         for field in self._FACET_KEY_MAP:
