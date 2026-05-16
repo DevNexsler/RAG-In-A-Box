@@ -126,6 +126,11 @@ class LanceDBStore:
         return value.replace("'", "''")
 
     @staticmethod
+    def _escape_fts_query(query: str) -> str:
+        """Escape natural-language tokens Tantivy misreads as field syntax."""
+        return re.sub(r"(?<!\\):", r"\\:", query)
+
+    @staticmethod
     def _validate_identifier(key: str) -> None:
         """Raise ValueError if *key* is not a safe SQL identifier."""
         if not _SAFE_IDENTIFIER_RE.match(key):
@@ -637,7 +642,7 @@ class LanceDBStore:
             table = self._vs.table
         except TableNotFoundError:
             return []  # Table not created yet — legitimately empty
-        q = table.search(query, query_type="fts")
+        q = table.search(self._escape_fts_query(query), query_type="fts")
         if where:
             q = q.where(where, prefilter=True)
         rows = q.limit(top_k).to_list()
