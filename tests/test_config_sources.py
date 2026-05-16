@@ -79,3 +79,56 @@ def test_backward_compat_preserves_scan_include_exclude(tmp_path):
     src = cfg["sources"][0]
     assert src["scan"]["include"] == ["**/*.md", "**/*.pdf"]
     assert src["scan"]["exclude"] == ["**/.git/**"]
+
+
+def test_communication_context_defaults(tmp_path):
+    cfg_path = _write_config(tmp_path, {
+        "documents_root": str(tmp_path / "vault"),
+    })
+
+    cfg = load_config(str(cfg_path))
+
+    assert cfg["communication_context"] == {
+        "enabled": True,
+        "window_before": 5,
+        "window_after": 5,
+        "max_time_window_minutes": 15,
+        "same_channel_only": True,
+        "include_batch": True,
+    }
+
+
+def test_communication_context_must_be_mapping(tmp_path):
+    cfg_path = _write_config(tmp_path, {
+        "documents_root": str(tmp_path / "vault"),
+        "communication_context": "enabled",
+    })
+
+    with pytest.raises(ValueError, match="communication_context must be a mapping"):
+        load_config(str(cfg_path))
+
+
+def test_communication_context_window_must_be_non_negative(tmp_path):
+    cfg_path = _write_config(tmp_path, {
+        "documents_root": str(tmp_path / "vault"),
+        "communication_context": {"window_before": -1},
+    })
+
+    with pytest.raises(
+        ValueError,
+        match="communication_context.window_before must be a non-negative integer",
+    ):
+        load_config(str(cfg_path))
+
+
+def test_communication_context_same_channel_only_must_remain_true(tmp_path):
+    cfg_path = _write_config(tmp_path, {
+        "documents_root": str(tmp_path / "vault"),
+        "communication_context": {"same_channel_only": False},
+    })
+
+    with pytest.raises(
+        ValueError,
+        match="communication_context.same_channel_only must remain true",
+    ):
+        load_config(str(cfg_path))

@@ -1,6 +1,7 @@
 """Load and validate config from config.yaml. Fail fast on missing/invalid keys."""
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -183,6 +184,40 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
             raise ValueError(
                 f"chunking.overlap ({overlap}) must be less than max_chars ({effective_max})"
             )
+
+    # --- Validate communication context parameters ---
+    if "communication_context" in raw:
+        comm_ctx_cfg = raw["communication_context"]
+        if not isinstance(comm_ctx_cfg, Mapping):
+            raise ValueError("communication_context must be a mapping")
+    else:
+        comm_ctx_cfg = {}
+
+    comm_ctx = {
+        "enabled": True,
+        "window_before": 5,
+        "window_after": 5,
+        "max_time_window_minutes": 15,
+        "same_channel_only": True,
+        "include_batch": True,
+        **dict(comm_ctx_cfg),
+    }
+
+    for key in ("enabled", "same_channel_only", "include_batch"):
+        if not isinstance(comm_ctx[key], bool):
+            raise ValueError(f"communication_context.{key} must be a boolean")
+
+    for key in ("window_before", "window_after", "max_time_window_minutes"):
+        value = comm_ctx[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"communication_context.{key} must be a non-negative integer")
+
+    if comm_ctx["same_channel_only"] is not True:
+        raise ValueError(
+            "communication_context.same_channel_only must remain true for channel-specific context"
+        )
+
+    raw["communication_context"] = comm_ctx
 
     # --- Validate search parameters ---
     search_cfg = raw.get("search", {})

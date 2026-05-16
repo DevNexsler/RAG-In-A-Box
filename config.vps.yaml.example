@@ -94,6 +94,14 @@ chunking:
   semantic:
     enabled: false
 
+communication_context:
+  enabled: true
+  window_before: 5
+  window_after: 5
+  max_time_window_minutes: 15
+  same_channel_only: true
+  include_batch: true
+
 enrichment:
   enabled: true
   provider: "openrouter"
