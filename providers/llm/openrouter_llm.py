@@ -17,6 +17,7 @@ from typing import Any, TypedDict
 
 import httpx
 
+from doc_enrichment import enrichment_response_schema
 from providers.llm.trace_recorder import LLMTraceRecorder
 
 logger = logging.getLogger(__name__)
@@ -37,75 +38,21 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _ENRICHMENT_SCHEMA = {
     "name": "enrichment",
     "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "summary": {
-                "type": "string",
-                "description": "2-3 sentence summary of the document's purpose and key content",
-            },
-            "doc_type": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Document type classifications",
-            },
-            "entities_people": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Full names of people mentioned",
-            },
-            "entities_places": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Addresses, cities, locations",
-            },
-            "entities_orgs": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Company and organization names",
-            },
-            "entities_dates": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Dates mentioned in YYYY-MM-DD format",
-            },
-            "topics": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "5-10 high-level topics",
-            },
-            "keywords": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "10-20 specific terms and phrases",
-            },
-            "key_facts": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Most important facts, conclusions, or action items",
-            },
-            "suggested_tags": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Classification tags for this document, preferring taxonomy entries when available",
-            },
-            "suggested_folder": {
-                "type": "string",
-                "description": "Best folder path for filing this document from the taxonomy, or empty string",
-            },
-            "importance": {
-                "type": "number",
-                "description": "Importance score from 0.0 to 1.0",
-            },
-        },
-        "required": [
-            "summary", "doc_type", "entities_people", "entities_places",
-            "entities_orgs", "entities_dates", "topics", "keywords", "key_facts",
-            "suggested_tags", "suggested_folder", "importance",
-        ],
-        "additionalProperties": False,
-    },
+    "schema": enrichment_response_schema(),
 }
+
+
+def _is_response_format_rejection(response: httpx.Response) -> bool:
+    body = response.text.lower()
+    return any(
+        phrase in body
+        for phrase in (
+            "response_format",
+            "json_schema",
+            "structured output",
+            "schema",
+        )
+    )
 
 
 class OpenRouterReplayMetadata(TypedDict):
@@ -150,15 +97,13 @@ class OpenRouterGenerator:
             "OpenRouterGenerator initialized: model=%s", model,
         )
 
-    def _build_response_format(self) -> dict:
+    def _build_response_format(self, *, allow_schema: bool = True) -> dict:
         """Build the response_format payload based on model capabilities."""
-        # Models supporting structured output (json_schema)
-        if self.model.startswith(("openai/", "google/")):
+        if allow_schema:
             return {
                 "type": "json_schema",
                 "json_schema": _ENRICHMENT_SCHEMA,
             }
-        # Fallback: basic JSON mode for other models
         return {"type": "json_object"}
 
     def generate(self, user_prompt: str, max_tokens: int = 512) -> str:
@@ -214,9 +159,11 @@ class OpenRouterGenerator:
 
         for attempt in range(MAX_RETRIES):
             try:
+                attempt_payload = copy.deepcopy(payload)
+                trace_request["payload"] = attempt_payload
                 resp = httpx.post(
                     f"{OPENROUTER_BASE_URL}/chat/completions",
-                    json=payload,
+                    json=attempt_payload,
                     headers=headers,
                     timeout=request_timeout,
                 )
@@ -252,6 +199,20 @@ class OpenRouterGenerator:
             except httpx.HTTPStatusError as exc:
                 # 429 (rate limit) and 5xx are retryable; everything else is fatal.
                 status = exc.response.status_code
+                if (
+                    status in (400, 422)
+                    and payload["response_format"].get("type") == "json_schema"
+                    and _is_response_format_rejection(exc.response)
+                ):
+                    logger.warning(
+                        "OpenRouter model %s rejected json_schema response_format; "
+                        "retrying with json_object.",
+                        self.model,
+                    )
+                    payload["response_format"] = self._build_response_format(
+                        allow_schema=False
+                    )
+                    continue
                 if status == 429 or 500 <= status < 600:
                     last_exc = exc
                     if attempt == MAX_RETRIES - 1:

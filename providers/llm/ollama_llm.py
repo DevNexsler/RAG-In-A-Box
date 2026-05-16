@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 import time
 
+from doc_enrichment import enrichment_response_schema
+
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
@@ -27,24 +29,7 @@ _SYSTEM_PROMPT = (
     "markdown fences, or any text outside the JSON object."
 )
 
-_ENRICHMENT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "doc_type": {"type": "array", "items": {"type": "string"}},
-        "entities_people": {"type": "array", "items": {"type": "string"}},
-        "entities_places": {"type": "array", "items": {"type": "string"}},
-        "entities_orgs": {"type": "array", "items": {"type": "string"}},
-        "entities_dates": {"type": "array", "items": {"type": "string"}},
-        "topics": {"type": "array", "items": {"type": "string"}},
-        "keywords": {"type": "array", "items": {"type": "string"}},
-        "key_facts": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": [
-        "summary", "doc_type", "entities_people", "entities_places",
-        "entities_orgs", "entities_dates", "topics", "keywords", "key_facts",
-    ],
-}
+_ENRICHMENT_SCHEMA = enrichment_response_schema()
 
 WARMUP_TIMEOUT = 300.0  # 5 min for cold-start model loading
 MAX_RETRIES = 3

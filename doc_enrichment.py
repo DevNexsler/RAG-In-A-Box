@@ -14,6 +14,7 @@ for key_facts) for consistent querying and filtering.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -176,6 +177,73 @@ _CONTEXT_KEYS_RAW = (
 # Prefixed field names stored in LanceDB metadata (prevent collision with frontmatter)
 CORE_ENRICHMENT_FIELDS = tuple(f"enr_{k}" for k in _ENRICHMENT_KEYS_RAW)
 ENRICHMENT_FIELDS = tuple(f"enr_{k}" for k in (*_ENRICHMENT_KEYS_RAW, *_CONTEXT_KEYS_RAW))
+
+_SCHEMA_STRING_KEYS = {
+    "summary",
+    "suggested_folder",
+    "context_relationship",
+    "context_confidence",
+    "context_warning",
+}
+
+_SCHEMA_FIELD_DESCRIPTIONS = {
+    "summary": "2-3 sentence summary of the primary item's purpose and key content",
+    "doc_type": "Document type classifications",
+    "entities_people": "Full names of people mentioned",
+    "entities_places": "Addresses, cities, locations",
+    "entities_orgs": "Company and organization names",
+    "entities_dates": "Dates mentioned in YYYY-MM-DD format",
+    "topics": "5-10 high-level topics",
+    "keywords": "10-20 specific terms and phrases",
+    "key_facts": "Most important facts, conclusions, or action items",
+    "suggested_tags": "Classification tags for this document",
+    "suggested_folder": "Best folder path for filing this document, or empty string",
+    "importance": "Importance score from 0.0 to 1.0",
+    "atomic_entities_people": "People mentioned in the primary item only",
+    "atomic_entities_places": "Places mentioned in the primary item only",
+    "atomic_entities_orgs": "Organizations mentioned in the primary item only",
+    "atomic_entities_dates": "Dates mentioned in the primary item only",
+    "atomic_topics": "Topics from the primary item only",
+    "context_entities_people": "People inferred from relevant nearby context",
+    "context_entities_places": "Places inferred from relevant nearby context",
+    "context_entities_orgs": "Organizations inferred from relevant nearby context",
+    "context_entities_dates": "Dates inferred from relevant nearby context",
+    "context_topics": "Topics inferred from relevant nearby context",
+    "context_key_facts": "Facts inferred from relevant nearby context",
+    "context_relationship": "Why the nearby context is relevant, or empty string",
+    "context_confidence": "high, medium, low, ambiguous, or empty string",
+    "context_source_message_ids": "Nearby message ids used",
+    "context_warning": "Ambiguity or unrelated nearby context warning",
+}
+
+
+def _schema_property_for(raw_key: str) -> dict[str, Any]:
+    description = _SCHEMA_FIELD_DESCRIPTIONS.get(raw_key, raw_key.replace("_", " "))
+    if raw_key == "importance":
+        return {"type": "number", "description": description}
+    if raw_key in _SCHEMA_STRING_KEYS:
+        return {"type": "string", "description": description}
+    return {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": description,
+    }
+
+
+_ENRICHMENT_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        raw_key: _schema_property_for(raw_key)
+        for raw_key in (*_ENRICHMENT_KEYS_RAW, *_CONTEXT_KEYS_RAW)
+    },
+    "required": list((*_ENRICHMENT_KEYS_RAW, *_CONTEXT_KEYS_RAW)),
+    "additionalProperties": False,
+}
+
+
+def enrichment_response_schema() -> dict[str, Any]:
+    """Return the provider JSON schema for the same fields requested in prompts."""
+    return copy.deepcopy(_ENRICHMENT_RESPONSE_SCHEMA)
 
 
 def empty_enrichment() -> dict[str, str]:

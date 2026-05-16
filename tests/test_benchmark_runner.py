@@ -4,7 +4,12 @@ import httpx
 import pytest
 
 from core.benchmarking.runner import run_benchmark
-from providers.llm.openrouter_llm import OpenRouterGenerator
+from doc_enrichment import _CONTEXT_KEYS_RAW, _ENRICHMENT_KEYS_RAW
+from providers.llm.ollama_llm import _ENRICHMENT_SCHEMA as OLLAMA_ENRICHMENT_SCHEMA
+from providers.llm.openrouter_llm import (
+    _ENRICHMENT_SCHEMA as OPENROUTER_ENRICHMENT_SCHEMA,
+    OpenRouterGenerator,
+)
 
 
 def test_generate_with_metadata_returns_content_usage_and_latency(tmp_path):
@@ -54,6 +59,70 @@ def test_openrouter_json_schema_includes_importance(tmp_path):
 
     assert "importance" in schema["properties"]
     assert "importance" in schema["required"]
+
+
+def test_provider_enrichment_schemas_include_all_prompt_fields():
+    expected = set(_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW)
+    openrouter_schema = OPENROUTER_ENRICHMENT_SCHEMA["schema"]
+
+    for schema in (openrouter_schema, OLLAMA_ENRICHMENT_SCHEMA):
+        assert expected <= set(schema["properties"])
+        assert expected <= set(schema["required"])
+
+
+def test_openrouter_attempts_json_schema_for_non_openai_models(tmp_path):
+    response_json = {
+        "id": "chatcmpl-123",
+        "choices": [{"message": {"content": '{"summary":"ok","importance":0.8}'}}],
+        "usage": {"total_tokens": 42},
+    }
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(200, json=response_json, request=request)
+
+    with patch("providers.llm.openrouter_llm.httpx.post", return_value=response) as mock_post:
+        generator = OpenRouterGenerator(
+            model="minimax/minimax-m2.5",
+            api_key="secret-key",
+            trace_capture={"enabled": True, "directory": str(tmp_path)},
+        )
+        generator.generate_with_metadata("hello", max_tokens=77)
+
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["response_format"]["type"] == "json_schema"
+
+
+def test_openrouter_falls_back_to_json_object_when_schema_rejected(tmp_path):
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    schema_error = httpx.Response(
+        400,
+        text='{"error":"json_schema response_format unsupported"}',
+        request=request,
+    )
+    fallback_response = httpx.Response(
+        200,
+        json={
+            "id": "chatcmpl-123",
+            "choices": [{"message": {"content": '{"summary":"ok"}'}}],
+        },
+        request=request,
+    )
+
+    with patch(
+        "providers.llm.openrouter_llm.httpx.post",
+        side_effect=[schema_error, fallback_response],
+    ) as mock_post:
+        generator = OpenRouterGenerator(
+            model="minimax/minimax-m2.5",
+            api_key="secret-key",
+            trace_capture={"enabled": True, "directory": str(tmp_path)},
+        )
+        result = generator.generate_with_metadata("hello", max_tokens=77)
+
+    first_payload = mock_post.call_args_list[0].kwargs["json"]
+    second_payload = mock_post.call_args_list[1].kwargs["json"]
+    assert result["content"] == '{"summary":"ok"}'
+    assert first_payload["response_format"]["type"] == "json_schema"
+    assert second_payload["response_format"]["type"] == "json_object"
 
 
 def test_generate_with_metadata_uses_shorter_connect_timeout(tmp_path):
