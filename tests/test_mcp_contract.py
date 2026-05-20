@@ -343,6 +343,35 @@ def test_get_deps_failure_in_status():
         mcp_server._cache = old_cache
 
 
+def test_build_store_and_embed_uses_recovery_open():
+    config = {"index_root": "/tmp/doc-index", "lancedb": {"table": "chunks"}}
+    sentinel_store = object()
+    sentinel_embed = object()
+
+    with patch.object(mcp_server, "load_config", return_value=config):
+        with patch.object(
+            mcp_server,
+            "open_store_with_recovery",
+            return_value=sentinel_store,
+        ) as open_store:
+            with patch.object(
+                mcp_server,
+                "build_embed_provider",
+                return_value=sentinel_embed,
+            ):
+                store, embed, loaded = mcp_server._build_store_and_embed()
+
+    assert store is sentinel_store
+    assert embed is sentinel_embed
+    assert loaded is config
+    open_store.assert_called_once_with(
+        Path("/tmp/doc-index"),
+        "chunks",
+        logger_obj=mcp_server.logger,
+        auto_recover=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # _enrich_doc_list helper tests
 # ---------------------------------------------------------------------------

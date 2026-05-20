@@ -74,7 +74,7 @@ from doc_id_store import (
 )
 from hooks.dispatcher import dispatch_event
 from hooks.events import build_document_indexed_event
-from lancedb_store import LanceDBStore
+from lancedb_store import LanceDBStore, open_store_with_recovery
 
 
 # Module-level runtime context populated by the flow, read by tasks.
@@ -913,7 +913,7 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
 
     # --- Build components from config (stored in _RUNTIME for tasks) ---
     table_name = config.get("lancedb", {}).get("table", "chunks")
-    store = LanceDBStore(index_root, table_name)
+    store = open_store_with_recovery(index_root, table_name, logger_obj=logger, auto_recover=True)
 
     # Persistent document ID registry
     doc_id_store = DocIDStore(Path(index_root) / "doc_registry.db")

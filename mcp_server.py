@@ -10,7 +10,7 @@ from pathlib import Path
 from core.config import load_config
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
-from lancedb_store import LanceDBStore
+from lancedb_store import LanceDBStore, open_store_with_recovery
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
 
@@ -211,7 +211,7 @@ def _build_store_and_embed(config_path: str = "config.yaml"):
     config = load_config(config_path)
     index_root = Path(config["index_root"])
     table = config.get("lancedb", {}).get("table", "chunks")
-    store = LanceDBStore(index_root, table)
+    store = open_store_with_recovery(index_root, table, logger_obj=logger, auto_recover=True)
 
     embed_provider = build_embed_provider(config)
     return store, embed_provider, config
