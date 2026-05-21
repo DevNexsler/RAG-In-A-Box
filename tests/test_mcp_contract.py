@@ -2,6 +2,8 @@
 
 No external services needed. Uses mocks and direct function calls."""
 
+import os
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -944,3 +946,57 @@ def test_file_status_health_reranker_disabled():
             assert health["last_index_failed_count"] == 0
         finally:
             mcp_server._cache = old_cache
+
+
+def test_file_status_ignores_zombie_indexer_pid(tmp_path):
+    """Zombie indexer PID should be treated as not running and cleaned up."""
+    zombie_pid = os.fork()
+    if zombie_pid == 0:
+        os._exit(0)
+
+    pid_file = tmp_path / "indexer.pid"
+    pid_file.write_text(str(zombie_pid))
+
+    deadline = time.time() + 5
+    status_path = Path(f"/proc/{zombie_pid}/status")
+    while time.time() < deadline:
+        try:
+            status = status_path.read_text()
+        except FileNotFoundError:
+            break
+        if "State:\tZ" in status:
+            break
+        time.sleep(0.01)
+    else:
+        os.waitpid(zombie_pid, 0)
+        raise AssertionError("Failed to create zombie child for test")
+
+    old_cache = mcp_server._cache
+    try:
+        mock_store = MagicMock()
+        mock_store.list_doc_ids.return_value = ["a.md"]
+        mock_store.count_chunks.return_value = 1
+        mock_store._metadata_subfields.return_value = {"doc_id"}
+        mock_store.fts_available.return_value = True
+
+        mcp_server._cache = (
+            mock_store,
+            MagicMock(),
+            {
+                "index_root": str(tmp_path),
+                "embeddings": {"provider": "openrouter"},
+                "search": {"reranker": {"enabled": False}},
+            },
+        )
+
+        result = mcp_server._file_status_impl()
+
+        assert result["indexer_running"] is False
+        assert "indexer_pid" not in result
+        assert not pid_file.exists(), "Zombie PID file should be removed during status check"
+    finally:
+        mcp_server._cache = old_cache
+        try:
+            os.waitpid(zombie_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
