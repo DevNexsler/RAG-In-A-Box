@@ -4,10 +4,41 @@ The indexer must run in a background subprocess so the MCP server
 can continue serving search/status requests while indexing runs.
 """
 
+from pathlib import Path
 import os
 import time
+from unittest.mock import patch
 
 import pytest
+
+
+def _spawn_zombie_child() -> int:
+    """Create a zombie child for the current process and return its PID."""
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+
+    deadline = time.time() + 5
+    status_path = Path(f"/proc/{pid}/status")
+    while time.time() < deadline:
+        try:
+            status = status_path.read_text()
+        except FileNotFoundError:
+            break
+        if "State:\tZ" in status:
+            return pid
+        time.sleep(0.01)
+
+    os.waitpid(pid, 0)
+    raise AssertionError("Failed to create zombie child for test")
+
+
+def _patch_index_config(monkeypatch, mcp_server, tmp_path):
+    monkeypatch.setattr(
+        mcp_server,
+        "load_config",
+        lambda _path: {"index_root": str(tmp_path)},
+    )
 
 
 def test_index_update_returns_started(tmp_path, monkeypatch):
@@ -20,8 +51,13 @@ def test_index_update_returns_started(tmp_path, monkeypatch):
     import mcp_server
 
     monkeypatch.setenv("INDEX_ROOT", str(tmp_path))
+    _patch_index_config(monkeypatch, mcp_server, tmp_path)
 
-    result = mcp_server._file_index_update_impl("config.yaml")
+    class DummyProc:
+        pid = 424242
+
+    with patch("subprocess.Popen", return_value=DummyProc()):
+        result = mcp_server._file_index_update_impl("config.yaml")
 
     assert result.get("status") == "started", (
         f"Expected status='started' (non-blocking), got {result.get('status')!r}. "
@@ -30,16 +66,7 @@ def test_index_update_returns_started(tmp_path, monkeypatch):
     assert "pid" in result, "Must return the subprocess PID for tracking"
     assert isinstance(result["pid"], int), "PID must be an integer"
     assert result["pid"] > 0, "PID must be positive"
-
-    # Clean up: wait briefly for the subprocess to exit (it will fail fast
-    # in the test environment since config.yaml doesn't exist — that's fine)
-    import subprocess
-    try:
-        proc = subprocess.Popen.__new__(subprocess.Popen)
-        # Just check via os.waitpid with WNOHANG; ignore errors
-        pass
-    except Exception:
-        pass
+    assert result["pid"] == 424242
 
 
 def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
@@ -50,6 +77,7 @@ def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
     import mcp_server
 
     monkeypatch.setenv("INDEX_ROOT", str(tmp_path))
+    _patch_index_config(monkeypatch, mcp_server, tmp_path)
 
     # Launch a long-lived dummy subprocess and write its PID file manually,
     # simulating an in-progress indexer run.
@@ -78,6 +106,7 @@ def test_index_update_clears_stale_pid_file(tmp_path, monkeypatch):
     import mcp_server
 
     monkeypatch.setenv("INDEX_ROOT", str(tmp_path))
+    _patch_index_config(monkeypatch, mcp_server, tmp_path)
 
     # Write a PID that cannot possibly be alive (PID 1 is init/systemd, which
     # we can't signal to test "dead", so use a PID that we know exited by
@@ -90,13 +119,47 @@ def test_index_update_clears_stale_pid_file(tmp_path, monkeypatch):
     pid_file = tmp_path / "indexer.pid"
     pid_file.write_text(str(dead_pid))
 
-    result = mcp_server._file_index_update_impl("config.yaml")
+    class DummyProc:
+        pid = 424243
+
+    with patch("subprocess.Popen", return_value=DummyProc()):
+        result = mcp_server._file_index_update_impl("config.yaml")
 
     # Should have cleaned up the stale PID and started a new indexer
     assert result.get("status") == "started", (
         f"Expected 'started' after clearing stale PID file, got {result!r}"
     )
-    assert "pid" in result
+    assert result.get("pid") == 424243
+
+
+def test_index_update_clears_zombie_pid_file(tmp_path, monkeypatch):
+    """Zombie PID file must not block a fresh indexer start."""
+    import mcp_server
+
+    monkeypatch.setenv("INDEX_ROOT", str(tmp_path))
+    _patch_index_config(monkeypatch, mcp_server, tmp_path)
+
+    zombie_pid = _spawn_zombie_child()
+    pid_file = tmp_path / "indexer.pid"
+    pid_file.write_text(str(zombie_pid))
+
+    class DummyProc:
+        pid = 424242
+
+    try:
+        with patch("subprocess.Popen", return_value=DummyProc()):
+            result = mcp_server._file_index_update_impl("config_test.yaml")
+
+        assert result.get("status") == "started", (
+            f"Expected zombie PID file to be cleared, got {result!r}"
+        )
+        assert result.get("pid") == 424242
+        assert not pid_file.exists(), "Zombie PID file should be removed before restart"
+    finally:
+        try:
+            os.waitpid(zombie_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
 
 
 def test_pid_file_is_cleaned_up_by_subprocess(tmp_path, monkeypatch):
