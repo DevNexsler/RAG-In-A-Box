@@ -19,6 +19,11 @@ from doc_enrichment import CORE_ENRICHMENT_FIELDS
 logger = logging.getLogger(__name__)
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_CORRUPT_LANCE_MARKERS = (
+    "lanceerror(io)",
+    "invalid range 0..0",
+    "manifest was not found",
+)
 
 _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
 _ENRICHMENT_AUX_FIELDS = ("enr_importance_source",)
@@ -911,3 +916,88 @@ class LanceDBStore:
         hits = [self._row_to_hit(row) for row in rows]
         hits.sort(key=lambda h: h.loc)
         return hits
+
+
+def _looks_like_corrupt_lance_error(exc: Exception) -> bool:
+    """Return True when a store-open failure matches known Lance corruption signatures."""
+    message = str(exc).lower()
+    return any(marker in message for marker in _CORRUPT_LANCE_MARKERS)
+
+
+def recover_corrupt_table(
+    index_root: str | Path,
+    table_name: str,
+    logger_obj: logging.Logger | None = None,
+) -> LanceDBStore | None:
+    """Walk Lance versions backward, rebuild from last readable snapshot, return fresh store."""
+    import lance
+
+    active_logger = logger_obj or logger
+    lance_path = Path(index_root) / f"{table_name}.lance"
+    if not lance_path.exists():
+        return None
+
+    active_logger.warning("Corruption detected — attempting auto-recovery for %s", lance_path)
+
+    try:
+        dataset = lance.dataset(str(lance_path))
+        versions = sorted(dataset.versions(), key=lambda item: item["version"], reverse=True)
+    except Exception as exc:
+        active_logger.error("Cannot read dataset versions: %s", exc)
+        return None
+
+    clean_version = None
+    for version_info in versions:
+        version = version_info["version"]
+        try:
+            clean_dataset = lance.dataset(str(lance_path), version=version)
+            clean_dataset.to_table(limit=1)
+            clean_version = version
+            break
+        except Exception:
+            continue
+
+    if clean_version is None:
+        active_logger.error("No readable version found — manual recovery needed")
+        return None
+
+    clean_table = lance.dataset(str(lance_path), version=clean_version).to_table()
+    active_logger.info(
+        "Found clean version %d with %d rows — rebuilding table",
+        clean_version,
+        clean_table.num_rows,
+    )
+
+    corrupt_path = Path(f"{lance_path}.corrupt")
+    if corrupt_path.exists():
+        shutil.rmtree(corrupt_path)
+    shutil.move(str(lance_path), str(corrupt_path))
+    lance.write_dataset(clean_table, str(lance_path))
+
+    rebuilt = lance.dataset(str(lance_path))
+    rebuilt.to_table(limit=1)
+    active_logger.info(
+        "Recovery complete: %d rows restored. Corrupt backup at %s",
+        rebuilt.count_rows(),
+        corrupt_path,
+    )
+    return LanceDBStore(index_root, table_name)
+
+
+def open_store_with_recovery(
+    index_root: str | Path,
+    table_name: str = "chunks",
+    *,
+    logger_obj: logging.Logger | None = None,
+    auto_recover: bool = True,
+) -> LanceDBStore:
+    """Open LanceDBStore and auto-recover from known corruption signatures when possible."""
+    try:
+        return LanceDBStore(index_root, table_name)
+    except Exception as exc:
+        if not auto_recover or not _looks_like_corrupt_lance_error(exc):
+            raise
+        recovered = recover_corrupt_table(index_root, table_name, logger_obj=logger_obj)
+        if recovered is not None:
+            return recovered
+        raise

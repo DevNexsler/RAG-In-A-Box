@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
-from lancedb_store import LanceDBStore
+from lancedb_store import LanceDBStore, open_store_with_recovery
 
 
 def _make_node(doc_id: str, loc: str, text: str, vector: list[float]) -> TextNode:
@@ -1102,3 +1102,29 @@ class TestSourceNameFilter:
         where = store._build_where_clause(source_name="comm_messages")
         assert "source_name" in where
         assert "comm_messages" in where
+
+
+def test_open_store_with_recovery_recovers_known_corruption():
+    sentinel = object()
+    error = RuntimeError(
+        "LanceError(IO): Generic memory error: Invalid range 0..0 for object of size 0 bytes"
+    )
+
+    with patch("lancedb_store.LanceDBStore", side_effect=error) as store_cls:
+        with patch("lancedb_store.recover_corrupt_table", return_value=sentinel) as recover:
+            result = open_store_with_recovery("/tmp/index", "chunks")
+
+    assert result is sentinel
+    store_cls.assert_called_once_with("/tmp/index", "chunks")
+    recover.assert_called_once()
+
+
+def test_open_store_with_recovery_reraises_non_corruption():
+    error = RuntimeError("bad config")
+
+    with patch("lancedb_store.LanceDBStore", side_effect=error):
+        with patch("lancedb_store.recover_corrupt_table") as recover:
+            with pytest.raises(RuntimeError, match="bad config"):
+                open_store_with_recovery("/tmp/index", "chunks")
+
+    recover.assert_not_called()
