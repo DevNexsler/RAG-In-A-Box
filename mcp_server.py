@@ -64,6 +64,35 @@ def _error(code: str, message: str, fix: str | None = None) -> dict:
     return err
 
 
+def _pid_is_running(pid: int) -> bool:
+    """Return True only for a live, non-zombie process."""
+    if pid <= 0:
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+
+    proc_status = Path("/proc") / str(pid) / "status"
+    if proc_status.exists():
+        try:
+            for line in proc_status.read_text().splitlines():
+                if not line.startswith("State:"):
+                    continue
+                if "\tZ" in line or "(zombie)" in line.lower():
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except (ChildProcessError, OSError):
+                        pass
+                    return False
+                break
+        except OSError:
+            return False
+
+    return True
+
+
 def _validate_source_type(source_type: str | None) -> dict | None:
     """Return an error dict if source_type is invalid, else None."""
     if source_type and not is_safe_source_type(source_type):
@@ -656,10 +685,14 @@ def _file_status_impl() -> dict:
     indexer_pid = None
     if pid_file.exists():
         try:
-            indexer_pid = int(pid_file.read_text().strip())
-            os.kill(indexer_pid, 0)  # Signal 0 = existence check
-            indexer_running = True
-        except (OSError, ValueError):
+            candidate_pid = int(pid_file.read_text().strip())
+            if _pid_is_running(candidate_pid):
+                indexer_pid = candidate_pid
+                indexer_running = True
+            else:
+                pid_file.unlink(missing_ok=True)
+        except ValueError:
+            pid_file.unlink(missing_ok=True)
             indexer_pid = None
 
     result: dict = {
@@ -791,16 +824,21 @@ def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
     if pid_file.exists():
         try:
             old_pid = int(pid_file.read_text().strip())
-            os.kill(old_pid, 0)  # Signal 0 = existence check; raises OSError if dead
-            logger.info("file_index_update: indexer already running (pid %d)", old_pid)
-            return {
-                "status": "already_running",
-                "pid": old_pid,
-                "message": "An indexer is already running. Use file_status to check progress.",
-            }
-        except (OSError, ValueError):
-            # Process is dead or PID file is corrupt — clean up and proceed
+            if _pid_is_running(old_pid):
+                logger.info("file_index_update: indexer already running (pid %d)", old_pid)
+                return {
+                    "status": "already_running",
+                    "pid": old_pid,
+                    "message": "An indexer is already running. Use file_status to check progress.",
+                }
+        except ValueError:
+            pass
+
+        # Process is dead, zombie, or PID file is corrupt — clean up and proceed
+        try:
             pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # Ensure index_root exists so the subprocess can write its PID file
     index_root.mkdir(parents=True, exist_ok=True)

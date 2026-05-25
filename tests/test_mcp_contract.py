@@ -728,6 +728,49 @@ def test_file_status_includes_health():
             mcp_server._cache = old_cache
 
 
+def test_file_status_reports_zombie_indexer_as_not_running():
+    """Zombie indexer PID should not surface as a live background run."""
+    import subprocess
+    import sys
+    import tempfile
+    import time
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pid_file = Path(tmpdir) / "indexer.pid"
+        zombie = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            start_new_session=True,
+        )
+        time.sleep(0.1)
+        pid_file.write_text(str(zombie.pid))
+
+        old_cache = mcp_server._cache
+        try:
+            mock_store = MagicMock()
+            mock_store.list_doc_ids.return_value = ["a.md"]
+            mock_store.count_chunks.return_value = 1
+            mock_store._metadata_subfields.return_value = {"doc_id"}
+            mock_store.fts_available.return_value = True
+
+            mcp_server._cache = (
+                mock_store,
+                MagicMock(),
+                {
+                    "index_root": tmpdir,
+                    "embeddings": {"provider": "openrouter"},
+                    "search": {"reranker": {"enabled": False}},
+                },
+            )
+
+            result = mcp_server._file_status_impl()
+            assert result["indexer_running"] is False
+            assert "indexer_pid" not in result
+        finally:
+            mcp_server._cache = old_cache
+            zombie.wait()
+            pid_file.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # enr_doc_type / enr_topics passthrough
 # ---------------------------------------------------------------------------
