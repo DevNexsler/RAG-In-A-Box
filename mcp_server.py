@@ -335,6 +335,7 @@ _cache: tuple | None = None
 _cache_index_signature: tuple[int, int] | None = None
 _cache_identity: int | None = None
 _DEEP_HEALTH_CACHE_TTL_SECONDS = 600
+_DEEP_HEALTH_SNAPSHOT = "index_health.json"
 _deep_health_cache: dict | None = None
 
 
@@ -401,7 +402,7 @@ def _count_doc_ids_by_source(doc_ids: list[str]) -> dict[str, int]:
     return counts
 
 
-def _registry_source_counts(index_root: Path) -> tuple[dict[str, int], str | None]:
+def _registry_source_stats(index_root: Path) -> tuple[dict[str, dict], str | None]:
     registry_path = index_root / "doc_registry.db"
     if not registry_path.exists():
         return {}, None
@@ -412,10 +413,17 @@ def _registry_source_counts(index_root: Path) -> tuple[dict[str, int], str | Non
     try:
         with registry._lock:
             cur = registry._conn.execute(
-                "SELECT COALESCE(NULLIF(source_name, ''), 'documents'), COUNT(*) "
+                "SELECT COALESCE(NULLIF(source_name, ''), 'documents'), COUNT(*), "
+                "MAX(COALESCE(last_seen_at, first_seen_at, created)) "
                 "FROM doc_registry GROUP BY COALESCE(NULLIF(source_name, ''), 'documents')"
             )
-            return {str(row[0]): int(row[1]) for row in cur.fetchall()}, None
+            return {
+                str(row[0]): {
+                    "doc_count": int(row[1]),
+                    "latest_seen_at": float(row[2]) if row[2] is not None else None,
+                }
+                for row in cur.fetchall()
+            }, None
     except Exception as exc:
         return {}, str(exc)
     finally:
@@ -473,6 +481,37 @@ def _overall_deep_health(
     return "ok"
 
 
+def _iso_or_none(ts: float | int | str | None) -> str | None:
+    if ts is None or ts == "":
+        return None
+    try:
+        return _utc_iso(float(ts))
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _index_source_freshness(store: LanceDBStore) -> tuple[dict[str, float], str | None]:
+    try:
+        recent_docs = store.list_recent_docs(limit=100_000)
+    except Exception as exc:
+        return {}, str(exc)
+
+    latest_by_source: dict[str, float] = {}
+    for doc in recent_docs:
+        if not isinstance(doc, dict):
+            continue
+        doc_id = str(doc.get("doc_id") or "")
+        if not doc_id:
+            continue
+        try:
+            mtime = float(doc.get("mtime"))
+        except (TypeError, ValueError):
+            continue
+        source_name = _source_name_from_doc_id(doc_id)
+        latest_by_source[source_name] = max(latest_by_source.get(source_name, mtime), mtime)
+    return latest_by_source, None
+
+
 def _compute_deep_health(
     *,
     store: LanceDBStore,
@@ -483,18 +522,23 @@ def _compute_deep_health(
     indexer_running: bool,
     last_run_at: str | None,
 ) -> dict:
-    del store  # Deep check currently uses deterministic registry + doc-id coverage only.
     index_root = Path(config["index_root"])
     configured_sources = _configured_source_names(config)
-    registry_counts, registry_error = _registry_source_counts(index_root)
+    registry_stats, registry_error = _registry_source_stats(index_root)
     index_counts = _count_doc_ids_by_source(doc_ids)
-    source_names = sorted(set(configured_sources) | set(registry_counts) | set(index_counts))
+    index_freshness, index_freshness_error = _index_source_freshness(store)
+    source_names = sorted(
+        set(configured_sources) | set(registry_stats) | set(index_counts) | set(index_freshness)
+    )
 
     sources: dict[str, dict] = {}
     source_statuses: list[str] = []
     for source_name in source_names:
-        registry_doc_count = registry_counts.get(source_name, 0)
+        registry_source_stats = registry_stats.get(source_name, {})
+        registry_doc_count = int(registry_source_stats.get("doc_count") or 0)
+        registry_latest_seen_at = registry_source_stats.get("latest_seen_at")
         index_doc_count = index_counts.get(source_name, 0)
+        index_latest_mtime = index_freshness.get(source_name)
         status, reason = _source_health_status(
             configured=source_name in configured_sources,
             registry_doc_count=registry_doc_count,
@@ -509,6 +553,9 @@ def _compute_deep_health(
             "configured": source_name in configured_sources,
             "registry_doc_count": registry_doc_count,
             "index_doc_count": index_doc_count,
+            "registry_latest_seen_at": _iso_or_none(registry_latest_seen_at),
+            "index_latest_mtime": index_latest_mtime,
+            "index_latest_mtime_iso": _iso_or_none(index_latest_mtime),
         }
 
     return {
@@ -529,18 +576,63 @@ def _compute_deep_health(
             "index_doc_count": len(doc_ids),
             "chunk_count": chunk_count,
             "fts_available": fts_available,
+            "index_freshness_available": index_freshness_error is None,
+            "index_freshness_error": index_freshness_error,
         },
     }
 
 
-def _deep_health_cache_key(store: LanceDBStore, config: dict, indexer_running: bool) -> tuple:
+def _deep_health_persistent_key(config: dict, indexer_running: bool) -> dict:
+    signature = _index_metadata_signature(config)
+    return {
+        "index_root": str(config.get("index_root")),
+        "index_metadata_signature": list(signature) if signature else None,
+        "configured_sources": _configured_source_names(config),
+        "indexer_running": indexer_running,
+    }
+
+
+def _deep_health_memory_key(store: LanceDBStore, persistent_key: dict) -> tuple:
+    import json
+
     return (
         id(store),
-        str(config.get("index_root")),
-        _index_metadata_signature(config),
-        tuple(_configured_source_names(config)),
-        indexer_running,
+        json.dumps(persistent_key, sort_keys=True),
     )
+
+
+def _health_snapshot_path(config: dict) -> Path:
+    return Path(config["index_root"]) / _DEEP_HEALTH_SNAPSHOT
+
+
+def _read_deep_health_snapshot(config: dict) -> dict | None:
+    try:
+        import json
+
+        return json.loads(_health_snapshot_path(config).read_text())
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_deep_health_snapshot(config: dict, snapshot: dict) -> None:
+    try:
+        import json
+
+        path = _health_snapshot_path(config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(snapshot, sort_keys=True))
+        tmp_path.replace(path)
+    except OSError as exc:
+        logger.warning("Failed to persist deep health snapshot: %s", exc)
+
+
+def _cached_deep_health_payload(payload: dict) -> dict:
+    import copy
+
+    cached = copy.deepcopy(payload)
+    cached["cached"] = True
+    return cached
 
 
 def _get_deep_health(
@@ -557,13 +649,25 @@ def _get_deep_health(
 
     global _deep_health_cache
     now = time.time()
-    key = _deep_health_cache_key(store, config, indexer_running)
+    persistent_key = _deep_health_persistent_key(config, indexer_running)
+    memory_key = _deep_health_memory_key(store, persistent_key)
     if _deep_health_cache:
         expires_at = float(_deep_health_cache.get("expires_at", 0))
-        if _deep_health_cache.get("key") == key and now < expires_at:
-            payload = copy.deepcopy(_deep_health_cache["payload"])
-            payload["cached"] = True
-            return payload
+        if _deep_health_cache.get("key") == memory_key and now < expires_at:
+            return _cached_deep_health_payload(_deep_health_cache["payload"])
+
+    snapshot = _read_deep_health_snapshot(config)
+    if snapshot:
+        expires_at = float(snapshot.get("expires_at", 0))
+        if snapshot.get("key") == persistent_key and now < expires_at:
+            payload = snapshot.get("payload")
+            if isinstance(payload, dict):
+                _deep_health_cache = {
+                    "key": memory_key,
+                    "expires_at": expires_at,
+                    "payload": copy.deepcopy(payload),
+                }
+                return _cached_deep_health_payload(payload)
 
     payload = _compute_deep_health(
         store=store,
@@ -575,10 +679,18 @@ def _get_deep_health(
         last_run_at=last_run_at,
     )
     _deep_health_cache = {
-        "key": key,
+        "key": memory_key,
         "expires_at": now + _DEEP_HEALTH_CACHE_TTL_SECONDS,
         "payload": copy.deepcopy(payload),
     }
+    _write_deep_health_snapshot(
+        config,
+        {
+            "key": persistent_key,
+            "expires_at": now + _DEEP_HEALTH_CACHE_TTL_SECONDS,
+            "payload": copy.deepcopy(payload),
+        },
+    )
     return payload
 
 
@@ -1628,12 +1740,19 @@ if HAS_MCP and FastMCP is not None:
                   responding, null if reranker is not enabled.
                 - last_index_failed_count: Number of documents that failed during
                   the last indexing run (0 = clean).
+                - deep_check: Deterministic source coverage check, cached for 600s
+                  and persisted to index_health.json. Includes cached, last_ran_at,
+                  uses_llm=false, overall, and per-source registry/index counts plus
+                  latest registry/index timestamps.
 
         Troubleshooting:
             - If doc_count is 0, run file_index_update to index your documents.
             - If last_run_at is null, the index has never been built.
             - If health.fts_available is false, run file_index_update to rebuild
               the FTS index.
+            - If health.deep_check.sources.<name>.status is degraded or critical,
+              treat source-scoped search as inconclusive and do not create records
+              from missing search results.
             - If health.reranker_responsive is false, check DEEPINFRA_API_KEY is set
               and DeepInfra API is reachable.
         """

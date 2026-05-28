@@ -806,6 +806,8 @@ def test_file_status_includes_cached_deep_health_source_coverage(tmp_path):
     registry.close()
 
     old_cache = mcp_server._cache
+    old_signature = mcp_server._cache_index_signature
+    old_identity = mcp_server._cache_identity
     old_deep_cache = mcp_server._deep_health_cache
     try:
         mock_store = MagicMock()
@@ -830,6 +832,8 @@ def test_file_status_includes_cached_deep_health_source_coverage(tmp_path):
                 ],
             },
         )
+        mcp_server._cache_index_signature = mcp_server._index_metadata_signature(mcp_server._cache[2])
+        mcp_server._cache_identity = id(mcp_server._cache)
         mcp_server._deep_health_cache = None
 
         first = mcp_server._file_status_impl()
@@ -852,6 +856,135 @@ def test_file_status_includes_cached_deep_health_source_coverage(tmp_path):
         assert second_deep["sources"]["sor"]["status"] == "critical"
     finally:
         mcp_server._cache = old_cache
+        mcp_server._cache_index_signature = old_signature
+        mcp_server._cache_identity = old_identity
+        mcp_server._deep_health_cache = old_deep_cache
+
+
+def test_file_status_persists_deep_health_snapshot_for_restart_cache(tmp_path):
+    """Deep health cache should survive process restart via index_health.json."""
+    import json
+    from doc_id_store import DocIDStore
+
+    (tmp_path / "index_metadata.json").write_text(
+        json.dumps({"last_run_at": "2026-05-28T18:00:00Z", "failed_count": 0})
+    )
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("documents::doc-1", "doc-1.md", source_name="documents")
+    registry.register("sor::task-1", "task/1", source_name="sor")
+    registry.close()
+
+    config = {
+        "index_root": str(tmp_path),
+        "embeddings": {"provider": "openrouter"},
+        "search": {"reranker": {"enabled": False}},
+        "sources": [
+            {"type": "filesystem", "name": "documents"},
+            {"type": "postgres", "name": "sor"},
+        ],
+    }
+    old_cache = mcp_server._cache
+    old_signature = mcp_server._cache_index_signature
+    old_identity = mcp_server._cache_identity
+    old_deep_cache = mcp_server._deep_health_cache
+    try:
+        first_store = MagicMock()
+        first_store.list_doc_ids.return_value = ["documents::doc-1"]
+        first_store.count_chunks.return_value = 1
+        first_store._metadata_subfields.return_value = {"doc_id", "source_name"}
+        first_store.fts_available.return_value = True
+        mcp_server._cache = (first_store, MagicMock(), config)
+        mcp_server._cache_index_signature = mcp_server._index_metadata_signature(config)
+        mcp_server._cache_identity = id(mcp_server._cache)
+        mcp_server._deep_health_cache = None
+
+        first = mcp_server._file_status_impl()
+        health_path = tmp_path / "index_health.json"
+
+        assert health_path.exists()
+        persisted = json.loads(health_path.read_text())
+        assert persisted["payload"]["last_ran_at"] == first["health"]["deep_check"]["last_ran_at"]
+
+        second_store = MagicMock()
+        second_store.list_doc_ids.return_value = ["documents::doc-1", "sor::task-1"]
+        second_store.count_chunks.return_value = 2
+        second_store._metadata_subfields.return_value = {"doc_id", "source_name"}
+        second_store.fts_available.return_value = True
+        mcp_server._cache = (second_store, MagicMock(), config)
+        mcp_server._cache_index_signature = mcp_server._index_metadata_signature(config)
+        mcp_server._cache_identity = id(mcp_server._cache)
+        mcp_server._deep_health_cache = None
+
+        second = mcp_server._file_status_impl()
+        second_deep = second["health"]["deep_check"]
+        assert second_deep["cached"] is True
+        assert second_deep["last_ran_at"] == first["health"]["deep_check"]["last_ran_at"]
+        assert second_deep["sources"]["sor"]["status"] == "critical"
+    finally:
+        mcp_server._cache = old_cache
+        mcp_server._cache_index_signature = old_signature
+        mcp_server._cache_identity = old_identity
+        mcp_server._deep_health_cache = old_deep_cache
+
+
+def test_file_status_deep_health_includes_source_freshness_fields(tmp_path):
+    """Deep health should report latest registry and indexed timestamps per source."""
+    import json
+    from doc_id_store import DocIDStore
+
+    (tmp_path / "index_metadata.json").write_text(
+        json.dumps({"last_run_at": "2026-05-28T18:00:00Z", "failed_count": 0})
+    )
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("documents::doc-1", "doc-1.md", source_name="documents")
+    registry.register("sor::task-1", "task/1", source_name="sor")
+    registry._conn.execute(
+        "UPDATE doc_registry SET created = 1500, first_seen_at = 1500, last_seen_at = 1500 "
+        "WHERE source_name = 'sor'"
+    )
+    registry._conn.commit()
+    registry.close()
+
+    old_cache = mcp_server._cache
+    old_signature = mcp_server._cache_index_signature
+    old_identity = mcp_server._cache_identity
+    old_deep_cache = mcp_server._deep_health_cache
+    try:
+        mock_store = MagicMock()
+        mock_store.list_doc_ids.return_value = ["documents::doc-1", "sor::task-1"]
+        mock_store.count_chunks.return_value = 2
+        mock_store.list_recent_docs.return_value = [
+            {"doc_id": "documents::doc-1", "mtime": 1000.0},
+            {"doc_id": "sor::task-1", "mtime": 2000.0},
+        ]
+        mock_store._metadata_subfields.return_value = {"doc_id", "source_name", "mtime"}
+        mock_store.fts_available.return_value = True
+
+        mcp_server._cache = (
+            mock_store,
+            MagicMock(),
+            {
+                "index_root": str(tmp_path),
+                "embeddings": {"provider": "openrouter"},
+                "search": {"reranker": {"enabled": False}},
+                "sources": [{"type": "postgres", "name": "sor"}],
+            },
+        )
+        mcp_server._cache_index_signature = mcp_server._index_metadata_signature(mcp_server._cache[2])
+        mcp_server._cache_identity = id(mcp_server._cache)
+        mcp_server._deep_health_cache = None
+
+        result = mcp_server._file_status_impl()
+        sor = result["health"]["deep_check"]["sources"]["sor"]
+
+        assert sor["registry_latest_seen_at"] == "1970-01-01T00:25:00+00:00"
+        assert sor["index_latest_mtime"] == 2000.0
+        assert sor["index_latest_mtime_iso"] == "1970-01-01T00:33:20+00:00"
+        assert result["health"]["deep_check"]["checks"]["index_freshness_available"] is True
+    finally:
+        mcp_server._cache = old_cache
+        mcp_server._cache_index_signature = old_signature
+        mcp_server._cache_identity = old_identity
         mcp_server._deep_health_cache = old_deep_cache
 
 
