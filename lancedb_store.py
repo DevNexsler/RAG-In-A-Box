@@ -138,7 +138,7 @@ class LanceDBStore:
     @staticmethod
     def _is_probable_corruption_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        return all(marker in text for marker in _LANCE_CORRUPTION_MARKERS) or "corrupt" in text
+        return _looks_like_corrupt_lance_error(exc) or "corrupt" in text
 
     def _probe_table_read(self) -> None:
         """Cheap read probe so init fails fast on unreadable tables, not first user query."""
