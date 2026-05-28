@@ -99,6 +99,35 @@ def test_index_update_clears_stale_pid_file(tmp_path, monkeypatch):
     assert "pid" in result
 
 
+def test_index_update_ignores_zombie_pid_file(tmp_path, monkeypatch):
+    """A zombie PID must not block a new indexing run."""
+    import subprocess
+    import sys
+
+    import mcp_server
+
+    monkeypatch.setenv("INDEX_ROOT", str(tmp_path))
+
+    zombie = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        start_new_session=True,
+    )
+    time.sleep(0.1)
+
+    pid_file = tmp_path / "indexer.pid"
+    pid_file.write_text(str(zombie.pid))
+
+    try:
+        result = mcp_server._file_index_update_impl("config.yaml")
+        assert result.get("status") == "started", (
+            f"Expected zombie PID to be ignored, got {result!r}"
+        )
+        assert "pid" in result
+    finally:
+        zombie.wait()
+        pid_file.unlink(missing_ok=True)
+
+
 def test_pid_file_is_cleaned_up_by_subprocess(tmp_path, monkeypatch):
     """The PID file written inside the subprocess must be removed when the
     subprocess exits (even if the indexer flow raises an exception)."""

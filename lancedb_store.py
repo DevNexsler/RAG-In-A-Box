@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import shutil
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -108,6 +109,7 @@ class LanceDBStore:
     def __init__(self, index_root: str | Path, table_name: str = "chunks") -> None:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
+        self._schema_lock = threading.Lock()
         self._vs = self._build_vector_store()
         self._ensure_scalar_index()
         try:
@@ -487,9 +489,14 @@ class LanceDBStore:
             for n in nodes:
                 if n.metadata:
                     incoming_keys.update(n.metadata.keys())
-            new_fields = incoming_keys - existing_subfields
-            if new_fields:
-                self._evolve_metadata_schema(new_fields)
+            if incoming_keys:
+                # Threaded indexing shares one store instance; re-check missing
+                # fields under a lock so temp-table schema evolution is serialized.
+                with self._schema_lock:
+                    existing_subfields = self._metadata_subfields()
+                    new_fields = incoming_keys - existing_subfields
+                    if new_fields:
+                        self._evolve_metadata_schema(new_fields)
 
         # Collect distinct doc_ids from this batch
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
