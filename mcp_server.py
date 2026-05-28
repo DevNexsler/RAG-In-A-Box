@@ -334,6 +334,8 @@ def _build_store_and_embed(config_path: str = "config.yaml"):
 _cache: tuple | None = None
 _cache_index_signature: tuple[int, int] | None = None
 _cache_identity: int | None = None
+_DEEP_HEALTH_CACHE_TTL_SECONDS = 600
+_deep_health_cache: dict | None = None
 
 
 def _index_metadata_signature(config: dict) -> tuple[int, int] | None:
@@ -364,6 +366,220 @@ def _get_deps(config_path: str = "config.yaml"):
             _cache_index_signature = _index_metadata_signature(_cache[2])
             _cache_identity = id(_cache)
     return _cache[0], _cache[1], _cache[2]
+
+
+def _utc_iso(ts: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _configured_source_names(config: dict) -> list[str]:
+    names: list[str] = []
+    for source in config.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        name = str(source.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    if not names and config.get("documents_root"):
+        names.append("documents")
+    return names
+
+
+def _source_name_from_doc_id(doc_id: str) -> str:
+    if "::" not in doc_id:
+        return "documents"
+    return doc_id.split("::", 1)[0] or "documents"
+
+
+def _count_doc_ids_by_source(doc_ids: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for doc_id in doc_ids:
+        source_name = _source_name_from_doc_id(str(doc_id))
+        counts[source_name] = counts.get(source_name, 0) + 1
+    return counts
+
+
+def _registry_source_counts(index_root: Path) -> tuple[dict[str, int], str | None]:
+    registry_path = index_root / "doc_registry.db"
+    if not registry_path.exists():
+        return {}, None
+
+    from doc_id_store import DocIDStore
+
+    registry = DocIDStore(registry_path)
+    try:
+        with registry._lock:
+            cur = registry._conn.execute(
+                "SELECT COALESCE(NULLIF(source_name, ''), 'documents'), COUNT(*) "
+                "FROM doc_registry GROUP BY COALESCE(NULLIF(source_name, ''), 'documents')"
+            )
+            return {str(row[0]): int(row[1]) for row in cur.fetchall()}, None
+    except Exception as exc:
+        return {}, str(exc)
+    finally:
+        registry.close()
+
+
+def _source_health_status(
+    *,
+    configured: bool,
+    registry_doc_count: int,
+    index_doc_count: int,
+    indexer_running: bool,
+    last_run_at: str | None,
+) -> tuple[str, str]:
+    if registry_doc_count > 0 and index_doc_count == 0:
+        if indexer_running:
+            return "indexing", "registry_has_docs_but_index_has_none"
+        return "critical", "registry_has_docs_but_index_has_none"
+    if registry_doc_count > 0 and index_doc_count < registry_doc_count:
+        if indexer_running:
+            return "indexing", "index_missing_some_registry_docs"
+        return "degraded", "index_missing_some_registry_docs"
+    if index_doc_count > 0:
+        return "ok", "indexed"
+    if configured and indexer_running:
+        return "indexing", "configured_source_not_seen_yet"
+    if configured and last_run_at:
+        return "missing", "configured_source_has_no_indexed_docs"
+    if configured:
+        return "unknown", "configured_source_not_indexed_yet"
+    return "ok", "observed_source"
+
+
+def _overall_deep_health(
+    source_statuses: list[str],
+    *,
+    fts_available: bool,
+    indexer_running: bool,
+    registry_error: str | None,
+) -> str:
+    if registry_error:
+        return "degraded"
+    rank = {"ok": 0, "unknown": 1, "missing": 2, "indexing": 2, "degraded": 3, "critical": 4}
+    worst = max((rank.get(status, 1) for status in source_statuses), default=0)
+    if not fts_available:
+        worst = max(worst, rank["indexing" if indexer_running else "degraded"])
+    if worst >= rank["critical"]:
+        return "critical"
+    if worst >= rank["degraded"]:
+        return "degraded"
+    if worst >= rank["indexing"]:
+        return "indexing" if indexer_running else "degraded"
+    if worst >= rank["unknown"]:
+        return "unknown"
+    return "ok"
+
+
+def _compute_deep_health(
+    *,
+    store: LanceDBStore,
+    config: dict,
+    doc_ids: list[str],
+    chunk_count: int,
+    fts_available: bool,
+    indexer_running: bool,
+    last_run_at: str | None,
+) -> dict:
+    del store  # Deep check currently uses deterministic registry + doc-id coverage only.
+    index_root = Path(config["index_root"])
+    configured_sources = _configured_source_names(config)
+    registry_counts, registry_error = _registry_source_counts(index_root)
+    index_counts = _count_doc_ids_by_source(doc_ids)
+    source_names = sorted(set(configured_sources) | set(registry_counts) | set(index_counts))
+
+    sources: dict[str, dict] = {}
+    source_statuses: list[str] = []
+    for source_name in source_names:
+        registry_doc_count = registry_counts.get(source_name, 0)
+        index_doc_count = index_counts.get(source_name, 0)
+        status, reason = _source_health_status(
+            configured=source_name in configured_sources,
+            registry_doc_count=registry_doc_count,
+            index_doc_count=index_doc_count,
+            indexer_running=indexer_running,
+            last_run_at=last_run_at,
+        )
+        source_statuses.append(status)
+        sources[source_name] = {
+            "status": status,
+            "reason": reason,
+            "configured": source_name in configured_sources,
+            "registry_doc_count": registry_doc_count,
+            "index_doc_count": index_doc_count,
+        }
+
+    return {
+        "cached": False,
+        "last_ran_at": _utc_iso(time.time()),
+        "ttl_seconds": _DEEP_HEALTH_CACHE_TTL_SECONDS,
+        "uses_llm": False,
+        "overall": _overall_deep_health(
+            source_statuses,
+            fts_available=fts_available,
+            indexer_running=indexer_running,
+            registry_error=registry_error,
+        ),
+        "sources": sources,
+        "checks": {
+            "registry_available": registry_error is None,
+            "registry_error": registry_error,
+            "index_doc_count": len(doc_ids),
+            "chunk_count": chunk_count,
+            "fts_available": fts_available,
+        },
+    }
+
+
+def _deep_health_cache_key(store: LanceDBStore, config: dict, indexer_running: bool) -> tuple:
+    return (
+        id(store),
+        str(config.get("index_root")),
+        _index_metadata_signature(config),
+        tuple(_configured_source_names(config)),
+        indexer_running,
+    )
+
+
+def _get_deep_health(
+    *,
+    store: LanceDBStore,
+    config: dict,
+    doc_ids: list[str],
+    chunk_count: int,
+    fts_available: bool,
+    indexer_running: bool,
+    last_run_at: str | None,
+) -> dict:
+    import copy
+
+    global _deep_health_cache
+    now = time.time()
+    key = _deep_health_cache_key(store, config, indexer_running)
+    if _deep_health_cache:
+        expires_at = float(_deep_health_cache.get("expires_at", 0))
+        if _deep_health_cache.get("key") == key and now < expires_at:
+            payload = copy.deepcopy(_deep_health_cache["payload"])
+            payload["cached"] = True
+            return payload
+
+    payload = _compute_deep_health(
+        store=store,
+        config=config,
+        doc_ids=doc_ids,
+        chunk_count=chunk_count,
+        fts_available=fts_available,
+        indexer_running=indexer_running,
+        last_run_at=last_run_at,
+    )
+    _deep_health_cache = {
+        "key": key,
+        "expires_at": now + _DEEP_HEALTH_CACHE_TTL_SECONDS,
+        "payload": copy.deepcopy(payload),
+    }
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +1004,15 @@ def _file_status_impl() -> dict:
     index_root = Path(config["index_root"])
     pid_file = index_root / "indexer.pid"
     indexer_running, indexer_pid = _resolve_indexer_pid(pid_file)
+    deep_health = _get_deep_health(
+        store=store,
+        config=config,
+        doc_ids=doc_ids,
+        chunk_count=chunk_count,
+        fts_available=fts_ok,
+        indexer_running=indexer_running,
+        last_run_at=last_run_at,
+    )
 
     result: dict = {
         "doc_count": len(doc_ids),
@@ -802,6 +1027,7 @@ def _file_status_impl() -> dict:
             "reranker_responsive": reranker_responsive,
             "last_index_failed_count": last_index_failed_count,
             "last_index_warnings": last_index_warnings,
+            "deep_check": deep_health,
         },
     }
     if indexer_running and indexer_pid is not None:

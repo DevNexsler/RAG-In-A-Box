@@ -792,6 +792,69 @@ def test_file_status_includes_health():
             mcp_server._cache = old_cache
 
 
+def test_file_status_includes_cached_deep_health_source_coverage(tmp_path):
+    """Deep health check should cache deterministic source coverage for 10 minutes."""
+    import json
+    from doc_id_store import DocIDStore
+
+    (tmp_path / "index_metadata.json").write_text(
+        json.dumps({"last_run_at": "2026-05-28T18:00:00Z", "failed_count": 0})
+    )
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("documents::doc-1", "doc-1.md", source_name="documents")
+    registry.register("sor::task-1", "task/1", source_name="sor")
+    registry.close()
+
+    old_cache = mcp_server._cache
+    old_deep_cache = mcp_server._deep_health_cache
+    try:
+        mock_store = MagicMock()
+        mock_store.list_doc_ids.side_effect = [
+            ["documents::doc-1"],
+            ["documents::doc-1", "sor::task-1"],
+        ]
+        mock_store.count_chunks.return_value = 2
+        mock_store._metadata_subfields.return_value = {"doc_id", "source_name"}
+        mock_store.fts_available.return_value = True
+
+        mcp_server._cache = (
+            mock_store,
+            MagicMock(),
+            {
+                "index_root": str(tmp_path),
+                "embeddings": {"provider": "openrouter"},
+                "search": {"reranker": {"enabled": False}},
+                "sources": [
+                    {"type": "filesystem", "name": "documents"},
+                    {"type": "postgres", "name": "sor"},
+                ],
+            },
+        )
+        mcp_server._deep_health_cache = None
+
+        first = mcp_server._file_status_impl()
+        second = mcp_server._file_status_impl()
+
+        first_deep = first["health"]["deep_check"]
+        second_deep = second["health"]["deep_check"]
+        assert first_deep["cached"] is False
+        assert first_deep["ttl_seconds"] == 600
+        assert first_deep["uses_llm"] is False
+        assert first_deep["last_ran_at"]
+        assert first_deep["sources"]["documents"]["status"] == "ok"
+        assert first_deep["sources"]["sor"]["status"] == "critical"
+        assert first_deep["sources"]["sor"]["registry_doc_count"] == 1
+        assert first_deep["sources"]["sor"]["index_doc_count"] == 0
+        assert first_deep["overall"] == "critical"
+
+        assert second_deep["cached"] is True
+        assert second_deep["last_ran_at"] == first_deep["last_ran_at"]
+        assert second_deep["sources"]["sor"]["status"] == "critical"
+    finally:
+        mcp_server._cache = old_cache
+        mcp_server._deep_health_cache = old_deep_cache
+
+
 def test_file_status_reports_zombie_indexer_as_not_running():
     """Zombie indexer PID should not surface as a live background run."""
     import subprocess
