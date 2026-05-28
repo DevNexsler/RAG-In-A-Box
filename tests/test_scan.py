@@ -699,7 +699,7 @@ def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
 
     with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
         with patch("flow_index_vault.load_config", return_value=config):
-            with patch("flow_index_vault.LanceDBStore", return_value=fake_store):
+            with patch("flow_index_vault.open_store_with_recovery", return_value=fake_store):
                 with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
                     with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
                         with patch("flow_index_vault.build_ocr_provider", return_value=None):
