@@ -82,7 +82,7 @@ def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
     # Launch a long-lived dummy subprocess and write its PID file manually,
     # simulating an in-progress indexer run.
     dummy = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(30)"],
+        [sys.executable, "-c", "import time; index_vault_flow = True; time.sleep(30)"],
         start_new_session=True,
     )
     pid_file = tmp_path / "indexer.pid"
@@ -190,6 +190,41 @@ def test_index_update_ignores_zombie_pid_file(tmp_path, monkeypatch):
     finally:
         zombie.wait()
         pid_file.unlink(missing_ok=True)
+
+
+def test_index_update_ignores_non_indexer_pid_file(tmp_path, monkeypatch):
+    """A reused PID for another process must not block a fresh indexer."""
+    import subprocess
+    import sys
+
+    import mcp_server
+
+    monkeypatch.setenv("INDEX_ROOT", str(tmp_path))
+    _patch_index_config(monkeypatch, mcp_server, tmp_path)
+
+    other_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+
+    pid_file = tmp_path / "indexer.pid"
+    pid_file.write_text(str(other_proc.pid))
+
+    class DummyProc:
+        pid = 424244
+
+    try:
+        with patch("subprocess.Popen", return_value=DummyProc()):
+            result = mcp_server._file_index_update_impl("config.yaml")
+
+        assert result.get("status") == "started", (
+            f"Expected foreign PID to be ignored, got {result!r}"
+        )
+        assert result.get("pid") == 424244
+        assert not pid_file.exists(), "Foreign PID file should be removed before restart"
+    finally:
+        other_proc.terminate()
+        other_proc.wait()
 
 
 def test_pid_file_is_cleaned_up_by_subprocess(tmp_path, monkeypatch):

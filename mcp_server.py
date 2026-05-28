@@ -120,11 +120,29 @@ def _pid_state(pid: int) -> str | None:
     return None
 
 
-def _resolve_indexer_pid(pid_file: Path) -> tuple[bool, int | None]:
-    """Return whether the pid file points to a live, non-zombie process.
+def _pid_cmdline(pid: int) -> str | None:
+    """Return Linux process command line when available."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return raw.replace(b"\0", b" ").decode(errors="replace").strip()
 
-    Stale, corrupt, or zombie pid files are cleaned up so callers can safely
-    start a fresh indexer run.
+
+def _pid_is_indexer(pid: int) -> bool:
+    """Return True when pid appears to be the background indexer subprocess."""
+    cmdline = _pid_cmdline(pid)
+    if not cmdline:
+        # If cmdline is unavailable, keep legacy liveness behavior.
+        return True
+    return "index_vault_flow" in cmdline or "flow_index_vault" in cmdline
+
+
+def _resolve_indexer_pid(pid_file: Path) -> tuple[bool, int | None]:
+    """Return whether the pid file points to a live indexer process.
+
+    Stale, corrupt, zombie, or PID-reused files are cleaned up so callers can
+    safely start a fresh indexer run.
     """
     if not pid_file.exists():
         return False, None
@@ -152,6 +170,10 @@ def _resolve_indexer_pid(pid_file: Path) -> tuple[bool, int | None]:
         pass
 
     if _pid_state(pid) == "Z":
+        pid_file.unlink(missing_ok=True)
+        return False, None
+
+    if not _pid_is_indexer(pid):
         pid_file.unlink(missing_ok=True)
         return False, None
 

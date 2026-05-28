@@ -1105,3 +1105,45 @@ def test_file_status_ignores_zombie_indexer_pid(tmp_path):
             os.waitpid(zombie_pid, os.WNOHANG)
         except ChildProcessError:
             pass
+
+
+def test_file_status_ignores_non_indexer_pid_file(tmp_path):
+    """A reused PID for another process must not be treated as an indexer."""
+    import subprocess
+    import sys
+
+    other_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+
+    pid_file = tmp_path / "indexer.pid"
+    pid_file.write_text(str(other_proc.pid))
+
+    old_cache = mcp_server._cache
+    try:
+        mock_store = MagicMock()
+        mock_store.list_doc_ids.return_value = ["a.md"]
+        mock_store.count_chunks.return_value = 1
+        mock_store._metadata_subfields.return_value = {"doc_id"}
+        mock_store.fts_available.return_value = True
+
+        mcp_server._cache = (
+            mock_store,
+            MagicMock(),
+            {
+                "index_root": str(tmp_path),
+                "embeddings": {"provider": "openrouter"},
+                "search": {"reranker": {"enabled": False}},
+            },
+        )
+
+        result = mcp_server._file_status_impl()
+
+        assert result["indexer_running"] is False
+        assert "indexer_pid" not in result
+        assert not pid_file.exists(), "Foreign PID file should be removed during status check"
+    finally:
+        mcp_server._cache = old_cache
+        other_proc.terminate()
+        other_proc.wait()
