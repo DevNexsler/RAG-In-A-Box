@@ -1,13 +1,16 @@
 """Tests for LanceDBStore (uses a temp directory, no mocks needed)."""
 
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
-from lancedb_store import LanceDBStore
+from lancedb_store import LanceDBStore, open_store_with_recovery
 
 
 def _make_node(doc_id: str, loc: str, text: str, vector: list[float]) -> TextNode:
@@ -450,6 +453,65 @@ def test_schema_evolution_multiple_new_fields():
         subfields = store._metadata_subfields()
         assert "section" in subfields
         assert "sentiment" in subfields
+
+
+def test_schema_evolution_concurrent_new_fields_on_shared_store():
+    """Concurrent schema evolution should not corrupt the shared temp table path."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+
+        store.upsert_nodes([_make_node_with_meta("seed.md", "c:0", "seed", vec)])
+
+        field_names = ["field_alpha", "field_beta", "field_gamma", "field_delta"]
+        nodes = [
+            _make_node_with_meta(
+                f"doc-{idx}.md",
+                "c:0",
+                f"body {idx}",
+                vec,
+                **{field_name: f"value-{idx}"},
+            )
+            for idx, field_name in enumerate(field_names, start=1)
+        ]
+
+        metadata_barrier = threading.Barrier(len(nodes))
+        metadata_call_lock = threading.Lock()
+        metadata_call_count = 0
+        real_metadata_subfields = store._metadata_subfields
+        real_evolve_metadata_schema = store._evolve_metadata_schema
+
+        def _synchronized_metadata_subfields():
+            nonlocal metadata_call_count
+            result = real_metadata_subfields()
+            with metadata_call_lock:
+                metadata_call_count += 1
+                call_number = metadata_call_count
+            if result and call_number <= len(nodes):
+                metadata_barrier.wait(timeout=5)
+            return result
+
+        def _slow_evolve_metadata_schema(new_fields):
+            time.sleep(0.05)
+            return real_evolve_metadata_schema(new_fields)
+
+        store._metadata_subfields = _synchronized_metadata_subfields  # type: ignore[method-assign]
+        store._evolve_metadata_schema = _slow_evolve_metadata_schema  # type: ignore[method-assign]
+
+        errors: list[Exception] = []
+
+        def _worker(node: TextNode) -> None:
+            try:
+                store.upsert_nodes([node])
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with ThreadPoolExecutor(max_workers=len(nodes)) as executor:
+            list(executor.map(_worker, nodes))
+
+        assert errors == []
+        assert set(store.list_doc_ids()) == {"seed.md", *(n.ref_doc_id for n in nodes)}
+        assert set(field_names) <= store._metadata_subfields()
 
 
 # --- Dynamic metadata pipeline tests ---
@@ -1159,3 +1221,29 @@ class TestSourceNameFilter:
         where = store._build_where_clause(source_name="comm_messages")
         assert "source_name" in where
         assert "comm_messages" in where
+
+
+def test_open_store_with_recovery_recovers_known_corruption():
+    sentinel = object()
+    error = RuntimeError(
+        "LanceError(IO): Generic memory error: Invalid range 0..0 for object of size 0 bytes"
+    )
+
+    with patch("lancedb_store.LanceDBStore", side_effect=error) as store_cls:
+        with patch("lancedb_store.recover_corrupt_table", return_value=sentinel) as recover:
+            result = open_store_with_recovery("/tmp/index", "chunks")
+
+    assert result is sentinel
+    store_cls.assert_called_once_with("/tmp/index", "chunks")
+    recover.assert_called_once()
+
+
+def test_open_store_with_recovery_reraises_non_corruption():
+    error = RuntimeError("bad config")
+
+    with patch("lancedb_store.LanceDBStore", side_effect=error):
+        with patch("lancedb_store.recover_corrupt_table") as recover:
+            with pytest.raises(RuntimeError, match="bad config"):
+                open_store_with_recovery("/tmp/index", "chunks")
+
+    recover.assert_not_called()

@@ -2,6 +2,8 @@
 
 No external services needed. Uses mocks and direct function calls."""
 
+import os
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -343,6 +345,35 @@ def test_get_deps_failure_in_status():
         mcp_server._cache = old_cache
 
 
+def test_build_store_and_embed_uses_recovery_open():
+    config = {"index_root": "/tmp/doc-index", "lancedb": {"table": "chunks"}}
+    sentinel_store = object()
+    sentinel_embed = object()
+
+    with patch.object(mcp_server, "load_config", return_value=config):
+        with patch.object(
+            mcp_server,
+            "open_store_with_recovery",
+            return_value=sentinel_store,
+        ) as open_store:
+            with patch.object(
+                mcp_server,
+                "build_embed_provider",
+                return_value=sentinel_embed,
+            ):
+                store, embed, loaded = mcp_server._build_store_and_embed()
+
+    assert store is sentinel_store
+    assert embed is sentinel_embed
+    assert loaded is config
+    open_store.assert_called_once_with(
+        Path("/tmp/doc-index"),
+        "chunks",
+        logger_obj=mcp_server.logger,
+        auto_recover=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # _enrich_doc_list helper tests
 # ---------------------------------------------------------------------------
@@ -562,6 +593,39 @@ def test_search_response_degraded_flag():
         mcp_server._cache = old_cache
 
 
+def test_source_scoped_empty_degraded_search_fails_closed(tmp_path):
+    """Source-scoped degraded empty results are inconclusive, not proof of absence."""
+    from search_hybrid import SearchResult
+
+    mock_result = SearchResult(
+        hits=[],
+        diagnostics={
+            "vector_search_active": True,
+            "keyword_search_active": False,
+            "reranker_applied": True,
+            "degraded": True,
+        },
+    )
+
+    old_cache = mcp_server._cache
+    try:
+        mock_store = MagicMock()
+        mock_embed = MagicMock()
+        mock_config = {"index_root": str(tmp_path), "search": {"recency": {}}}
+        mcp_server._cache = (mock_store, mock_embed, mock_config)
+
+        with patch("mcp_server.hybrid_search", return_value=mock_result):
+            with patch("mcp_server.build_reranker", return_value=None):
+                result = mcp_server._file_search_impl("rent payment", source_name="sor")
+
+        assert result["error"] is True
+        assert result["code"] == "source_search_degraded"
+        assert "results" not in result
+        assert "diagnostics" not in result
+    finally:
+        mcp_server._cache = old_cache
+
+
 def test_file_search_compact_default_keeps_source_content_and_excludes_bloat():
     """Default compact search response should keep source content without raw node bloat."""
     from search_hybrid import SearchResult
@@ -726,6 +790,49 @@ def test_file_status_includes_health():
             assert health["last_index_failed_count"] == 1
         finally:
             mcp_server._cache = old_cache
+
+
+def test_file_status_reports_zombie_indexer_as_not_running():
+    """Zombie indexer PID should not surface as a live background run."""
+    import subprocess
+    import sys
+    import tempfile
+    import time
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pid_file = Path(tmpdir) / "indexer.pid"
+        zombie = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            start_new_session=True,
+        )
+        time.sleep(0.1)
+        pid_file.write_text(str(zombie.pid))
+
+        old_cache = mcp_server._cache
+        try:
+            mock_store = MagicMock()
+            mock_store.list_doc_ids.return_value = ["a.md"]
+            mock_store.count_chunks.return_value = 1
+            mock_store._metadata_subfields.return_value = {"doc_id"}
+            mock_store.fts_available.return_value = True
+
+            mcp_server._cache = (
+                mock_store,
+                MagicMock(),
+                {
+                    "index_root": tmpdir,
+                    "embeddings": {"provider": "openrouter"},
+                    "search": {"reranker": {"enabled": False}},
+                },
+            )
+
+            result = mcp_server._file_status_impl()
+            assert result["indexer_running"] is False
+            assert "indexer_pid" not in result
+        finally:
+            mcp_server._cache = old_cache
+            zombie.wait()
+            pid_file.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -944,3 +1051,99 @@ def test_file_status_health_reranker_disabled():
             assert health["last_index_failed_count"] == 0
         finally:
             mcp_server._cache = old_cache
+
+
+def test_file_status_ignores_zombie_indexer_pid(tmp_path):
+    """Zombie indexer PID should be treated as not running and cleaned up."""
+    zombie_pid = os.fork()
+    if zombie_pid == 0:
+        os._exit(0)
+
+    pid_file = tmp_path / "indexer.pid"
+    pid_file.write_text(str(zombie_pid))
+
+    deadline = time.time() + 5
+    status_path = Path(f"/proc/{zombie_pid}/status")
+    while time.time() < deadline:
+        try:
+            status = status_path.read_text()
+        except FileNotFoundError:
+            break
+        if "State:\tZ" in status:
+            break
+        time.sleep(0.01)
+    else:
+        os.waitpid(zombie_pid, 0)
+        raise AssertionError("Failed to create zombie child for test")
+
+    old_cache = mcp_server._cache
+    try:
+        mock_store = MagicMock()
+        mock_store.list_doc_ids.return_value = ["a.md"]
+        mock_store.count_chunks.return_value = 1
+        mock_store._metadata_subfields.return_value = {"doc_id"}
+        mock_store.fts_available.return_value = True
+
+        mcp_server._cache = (
+            mock_store,
+            MagicMock(),
+            {
+                "index_root": str(tmp_path),
+                "embeddings": {"provider": "openrouter"},
+                "search": {"reranker": {"enabled": False}},
+            },
+        )
+
+        result = mcp_server._file_status_impl()
+
+        assert result["indexer_running"] is False
+        assert "indexer_pid" not in result
+        assert not pid_file.exists(), "Zombie PID file should be removed during status check"
+    finally:
+        mcp_server._cache = old_cache
+        try:
+            os.waitpid(zombie_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+def test_file_status_ignores_non_indexer_pid_file(tmp_path):
+    """A reused PID for another process must not be treated as an indexer."""
+    import subprocess
+    import sys
+
+    other_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+
+    pid_file = tmp_path / "indexer.pid"
+    pid_file.write_text(str(other_proc.pid))
+
+    old_cache = mcp_server._cache
+    try:
+        mock_store = MagicMock()
+        mock_store.list_doc_ids.return_value = ["a.md"]
+        mock_store.count_chunks.return_value = 1
+        mock_store._metadata_subfields.return_value = {"doc_id"}
+        mock_store.fts_available.return_value = True
+
+        mcp_server._cache = (
+            mock_store,
+            MagicMock(),
+            {
+                "index_root": str(tmp_path),
+                "embeddings": {"provider": "openrouter"},
+                "search": {"reranker": {"enabled": False}},
+            },
+        )
+
+        result = mcp_server._file_status_impl()
+
+        assert result["indexer_running"] is False
+        assert "indexer_pid" not in result
+        assert not pid_file.exists(), "Foreign PID file should be removed during status check"
+    finally:
+        mcp_server._cache = old_cache
+        other_proc.terminate()
+        other_proc.wait()

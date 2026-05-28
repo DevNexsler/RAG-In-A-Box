@@ -10,7 +10,7 @@ from pathlib import Path
 from core.config import load_config
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
-from lancedb_store import LanceDBStore
+from lancedb_store import LanceDBStore, open_store_with_recovery
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
 
@@ -64,6 +64,35 @@ def _error(code: str, message: str, fix: str | None = None) -> dict:
     return err
 
 
+def _pid_is_running(pid: int) -> bool:
+    """Return True only for a live, non-zombie process."""
+    if pid <= 0:
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+
+    proc_status = Path("/proc") / str(pid) / "status"
+    if proc_status.exists():
+        try:
+            for line in proc_status.read_text().splitlines():
+                if not line.startswith("State:"):
+                    continue
+                if "\tZ" in line or "(zombie)" in line.lower():
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except (ChildProcessError, OSError):
+                        pass
+                    return False
+                break
+        except OSError:
+            return False
+
+    return True
+
+
 def _validate_source_type(source_type: str | None) -> dict | None:
     """Return an error dict if source_type is invalid, else None."""
     if source_type and not is_safe_source_type(source_type):
@@ -74,6 +103,81 @@ def _validate_source_type(source_type: str | None) -> dict | None:
             f"{', '.join(sorted(_VALID_SOURCE_TYPES))}.",
         )
     return None
+
+
+def _pid_state(pid: int) -> str | None:
+    """Return Linux process state code (e.g. 'R', 'S', 'Z') when available."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("State:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return parts[1]
+                    break
+    except OSError:
+        return None
+    return None
+
+
+def _pid_cmdline(pid: int) -> str | None:
+    """Return Linux process command line when available."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return raw.replace(b"\0", b" ").decode(errors="replace").strip()
+
+
+def _pid_is_indexer(pid: int) -> bool:
+    """Return True when pid appears to be the background indexer subprocess."""
+    cmdline = _pid_cmdline(pid)
+    if not cmdline:
+        # If cmdline is unavailable, keep legacy liveness behavior.
+        return True
+    return "index_vault_flow" in cmdline or "flow_index_vault" in cmdline
+
+
+def _resolve_indexer_pid(pid_file: Path) -> tuple[bool, int | None]:
+    """Return whether the pid file points to a live indexer process.
+
+    Stale, corrupt, zombie, or PID-reused files are cleaned up so callers can
+    safely start a fresh indexer run.
+    """
+    if not pid_file.exists():
+        return False, None
+
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        pid_file.unlink(missing_ok=True)
+        return False, None
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        pid_file.unlink(missing_ok=True)
+        return False, None
+
+    # Crash-aborted children can remain as zombies; os.kill(pid, 0) still
+    # succeeds for them, so treat zombie state as dead and clean up the pid.
+    try:
+        waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            pid_file.unlink(missing_ok=True)
+            return False, None
+    except ChildProcessError:
+        pass
+
+    if _pid_state(pid) == "Z":
+        pid_file.unlink(missing_ok=True)
+        return False, None
+
+    if not _pid_is_indexer(pid):
+        pid_file.unlink(missing_ok=True)
+        return False, None
+
+    return True, pid
 
 
 def _hit_to_dict(h: SearchHit, include_text: bool = False) -> dict:
@@ -211,7 +315,7 @@ def _build_store_and_embed(config_path: str = "config.yaml"):
     config = load_config(config_path)
     index_root = Path(config["index_root"])
     table = config.get("lancedb", {}).get("table", "chunks")
-    store = LanceDBStore(index_root, table)
+    store = open_store_with_recovery(index_root, table, logger_obj=logger, auto_recover=True)
 
     embed_provider = build_embed_provider(config)
     return store, embed_provider, config
@@ -419,11 +523,19 @@ def _file_search_impl(
     except Exception as exc:
         return _error("search_failed", f"Search operation failed: {exc}",
                        "Check that the index exists (run file_index_update) and configured services are running.")
+    diagnostics = result.diagnostics or {}
+    if source_name and not result.hits and diagnostics.get("degraded"):
+        return _error(
+            "source_search_degraded",
+            f"Search for source_name={source_name!r} is degraded and returned no results.",
+            "Treat this result as inconclusive. Do not create records from it. "
+            "Run file_status/file_index_update and retry after vector and keyword search are healthy.",
+        )
     if return_mode == "full":
         results = [_hit_to_dict(h) for h in result.hits]
     else:
         results = [_compact_hit_to_dict(h, content_max_character) for h in result.hits]
-    return {"results": results, "diagnostics": result.diagnostics}
+    return {"results": results, "diagnostics": diagnostics}
 
 
 def _file_get_chunk_impl(doc_id: str, loc: str) -> dict:
@@ -652,15 +764,7 @@ def _file_status_impl() -> dict:
     # Check if an indexer subprocess is currently running
     index_root = Path(config["index_root"])
     pid_file = index_root / "indexer.pid"
-    indexer_running = False
-    indexer_pid = None
-    if pid_file.exists():
-        try:
-            indexer_pid = int(pid_file.read_text().strip())
-            os.kill(indexer_pid, 0)  # Signal 0 = existence check
-            indexer_running = True
-        except (OSError, ValueError):
-            indexer_pid = None
+    indexer_running, indexer_pid = _resolve_indexer_pid(pid_file)
 
     result: dict = {
         "doc_count": len(doc_ids),
@@ -788,19 +892,14 @@ def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
     pid_file = index_root / "indexer.pid"
 
     # Check if an indexer is already running
-    if pid_file.exists():
-        try:
-            old_pid = int(pid_file.read_text().strip())
-            os.kill(old_pid, 0)  # Signal 0 = existence check; raises OSError if dead
-            logger.info("file_index_update: indexer already running (pid %d)", old_pid)
-            return {
-                "status": "already_running",
-                "pid": old_pid,
-                "message": "An indexer is already running. Use file_status to check progress.",
-            }
-        except (OSError, ValueError):
-            # Process is dead or PID file is corrupt — clean up and proceed
-            pid_file.unlink(missing_ok=True)
+    indexer_running, old_pid = _resolve_indexer_pid(pid_file)
+    if indexer_running and old_pid is not None:
+        logger.info("file_index_update: indexer already running (pid %d)", old_pid)
+        return {
+            "status": "already_running",
+            "pid": old_pid,
+            "message": "An indexer is already running. Use file_status to check progress.",
+        }
 
     # Ensure index_root exists so the subprocess can write its PID file
     index_root.mkdir(parents=True, exist_ok=True)
