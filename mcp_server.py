@@ -138,6 +138,16 @@ def _pid_is_indexer(pid: int) -> bool:
     return "index_vault_flow" in cmdline or "flow_index_vault" in cmdline
 
 
+def _looks_like_lance_stale_read(exc: Exception) -> bool:
+    """Return True for Lance read errors that can be fixed by reopening the table."""
+    message = str(exc).lower()
+    return (
+        "manifest was not found" in message
+        or "invalid range 0..0" in message
+        or "lanceerror(io)" in message
+    )
+
+
 def _resolve_indexer_pid(pid_file: Path) -> tuple[bool, int | None]:
     """Return whether the pid file points to a live indexer process.
 
@@ -714,8 +724,21 @@ def _file_status_impl() -> dict:
         doc_ids = store.list_doc_ids()
         chunk_count = store.count_chunks()
     except Exception as exc:
-        return _error("retrieval_failed", f"Failed to read index status: {exc}",
-                       "Check that the index exists (run file_index_update).")
+        if not _looks_like_lance_stale_read(exc):
+            return _error("retrieval_failed", f"Failed to read index status: {exc}",
+                           "Check that the index exists (run file_index_update).")
+        logger.warning("Refreshing LanceDB store after stale/corrupt read during status: %s", exc)
+        global _cache, _cache_index_signature, _cache_identity
+        _cache = None
+        _cache_index_signature = None
+        _cache_identity = None
+        try:
+            store, embed_provider, config = _get_deps()
+            doc_ids = store.list_doc_ids()
+            chunk_count = store.count_chunks()
+        except Exception as retry_exc:
+            return _error("retrieval_failed", f"Failed to read index status: {retry_exc}",
+                           "Check that the index exists (run file_index_update).")
 
     import json
     index_root = Path(config["index_root"])

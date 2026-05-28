@@ -1053,6 +1053,50 @@ def test_file_status_health_reranker_disabled():
             mcp_server._cache = old_cache
 
 
+def test_file_status_refreshes_cache_after_lance_manifest_error(tmp_path):
+    """A stale Lance table handle should be reopened once before status fails."""
+    old_cache = mcp_server._cache
+    old_signature = getattr(mcp_server, "_cache_index_signature", None)
+    old_identity = getattr(mcp_server, "_cache_identity", None)
+    try:
+        bad_store = MagicMock()
+        bad_store.list_doc_ids.side_effect = RuntimeError(
+            "Dataset at path data/index/chunks.lance/_versions/1240.manifest was not found"
+        )
+
+        good_store = MagicMock()
+        good_store.list_doc_ids.return_value = ["a.md"]
+        good_store.count_chunks.return_value = 1
+        good_store._metadata_subfields.return_value = {"doc_id"}
+        good_store.fts_available.return_value = True
+
+        config = {
+            "index_root": str(tmp_path),
+            "embeddings": {"provider": "openrouter"},
+            "search": {"reranker": {"enabled": False}},
+        }
+
+        mcp_server._cache = (bad_store, MagicMock(), config)
+        mcp_server._cache_index_signature = None
+        mcp_server._cache_identity = id(mcp_server._cache)
+
+        with patch.object(
+            mcp_server,
+            "_build_store_and_embed",
+            return_value=(good_store, MagicMock(), config),
+        ) as build:
+            result = mcp_server._file_status_impl()
+
+        assert "error" not in result
+        assert result["doc_count"] == 1
+        assert result["chunk_count"] == 1
+        assert build.call_count == 1
+    finally:
+        mcp_server._cache = old_cache
+        mcp_server._cache_index_signature = old_signature
+        mcp_server._cache_identity = old_identity
+
+
 def test_file_status_ignores_zombie_indexer_pid(tmp_path):
     """Zombie indexer PID should be treated as not running and cleaned up."""
     zombie_pid = os.fork()
