@@ -855,6 +855,7 @@ def write_index_metadata_task(
 ) -> None:
     """Write index_metadata.json for file_status (last_run_at, counts, failures, warnings)."""
     import json
+    from collections import Counter
     from datetime import datetime, timezone
     path = Path(index_root) / "index_metadata.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -867,6 +868,10 @@ def write_index_metadata_task(
         meta["failed_count"] = len(failed_docs)
         meta["failed_docs"] = failed_docs[:20]
     if warnings:
+        warning_counts = Counter(w.split(":", 1)[0] for w in warnings)
+        meta["warning_count"] = len(warnings)
+        meta["warning_counts"] = dict(sorted(warning_counts.items()))
+        meta["enrichment_failed_count"] = warning_counts.get("enrichment_failed", 0)
         meta["warnings"] = warnings[:50]
     with open(path, "w") as f:
         json.dump(meta, f, indent=2)
@@ -940,7 +945,7 @@ def _recover_corrupt_table(index_root: str | Path, table_name: str, logger) -> L
 
 
 @flow(name="index_vault_flow")
-def index_vault_flow(config_path: str = "config.yaml") -> None:
+def index_vault_flow(config_path: str = "config.yaml", source_name: str | None = None) -> None:
     """Scan vault, diff with store, process new/updated docs, delete removed, log stats."""
     _RUNTIME.clear()
     import time
@@ -993,6 +998,16 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     sources_cfg = config.get("sources", [])
     if not sources_cfg:
         raise ValueError("No sources configured. Set 'sources:' or legacy 'documents_root:' in config.yaml")
+    if source_name is not None:
+        source_name = str(source_name).strip()
+        source_names = [str(s.get("name") or "").strip() for s in sources_cfg if isinstance(s, dict)]
+        if source_name not in source_names:
+            raise ValueError(f"Unknown source_name {source_name!r}. Valid sources: {source_names}")
+        sources_cfg = [
+            s for s in sources_cfg
+            if isinstance(s, dict) and str(s.get("name") or "").strip() == source_name
+        ]
+        logger.info("Source-scoped indexing enabled: %s", source_name)
 
     pdf_cfg_for_sources = config.get("pdf", {})
     all_sources = [
@@ -1102,7 +1117,12 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     # Wipe the LanceDB table to force full re-index with new persistent IDs.
     if doc_id_store.count() == 0:
         existing_doc_ids = store.list_doc_ids()
-        if existing_doc_ids:
+        if existing_doc_ids and source_name:
+            logger.warning(
+                "Skipping global registry-empty migration during source-scoped index for %s",
+                source_name,
+            )
+        elif existing_doc_ids:
             logger.info(
                 "Migration: registry empty but store has %d docs — wiping table for re-index",
                 len(existing_doc_ids),
@@ -1150,6 +1170,13 @@ def index_vault_flow(config_path: str = "config.yaml") -> None:
     )
 
     stored_mtimes = store.list_doc_mtimes()
+    if source_name:
+        source_prefix = f"{source_name}::"
+        stored_mtimes = {
+            doc_id: mtime
+            for doc_id, mtime in stored_mtimes.items()
+            if str(doc_id).startswith(source_prefix)
+        }
     to_add_or_update, to_delete = diff_index_task(scanned, stored_mtimes)
 
     concurrency = int(enrichment_cfg.get("concurrency", 1) or 1)

@@ -69,6 +69,40 @@ def test_index_update_returns_started(tmp_path, monkeypatch):
     assert result["pid"] == 424242
 
 
+def test_index_update_can_start_source_scoped_run(tmp_path, monkeypatch):
+    """A caller can request one source without launching a full all-source run."""
+    import mcp_server
+
+    monkeypatch.setenv("INDEX_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        mcp_server,
+        "load_config",
+        lambda _path: {
+            "index_root": str(tmp_path),
+            "sources": [
+                {"type": "filesystem", "name": "documents"},
+                {"type": "postgres", "name": "sor"},
+            ],
+        },
+    )
+
+    class DummyProc:
+        pid = 424245
+
+    popen_args = []
+
+    def fake_popen(args, **kwargs):
+        popen_args.append(args)
+        return DummyProc()
+
+    with patch("subprocess.Popen", side_effect=fake_popen):
+        result = mcp_server._file_index_update_impl("config.yaml", source_name="sor")
+
+    assert result["status"] == "started"
+    assert result["source_name"] == "sor"
+    assert "source_name='sor'" in popen_args[0][3]
+
+
 def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
     """If an indexer subprocess is still running, a second call returns
     'already_running' instead of launching a competing process."""

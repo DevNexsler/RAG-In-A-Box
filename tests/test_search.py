@@ -340,6 +340,12 @@ def test_diagnostics_normal_search():
         assert result.diagnostics["keyword_search_active"] is True
         assert result.diagnostics["reranker_applied"] is False  # no reranker configured
         assert result.diagnostics["degraded"] is False
+        timing = result.diagnostics["timing_ms"]
+        for key in ("total", "embed", "vector", "keyword", "fusion", "rerank", "mmr"):
+            assert isinstance(timing[key], (int, float))
+            assert timing[key] >= 0
+        assert result.diagnostics["candidate_counts"]["vector"] == 1
+        assert result.diagnostics["candidate_counts"]["keyword"] == 1
 
 
 def test_diagnostics_keyword_failure():

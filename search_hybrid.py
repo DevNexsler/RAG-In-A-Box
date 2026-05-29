@@ -601,14 +601,41 @@ def hybrid_search(
 
     Returns a SearchResult (list-compatible) with a diagnostics dict.
     """
+    search_started = time.perf_counter()
+    timing_ms = {
+        "total": 0.0,
+        "embed": 0.0,
+        "vector": 0.0,
+        "keyword": 0.0,
+        "fusion": 0.0,
+        "rerank": 0.0,
+        "mmr": 0.0,
+    }
+    candidate_counts = {
+        "vector": 0,
+        "keyword": 0,
+        "fused": 0,
+        "returned": 0,
+    }
     if not query.strip():
-        return SearchResult(hits=[])
+        timing_ms["total"] = round((time.perf_counter() - search_started) * 1000, 3)
+        diagnostics = {
+            "vector_search_active": True,
+            "keyword_search_active": True,
+            "reranker_applied": False,
+            "degraded": False,
+            "timing_ms": timing_ms,
+            "candidate_counts": candidate_counts,
+        }
+        return SearchResult(hits=[], diagnostics=diagnostics)
 
     diagnostics = {
         "vector_search_active": True,
         "keyword_search_active": True,
         "reranker_applied": False,
         "degraded": False,
+        "timing_ms": timing_ms,
+        "candidate_counts": candidate_counts,
     }
 
     # 0. Build WHERE clause for pre-filtering (applied inside LanceDB before scoring)
@@ -626,21 +653,35 @@ def hybrid_search(
     )
 
     # 1. Embed query
+    stage_started = time.perf_counter()
     query_vector = embed_provider.embed_query(query)
+    timing_ms["embed"] = round((time.perf_counter() - stage_started) * 1000, 3)
 
     # 2. Parallel retrieval: vector (semantic) + keyword (BM25/FTS)
+    def _timed_vector_search():
+        started = time.perf_counter()
+        return store.vector_search(query_vector, vector_top_k, where), round(
+            (time.perf_counter() - started) * 1000, 3
+        )
+
+    def _timed_keyword_search():
+        started = time.perf_counter()
+        return store.keyword_search(query, keyword_top_k, where), round(
+            (time.perf_counter() - started) * 1000, 3
+        )
+
     with ThreadPoolExecutor(max_workers=2) as executor:
-        vec_future = executor.submit(store.vector_search, query_vector, vector_top_k, where)
-        kw_future = executor.submit(store.keyword_search, query, keyword_top_k, where)
+        vec_future = executor.submit(_timed_vector_search)
+        kw_future = executor.submit(_timed_keyword_search)
         vector_error = None
         keyword_error = None
         try:
-            vector_hits = vec_future.result()
+            vector_hits, timing_ms["vector"] = vec_future.result()
         except Exception as e:
             vector_hits = []
             vector_error = e
         try:
-            keyword_hits = kw_future.result()
+            keyword_hits, timing_ms["keyword"] = kw_future.result()
         except Exception as e:
             keyword_hits = []
             keyword_error = e
@@ -650,13 +691,16 @@ def hybrid_search(
     # declaring a degraded search path.
     if vector_error is not None:
         try:
+            stage_started = time.perf_counter()
             vector_hits = store.vector_search(query_vector, vector_top_k, where)
+            timing_ms["vector"] += round((time.perf_counter() - stage_started) * 1000, 3)
             logger.info("Vector search recovered on retry after transient failure: %s", vector_error)
         except Exception as retry_error:
             logger.warning("Vector search failed (degraded to keyword-only): %s", retry_error)
             diagnostics["vector_search_active"] = False
 
     if keyword_error is not None:
+        stage_started = time.perf_counter()
         keyword_hits, retry_error = _retry_keyword_search(
             store,
             query,
@@ -664,11 +708,15 @@ def hybrid_search(
             where,
             keyword_error,
         )
+        timing_ms["keyword"] += round((time.perf_counter() - stage_started) * 1000, 3)
         if retry_error is None:
             logger.info("Keyword/FTS search recovered on retry after transient failure: %s", keyword_error)
         else:
             logger.warning("Keyword/FTS search failed (degraded to vector-only): %s", retry_error)
             diagnostics["keyword_search_active"] = False
+
+    candidate_counts["vector"] = len(vector_hits)
+    candidate_counts["keyword"] = len(keyword_hits)
 
     logger.info(
         "Retrieval: %d vector hits, %d keyword hits (fts_ok=%s, where=%s)",
@@ -679,6 +727,7 @@ def hybrid_search(
     )
 
     # 3. Reciprocal Rank Fusion
+    stage_started = time.perf_counter()
     fused = reciprocal_rank_fusion([vector_hits, keyword_hits], k=rrf_k)
 
     # 4. Length normalization (prevents long keyword-rich chunks from dominating)
@@ -690,23 +739,31 @@ def hybrid_search(
     # 6. Optional recency boost + time decay (applied after fusion so boost is uniform)
     if prefer_recent:
         fused = _apply_recency_boost(fused, recency_half_life_days, recency_weight)
+    timing_ms["fusion"] = round((time.perf_counter() - stage_started) * 1000, 3)
+    candidate_counts["fused"] = len(fused)
 
     # 7. Optional cross-encoder re-rank (on top N candidates for efficiency)
     #    On failure: cosine similarity fallback instead of giving up entirely.
     if reranker is not None:
         rerank_pool = fused[: final_top_k * 6]
         try:
+            stage_started = time.perf_counter()
             fused = reranker.rerank(query, rerank_pool)
+            timing_ms["rerank"] = round((time.perf_counter() - stage_started) * 1000, 3)
             diagnostics["reranker_applied"] = True
         except Exception as e:
             logger.warning("Reranker failed, falling back to cosine rerank: %s", e)
+            stage_started = time.perf_counter()
             fused = _cosine_fallback_rerank(query_vector, rerank_pool, store)
+            timing_ms["rerank"] = round((time.perf_counter() - stage_started) * 1000, 3)
 
     # 8. MMR diversity (remove near-duplicate chunks)
+    stage_started = time.perf_counter()
     fused = _apply_mmr_diversity(fused, store)
 
     # 9. Minimum score threshold (discard noise)
     fused = _apply_min_score_threshold(fused, threshold=min_score_threshold)
+    timing_ms["mmr"] = round((time.perf_counter() - stage_started) * 1000, 3)
 
     # 10. Compute degraded flag
     diagnostics["degraded"] = (
@@ -716,4 +773,7 @@ def hybrid_search(
     )
 
     # 11. Final top_k
-    return SearchResult(hits=fused[:final_top_k], diagnostics=diagnostics)
+    hits = fused[:final_top_k]
+    candidate_counts["returned"] = len(hits)
+    timing_ms["total"] = round((time.perf_counter() - search_started) * 1000, 3)
+    return SearchResult(hits=hits, diagnostics=diagnostics)

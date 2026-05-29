@@ -14,6 +14,7 @@ from flow_index_vault import (
     _build_chunk_context,
     _split_section,
     _RUNTIME,
+    write_index_metadata_task,
 )
 
 
@@ -787,6 +788,178 @@ def test_index_flow_syncs_folder_taxonomy_from_sources(tmp_path):
     sync_mock.assert_called_once()
 
 
+def test_index_flow_source_scope_deletes_only_selected_source(tmp_path):
+    """Source-scoped indexing must not delete rows from unscanned sources."""
+    from sources.base import SourceRecord
+    from flow_index_vault import index_vault_flow
+
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = []
+    fake_store.list_doc_mtimes.return_value = {
+        "documents::old-doc": 1.0,
+        "sor::old-task": 1.0,
+    }
+    fake_store.count_chunks.return_value = 0
+    fake_store.fts_available.return_value = True
+
+    fake_registry = MagicMock()
+    fake_registry.count.return_value = 1
+
+    fake_taxonomy = MagicMock()
+    fake_taxonomy.count.return_value = 0
+
+    class _FakeSource:
+        def __init__(self, name, records):
+            self.name = name
+            self.records = records
+            self.scanned = False
+
+        def scan(self):
+            self.scanned = True
+            return iter(self.records)
+
+        def set_ocr_provider(self, provider):
+            return None
+
+        def set_media_provider(self, provider):
+            return None
+
+    documents_source = _FakeSource(
+        "documents",
+        [
+            SourceRecord(
+                doc_id="new-doc",
+                natural_key="new-doc.md",
+                source_type="md",
+                mtime=2.0,
+                size=7,
+                metadata={"abs_path": str(tmp_path / "new-doc.md"), "ext": "md"},
+            )
+        ],
+    )
+    sor_source = _FakeSource(
+        "sor",
+        [
+            SourceRecord(
+                doc_id="new-task",
+                natural_key="task/1",
+                source_type="task",
+                mtime=2.0,
+                size=7,
+                metadata={"abs_path": "task/1", "ext": "task"},
+            )
+        ],
+    )
+
+    def build_fake_source(source_cfg, registry, pdf_config):
+        return {"documents": documents_source, "sor": sor_source}[source_cfg["name"]]
+
+    config = {
+        "index_root": str(tmp_path / "index"),
+        "sources": [
+            {"type": "filesystem", "name": "documents", "root": str(tmp_path)},
+            {"type": "postgres", "name": "sor"},
+        ],
+        "chunking": {"max_chars": 1800, "overlap": 200, "semantic": {"enabled": False}},
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "media": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+
+    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+        with patch("flow_index_vault.load_config", return_value=config):
+            with patch("flow_index_vault.open_store_with_recovery", return_value=fake_store):
+                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                            with patch("flow_index_vault.build_media_provider", return_value=None):
+                                with patch("sources.build_source", side_effect=build_fake_source):
+                                    with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                        with patch("core.taxonomy.sync_folder_taxonomy_from_sources", return_value={
+                                            "sources": 1,
+                                            "discovered": 0,
+                                            "added": 0,
+                                            "existing": 0,
+                                        }):
+                                            with patch("flow_index_vault._process_docs", return_value=[]):
+                                                with patch("flow_index_vault.delete_docs_task") as delete_mock:
+                                                    with patch("flow_index_vault.index_stats_task"):
+                                                        with patch("flow_index_vault.write_index_metadata_task"):
+                                                            index_vault_flow.fn("dummy.yaml", source_name="sor")
+
+    assert documents_source.scanned is False
+    assert sor_source.scanned is True
+    delete_mock.assert_called_once_with(["sor::old-task"])
+
+
+def test_index_flow_source_scope_skips_global_empty_registry_migration(tmp_path):
+    """A source-scoped run must never wipe the whole table for registry migration."""
+    from flow_index_vault import index_vault_flow
+
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = ["documents::old-doc"]
+    fake_store.list_doc_mtimes.return_value = {}
+    fake_store.count_chunks.return_value = 0
+    fake_store.fts_available.return_value = True
+
+    fake_registry = MagicMock()
+    fake_registry.count.return_value = 0
+
+    fake_taxonomy = MagicMock()
+    fake_taxonomy.count.return_value = 0
+
+    class _FakeSource:
+        name = "sor"
+
+        def scan(self):
+            return iter([])
+
+        def set_ocr_provider(self, provider):
+            return None
+
+        def set_media_provider(self, provider):
+            return None
+
+    config = {
+        "index_root": str(tmp_path / "index"),
+        "sources": [{"type": "postgres", "name": "sor"}],
+        "chunking": {"max_chars": 1800, "overlap": 200, "semantic": {"enabled": False}},
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "media": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+
+    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+        with patch("flow_index_vault.load_config", return_value=config):
+            with patch("flow_index_vault.open_store_with_recovery", return_value=fake_store):
+                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                            with patch("flow_index_vault.build_media_provider", return_value=None):
+                                with patch("sources.build_source", return_value=_FakeSource()):
+                                    with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                        with patch("core.taxonomy.sync_folder_taxonomy_from_sources", return_value={
+                                            "sources": 1,
+                                            "discovered": 0,
+                                            "added": 0,
+                                            "existing": 0,
+                                        }):
+                                            with patch("flow_index_vault._process_docs", return_value=[]):
+                                                with patch("flow_index_vault.delete_docs_task"):
+                                                    with patch("flow_index_vault.index_stats_task"):
+                                                        with patch("flow_index_vault.write_index_metadata_task"):
+                                                            with patch("lancedb.connect") as connect_mock:
+                                                                index_vault_flow.fn("dummy.yaml", source_name="sor")
+
+    connect_mock.assert_not_called()
+
+
 def test_index_flow_injects_media_provider_into_sources(tmp_path):
     """Index flow should inject optional media provider into filesystem sources."""
     from flow_index_vault import index_vault_flow
@@ -863,3 +1036,29 @@ def test_zip_strict_catches_length_mismatch():
     """
     with pytest.raises(ValueError):
         list(zip([1, 2, 3], [4, 5], strict=True))
+
+
+def test_write_index_metadata_counts_warnings_separately(tmp_path):
+    """Warning counts must not masquerade as document processing failures."""
+    write_index_metadata_task.fn(
+        tmp_path,
+        doc_count=2,
+        chunk_count=3,
+        failed_docs=["broken.pdf"],
+        warnings=[
+            "enrichment_failed:sor::1:402 Payment Required",
+            "enrichment_failed:sor::2:402 Payment Required",
+            "fts_rebuild_failed:timeout",
+        ],
+    )
+
+    import json
+
+    meta = json.loads((tmp_path / "index_metadata.json").read_text())
+    assert meta["failed_count"] == 1
+    assert meta["warning_count"] == 3
+    assert meta["warning_counts"] == {
+        "enrichment_failed": 2,
+        "fts_rebuild_failed": 1,
+    }
+    assert meta["enrichment_failed_count"] == 2

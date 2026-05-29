@@ -751,6 +751,12 @@ def test_file_status_includes_health():
             "chunk_count": 50,
             "failed_count": 1,
             "failed_docs": ["broken.pdf"],
+            "warning_count": 3,
+            "warning_counts": {
+                "enrichment_failed": 2,
+                "fts_rebuild_failed": 1,
+            },
+            "enrichment_failed_count": 2,
         }
         meta_path = Path(tmpdir) / "index_metadata.json"
         with open(meta_path, "w") as f:
@@ -788,6 +794,12 @@ def test_file_status_includes_health():
             assert health["reranker_enabled"] is True
             assert health["reranker_responsive"] is True
             assert health["last_index_failed_count"] == 1
+            assert health["last_index_warning_count"] == 3
+            assert health["last_index_warning_counts"] == {
+                "enrichment_failed": 2,
+                "fts_rebuild_failed": 1,
+            }
+            assert health["last_enrichment_failed_count"] == 2
         finally:
             mcp_server._cache = old_cache
 

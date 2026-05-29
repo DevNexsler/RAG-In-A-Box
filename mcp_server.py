@@ -1073,6 +1073,9 @@ def _file_status_impl() -> dict:
     meta_path = index_root / "index_metadata.json"
     last_run_at = None
     last_index_failed_count = 0
+    last_index_warning_count = 0
+    last_index_warning_counts: dict[str, int] = {}
+    last_enrichment_failed_count = 0
     last_index_warnings: list[str] = []
     if meta_path.exists():
         try:
@@ -1080,6 +1083,9 @@ def _file_status_impl() -> dict:
                 meta = json.load(f)
                 last_run_at = meta.get("last_run_at")
                 last_index_failed_count = meta.get("failed_count", 0)
+                last_index_warning_count = meta.get("warning_count", 0)
+                last_index_warning_counts = meta.get("warning_counts", {})
+                last_enrichment_failed_count = meta.get("enrichment_failed_count", 0)
                 last_index_warnings = meta.get("warnings", [])
         except Exception as exc:
             logger.warning("Failed to read index_metadata.json: %s", exc)
@@ -1138,6 +1144,9 @@ def _file_status_impl() -> dict:
             "reranker_enabled": reranker_enabled,
             "reranker_responsive": reranker_responsive,
             "last_index_failed_count": last_index_failed_count,
+            "last_index_warning_count": last_index_warning_count,
+            "last_index_warning_counts": last_index_warning_counts,
+            "last_enrichment_failed_count": last_enrichment_failed_count,
             "last_index_warnings": last_index_warnings,
             "deep_check": deep_health,
         },
@@ -1238,7 +1247,7 @@ def _file_folders_impl() -> dict:
     }
 
 
-def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
+def _file_index_update_impl(config_path: str = "config.yaml", source_name: str | None = None) -> dict:
     """Start the indexer in a background subprocess.
 
     Returns immediately with status="started" so the MCP server stays
@@ -1249,6 +1258,15 @@ def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
     import sys
 
     config = load_config(config_path)
+    if source_name is not None:
+        source_name = str(source_name).strip()
+        valid_sources = _configured_source_names(config)
+        if not source_name or source_name not in valid_sources:
+            return _error(
+                "invalid_source_name",
+                f"Unknown source_name: {source_name!r}",
+                f"Use one of: {', '.join(valid_sources) if valid_sources else '(none configured)'}",
+            )
     index_root = Path(config["index_root"])
     pid_file = index_root / "indexer.pid"
 
@@ -1259,6 +1277,7 @@ def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
         return {
             "status": "already_running",
             "pid": old_pid,
+            "source_name": source_name,
             "message": "An indexer is already running. Use file_status to check progress.",
         }
 
@@ -1282,7 +1301,7 @@ def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
         "pid_file.write_text(str(os.getpid()))\n"
         "try:\n"
         "    from flow_index_vault import index_vault_flow\n"
-        f"    index_vault_flow({config_path!r})\n"
+        f"    index_vault_flow({config_path!r}, source_name={source_name!r})\n"
         "finally:\n"
         "    pid_file.unlink(missing_ok=True)\n"
     )
@@ -1305,6 +1324,7 @@ def _file_index_update_impl(config_path: str = "config.yaml") -> dict:
     return {
         "status": "started",
         "pid": proc.pid,
+        "source_name": source_name,
         "message": "Indexing started in background. Use file_status to check progress.",
     }
 
@@ -1934,18 +1954,19 @@ if HAS_MCP and FastMCP is not None:
         return _file_taxonomy_import_impl()
 
     @mcp.tool()
-    def file_index_update() -> dict:
+    def file_index_update(source_name: str | None = None) -> dict:
         """Incrementally update the index based on file changes.
 
-        Scans the documents directory, diffs against the current index, and only processes
-        new, modified, or deleted files. Does NOT rebuild from scratch — existing
-        unchanged documents keep their current index entries.
+        Scans configured sources, diffs against the current index, and only
+        processes new, modified, or deleted records. Does NOT rebuild from
+        scratch — existing unchanged documents keep their current index entries.
 
-        WARNING: This is a blocking operation that may take several minutes for
-        large document sets with many changes.
+        Args:
+            source_name: Optional configured source to index, e.g. "sor". When set,
+                deletes are scoped to that source so unscanned sources are preserved.
 
-        Takes no arguments. Pipeline steps:
-            1. Scans the documents directory for all supported files.
+        Pipeline steps:
+            1. Scans all configured sources, or the selected source only.
             2. Diffs against the current index (by file modification time) to find
                new, modified, and deleted files.
             3. Extracts text from new/modified files only (Markdown, PDF, images, documents, spreadsheets, plain text).
@@ -1955,16 +1976,14 @@ if HAS_MCP and FastMCP is not None:
             7. Rebuilds the keyword search (FTS) index if any changes occurred.
 
         Returns a dict with:
-            - status: "completed" on success.
-            - elapsed_seconds: Time taken (float).
-            - doc_count: Total documents after updating.
-            - chunk_count: Total chunks after updating.
-            - last_run_at: ISO 8601 timestamp of this run.
+            - status: "started" if a background indexer was launched.
+            - pid: subprocess PID.
+            - source_name: selected source, or null for all sources.
 
         On error, returns {"error": true, "code": "index_failed", "message": "...",
         "fix": "..."} with guidance (e.g., check configured services are running, verify config paths).
         """
-        return _file_index_update_impl()
+        return _file_index_update_impl(source_name=source_name)
 
     def run_server(transport: str = "stdio", host: str = "127.0.0.1", port: int = 7788):
         """Run the MCP server.
