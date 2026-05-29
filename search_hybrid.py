@@ -626,19 +626,33 @@ def hybrid_search(
     )
 
     # 1. Embed query
-    query_vector = embed_provider.embed_query(query)
+    query_vector: list[float] | None = None
+    query_embed_error: Exception | None = None
+    try:
+        query_vector = embed_provider.embed_query(query)
+    except Exception as e:
+        query_embed_error = e
+        diagnostics["vector_search_active"] = False
+        logger.warning("Query embedding failed (degraded to keyword-only): %s", e)
 
     # 2. Parallel retrieval: vector (semantic) + keyword (BM25/FTS)
+    vector_hits = []
+    keyword_hits = []
+    vector_error = query_embed_error
+    keyword_error = None
     with ThreadPoolExecutor(max_workers=2) as executor:
-        vec_future = executor.submit(store.vector_search, query_vector, vector_top_k, where)
+        vec_future = (
+            executor.submit(store.vector_search, query_vector, vector_top_k, where)
+            if query_vector is not None
+            else None
+        )
         kw_future = executor.submit(store.keyword_search, query, keyword_top_k, where)
-        vector_error = None
-        keyword_error = None
-        try:
-            vector_hits = vec_future.result()
-        except Exception as e:
-            vector_hits = []
-            vector_error = e
+        if vec_future is not None:
+            try:
+                vector_hits = vec_future.result()
+            except Exception as e:
+                vector_hits = []
+                vector_error = e
         try:
             keyword_hits = kw_future.result()
         except Exception as e:
@@ -648,7 +662,7 @@ def hybrid_search(
     # LanceDB can intermittently fail one side of concurrent retrieval even
     # though the underlying index is healthy. Retry once serially before
     # declaring a degraded search path.
-    if vector_error is not None:
+    if vector_error is not None and query_vector is not None:
         try:
             vector_hits = store.vector_search(query_vector, vector_top_k, where)
             logger.info("Vector search recovered on retry after transient failure: %s", vector_error)
@@ -669,6 +683,9 @@ def hybrid_search(
         else:
             logger.warning("Keyword/FTS search failed (degraded to vector-only): %s", retry_error)
             diagnostics["keyword_search_active"] = False
+
+    if query_embed_error is not None and not diagnostics["keyword_search_active"]:
+        raise query_embed_error
 
     logger.info(
         "Retrieval: %d vector hits, %d keyword hits (fts_ok=%s, where=%s)",
@@ -699,8 +716,11 @@ def hybrid_search(
             fused = reranker.rerank(query, rerank_pool)
             diagnostics["reranker_applied"] = True
         except Exception as e:
-            logger.warning("Reranker failed, falling back to cosine rerank: %s", e)
-            fused = _cosine_fallback_rerank(query_vector, rerank_pool, store)
+            if query_vector is None:
+                logger.warning("Reranker failed after query embedding failure; keeping fused order: %s", e)
+            else:
+                logger.warning("Reranker failed, falling back to cosine rerank: %s", e)
+                fused = _cosine_fallback_rerank(query_vector, rerank_pool, store)
 
     # 8. MMR diversity (remove near-duplicate chunks)
     fused = _apply_mmr_diversity(fused, store)

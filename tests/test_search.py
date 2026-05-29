@@ -34,6 +34,13 @@ class MockEmbedProvider:
         return self._vector
 
 
+class FailingQueryEmbedProvider(MockEmbedProvider):
+    """Raises on embed_query to simulate exhausted/failed remote embeddings."""
+
+    def embed_query(self, query: str) -> list[float]:
+        raise TimeoutError("Embedding provider unavailable")
+
+
 def _make_node(doc_id, loc, text, vector, source_type="md", **extra_meta):
     meta = {
         "doc_id": doc_id,
@@ -744,4 +751,20 @@ def test_diagnostics_vector_search_failure():
         assert result.diagnostics["keyword_search_active"] is True
         assert result.diagnostics["degraded"] is True
         # Should still return keyword-only results
+        assert len(result) >= 1
+
+
+def test_diagnostics_query_embedding_failure_degrades_to_keyword_only():
+    """Query embedding failure should still allow keyword-only search on pre-indexed docs."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [1.0] + [0.0] * 767
+        nodes = [_make_node("a.md", "c:0", "roof insurance claim damage", vec)]
+        store = _build_store_with_fts(tmpdir, nodes)
+        embed = FailingQueryEmbedProvider(vec)
+
+        result = hybrid_search(store, embed, "roof claim", vector_top_k=10, final_top_k=5)
+        assert isinstance(result, SearchResult)
+        assert result.diagnostics["vector_search_active"] is False
+        assert result.diagnostics["keyword_search_active"] is True
+        assert result.diagnostics["degraded"] is True
         assert len(result) >= 1

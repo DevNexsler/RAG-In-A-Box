@@ -257,13 +257,8 @@ async def test_upload_index_search_download_lifecycle(e2e_system):
 async def test_search_remains_functional_when_embed_provider_fails(e2e_system):
     """E2E: Pre-indexed docs searchable via keyword fallback when embed provider is down.
 
-    Note: hybrid_search calls embed_query() before submitting to ThreadPoolExecutor.
-    If embed_query() raises, the error propagates directly (not caught by the
-    vector search future). The keyword-only fallback only works when the vector
-    search future itself fails (i.e., when the error happens inside the thread).
-
-    This test verifies that even with a failing embed provider, the FTS index
-    is still independently functional for keyword search.
+    hybrid_search should degrade to keyword-only search when query embedding
+    fails, as long as the FTS index is healthy and docs were pre-indexed.
     """
     system = e2e_system
     store = system["store"]
