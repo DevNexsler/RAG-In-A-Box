@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -39,6 +41,21 @@ def _sql_escape(value: str) -> str:
     return value.replace("'", "''")
 
 
+def _looks_like_lancedb_corruption(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "invalid range",
+            "generic memory error",
+            "lanceerror",
+            "corrupt",
+            "manifest was not found",
+            "object of size 0",
+        )
+    )
+
+
 class TaxonomyStore:
     """CRUD store for taxonomy entries backed by a LanceDB table."""
 
@@ -60,8 +77,32 @@ class TaxonomyStore:
         except Exception:
             tables = []
         if self.table_name in tables:
-            return self._db.open_table(self.table_name)
+            try:
+                return self._db.open_table(self.table_name)
+            except Exception as exc:
+                if not _looks_like_lancedb_corruption(exc):
+                    raise
+                self._quarantine_table(exc)
+                return None
         return None  # created lazily on first add
+
+    def _quarantine_table(self, exc: Exception) -> None:
+        table_path = Path(self.index_root) / f"{self.table_name}.lance"
+        if not table_path.exists():
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = table_path.with_name(f"{table_path.name}.corrupt-{stamp}")
+        suffix = 1
+        while backup.exists():
+            backup = table_path.with_name(f"{table_path.name}.corrupt-{stamp}-{suffix}")
+            suffix += 1
+        logger.warning(
+            "Taxonomy table '%s' is corrupt, moving aside to %s: %s",
+            self.table_name,
+            backup,
+            exc,
+        )
+        shutil.move(str(table_path), str(backup))
 
     def _ensure_table(self) -> None:
         """Re-check disk and open the table if it exists but _table is None.
@@ -75,8 +116,11 @@ class TaxonomyStore:
         try:
             self._table = self._db.open_table(self.table_name)
             logger.info("Taxonomy table '%s' found on disk (was not open)", self.table_name)
-        except Exception:
-            pass  # table truly doesn't exist
+        except Exception as exc:
+            if _looks_like_lancedb_corruption(exc):
+                self._quarantine_table(exc)
+            # Table truly does not exist, or was just quarantined.
+            pass
 
     def _create_table(self, data: list[dict]) -> None:
         # Guard: table may exist on disk even though _table is None

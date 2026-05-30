@@ -4,7 +4,9 @@ Single service: both querying and indexing via MCP tools. Same config as indexer
 
 import logging
 import os
+import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from core.config import load_config
@@ -33,6 +35,9 @@ _MAX_TOP_K = 100
 _MAX_LIMIT = 200
 _DEFAULT_CONTENT_MAX_CHARACTER = 10_000
 _VALID_SEARCH_RETURN_MODES = {"compact", "full"}
+_PROVIDER_FAILURE_LOOKBACK_SECONDS = 24 * 60 * 60
+_PROVIDER_FAILURE_LOG_NAMES = ("indexer.log", "indexer.log.prev")
+_PROVIDER_FAILURE_MAX_BYTES = 128 * 1024 * 1024
 _COMPACT_EXCLUDED_METADATA_KEYS = {
     "_node_content",
     "_node_type",
@@ -370,8 +375,6 @@ def _get_deps(config_path: str = "config.yaml"):
 
 
 def _utc_iso(ts: float) -> str:
-    from datetime import datetime, timezone
-
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
@@ -394,6 +397,12 @@ def _source_name_from_doc_id(doc_id: str) -> str:
     return doc_id.split("::", 1)[0] or "documents"
 
 
+def _canonical_registry_doc_id(source_name: str, doc_id: str) -> str:
+    if "::" in doc_id:
+        return doc_id
+    return f"{source_name or 'documents'}::{doc_id}"
+
+
 def _count_doc_ids_by_source(doc_ids: list[str]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for doc_id in doc_ids:
@@ -413,17 +422,38 @@ def _registry_source_stats(index_root: Path) -> tuple[dict[str, dict], str | Non
     try:
         with registry._lock:
             cur = registry._conn.execute(
-                "SELECT COALESCE(NULLIF(source_name, ''), 'documents'), COUNT(*), "
-                "MAX(COALESCE(last_seen_at, first_seen_at, created)) "
-                "FROM doc_registry GROUP BY COALESCE(NULLIF(source_name, ''), 'documents')"
+                "SELECT COALESCE(NULLIF(source_name, ''), 'documents'), doc_id, "
+                "COALESCE(last_seen_at, first_seen_at, created) FROM doc_registry"
             )
-            return {
-                str(row[0]): {
-                    "doc_count": int(row[1]),
-                    "latest_seen_at": float(row[2]) if row[2] is not None else None,
-                }
-                for row in cur.fetchall()
-            }, None
+            rows = cur.fetchall()
+
+        stats: dict[str, dict] = {}
+        for source_name, doc_id, seen_at in rows:
+            source = str(source_name or "documents")
+            entry = stats.setdefault(
+                source,
+                {
+                    "doc_ids": set(),
+                    "raw_doc_count": 0,
+                    "latest_seen_at": None,
+                },
+            )
+            entry["raw_doc_count"] += 1
+            entry["doc_ids"].add(_canonical_registry_doc_id(source, str(doc_id)))
+            if seen_at is not None:
+                seen = float(seen_at)
+                latest = entry["latest_seen_at"]
+                entry["latest_seen_at"] = seen if latest is None else max(latest, seen)
+
+        return {
+            source: {
+                "doc_count": len(entry["doc_ids"]),
+                "raw_doc_count": entry["raw_doc_count"],
+                "duplicate_doc_count": entry["raw_doc_count"] - len(entry["doc_ids"]),
+                "latest_seen_at": entry["latest_seen_at"],
+            }
+            for source, entry in stats.items()
+        }, None
     except Exception as exc:
         return {}, str(exc)
     finally:
@@ -437,12 +467,21 @@ def _source_health_status(
     index_doc_count: int,
     indexer_running: bool,
     last_run_at: str | None,
+    not_extractable_doc_count: int = 0,
 ) -> tuple[str, str]:
+    covered_doc_count = index_doc_count + max(0, not_extractable_doc_count)
+    missing_doc_count = max(0, registry_doc_count - covered_doc_count)
+    if registry_doc_count > 0 and missing_doc_count == 0:
+        if index_doc_count > 0 and not_extractable_doc_count > 0:
+            return "ok", "indexed_or_not_extractable"
+        if not_extractable_doc_count > 0:
+            return "ok", "not_extractable"
+        return "ok", "indexed"
     if registry_doc_count > 0 and index_doc_count == 0:
         if indexer_running:
             return "indexing", "registry_has_docs_but_index_has_none"
         return "critical", "registry_has_docs_but_index_has_none"
-    if registry_doc_count > 0 and index_doc_count < registry_doc_count:
+    if registry_doc_count > 0 and missing_doc_count > 0:
         if indexer_running:
             return "indexing", "index_missing_some_registry_docs"
         return "degraded", "index_missing_some_registry_docs"
@@ -463,11 +502,13 @@ def _overall_deep_health(
     fts_available: bool,
     indexer_running: bool,
     registry_error: str | None,
+    provider_status: str = "ok",
 ) -> str:
     if registry_error:
         return "degraded"
     rank = {"ok": 0, "unknown": 1, "missing": 2, "indexing": 2, "degraded": 3, "critical": 4}
     worst = max((rank.get(status, 1) for status in source_statuses), default=0)
+    worst = max(worst, rank.get(provider_status, 1))
     if not fts_available:
         worst = max(worst, rank["indexing" if indexer_running else "degraded"])
     if worst >= rank["critical"]:
@@ -512,6 +553,195 @@ def _index_source_freshness(store: LanceDBStore) -> tuple[dict[str, float], str 
     return latest_by_source, None
 
 
+_NO_TEXT_RE = re.compile(r"No text extracted:\s+([A-Za-z0-9_]+::[^\s\],]+)")
+_LOG_TIMESTAMP_RE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)?")
+_HTTP_STATUS_RES = (
+    re.compile(r"HTTP/1\.1\s+([1-5]\d\d)"),
+    re.compile(r"\berror:\s*([1-5]\d\d)\b", re.IGNORECASE),
+    re.compile(r"Client error '([1-5]\d\d)\b", re.IGNORECASE),
+    re.compile(r'"code"\s*:\s*([1-5]\d\d)'),
+)
+
+
+def _empty_provider_failures() -> dict:
+    return {
+        "status": "ok",
+        "lookback_seconds": _PROVIDER_FAILURE_LOOKBACK_SECONDS,
+        "total_count": 0,
+        "last_seen_at": None,
+        "by_key": {},
+    }
+
+
+def _parse_log_timestamp(line: str) -> float | None:
+    match = _LOG_TIMESTAMP_RE.match(line)
+    if not match:
+        return None
+    try:
+        parsed = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc).timestamp()
+
+
+def _http_status_from_log_line(line: str) -> int | None:
+    for pattern in _HTTP_STATUS_RES:
+        match = pattern.search(line)
+        if not match:
+            continue
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _read_recent_log_text(path: Path) -> str:
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        if size > _PROVIDER_FAILURE_MAX_BYTES:
+            f.seek(-_PROVIDER_FAILURE_MAX_BYTES, os.SEEK_END)
+            f.readline()
+        return f.read().decode("utf-8", errors="replace")
+
+
+def _not_extractable_doc_counts(index_root: Path) -> tuple[dict[str, int], str | None]:
+    """Count docs that were processed but intentionally produced no chunks."""
+    doc_ids_by_source: dict[str, set[str]] = {}
+    try:
+        for log_name in _PROVIDER_FAILURE_LOG_NAMES:
+            path = index_root / log_name
+            if not path.exists():
+                continue
+            for match in _NO_TEXT_RE.finditer(_read_recent_log_text(path)):
+                doc_id = match.group(1)
+                source_name = _source_name_from_doc_id(doc_id)
+                doc_ids_by_source.setdefault(source_name, set()).add(doc_id)
+    except Exception as exc:
+        return {}, str(exc)
+    return {source: len(doc_ids) for source, doc_ids in doc_ids_by_source.items()}, None
+
+
+def _provider_failure_kind(line: str) -> tuple[str, str, str] | None:
+    lower = line.lower()
+    status_code = _http_status_from_log_line(line)
+    failure_marker = (
+        status_code is not None and status_code >= 400
+    ) or any(
+        marker in lower
+        for marker in (
+            "error",
+            "failed",
+            "forbidden",
+            "timeout",
+            "timed out",
+            "limit exceeded",
+            "rate limit",
+            "httpstatuserror",
+        )
+    )
+    if not failure_marker:
+        return None
+
+    if "openrouter" in lower:
+        if "embedding" in lower or "/embeddings" in lower or "openrouter_embed" in lower:
+            return "openrouter_embeddings", "openrouter", "embeddings"
+        if (
+            "chat/completions" in lower
+            or "openrouter_llm" in lower
+            or "doc_enrichment" in lower
+            or "enrichment failed" in lower
+        ):
+            return "openrouter_chat", "openrouter", "chat"
+    if "deepinfra" in lower or "reranker" in lower:
+        return "deepinfra_reranker", "deepinfra", "reranker"
+    return None
+
+
+def _provider_failure_severity(operation: str, http_status: int | None) -> str:
+    if http_status in {401, 403}:
+        return "critical"
+    if operation == "embeddings":
+        return "critical"
+    return "degraded"
+
+
+def _recent_provider_failures(
+    index_root: Path,
+    *,
+    now: float | None = None,
+    lookback_seconds: int = _PROVIDER_FAILURE_LOOKBACK_SECONDS,
+) -> dict:
+    now = time.time() if now is None else now
+    cutoff = now - lookback_seconds
+    by_key: dict[str, dict] = {}
+    last_seen_by_key: dict[str, float] = {}
+    last_seen_at: float | None = None
+    rank = {"ok": 0, "degraded": 1, "critical": 2}
+    overall_status = "ok"
+
+    for log_name in _PROVIDER_FAILURE_LOG_NAMES:
+        path = index_root / log_name
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_mtime < cutoff:
+            continue
+        try:
+            lines = _read_recent_log_text(path).splitlines()
+        except OSError as exc:
+            logger.warning("Failed to read provider health log %s: %s", path, exc)
+            continue
+
+        for line in lines:
+            event_ts = _parse_log_timestamp(line)
+            if event_ts is None:
+                continue
+            if event_ts < cutoff:
+                continue
+            kind = _provider_failure_kind(line)
+            if not kind:
+                continue
+            key, provider, operation = kind
+            http_status = _http_status_from_log_line(line)
+            severity = _provider_failure_severity(operation, http_status)
+            overall_status = max(overall_status, severity, key=lambda value: rank.get(value, 0))
+            last_seen_at = max(last_seen_at or event_ts, event_ts)
+
+            existing = by_key.get(key)
+            if existing is None:
+                last_seen_by_key[key] = event_ts
+                by_key[key] = {
+                    "provider": provider,
+                    "operation": operation,
+                    "severity": severity,
+                    "count": 1,
+                    "http_status": http_status,
+                    "last_seen_at": _utc_iso(event_ts),
+                    "sample": line[:500],
+                }
+                continue
+
+            existing["count"] += 1
+            if rank.get(severity, 0) > rank.get(str(existing.get("severity")), 0):
+                existing["severity"] = severity
+            if http_status is not None:
+                existing["http_status"] = http_status
+            if event_ts >= last_seen_by_key.get(key, 0):
+                last_seen_by_key[key] = event_ts
+                existing["last_seen_at"] = _utc_iso(event_ts)
+                existing["sample"] = line[:500]
+
+    return {
+        "status": overall_status,
+        "lookback_seconds": lookback_seconds,
+        "total_count": sum(item["count"] for item in by_key.values()),
+        "last_seen_at": _utc_iso(last_seen_at) if last_seen_at is not None else None,
+        "by_key": by_key,
+    }
+
+
 def _compute_deep_health(
     *,
     store: LanceDBStore,
@@ -527,8 +757,14 @@ def _compute_deep_health(
     registry_stats, registry_error = _registry_source_stats(index_root)
     index_counts = _count_doc_ids_by_source(doc_ids)
     index_freshness, index_freshness_error = _index_source_freshness(store)
+    not_extractable_counts, not_extractable_error = _not_extractable_doc_counts(index_root)
+    provider_failures = _recent_provider_failures(index_root)
     source_names = sorted(
-        set(configured_sources) | set(registry_stats) | set(index_counts) | set(index_freshness)
+        set(configured_sources)
+        | set(registry_stats)
+        | set(index_counts)
+        | set(index_freshness)
+        | set(not_extractable_counts)
     )
 
     sources: dict[str, dict] = {}
@@ -539,12 +775,21 @@ def _compute_deep_health(
         registry_latest_seen_at = registry_source_stats.get("latest_seen_at")
         index_doc_count = index_counts.get(source_name, 0)
         index_latest_mtime = index_freshness.get(source_name)
+        missing_before_no_text = max(0, registry_doc_count - index_doc_count)
+        not_extractable_doc_count = min(
+            int(not_extractable_counts.get(source_name, 0) or 0),
+            missing_before_no_text,
+        )
+        unindexed_registry_doc_count = max(
+            0, registry_doc_count - index_doc_count - not_extractable_doc_count
+        )
         status, reason = _source_health_status(
             configured=source_name in configured_sources,
             registry_doc_count=registry_doc_count,
             index_doc_count=index_doc_count,
             indexer_running=indexer_running,
             last_run_at=last_run_at,
+            not_extractable_doc_count=not_extractable_doc_count,
         )
         source_statuses.append(status)
         sources[source_name] = {
@@ -552,7 +797,11 @@ def _compute_deep_health(
             "reason": reason,
             "configured": source_name in configured_sources,
             "registry_doc_count": registry_doc_count,
+            "registry_raw_doc_count": int(registry_source_stats.get("raw_doc_count") or registry_doc_count),
+            "registry_duplicate_doc_count": int(registry_source_stats.get("duplicate_doc_count") or 0),
             "index_doc_count": index_doc_count,
+            "not_extractable_doc_count": not_extractable_doc_count,
+            "unindexed_registry_doc_count": unindexed_registry_doc_count,
             "registry_latest_seen_at": _iso_or_none(registry_latest_seen_at),
             "index_latest_mtime": index_latest_mtime,
             "index_latest_mtime_iso": _iso_or_none(index_latest_mtime),
@@ -568,6 +817,7 @@ def _compute_deep_health(
             fts_available=fts_available,
             indexer_running=indexer_running,
             registry_error=registry_error,
+            provider_status=provider_failures["status"],
         ),
         "sources": sources,
         "checks": {
@@ -578,6 +828,10 @@ def _compute_deep_health(
             "fts_available": fts_available,
             "index_freshness_available": index_freshness_error is None,
             "index_freshness_error": index_freshness_error,
+            "not_extractable_log_available": not_extractable_error is None,
+            "not_extractable_log_error": not_extractable_error,
+            "provider_status": provider_failures["status"],
+            "provider_failures": provider_failures,
         },
     }
 
@@ -1131,6 +1385,13 @@ def _file_status_impl() -> dict:
         indexer_running=indexer_running,
         last_run_at=last_run_at,
     )
+    provider_failures = (
+        deep_health.get("checks", {}).get("provider_failures")
+        if isinstance(deep_health, dict)
+        else None
+    )
+    if not isinstance(provider_failures, dict):
+        provider_failures = _empty_provider_failures()
 
     result: dict = {
         "doc_count": len(doc_ids),
@@ -1148,6 +1409,8 @@ def _file_status_impl() -> dict:
             "last_index_warning_counts": last_index_warning_counts,
             "last_enrichment_failed_count": last_enrichment_failed_count,
             "last_index_warnings": last_index_warnings,
+            "provider_status": provider_failures.get("status", "unknown"),
+            "provider_failures": provider_failures,
             "deep_check": deep_health,
         },
     }
@@ -1764,6 +2027,8 @@ if HAS_MCP and FastMCP is not None:
                   and persisted to index_health.json. Includes cached, last_ran_at,
                   uses_llm=false, overall, and per-source registry/index counts plus
                   latest registry/index timestamps.
+                - provider_status/provider_failures: Log-derived provider failure
+                  summary from recent indexer logs (no live LLM/provider probe).
 
         Troubleshooting:
             - If doc_count is 0, run file_index_update to index your documents.

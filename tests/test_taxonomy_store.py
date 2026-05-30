@@ -328,6 +328,39 @@ class TestStaleConnectionRecovery:
         assert store.count() == 1
         assert store.count("folder") == 1
 
+    def test_corrupt_table_is_quarantined_and_recreated(self, tmp_path, monkeypatch):
+        """A corrupt existing taxonomy table should not disable taxonomy forever."""
+        table_dir = tmp_path / "taxonomy.lance"
+        table_dir.mkdir()
+        (table_dir / "broken").write_text("bad")
+        created_rows: list[list[dict]] = []
+
+        class FakeTable:
+            def create_scalar_index(self, *args, **kwargs):
+                return None
+
+        class FakeDB:
+            def list_tables(self):
+                return ["taxonomy"]
+
+            def open_table(self, name):
+                raise RuntimeError("Invalid range 0..0 for object of size 0 bytes")
+
+            def create_table(self, name, data):
+                created_rows.append(data)
+                return FakeTable()
+
+        monkeypatch.setattr("taxonomy_store.ldb.connect", lambda path: FakeDB())
+
+        store = TaxonomyStore(str(tmp_path), table_name="taxonomy", embed_fn=_fake_embed)
+        assert store.count() == 0
+        store.add("tag", "rebuilt", "Taxonomy recreated after corruption")
+
+        corrupt_backups = list(tmp_path.glob("taxonomy.lance.corrupt-*"))
+        assert len(corrupt_backups) == 1
+        assert not table_dir.exists()
+        assert created_rows[0][0]["id"] == "tag:rebuilt"
+
 
 class TestFolderSync:
     def test_sync_folder_taxonomy_from_filesystem_seeds_real_paths(self, tmp_path):
