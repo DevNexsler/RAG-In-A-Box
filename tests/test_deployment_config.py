@@ -19,3 +19,12 @@ def test_docker_compose_uses_env_vars_for_database_dsns():
     for item in env:
         if isinstance(item, str) and item.startswith(("SOR_DSN=", "COMM_DATA_STORE_DSN=")):
             assert "${" in item, f"{item.split('=', 1)[0]} must come from environment"
+
+
+def test_docker_compose_raises_doc_organizer_nofile_limit():
+    """Indexer concurrency needs a higher FD limit than Docker's default 1024."""
+    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+    nofile = compose["services"]["doc-organizer"]["ulimits"]["nofile"]
+
+    assert nofile["soft"] >= 65535
+    assert nofile["hard"] >= nofile["soft"]

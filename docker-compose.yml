@@ -9,6 +9,10 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     ports:
       - "7788:7788"
     volumes:
