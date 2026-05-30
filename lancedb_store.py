@@ -26,6 +26,12 @@ _CORRUPT_LANCE_MARKERS = (
     "manifest was not found",
 )
 _LANCE_CORRUPTION_MARKERS = _CORRUPT_LANCE_MARKERS
+_STALE_READ_MARKERS = (
+    ".lance/_versions/",
+    ".lance/data/",
+    ".lance/_deletions/",
+    "manifest was not found",
+)
 
 _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
 _ENRICHMENT_AUX_FIELDS = ("enr_importance_source",)
@@ -194,6 +200,32 @@ class LanceDBStore:
             logger.warning("Failed to create scalar index: %s", e)
 
     @staticmethod
+    def _is_stale_read_error(exc: Exception) -> bool:
+        text = str(exc)
+        text_lower = text.lower()
+        if "not found" not in text_lower:
+            return False
+        return any(marker in text for marker in _STALE_READ_MARKERS)
+
+    def _reopen_vector_store(self) -> None:
+        self._vs = self._build_vector_store()
+
+    def _run_read_with_recovery(self, operation, default_on_missing):
+        try:
+            return operation()
+        except TableNotFoundError:
+            return default_on_missing
+        except Exception as exc:
+            if not self._is_stale_read_error(exc):
+                raise
+            logger.warning("Refreshing LanceDB store after stale/corrupt read: %s", exc)
+            self._reopen_vector_store()
+            try:
+                return operation()
+            except TableNotFoundError:
+                return default_on_missing
+
+    @staticmethod
     def _sql_escape(value: str) -> str:
         """Escape single quotes for safe use in SQL WHERE clauses."""
         return value.replace("'", "''")
@@ -266,14 +298,17 @@ class LanceDBStore:
 
     def _metadata_subfields(self) -> set[str]:
         """Return the set of sub-field names inside the metadata struct column."""
-        try:
+        def _op():
             ds = self._vs.table.to_lance()
             for field in ds.schema:
                 if field.name == "metadata":
                     return {sf.name for sf in field.type}
+            return set()
+
+        try:
+            return self._run_read_with_recovery(_op, set())
         except Exception:
-            pass
-        return set()
+            return set()
 
     def _evolve_metadata_schema(self, new_fields: set[str]) -> None:
         """Add new string sub-fields to the metadata struct column.
@@ -628,14 +663,14 @@ class LanceDBStore:
         Uses Lance SQL DISTINCT — reads only the doc_id column, no vectors or text.
         Raises on failure so callers get a proper error (not empty results).
         """
-        try:
+        def _op():
             ds = self._vs.table.to_lance()
-        except TableNotFoundError:
-            return []  # Table not created yet — legitimately empty
-        batches = ds.sql("SELECT DISTINCT doc_id FROM dataset WHERE doc_id IS NOT NULL").build().to_batch_records()
-        if not batches:
-            return []
-        return pa.Table.from_batches(batches)["doc_id"].to_pylist()
+            batches = ds.sql("SELECT DISTINCT doc_id FROM dataset WHERE doc_id IS NOT NULL").build().to_batch_records()
+            if not batches:
+                return []
+            return pa.Table.from_batches(batches)["doc_id"].to_pylist()
+
+        return self._run_read_with_recovery(_op, [])
 
     def list_doc_mtimes(self) -> dict[str, float]:
         """Return {doc_id: mtime} for all docs in the store.
@@ -643,30 +678,27 @@ class LanceDBStore:
         Uses Lance SQL GROUP BY — reads only doc_id + metadata.mtime, no vectors or text.
         Raises on failure so callers get a proper error (not empty results).
         """
-        try:
+        def _op():
             ds = self._vs.table.to_lance()
-        except TableNotFoundError:
-            return {}  # Table not created yet — legitimately empty
-        batches = ds.sql(
-            "SELECT doc_id, MAX(metadata.mtime) AS mtime "
-            "FROM dataset WHERE doc_id IS NOT NULL GROUP BY doc_id"
-        ).build().to_batch_records()
-        if not batches:
-            return {}
-        t = pa.Table.from_batches(batches)
-        doc_ids = t["doc_id"].to_pylist()
-        mtimes = t["mtime"].to_pylist()
-        return {d: float(m) if m is not None else 0.0 for d, m in zip(doc_ids, mtimes)}
+            batches = ds.sql(
+                "SELECT doc_id, MAX(metadata.mtime) AS mtime "
+                "FROM dataset WHERE doc_id IS NOT NULL GROUP BY doc_id"
+            ).build().to_batch_records()
+            if not batches:
+                return {}
+            t = pa.Table.from_batches(batches)
+            doc_ids = t["doc_id"].to_pylist()
+            mtimes = t["mtime"].to_pylist()
+            return {d: float(m) if m is not None else 0.0 for d, m in zip(doc_ids, mtimes)}
+
+        return self._run_read_with_recovery(_op, {})
 
     def count_chunks(self) -> int:
         """Return total number of chunks (rows) in the store. O(1) via LanceDB.
 
         Raises on failure so callers get a proper error (not zero).
         """
-        try:
-            return self._vs.table.count_rows()
-        except TableNotFoundError:
-            return 0  # Table not created yet — legitimately empty
+        return self._run_read_with_recovery(lambda: self._vs.table.count_rows(), 0)
 
     def vector_search(
         self,
@@ -679,18 +711,17 @@ class LanceDBStore:
 
         Raises on failure so the caller (hybrid_search) can track degradation.
         """
-        try:
-            table = self._vs.table
-        except TableNotFoundError:
-            return []  # Table not created yet — legitimately empty
-        q = table.search(query_vector, query_type="vector")
-        if where:
-            q = q.where(where, prefilter=True)
-        rows = q.limit(top_k).to_list()
-        if not include_vector:
-            for row in rows:
-                row.pop("vector", None)
-        return [self._row_to_hit(row) for row in rows]
+        def _op():
+            q = self._vs.table.search(query_vector, query_type="vector")
+            if where:
+                q = q.where(where, prefilter=True)
+            rows = q.limit(top_k).to_list()
+            if not include_vector:
+                for row in rows:
+                    row.pop("vector", None)
+            return [self._row_to_hit(row) for row in rows]
+
+        return self._run_read_with_recovery(_op, [])
 
     # --- Full-Text Search (BM25/tantivy) ---
 
@@ -709,7 +740,10 @@ class LanceDBStore:
     def fts_available(self) -> bool:
         """Check if the FTS/tantivy index is operational (health check for file_status)."""
         try:
-            self._vs.table.search("test", query_type="fts").limit(1).to_list()
+            self._run_read_with_recovery(
+                lambda: self._vs.table.search("test", query_type="fts").limit(1).to_list(),
+                [],
+            )
             return True
         except Exception:
             return False
@@ -728,18 +762,17 @@ class LanceDBStore:
         """
         if not query.strip():
             return []
-        try:
-            table = self._vs.table
-        except TableNotFoundError:
-            return []  # Table not created yet — legitimately empty
-        q = table.search(self._escape_fts_query(query), query_type="fts")
-        if where:
-            q = q.where(where, prefilter=True)
-        rows = q.limit(top_k).to_list()
-        if not include_vector:
-            for row in rows:
-                row.pop("vector", None)
-        return [self._row_to_hit(row) for row in rows]
+        def _op():
+            q = self._vs.table.search(self._escape_fts_query(query), query_type="fts")
+            if where:
+                q = q.where(where, prefilter=True)
+            rows = q.limit(top_k).to_list()
+            if not include_vector:
+                for row in rows:
+                    row.pop("vector", None)
+            return [self._row_to_hit(row) for row in rows]
+
+        return self._run_read_with_recovery(_op, [])
 
     _RECENT_DOC_FIELDS = (
         "title",
@@ -763,50 +796,50 @@ class LanceDBStore:
         Uses Lance SQL with GROUP BY, ORDER BY, and LIMIT — all server-side.
         No vectors or text loaded. Raises on failure so callers get a proper error.
         """
-        try:
+        def _op():
             ds = self._vs.table.to_lance()
-        except TableNotFoundError:
-            return []  # Table not created yet — legitimately empty
-        available = self._metadata_subfields()
+            available = self._metadata_subfields()
 
-        where_parts: list[str] = ["doc_id IS NOT NULL"]
-        if source_type and "source_type" in available:
-            where_parts.append(f"metadata.source_type = '{self._sql_escape(source_type)}'")
-        if folder and "folder" in available:
-            where_parts.append(f"metadata.folder = '{self._sql_escape(folder)}'")
-        where_clause = " AND ".join(where_parts)
+            where_parts: list[str] = ["doc_id IS NOT NULL"]
+            if source_type and "source_type" in available:
+                where_parts.append(f"metadata.source_type = '{self._sql_escape(source_type)}'")
+            if folder and "folder" in available:
+                where_parts.append(f"metadata.folder = '{self._sql_escape(folder)}'")
+            where_clause = " AND ".join(where_parts)
 
-        # Build SELECT with only fields that exist in the metadata struct
-        select_parts = ["doc_id"]
-        output_fields = ["doc_id"]
-        if "mtime" in available:
-            select_parts.append("MAX(metadata.mtime) AS mtime")
-            output_fields.append("mtime")
-        for f in self._RECENT_DOC_FIELDS:
-            if f in available:
-                select_parts.append(f"MAX(metadata.{f}) AS {f}")
-                output_fields.append(f)
+            # Build SELECT with only fields that exist in the metadata struct
+            select_parts = ["doc_id"]
+            output_fields = ["doc_id"]
+            if "mtime" in available:
+                select_parts.append("MAX(metadata.mtime) AS mtime")
+                output_fields.append("mtime")
+            for f in self._RECENT_DOC_FIELDS:
+                if f in available:
+                    select_parts.append(f"MAX(metadata.{f}) AS {f}")
+                    output_fields.append(f)
 
-        sql = (
-            f"SELECT {', '.join(select_parts)} "
-            f"FROM dataset WHERE {where_clause} "
-            "GROUP BY doc_id "
-            f"ORDER BY mtime DESC LIMIT {limit}"
-        )
-        batches = ds.sql(sql).build().to_batch_records()
-        if not batches:
-            return []
-        t = pa.Table.from_batches(batches)
-        result: list[dict] = []
-        for i in range(len(t)):
-            rec: dict = {}
-            for f in output_fields:
-                try:
-                    rec[f] = t[f][i].as_py()
-                except (KeyError, IndexError):
-                    rec[f] = None
-            result.append(rec)
-        return result
+            sql = (
+                f"SELECT {', '.join(select_parts)} "
+                f"FROM dataset WHERE {where_clause} "
+                "GROUP BY doc_id "
+                f"ORDER BY mtime DESC LIMIT {limit}"
+            )
+            batches = ds.sql(sql).build().to_batch_records()
+            if not batches:
+                return []
+            t = pa.Table.from_batches(batches)
+            result: list[dict] = []
+            for i in range(len(t)):
+                rec: dict = {}
+                for f in output_fields:
+                    try:
+                        rec[f] = t[f][i].as_py()
+                    except (KeyError, IndexError):
+                        rec[f] = None
+                result.append(rec)
+            return result
+
+        return self._run_read_with_recovery(_op, [])
 
     _FACET_KEY_MAP = {
         "folder": "folders",
@@ -852,87 +885,84 @@ class LanceDBStore:
         total_chunks = self.count_chunks()
         if total_chunks == 0:
             return {"total_docs": 0, "total_chunks": 0}
+        def _op():
+            available = self._metadata_subfields()
 
-        try:
-            table = self._vs.table
-        except TableNotFoundError:
-            return {"total_docs": 0, "total_chunks": 0}  # Table not created yet
+            # Discover dynamic fields, excluding context narratives/JSON that
+            # would be corrupted by the comma-splitting facet logic.
+            dynamic_fields = self._dynamic_facet_fields(available)
 
-        available = self._metadata_subfields()
-
-        # Discover dynamic fields, excluding context narratives/JSON that
-        # would be corrupted by the comma-splitting facet logic.
-        dynamic_fields = self._dynamic_facet_fields(available)
-
-        projection = {"doc_id": "doc_id"}
-        for field in self._FACET_KEY_MAP:
-            if field in available:
+            projection = {"doc_id": "doc_id"}
+            for field in self._FACET_KEY_MAP:
+                if field in available:
+                    projection[field] = f"metadata.{field}"
+            for field in dynamic_fields:
                 projection[field] = f"metadata.{field}"
-        for field in dynamic_fields:
-            projection[field] = f"metadata.{field}"
-        if "tags" in available:
-            projection["tags"] = "metadata.tags"
+            if "tags" in available:
+                projection["tags"] = "metadata.tags"
 
-        t = table.search(None).select(projection).to_arrow()
+            t = self._vs.table.search(None).select(projection).to_arrow()
 
-        if len(t) == 0:
-            return {"total_docs": 0, "total_chunks": total_chunks}
+            if len(t) == 0:
+                return {"total_docs": 0, "total_chunks": total_chunks}
 
-        # Deduplicate by doc_id and count facet values
-        seen: set[str] = set()
-        all_counted_fields = set(self._FACET_KEY_MAP.keys()) | dynamic_fields
-        counters: dict[str, Counter] = {f: Counter() for f in all_counted_fields}
-        tag_counter: Counter = Counter()
+            # Deduplicate by doc_id and count facet values
+            seen: set[str] = set()
+            all_counted_fields = set(self._FACET_KEY_MAP.keys()) | dynamic_fields
+            counters: dict[str, Counter] = {f: Counter() for f in all_counted_fields}
+            tag_counter: Counter = Counter()
 
-        doc_ids = t["doc_id"].to_pylist()
-        field_columns: dict[str, list] = {}
-        for f in all_counted_fields:
-            try:
-                field_columns[f] = t[f].to_pylist()
-            except KeyError:
-                field_columns[f] = [None] * len(t)
-        try:
-            tags_col = t["tags"].to_pylist()
-        except KeyError:
-            tags_col = [None] * len(t)
-
-        for i, did in enumerate(doc_ids):
-            if not did or did in seen:
-                continue
-            seen.add(did)
-
+            doc_ids = t["doc_id"].to_pylist()
+            field_columns: dict[str, list] = {}
             for f in all_counted_fields:
-                val = field_columns[f][i]
-                if val and str(val).strip():
-                    for item in str(val).split(","):
-                        item = item.strip()
-                        if item:
-                            counters[f][item] += 1
+                try:
+                    field_columns[f] = t[f].to_pylist()
+                except KeyError:
+                    field_columns[f] = [None] * len(t)
+            try:
+                tags_col = t["tags"].to_pylist()
+            except KeyError:
+                tags_col = [None] * len(t)
 
-            raw_tags = tags_col[i]
-            if raw_tags and str(raw_tags).strip():
-                for tag in str(raw_tags).split(","):
-                    tag = tag.strip()
-                    if tag:
-                        tag_counter[tag] += 1
+            for i, did in enumerate(doc_ids):
+                if not did or did in seen:
+                    continue
+                seen.add(did)
 
-        def _to_list(counter: Counter) -> list[dict]:
-            return [{"value": v, "count": c} for v, c in counter.most_common()]
+                for f in all_counted_fields:
+                    val = field_columns[f][i]
+                    if val and str(val).strip():
+                        for item in str(val).split(","):
+                            item = item.strip()
+                            if item:
+                                counters[f][item] += 1
 
-        result: dict = {
-            "tags": _to_list(tag_counter),
-            "total_docs": len(seen),
-            "total_chunks": total_chunks,
-        }
-        for f, key in self._FACET_KEY_MAP.items():
-            result[key] = _to_list(counters[f])
-        # Dynamic fields use their own name as the result key
-        for f in dynamic_fields:
-            facet_list = _to_list(counters[f])
-            if facet_list:  # only include if there are non-empty values
-                result[f] = facet_list
+                raw_tags = tags_col[i]
+                if raw_tags and str(raw_tags).strip():
+                    for tag in str(raw_tags).split(","):
+                        tag = tag.strip()
+                        if tag:
+                            tag_counter[tag] += 1
 
-        return result
+            def _to_list(counter: Counter) -> list[dict]:
+                return [{"value": v, "count": c} for v, c in counter.most_common()]
+
+            result: dict = {
+                "tags": _to_list(tag_counter),
+                "total_docs": len(seen),
+                "total_chunks": total_chunks,
+            }
+            for f, key in self._FACET_KEY_MAP.items():
+                result[key] = _to_list(counters[f])
+            # Dynamic fields use their own name as the result key
+            for f in dynamic_fields:
+                facet_list = _to_list(counters[f])
+                if facet_list:  # only include if there are non-empty values
+                    result[f] = facet_list
+
+            return result
+
+        return self._run_read_with_recovery(_op, {"total_docs": 0, "total_chunks": 0})
 
     def get_vector(self, chunk_uid: str) -> list[float] | None:
         """Retrieve the stored embedding vector for a chunk by its UID (doc_id::loc).
@@ -940,26 +970,25 @@ class LanceDBStore:
         Used by MMR diversity and cosine fallback reranking. Returns None if
         the chunk is not found or the table doesn't exist yet.
         """
-        try:
-            table = self._vs.table
-        except TableNotFoundError:
-            return None
-        rows = (
-            table.search(None)
-            .where(f"id = '{self._sql_escape(chunk_uid)}'", prefilter=True)
-            .select(["vector"])
-            .limit(1)
-            .to_list()
-        )
-        if not rows:
-            return None
-        vec = rows[0].get("vector")
-        if vec is None:
-            return None
-        # Convert from Arrow/numpy to plain list if needed
-        if hasattr(vec, "tolist"):
-            return vec.tolist()
-        return list(vec)
+        def _op():
+            rows = (
+                self._vs.table.search(None)
+                .where(f"id = '{self._sql_escape(chunk_uid)}'", prefilter=True)
+                .select(["vector"])
+                .limit(1)
+                .to_list()
+            )
+            if not rows:
+                return None
+            vec = rows[0].get("vector")
+            if vec is None:
+                return None
+            # Convert from Arrow/numpy to plain list if needed
+            if hasattr(vec, "tolist"):
+                return vec.tolist()
+            return list(vec)
+
+        return self._run_read_with_recovery(_op, None)
 
     def get_vectors(self, chunk_uids: list[str]) -> dict[str, list[float]]:
         """Batch-load stored vectors for chunk UIDs missing from search hits."""
@@ -997,22 +1026,21 @@ class LanceDBStore:
         Uses predicate pushdown with BTREE index — O(log n), no full scan.
         Loads text + metadata for the matching row only; no vectors.
         """
-        try:
-            table = self._vs.table
-        except TableNotFoundError:
-            return None  # Table not created yet — legitimately empty
-        esc_doc = self._sql_escape(doc_id)
-        esc_loc = self._sql_escape(loc)
-        rows = (
-            table.search(None)
-            .where(f"doc_id = '{esc_doc}' AND metadata.loc = '{esc_loc}'", prefilter=True)
-            .select(["doc_id", "text", "metadata"])
-            .limit(1)
-            .to_list()
-        )
-        if not rows:
-            return None
-        return self._row_to_hit(rows[0])
+        def _op():
+            esc_doc = self._sql_escape(doc_id)
+            esc_loc = self._sql_escape(loc)
+            rows = (
+                self._vs.table.search(None)
+                .where(f"doc_id = '{esc_doc}' AND metadata.loc = '{esc_loc}'", prefilter=True)
+                .select(["doc_id", "text", "metadata"])
+                .limit(1)
+                .to_list()
+            )
+            if not rows:
+                return None
+            return self._row_to_hit(rows[0])
+
+        return self._run_read_with_recovery(_op, None)
 
     def get_doc_chunks(self, doc_id: str) -> list[SearchHit]:
         """Get all chunks for a document, sorted by loc.
@@ -1020,20 +1048,19 @@ class LanceDBStore:
         Uses predicate pushdown with BTREE index — O(log n + k), no full scan.
         Loads text + metadata for matching rows only; no vectors.
         """
-        try:
-            table = self._vs.table
-        except TableNotFoundError:
-            return []  # Table not created yet — legitimately empty
-        esc_doc = self._sql_escape(doc_id)
-        rows = (
-            table.search(None)
-            .where(f"doc_id = '{esc_doc}'", prefilter=True)
-            .select(["doc_id", "text", "metadata"])
-            .to_list()
-        )
-        hits = [self._row_to_hit(row) for row in rows]
-        hits.sort(key=lambda h: h.loc)
-        return hits
+        def _op():
+            esc_doc = self._sql_escape(doc_id)
+            rows = (
+                self._vs.table.search(None)
+                .where(f"doc_id = '{esc_doc}'", prefilter=True)
+                .select(["doc_id", "text", "metadata"])
+                .to_list()
+            )
+            hits = [self._row_to_hit(row) for row in rows]
+            hits.sort(key=lambda h: h.loc)
+            return hits
+
+        return self._run_read_with_recovery(_op, [])
 
 
 def _looks_like_corrupt_lance_error(exc: Exception) -> bool:
