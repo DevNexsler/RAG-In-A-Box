@@ -1000,6 +1000,174 @@ def test_file_status_deep_health_includes_source_freshness_fields(tmp_path):
         mcp_server._deep_health_cache = old_deep_cache
 
 
+def test_registry_source_stats_dedupes_legacy_and_namespaced_document_ids(tmp_path):
+    """Registry health should count canonical doc IDs, not both legacy and namespaced rows."""
+    from doc_id_store import DocIDStore
+
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("0003D", "docs/a@0003D@.pdf", source_name="documents")
+    registry.register("documents::0003D", "docs/a@0003D@.pdf", source_name="documents")
+    registry.register("sor::task/1", "task/1", source_name="sor")
+    registry.close()
+
+    stats, error = mcp_server._registry_source_stats(tmp_path)
+
+    assert error is None
+    assert stats["documents"]["doc_count"] == 1
+    assert stats["documents"]["raw_doc_count"] == 2
+    assert stats["documents"]["duplicate_doc_count"] == 1
+    assert stats["sor"]["doc_count"] == 1
+    assert stats["sor"]["raw_doc_count"] == 1
+    assert stats["sor"]["duplicate_doc_count"] == 0
+
+
+def test_file_status_deep_health_treats_no_text_docs_as_processed(tmp_path):
+    """Docs that were scanned but produced no text should not look like index loss."""
+    import json
+    from doc_id_store import DocIDStore
+
+    (tmp_path / "index_metadata.json").write_text(
+        json.dumps({"last_run_at": "2026-05-30T07:00:00Z", "failed_count": 0})
+    )
+    (tmp_path / "indexer.log").write_text(
+        "2026-05-30 07:00:01,000 WARNING prefect.task_runs: "
+        "No text extracted: documents::sidecar\n"
+    )
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("documents::indexed", "docs/indexed.md", source_name="documents")
+    registry.register("documents::sidecar", "docs/sidecar.json", source_name="documents")
+    registry.close()
+
+    old_cache = mcp_server._cache
+    old_signature = mcp_server._cache_index_signature
+    old_identity = mcp_server._cache_identity
+    old_deep_cache = mcp_server._deep_health_cache
+    try:
+        mock_store = MagicMock()
+        mock_store.list_doc_ids.return_value = ["documents::indexed"]
+        mock_store.count_chunks.return_value = 1
+        mock_store.list_recent_docs.return_value = [{"doc_id": "documents::indexed", "mtime": 1000.0}]
+        mock_store._metadata_subfields.return_value = {"doc_id", "source_name", "mtime"}
+        mock_store.fts_available.return_value = True
+
+        mcp_server._cache = (
+            mock_store,
+            MagicMock(),
+            {
+                "index_root": str(tmp_path),
+                "embeddings": {"provider": "openrouter"},
+                "search": {"reranker": {"enabled": False}},
+                "sources": [{"type": "filesystem", "name": "documents"}],
+            },
+        )
+        mcp_server._cache_index_signature = mcp_server._index_metadata_signature(mcp_server._cache[2])
+        mcp_server._cache_identity = id(mcp_server._cache)
+        mcp_server._deep_health_cache = None
+
+        result = mcp_server._file_status_impl()
+        documents = result["health"]["deep_check"]["sources"]["documents"]
+
+        assert documents["status"] == "ok"
+        assert documents["reason"] == "indexed_or_not_extractable"
+        assert documents["not_extractable_doc_count"] == 1
+        assert documents["unindexed_registry_doc_count"] == 0
+    finally:
+        mcp_server._cache = old_cache
+        mcp_server._cache_index_signature = old_signature
+        mcp_server._cache_identity = old_identity
+        mcp_server._deep_health_cache = old_deep_cache
+
+
+def test_recent_provider_failures_classifies_openrouter_403_logs(tmp_path):
+    """Recent OpenRouter 403s should become loud provider health failures."""
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 5, 29, 18, 0, 0, tzinfo=timezone.utc).timestamp()
+    (tmp_path / "indexer.log").write_text(
+        "\n".join(
+            [
+                "2026-05-28 17:59:59,000 ERROR providers.embed.openrouter_embed: "
+                "OpenRouter embedding API error: 403 old failure outside window",
+                "2026-05-29 17:40:00,000 INFO httpx: HTTP Request: POST "
+                'https://openrouter.ai/api/v1/embeddings "HTTP/1.1 200 OK"',
+                "2026-05-29 17:41:31,383 ERROR providers.embed.openrouter_embed: "
+                "OpenRouter embedding API error: 403 "
+                '{"error":{"message":"Key limit exceeded (monthly limit)","code":403}}',
+                "2026-05-29 17:41:31,493 ERROR providers.llm.openrouter_llm: "
+                "OpenRouter API error: 403 "
+                '{"error":{"message":"Key limit exceeded (monthly limit)","code":403}}',
+            ]
+        )
+    )
+
+    result = mcp_server._recent_provider_failures(tmp_path, now=now)
+
+    assert result["status"] == "critical"
+    assert result["total_count"] == 2
+    assert result["lookback_seconds"] == 86400
+    assert set(result["by_key"]) == {"openrouter_embeddings", "openrouter_chat"}
+    assert result["by_key"]["openrouter_embeddings"]["http_status"] == 403
+    assert result["by_key"]["openrouter_embeddings"]["severity"] == "critical"
+    assert result["by_key"]["openrouter_embeddings"]["last_seen_at"] == "2026-05-29T17:41:31+00:00"
+    assert "Key limit exceeded" in result["by_key"]["openrouter_embeddings"]["sample"]
+    assert result["by_key"]["openrouter_chat"]["operation"] == "chat"
+
+
+def test_file_status_surfaces_recent_provider_failures_from_logs(tmp_path):
+    """file_status should summarize recent provider failures without live provider probes."""
+    import json
+    from datetime import datetime, timezone
+
+    (tmp_path / "index_metadata.json").write_text(
+        json.dumps({"last_run_at": datetime.now(timezone.utc).isoformat(), "failed_count": 0})
+    )
+    (tmp_path / "indexer.log").write_text(
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S,000')} "
+        "ERROR providers.embed.openrouter_embed: OpenRouter embedding API error: 403 "
+        '{"error":{"message":"Key limit exceeded (monthly limit)","code":403}}\n'
+    )
+
+    old_cache = mcp_server._cache
+    old_signature = mcp_server._cache_index_signature
+    old_identity = mcp_server._cache_identity
+    old_deep_cache = mcp_server._deep_health_cache
+    try:
+        mock_store = MagicMock()
+        mock_store.list_doc_ids.return_value = ["documents::doc-1"]
+        mock_store.count_chunks.return_value = 1
+        mock_store.list_recent_docs.return_value = [{"doc_id": "documents::doc-1", "mtime": 1000.0}]
+        mock_store._metadata_subfields.return_value = {"doc_id", "source_name", "mtime"}
+        mock_store.fts_available.return_value = True
+
+        mcp_server._cache = (
+            mock_store,
+            MagicMock(),
+            {
+                "index_root": str(tmp_path),
+                "embeddings": {"provider": "openrouter"},
+                "search": {"reranker": {"enabled": False}},
+                "sources": [{"type": "filesystem", "name": "documents"}],
+            },
+        )
+        mcp_server._cache_index_signature = mcp_server._index_metadata_signature(mcp_server._cache[2])
+        mcp_server._cache_identity = id(mcp_server._cache)
+        mcp_server._deep_health_cache = None
+
+        result = mcp_server._file_status_impl()
+
+        health = result["health"]
+        assert health["provider_status"] == "critical"
+        assert health["provider_failures"]["total_count"] == 1
+        assert health["provider_failures"]["by_key"]["openrouter_embeddings"]["http_status"] == 403
+        assert health["deep_check"]["overall"] == "critical"
+        assert health["deep_check"]["checks"]["provider_status"] == "critical"
+    finally:
+        mcp_server._cache = old_cache
+        mcp_server._cache_index_signature = old_signature
+        mcp_server._cache_identity = old_identity
+        mcp_server._deep_health_cache = old_deep_cache
+
+
 def test_file_status_reports_zombie_indexer_as_not_running():
     """Zombie indexer PID should not surface as a live background run."""
     import subprocess
