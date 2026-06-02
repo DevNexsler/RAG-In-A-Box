@@ -333,6 +333,25 @@ def test_run_benchmark_accepts_task_and_suite_nested_layout(tmp_path):
     assert run.summary["suite"] == "hard"
 
 
+def test_run_benchmark_rejects_empty_score_mode(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+
+    fake_client = FakeReplayClient(
+        content='{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
+    )
+
+    with pytest.raises(ValueError, match="unsupported benchmark score_mode"):
+        run_benchmark(
+            bench_dir=fixture_bench_dir,
+            model="openai/gpt-4.1-mini",
+            run_id="empty-score-mode",
+            replay_client=fake_client,
+            score_mode="",
+        )
+
+
 def test_run_benchmark_records_parse_failures_per_case(tmp_path):
     fixture_bench_dir = tmp_path / "benchmarks"
     fixture_bench_dir.mkdir(parents=True)

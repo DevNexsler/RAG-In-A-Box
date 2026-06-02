@@ -41,7 +41,8 @@ def run_benchmark(
     run_dir = bench_path / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    score_mode = score_mode or bench_task.default_score_mode
+    if score_mode is None:
+        score_mode = bench_task.default_score_mode
     _validate_score_mode(score_mode, score_modes=bench_task.score_modes)
     client = replay_client or OpenRouterGenerator(model=model)
     case_ids = sorted(path.stem for path in (bench_path / "cases").glob("case_*.json"))
