@@ -13,10 +13,17 @@ from core.benchmarking.cases import (
     load_case,
     prepare_audit_cases,
     prepare_cases,
+    resolve_bench_path,
     write_gold_stub,
 )
+from core.benchmarking.mining import materialize_hard_suite
 from core.benchmarking.reporting import write_reports
 from core.benchmarking.runner import run_benchmark
+
+
+def _add_task_suite_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--task", default="enrichment")
+    parser.add_argument("--suite", default="standard")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_cmd = subparsers.add_parser("run")
     run_cmd.add_argument("--bench-dir", default=".evals/benchmarks")
+    _add_task_suite_args(run_cmd)
     run_cmd.add_argument("--model", required=True)
     run_cmd.add_argument("--run-id", required=True)
     run_cmd.add_argument("--max-cases", type=int)
@@ -63,11 +71,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     report_cmd = subparsers.add_parser("report")
     report_cmd.add_argument("--bench-dir", default=".evals/benchmarks")
+    _add_task_suite_args(report_cmd)
     report_cmd.add_argument("--run-id", required=True)
 
     audit_report_cmd = subparsers.add_parser("audit-report")
     audit_report_cmd.add_argument("--bench-dir", default=".evals/benchmarks/audit")
     audit_report_cmd.add_argument("--run-id", required=True)
+
+    mine = subparsers.add_parser("mine-hard")
+    mine.add_argument("--trace-dir", default=".evals/llm-traces")
+    mine.add_argument("--bench-dir", default=".evals/benchmarks")
+    mine.add_argument("--task", default="enrichment")
+    mine.add_argument("--suite", default="hard")
+    mine.add_argument("--limit", type=int, default=50)
 
     return parser
 
@@ -116,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
         _print_run(
             run_benchmark(
                 bench_dir=args.bench_dir,
+                task=args.task,
+                suite=args.suite,
                 model=args.model,
                 run_id=args.run_id,
                 max_cases=args.max_cases,
@@ -140,11 +158,27 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "report":
-        _print_report(bench_dir=args.bench_dir, run_id=args.run_id)
+        _print_report(
+            bench_dir=args.bench_dir,
+            task=args.task,
+            suite=args.suite,
+            run_id=args.run_id,
+        )
         return 0
 
     if args.command == "audit-report":
         _print_report(bench_dir=args.bench_dir, run_id=args.run_id)
+        return 0
+
+    if args.command == "mine-hard":
+        result = materialize_hard_suite(
+            trace_dir=args.trace_dir,
+            out_dir=args.bench_dir,
+            task=args.task,
+            suite=args.suite,
+            limit=args.limit,
+        )
+        print(f"Prepared {result.selected_count} hard cases")
         return 0
 
     parser.error(f"Unsupported command: {args.command}")
@@ -187,8 +221,15 @@ def _print_run(result, *, run_id: str, model: str) -> None:
     print(f"Artifacts: {result.run_dir}")
 
 
-def _print_report(*, bench_dir: str, run_id: str) -> None:
-    run_dir = Path(bench_dir) / "runs" / run_id
+def _print_report(
+    *,
+    bench_dir: str,
+    run_id: str,
+    task: str = "enrichment",
+    suite: str = "standard",
+) -> None:
+    suite_dir = resolve_bench_path(bench_dir=bench_dir, task=task, suite=suite)
+    run_dir = suite_dir / "runs" / run_id
     paths = write_reports(run_dir=run_dir)
     print(f"Run ID: {run_id}")
     print(f"Artifacts: {run_dir}")

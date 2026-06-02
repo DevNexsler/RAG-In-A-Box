@@ -193,6 +193,51 @@ def test_build_parser_registers_report_command():
     assert args.run_id == "baseline"
 
 
+def test_build_parser_registers_suite_aware_run_and_report():
+    parser = build_parser()
+
+    run_args = parser.parse_args(
+        [
+            "run",
+            "--task",
+            "enrichment",
+            "--suite",
+            "hard",
+            "--model",
+            "openai/gpt-4.1-mini",
+            "--run-id",
+            "hard-baseline",
+        ]
+    )
+    report_args = parser.parse_args(
+        [
+            "report",
+            "--task",
+            "enrichment",
+            "--suite",
+            "hard",
+            "--run-id",
+            "hard-baseline",
+        ]
+    )
+    mine_args = parser.parse_args(
+        [
+            "mine-hard",
+            "--task",
+            "enrichment",
+            "--suite",
+            "hard",
+            "--limit",
+            "50",
+        ]
+    )
+
+    assert run_args.task == "enrichment"
+    assert run_args.suite == "hard"
+    assert report_args.suite == "hard"
+    assert mine_args.command == "mine-hard"
+
+
 def test_build_report_includes_audit_subscores_in_json_csv_and_markdown(tmp_path):
     fixture_run_dir = _write_run_artifacts(tmp_path, run_id="audit-baseline", score_mode="audit")
 
