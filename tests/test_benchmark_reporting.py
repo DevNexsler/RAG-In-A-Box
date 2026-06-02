@@ -220,6 +220,49 @@ def test_build_report_includes_audit_subscores_in_json_csv_and_markdown(tmp_path
     ]
 
 
+def test_build_report_includes_task_suite_and_hard_breakdown(tmp_path):
+    run_dir = _write_run_artifacts(
+        tmp_path,
+        summary_overrides={
+            "task": "enrichment",
+            "suite": "hard",
+            "hard_case_breakdown": {
+                "huge_prompt": {"case_count": 2, "average_total_score": 0.4},
+                "nearby_context": {"case_count": 1, "average_total_score": 0.8},
+            },
+            "provider_failure_breakdown": {
+                "402": 3,
+                "ConnectError": 1,
+            },
+        },
+    )
+
+    paths = write_reports(run_dir=run_dir)
+    report = json.loads(paths["json"].read_text())
+    markdown = paths["markdown"].read_text()
+
+    assert report["summary"]["task"] == "enrichment"
+    assert report["summary"]["suite"] == "hard"
+    assert report["hard_case_breakdown"]["huge_prompt"]["case_count"] == 2
+    assert report["provider_failure_breakdown"]["402"] == 3
+    assert "## Hard Case Breakdown" in markdown
+    assert "## Provider Failure Breakdown" in markdown
+
+    with paths["hard_case_breakdown_csv"].open(encoding="utf-8", newline="") as handle:
+        hard_case_rows = list(csv.DictReader(handle))
+    with paths["provider_failures_csv"].open(encoding="utf-8", newline="") as handle:
+        provider_failure_rows = list(csv.DictReader(handle))
+
+    assert hard_case_rows == [
+        {"hard_case": "huge_prompt", "average_total_score": "0.4", "case_count": "2"},
+        {"hard_case": "nearby_context", "average_total_score": "0.8", "case_count": "1"},
+    ]
+    assert provider_failure_rows == [
+        {"failure": "402", "count": "3"},
+        {"failure": "ConnectError", "count": "1"},
+    ]
+
+
 def test_build_parser_registers_audit_commands():
     parser = build_parser()
 
