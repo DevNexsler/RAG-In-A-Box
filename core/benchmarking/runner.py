@@ -76,6 +76,7 @@ def run_benchmark(
         score_mode=score_mode,
         task=task,
         suite=suite,
+        bench_path=bench_path,
     )
     summary_path = run_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -178,6 +179,7 @@ def _build_summary(
     score_mode: str,
     task: str,
     suite: str,
+    bench_path: Path,
 ) -> dict[str, Any]:
     case_count = len(results)
     parse_failures = sum(1 for item in results if item["score"]["reliability"].get("parse_failed"))
@@ -221,7 +223,97 @@ def _build_summary(
     }
     if score_mode == "audit":
         summary["subscore_averages"] = _average_subscores(results=results, case_count=case_count)
+    hard_case_breakdown = _build_hard_case_breakdown(
+        bench_path=bench_path,
+        results=results,
+        suite=suite,
+    )
+    if hard_case_breakdown is not None:
+        summary["hard_case_breakdown"] = hard_case_breakdown
+    provider_failure_breakdown = _build_provider_failure_breakdown(bench_path=bench_path)
+    if provider_failure_breakdown is not None:
+        summary["provider_failure_breakdown"] = provider_failure_breakdown
     return summary
+
+
+def _build_hard_case_breakdown(
+    *,
+    bench_path: Path,
+    results: list[dict[str, Any]],
+    suite: str,
+) -> dict[str, dict[str, float | int]] | None:
+    if suite == "standard":
+        return None
+
+    manifest_path = bench_path / "cases" / "manifest.json"
+    if not manifest_path.exists():
+        return None
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cases = manifest.get("cases", [])
+    if not isinstance(cases, list):
+        return {}
+
+    results_by_case = {str(result.get("case_id")): result for result in results}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        result = results_by_case.get(str(case.get("case_id")))
+        if result is None:
+            continue
+        flags = case.get("flags", [])
+        if not isinstance(flags, list):
+            continue
+        for flag in flags:
+            grouped.setdefault(str(flag), []).append(result)
+
+    return {
+        flag: _summarize_result_group(group_results)
+        for flag, group_results in sorted(grouped.items())
+    }
+
+
+def _summarize_result_group(results: list[dict[str, Any]]) -> dict[str, float | int]:
+    case_count = len(results)
+    parse_failures = sum(
+        1 for item in results if item.get("score", {}).get("reliability", {}).get("parse_failed")
+    )
+    transport_failures = sum(1 for item in results if item.get("status") == "transport_failed")
+    successes = sum(1 for item in results if item.get("status") == "success")
+    return {
+        "case_count": case_count,
+        "average_total_score": round(
+            sum(item.get("score", {}).get("total_score", 0.0) for item in results) / case_count,
+            6,
+        )
+        if case_count
+        else 0.0,
+        "success_rate": round(successes / case_count, 6) if case_count else 0.0,
+        "parse_failure_rate": round(parse_failures / case_count, 6) if case_count else 0.0,
+        "transport_failure_rate": round(transport_failures / case_count, 6) if case_count else 0.0,
+    }
+
+
+def _build_provider_failure_breakdown(*, bench_path: Path) -> dict[str, int] | None:
+    failures_path = bench_path / "provider_failures.jsonl"
+    if not failures_path.exists():
+        return None
+
+    counts: dict[str, int] = {}
+    for line in failures_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            failure = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(failure, dict):
+            continue
+        key = failure.get("failure_status_code") or failure.get("failure_type") or "unknown"
+        key = str(key)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def _average_subscores(*, results: list[dict[str, Any]], case_count: int) -> dict[str, float]:

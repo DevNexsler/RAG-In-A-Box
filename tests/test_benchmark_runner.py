@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 import httpx
@@ -306,6 +307,8 @@ def test_run_benchmark_persists_per_case_results_and_summary(tmp_path):
     assert run.summary["latency_p95"] == 12.5
     assert run.summary["token_total"] == 42
     assert run.summary["token_average"] == 42.0
+    assert "hard_case_breakdown" not in run.summary
+    assert "provider_failure_breakdown" not in run.summary
     assert fake_client.calls[0]["user_prompt"] == "Prompt text for case_0001"
 
 
@@ -314,6 +317,24 @@ def test_run_benchmark_accepts_task_and_suite_nested_layout(tmp_path):
     suite_dir = fixture_bench_dir / "tasks" / "enrichment" / "hard"
     suite_dir.mkdir(parents=True)
     _write_case_and_gold(suite_dir, case_id="case_0001")
+    (suite_dir / "cases" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "case_id": "case_0001",
+                        "flags": ["huge_prompt", "business_critical"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_dir / "provider_failures.jsonl").write_text(
+        json.dumps({"failure_status_code": 402, "failure_type": "HTTPStatusError"}) + "\n"
+        + json.dumps({"failure_type": "ConnectError"}) + "\n",
+        encoding="utf-8",
+    )
 
     fake_client = FakeReplayClient(
         content='{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
@@ -331,6 +352,18 @@ def test_run_benchmark_accepts_task_and_suite_nested_layout(tmp_path):
     assert run.run_dir == suite_dir / "runs" / "hard-baseline"
     assert run.summary["task"] == "enrichment"
     assert run.summary["suite"] == "hard"
+    assert run.summary["hard_case_breakdown"]["huge_prompt"] == {
+        "case_count": 1,
+        "average_total_score": 1.0,
+        "success_rate": 1.0,
+        "parse_failure_rate": 0.0,
+        "transport_failure_rate": 0.0,
+    }
+    assert run.summary["hard_case_breakdown"]["business_critical"]["case_count"] == 1
+    assert run.summary["provider_failure_breakdown"] == {
+        "402": 1,
+        "ConnectError": 1,
+    }
 
 
 def test_run_benchmark_rejects_empty_score_mode(tmp_path):

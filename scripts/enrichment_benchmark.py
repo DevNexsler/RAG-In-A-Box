@@ -237,6 +237,10 @@ def _print_report(
     print(f"CSV: {paths['csv']}")
     if "subscores_csv" in paths:
         print(f"Subscores CSV: {paths['subscores_csv']}")
+    if "hard_case_breakdown_csv" in paths:
+        print(f"Hard Case Breakdown CSV: {paths['hard_case_breakdown_csv']}")
+    if "provider_failures_csv" in paths:
+        print(f"Provider Failures CSV: {paths['provider_failures_csv']}")
     print(f"Markdown: {paths['markdown']}")
 
 

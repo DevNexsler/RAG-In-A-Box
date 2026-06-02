@@ -63,9 +63,9 @@ python3 scripts/enrichment_benchmark.py report \
 Reports include aggregate scoring plus hard-case and provider-failure
 breakdowns:
 
-- `summary.json`
-- `summary.md`
-- `results.csv`
+- `report.json`
+- `leaderboard.md`
+- `field_scores.csv`
 - `hard_case_breakdown.csv`
 - `provider_failures.csv`
 

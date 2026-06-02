@@ -291,23 +291,31 @@ def test_synthetic_hard_suite_mine_run_report_e2e(tmp_path, capsys):
     report_json_path = run.run_dir / "report.json"
     report_csv_path = run.run_dir / "field_scores.csv"
     report_markdown_path = run.run_dir / "leaderboard.md"
+    hard_breakdown_csv_path = run.run_dir / "hard_case_breakdown.csv"
+    provider_failures_csv_path = run.run_dir / "provider_failures.csv"
     assert report_json_path.is_file()
     assert report_csv_path.is_file()
     assert report_markdown_path.is_file()
+    assert hard_breakdown_csv_path.is_file()
+    assert provider_failures_csv_path.is_file()
     report = json.loads(report_json_path.read_text(encoding="utf-8"))
 
     assert len(fake_client.calls) == manifest["selected_count"]
     assert run.summary["case_count"] == manifest["selected_count"]
     assert run.summary["task"] == "enrichment"
     assert run.summary["suite"] == "hard"
+    assert run.summary["hard_case_breakdown"]
+    assert run.summary["provider_failure_breakdown"]
     assert "summary" in report
     assert "leaderboard" in report
     assert report["summary"]["case_count"] == manifest["selected_count"]
     assert report["summary"]["task"] == "enrichment"
     assert report["summary"]["suite"] == "hard"
     assert report["leaderboard"][0]["model"] == "openai/gpt-4.1-mini"
-    if "hard_case_breakdown" in report:
-        assert report["hard_case_breakdown"]
+    assert report["hard_case_breakdown"]
+    assert report["provider_failure_breakdown"]
     assert f"JSON: {report_json_path}" in report_output
     assert f"CSV: {report_csv_path}" in report_output
+    assert f"Hard Case Breakdown CSV: {hard_breakdown_csv_path}" in report_output
+    assert f"Provider Failures CSV: {provider_failures_csv_path}" in report_output
     assert f"Markdown: {report_markdown_path}" in report_output
