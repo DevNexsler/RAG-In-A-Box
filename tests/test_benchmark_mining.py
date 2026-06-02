@@ -10,9 +10,11 @@ from core.benchmarking.mining import (
 )
 from core.benchmarking.models import TraceMetadata
 
+HARD_TRACES = Path("tests/fixtures/benchmarks/hard/hard_traces.jsonl")
+
 
 def test_load_trace_metadata_extracts_safe_fields_only():
-    rows = load_trace_metadata(Path("tests/fixtures/benchmarks/hard_traces.jsonl"))
+    rows = load_trace_metadata(HARD_TRACES)
 
     assert rows[0].trace_file == "hard_traces.jsonl"
     assert rows[0].trace_line == 1
@@ -23,7 +25,7 @@ def test_load_trace_metadata_extracts_safe_fields_only():
 
 
 def test_load_trace_metadata_preserves_duplicate_prompt_lines():
-    rows = load_trace_metadata(Path("tests/fixtures/benchmarks/hard_traces.jsonl"))
+    rows = load_trace_metadata(HARD_TRACES)
 
     assert len(rows) == 5
     assert rows[0].prompt_hash == rows[2].prompt_hash
@@ -92,7 +94,7 @@ def test_load_trace_metadata_tolerates_bad_nested_shapes(tmp_path):
 
 
 def test_score_hard_flags_detects_real_hard_patterns():
-    row = load_trace_metadata(Path("tests/fixtures/benchmarks/hard_traces.jsonl"))[0]
+    row = load_trace_metadata(HARD_TRACES)[0]
 
     scored = score_hard_flags(row)
 
@@ -105,7 +107,7 @@ def test_score_hard_flags_detects_real_hard_patterns():
 
 
 def test_score_hard_flags_detects_threshold_and_parse_patterns():
-    rows = load_trace_metadata(Path("tests/fixtures/benchmarks/hard_traces.jsonl"))
+    rows = load_trace_metadata(HARD_TRACES)
 
     threshold_row = TraceMetadata(
         trace_file="synthetic.jsonl",
@@ -134,7 +136,7 @@ def test_score_hard_flags_detects_threshold_and_parse_patterns():
 
 
 def test_select_hard_cases_keeps_provider_failures_separate():
-    rows = load_trace_metadata(Path("tests/fixtures/benchmarks/hard_traces.jsonl"))
+    rows = load_trace_metadata(HARD_TRACES)
 
     selected = select_hard_cases(rows, limit=10)
 
@@ -144,7 +146,7 @@ def test_select_hard_cases_keeps_provider_failures_separate():
 
 
 def test_select_hard_cases_requires_provider_failure_type_and_status_code():
-    rows = load_trace_metadata(Path("tests/fixtures/benchmarks/hard_traces.jsonl"))
+    rows = load_trace_metadata(HARD_TRACES)
 
     selected = select_hard_cases(rows, limit=10)
 
@@ -152,7 +154,7 @@ def test_select_hard_cases_requires_provider_failure_type_and_status_code():
 
 
 def test_select_hard_cases_keeps_failure_when_duplicate_prompt_succeeds_first():
-    success_row, _, failure_row = load_trace_metadata(Path("tests/fixtures/benchmarks/hard_traces.jsonl"))[:3]
+    success_row, _, failure_row = load_trace_metadata(HARD_TRACES)[:3]
     failure_after_success = TraceMetadata(
         trace_file=failure_row.trace_file,
         trace_line=99,
