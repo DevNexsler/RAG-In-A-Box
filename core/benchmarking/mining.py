@@ -31,7 +31,6 @@ _PROMPT_FEATURES_BY_HASH: dict[str, frozenset[str]] = {}
 def load_trace_metadata(trace_path: str | Path) -> list[TraceMetadata]:
     path = Path(trace_path)
     rows: list[TraceMetadata] = []
-    seen_hashes: set[str] = set()
 
     with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -41,9 +40,6 @@ def load_trace_metadata(trace_path: str | Path) -> list[TraceMetadata]:
             raw = json.loads(line)
             prompt = _extract_user_prompt(raw)
             prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
-            if prompt_hash in seen_hashes:
-                continue
-            seen_hashes.add(prompt_hash)
 
             _PROMPT_FEATURES_BY_HASH[prompt_hash] = frozenset(_extract_prompt_features(prompt))
 
@@ -108,7 +104,7 @@ def select_hard_cases(rows: list[TraceMetadata], *, limit: int = 50) -> HardCase
             continue
         seen_hashes.add(row.prompt_hash)
 
-        if not row.success and (row.failure_type or row.failure_status_code is not None):
+        if not row.success and row.failure_type and row.failure_status_code is not None:
             provider_failure_cases.append(row)
             continue
 
