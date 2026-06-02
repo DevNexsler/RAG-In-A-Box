@@ -119,10 +119,10 @@ def select_hard_cases(rows: list[TraceMetadata], *, limit: int = 50) -> HardCase
     provider_failure_cases: list[TraceMetadata] = []
     candidates: list[HardCaseCandidate] = []
     seen_hashes: set[str] = set()
-    seen_failure_keys: set[tuple[str, str, int]] = set()
+    seen_failure_keys: set[tuple[str, str | None, int | None]] = set()
 
     for row in rows:
-        if not row.success and row.failure_type and row.failure_status_code is not None:
+        if not row.success and (row.failure_type or row.failure_status_code is not None):
             failure_key = (row.prompt_hash, row.failure_type, row.failure_status_code)
             if failure_key not in seen_failure_keys:
                 seen_failure_keys.add(failure_key)
@@ -167,13 +167,13 @@ def materialize_hard_suite(
 
     cases: list[BenchmarkCase] = []
     manifest_cases: list[dict[str, Any]] = []
+    skipped_cases: list[dict[str, Any]] = []
     selection_flags: set[str] = set()
     case_index = 1
     for candidate in selection.hard_cases:
-        if not candidate.trace.response_looks_parseable:
-            continue
         full_row = full_rows.get((candidate.trace.trace_file, candidate.trace.trace_line))
         if full_row is None:
+            skipped_cases.append(_build_skipped_manifest_case(candidate, reason="missing_prompt_or_response"))
             continue
 
         case = BenchmarkCase(
@@ -211,6 +211,7 @@ def materialize_hard_suite(
         "selection_flags": sorted(selection_flags),
         "provider_failure_count": len(selection.provider_failure_cases),
         "cases": manifest_cases,
+        "skipped_cases": skipped_cases,
     }
     manifest_path = cases_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -269,6 +270,19 @@ def _build_manifest_case(case: BenchmarkCase, candidate: HardCaseCandidate) -> d
         "difficulty": case.difficulty,
         "flags": list(candidate.flags),
         "hard_score": candidate.hard_score,
+    }
+
+
+def _build_skipped_manifest_case(candidate: HardCaseCandidate, *, reason: str) -> dict[str, Any]:
+    trace = candidate.trace
+    return {
+        "trace_file": trace.trace_file,
+        "trace_line": trace.trace_line,
+        "title": trace.title,
+        "source_type": trace.source_type,
+        "flags": list(candidate.flags),
+        "hard_score": candidate.hard_score,
+        "skip_reason": reason,
     }
 
 

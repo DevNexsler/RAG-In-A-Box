@@ -146,12 +146,16 @@ def test_select_hard_cases_keeps_provider_failures_separate():
     assert selected.provider_failure_cases[0].failure_status_code == 402
 
 
-def test_select_hard_cases_requires_provider_failure_type_and_status_code():
+def test_select_hard_cases_includes_provider_failures_with_type_or_status_code():
     rows = load_trace_metadata(HARD_TRACES)
 
     selected = select_hard_cases(rows, limit=10)
 
-    assert [row.failure_type for row in selected.provider_failure_cases] == ["HTTPStatusError"]
+    assert [row.failure_type for row in selected.provider_failure_cases] == [
+        "HTTPStatusError",
+        "ConnectError",
+    ]
+    assert [row.failure_status_code for row in selected.provider_failure_cases] == [402, None]
 
 
 def test_select_hard_cases_keeps_failure_when_duplicate_prompt_succeeds_first():
@@ -191,15 +195,28 @@ def test_materialize_hard_suite_writes_cases_manifest_and_gold_stubs(tmp_path):
     suite_dir = tmp_path / "tasks" / "enrichment" / "hard"
     manifest = json.loads((suite_dir / "cases" / "manifest.json").read_text())
 
-    assert result.selected_count == 1
+    assert result.selected_count == 2
     assert manifest["suite"] == "hard"
     assert manifest["task"] == "enrichment"
     assert manifest["selection_flags"]
     assert "prompt" not in manifest["cases"][0]
     assert "baseline_response" not in manifest["cases"][0]
     assert (suite_dir / "cases" / "case_0001.json").is_file()
+    assert (suite_dir / "cases" / "case_0002.json").is_file()
     assert (suite_dir / "gold" / "case_0001.json").is_file()
-    provider_failure = json.loads((suite_dir / "provider_failures.jsonl").read_text().strip())
-    assert provider_failure["failure_status_code"] == 402
-    assert "prompt" not in provider_failure
-    assert "response" not in provider_failure
+    assert (suite_dir / "gold" / "case_0002.json").is_file()
+    parse_case = json.loads((suite_dir / "cases" / "case_0002.json").read_text())
+    assert parse_case["title"] == "Slow parse suspect"
+    assert parse_case["baseline_response"] == "not json"
+    provider_failures = [
+        json.loads(line)
+        for line in (suite_dir / "provider_failures.jsonl").read_text().splitlines()
+    ]
+    assert [failure["failure_status_code"] for failure in provider_failures] == [402, None]
+    assert [failure["failure_type"] for failure in provider_failures] == [
+        "HTTPStatusError",
+        "ConnectError",
+    ]
+    for provider_failure in provider_failures:
+        assert "prompt" not in provider_failure
+        assert "response" not in provider_failure
