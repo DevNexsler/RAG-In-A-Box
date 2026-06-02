@@ -7,8 +7,9 @@ from typing import Any
 
 import httpx
 
-from core.benchmarking.cases import load_case
-from core.benchmarking.scoring import score_audit_raw_case, score_failed_case, score_raw_case
+from core.benchmarking.cases import load_case, resolve_bench_path
+from core.benchmarking.scoring import score_failed_case
+from core.benchmarking.tasks import BenchmarkTask, get_task
 from providers.llm.openrouter_llm import OpenRouterGenerator
 
 
@@ -31,13 +32,18 @@ def run_benchmark(
     run_id: str,
     max_cases: int | None = None,
     replay_client: Any | None = None,
-    score_mode: str = "standard",
+    score_mode: str | None = None,
+    task: str = "enrichment",
+    suite: str = "standard",
 ) -> BenchmarkRunResult:
-    bench_path = Path(bench_dir)
+    bench_task = get_task(task)
+    bench_path = resolve_bench_path(bench_dir=bench_dir, task=task, suite=suite)
     run_dir = bench_path / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    _validate_score_mode(score_mode)
+    if score_mode is None:
+        score_mode = bench_task.default_score_mode
+    _validate_score_mode(score_mode, score_modes=bench_task.score_modes)
     client = replay_client or OpenRouterGenerator(model=model)
     case_ids = sorted(path.stem for path in (bench_path / "cases").glob("case_*.json"))
     if max_cases is not None:
@@ -47,7 +53,14 @@ def run_benchmark(
     for case_id in case_ids:
         case = load_case(bench_dir=bench_path, case_id=case_id)
         gold = _load_gold_record(bench_path=bench_path, case_id=case_id)
-        result = _run_case(case=case, gold=gold, client=client, model=model, score_mode=score_mode)
+        result = _run_case(
+            case=case,
+            gold=gold,
+            client=client,
+            model=model,
+            score_mode=score_mode,
+            bench_task=bench_task,
+        )
         results.append(result)
 
     per_case_path = run_dir / "per_case.jsonl"
@@ -56,7 +69,15 @@ def run_benchmark(
         encoding="utf-8",
     )
 
-    summary = _build_summary(results=results, model=model, run_id=run_id, score_mode=score_mode)
+    summary = _build_summary(
+        results=results,
+        model=model,
+        run_id=run_id,
+        score_mode=score_mode,
+        task=task,
+        suite=suite,
+        bench_path=bench_path,
+    )
     summary_path = run_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -70,14 +91,12 @@ def _run_case(
     client: Any,
     model: str,
     score_mode: str,
+    bench_task: BenchmarkTask,
 ) -> dict[str, Any]:
     replay: dict[str, Any] | None = None
     try:
         replay = client.generate_with_metadata(case.prompt, max_tokens=512)
-        if score_mode == "audit":
-            normalized_output, score = score_audit_raw_case(replay["content"], gold)
-        else:
-            normalized_output, score = score_raw_case(replay["content"], gold)
+        normalized_output, score = bench_task.score_raw_output(replay["content"], gold, score_mode)
         return {
             "case_id": case.case_id,
             "model": model,
@@ -158,6 +177,9 @@ def _build_summary(
     model: str,
     run_id: str,
     score_mode: str,
+    task: str,
+    suite: str,
+    bench_path: Path,
 ) -> dict[str, Any]:
     case_count = len(results)
     parse_failures = sum(1 for item in results if item["score"]["reliability"].get("parse_failed"))
@@ -182,6 +204,8 @@ def _build_summary(
 
     summary = {
         "run_id": run_id,
+        "task": task,
+        "suite": suite,
         "model": model,
         "score_mode": score_mode,
         "case_count": case_count,
@@ -199,7 +223,97 @@ def _build_summary(
     }
     if score_mode == "audit":
         summary["subscore_averages"] = _average_subscores(results=results, case_count=case_count)
+    hard_case_breakdown = _build_hard_case_breakdown(
+        bench_path=bench_path,
+        results=results,
+        suite=suite,
+    )
+    if hard_case_breakdown is not None:
+        summary["hard_case_breakdown"] = hard_case_breakdown
+    provider_failure_breakdown = _build_provider_failure_breakdown(bench_path=bench_path)
+    if provider_failure_breakdown is not None:
+        summary["provider_failure_breakdown"] = provider_failure_breakdown
     return summary
+
+
+def _build_hard_case_breakdown(
+    *,
+    bench_path: Path,
+    results: list[dict[str, Any]],
+    suite: str,
+) -> dict[str, dict[str, float | int]] | None:
+    if suite == "standard":
+        return None
+
+    manifest_path = bench_path / "cases" / "manifest.json"
+    if not manifest_path.exists():
+        return None
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cases = manifest.get("cases", [])
+    if not isinstance(cases, list):
+        return {}
+
+    results_by_case = {str(result.get("case_id")): result for result in results}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        result = results_by_case.get(str(case.get("case_id")))
+        if result is None:
+            continue
+        flags = case.get("flags", [])
+        if not isinstance(flags, list):
+            continue
+        for flag in flags:
+            grouped.setdefault(str(flag), []).append(result)
+
+    return {
+        flag: _summarize_result_group(group_results)
+        for flag, group_results in sorted(grouped.items())
+    }
+
+
+def _summarize_result_group(results: list[dict[str, Any]]) -> dict[str, float | int]:
+    case_count = len(results)
+    parse_failures = sum(
+        1 for item in results if item.get("score", {}).get("reliability", {}).get("parse_failed")
+    )
+    transport_failures = sum(1 for item in results if item.get("status") == "transport_failed")
+    successes = sum(1 for item in results if item.get("status") == "success")
+    return {
+        "case_count": case_count,
+        "average_total_score": round(
+            sum(item.get("score", {}).get("total_score", 0.0) for item in results) / case_count,
+            6,
+        )
+        if case_count
+        else 0.0,
+        "success_rate": round(successes / case_count, 6) if case_count else 0.0,
+        "parse_failure_rate": round(parse_failures / case_count, 6) if case_count else 0.0,
+        "transport_failure_rate": round(transport_failures / case_count, 6) if case_count else 0.0,
+    }
+
+
+def _build_provider_failure_breakdown(*, bench_path: Path) -> dict[str, int] | None:
+    failures_path = bench_path / "provider_failures.jsonl"
+    if not failures_path.exists():
+        return None
+
+    counts: dict[str, int] = {}
+    for line in failures_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            failure = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(failure, dict):
+            continue
+        key = failure.get("failure_status_code") or failure.get("failure_type") or "unknown"
+        key = str(key)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def _average_subscores(*, results: list[dict[str, Any]], case_count: int) -> dict[str, float]:
@@ -222,8 +336,8 @@ def _average_subscores(*, results: list[dict[str, Any]], case_count: int) -> dic
     }
 
 
-def _validate_score_mode(score_mode: str) -> None:
-    if score_mode not in {"standard", "audit"}:
+def _validate_score_mode(score_mode: str, *, score_modes: frozenset[str]) -> None:
+    if score_mode not in score_modes:
         raise ValueError(f"unsupported benchmark score_mode: {score_mode}")
 
 

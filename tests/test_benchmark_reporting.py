@@ -193,6 +193,51 @@ def test_build_parser_registers_report_command():
     assert args.run_id == "baseline"
 
 
+def test_build_parser_registers_suite_aware_run_and_report():
+    parser = build_parser()
+
+    run_args = parser.parse_args(
+        [
+            "run",
+            "--task",
+            "enrichment",
+            "--suite",
+            "hard",
+            "--model",
+            "openai/gpt-4.1-mini",
+            "--run-id",
+            "hard-baseline",
+        ]
+    )
+    report_args = parser.parse_args(
+        [
+            "report",
+            "--task",
+            "enrichment",
+            "--suite",
+            "hard",
+            "--run-id",
+            "hard-baseline",
+        ]
+    )
+    mine_args = parser.parse_args(
+        [
+            "mine-hard",
+            "--task",
+            "enrichment",
+            "--suite",
+            "hard",
+            "--limit",
+            "50",
+        ]
+    )
+
+    assert run_args.task == "enrichment"
+    assert run_args.suite == "hard"
+    assert report_args.suite == "hard"
+    assert mine_args.command == "mine-hard"
+
+
 def test_build_report_includes_audit_subscores_in_json_csv_and_markdown(tmp_path):
     fixture_run_dir = _write_run_artifacts(tmp_path, run_id="audit-baseline", score_mode="audit")
 
@@ -218,6 +263,73 @@ def test_build_report_includes_audit_subscores_in_json_csv_and_markdown(tmp_path
         {"subscore": "filing_taxonomy", "score": "0.35"},
         {"subscore": "summary_quality", "score": "0.4"},
     ]
+
+
+def test_build_report_includes_task_suite_and_hard_breakdown(tmp_path):
+    run_dir = _write_run_artifacts(
+        tmp_path,
+        summary_overrides={
+            "task": "enrichment",
+            "suite": "hard",
+            "hard_case_breakdown": {
+                "huge_prompt": {"case_count": 2, "average_total_score": 0.4},
+                "nearby_context": {"case_count": 1, "average_total_score": 0.8},
+            },
+            "provider_failure_breakdown": {
+                "402": 3,
+                "ConnectError": 1,
+            },
+        },
+    )
+
+    paths = write_reports(run_dir=run_dir)
+    report = json.loads(paths["json"].read_text())
+    markdown = paths["markdown"].read_text()
+
+    assert report["summary"]["task"] == "enrichment"
+    assert report["summary"]["suite"] == "hard"
+    assert report["hard_case_breakdown"]["huge_prompt"]["case_count"] == 2
+    assert report["provider_failure_breakdown"]["402"] == 3
+    assert "## Hard Case Breakdown" in markdown
+    assert "## Provider Failure Breakdown" in markdown
+
+    with paths["hard_case_breakdown_csv"].open(encoding="utf-8", newline="") as handle:
+        hard_case_rows = list(csv.DictReader(handle))
+    with paths["provider_failures_csv"].open(encoding="utf-8", newline="") as handle:
+        provider_failure_rows = list(csv.DictReader(handle))
+
+    assert hard_case_rows == [
+        {"hard_case": "huge_prompt", "average_total_score": "0.4", "case_count": "2"},
+        {"hard_case": "nearby_context", "average_total_score": "0.8", "case_count": "1"},
+    ]
+    assert provider_failure_rows == [
+        {"failure": "402", "count": "3"},
+        {"failure": "ConnectError", "count": "1"},
+    ]
+
+
+def test_build_report_includes_empty_present_breakdown_sections(tmp_path):
+    run_dir = _write_run_artifacts(
+        tmp_path,
+        summary_overrides={
+            "hard_case_breakdown": {},
+            "provider_failure_breakdown": {},
+        },
+    )
+
+    paths = write_reports(run_dir=run_dir)
+    report = json.loads(paths["json"].read_text())
+    markdown = paths["markdown"].read_text()
+
+    assert report["hard_case_breakdown"] == {}
+    assert report["provider_failure_breakdown"] == {}
+    assert paths["hard_case_breakdown_csv"].exists()
+    assert paths["provider_failures_csv"].exists()
+    assert "## Hard Case Breakdown" in markdown
+    assert "## Provider Failure Breakdown" in markdown
+
+    assert paths["hard_case_breakdown_csv"].read_text(encoding="utf-8") == "hard_case\n"
+    assert paths["provider_failures_csv"].read_text(encoding="utf-8") == "failure,count\n"
 
 
 def test_build_parser_registers_audit_commands():

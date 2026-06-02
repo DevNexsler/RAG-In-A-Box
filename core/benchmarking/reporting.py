@@ -36,6 +36,22 @@ def write_reports(*, run_dir: str | Path) -> dict[str, Path]:
         _write_subscores_csv(path=subscores_csv_path, subscores=report["subscore_averages"])
         extra_paths["subscores_csv"] = subscores_csv_path
 
+    if isinstance(report.get("hard_case_breakdown"), dict):
+        hard_case_breakdown_csv_path = run_path / "hard_case_breakdown.csv"
+        _write_hard_case_breakdown_csv(
+            path=hard_case_breakdown_csv_path,
+            hard_case_breakdown=report["hard_case_breakdown"],
+        )
+        extra_paths["hard_case_breakdown_csv"] = hard_case_breakdown_csv_path
+
+    if isinstance(report.get("provider_failure_breakdown"), dict):
+        provider_failures_csv_path = run_path / "provider_failures.csv"
+        _write_provider_failures_csv(
+            path=provider_failures_csv_path,
+            provider_failure_breakdown=report["provider_failure_breakdown"],
+        )
+        extra_paths["provider_failures_csv"] = provider_failures_csv_path
+
     markdown_path = run_path / "leaderboard.md"
     markdown_path.write_text(_build_markdown(report=report), encoding="utf-8")
 
@@ -70,13 +86,17 @@ def _build_report(*, summary: dict[str, Any], per_case: list[dict[str, Any]]) ->
         for key, value in subscore_averages.items():
             leaderboard_row[key] = value
 
+    for key in ("task", "suite"):
+        if summary.get(key) is not None:
+            leaderboard_row[key] = summary[key]
+
     costs = _extract_costs(per_case)
     if costs["cost_total"] is not None:
         leaderboard_row["cost_total"] = costs["cost_total"]
     if costs["cost_average"] is not None:
         leaderboard_row["cost_average"] = costs["cost_average"]
 
-    return {
+    report = {
         "run_id": summary["run_id"],
         "model": summary["model"],
         "score_mode": score_mode,
@@ -87,6 +107,10 @@ def _build_report(*, summary: dict[str, Any], per_case: list[dict[str, Any]]) ->
         "subscore_averages": subscore_averages,
         "worst_cases": _worst_cases(per_case),
     }
+    for key in ("task", "suite", "hard_case_breakdown", "provider_failure_breakdown"):
+        if summary.get(key) is not None:
+            report[key] = summary[key]
+    return report
 
 
 def _write_field_scores_csv(*, path: Path, field_scores: dict[str, Any]) -> None:
@@ -103,6 +127,31 @@ def _write_subscores_csv(*, path: Path, subscores: dict[str, Any]) -> None:
         writer.writerow(["subscore", "score"])
         for field, score in sorted(subscores.items()):
             writer.writerow([field, score])
+
+
+def _write_hard_case_breakdown_csv(*, path: Path, hard_case_breakdown: dict[str, Any]) -> None:
+    metric_headers = sorted(
+        {
+            metric
+            for metrics in hard_case_breakdown.values()
+            if isinstance(metrics, dict)
+            for metric in metrics
+        }
+    )
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["hard_case", *metric_headers])
+        for hard_case, metrics in sorted(hard_case_breakdown.items()):
+            metric_values = metrics if isinstance(metrics, dict) else {}
+            writer.writerow([hard_case, *[metric_values.get(metric, "") for metric in metric_headers]])
+
+
+def _write_provider_failures_csv(*, path: Path, provider_failure_breakdown: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["failure", "count"])
+        for failure, count in sorted(provider_failure_breakdown.items()):
+            writer.writerow([failure, count])
 
 
 def _build_markdown(*, report: dict[str, Any]) -> str:
@@ -125,6 +174,9 @@ def _build_markdown(*, report: dict[str, Any]) -> str:
     )
     optional_headers = ["token_total", "token_average", "cost_total", "cost_average"]
     for header in optional_headers:
+        if any(header in row for row in leaderboard):
+            headers.append(header)
+    for header in ("task", "suite"):
         if any(header in row for row in leaderboard):
             headers.append(header)
 
@@ -155,6 +207,47 @@ def _build_markdown(*, report: dict[str, Any]) -> str:
         )
         for field, score in sorted(report["subscore_averages"].items()):
             lines.append(f"| {field} | {score} |")
+
+    if isinstance(report.get("hard_case_breakdown"), dict):
+        hard_case_breakdown = report["hard_case_breakdown"]
+        metric_headers = sorted(
+            {
+                metric
+                for metrics in hard_case_breakdown.values()
+                if isinstance(metrics, dict)
+                for metric in metrics
+            }
+        )
+        lines.extend(
+            [
+                "",
+                "## Hard Case Breakdown",
+                "",
+                _markdown_table(
+                    headers=["hard_case", *metric_headers],
+                    rows=[
+                        {
+                            "hard_case": hard_case,
+                            **(metrics if isinstance(metrics, dict) else {}),
+                        }
+                        for hard_case, metrics in sorted(hard_case_breakdown.items())
+                    ],
+                ),
+            ]
+        )
+
+    if isinstance(report.get("provider_failure_breakdown"), dict):
+        lines.extend(
+            [
+                "",
+                "## Provider Failure Breakdown",
+                "",
+                "| failure | count |",
+                "| --- | --- |",
+            ]
+        )
+        for failure, count in sorted(report["provider_failure_breakdown"].items()):
+            lines.append(f"| {failure} | {count} |")
 
     lines.extend(
         [
