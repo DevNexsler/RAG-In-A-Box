@@ -1,7 +1,12 @@
 import json
 from pathlib import Path
 
-from core.benchmarking.cases import load_trace_rows, prepare_audit_cases, prepare_cases
+from core.benchmarking.cases import (
+    load_trace_rows,
+    prepare_audit_cases,
+    prepare_cases,
+    resolve_bench_path,
+)
 
 
 def test_load_trace_rows_reads_saved_prompt_and_output():
@@ -11,6 +16,16 @@ def test_load_trace_rows_reads_saved_prompt_and_output():
 
     assert rows[0].prompt.startswith("Extract metadata from this document")
     assert rows[0].baseline_response.startswith("{")
+
+
+def test_resolve_bench_path_preserves_legacy_layout(tmp_path):
+    assert resolve_bench_path(bench_dir=tmp_path, task="enrichment", suite="standard") == tmp_path
+
+
+def test_resolve_bench_path_uses_nested_layout_for_nonstandard_suite(tmp_path):
+    assert resolve_bench_path(bench_dir=tmp_path, task="enrichment", suite="hard") == (
+        tmp_path / "tasks" / "enrichment" / "hard"
+    )
 
 
 def test_prepare_cases_filters_smoke_rows_and_caps_to_limit(tmp_path):

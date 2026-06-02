@@ -64,6 +64,18 @@ _SUMMARY_RUBRIC_DEFAULT = {
 }
 
 
+def resolve_bench_path(
+    *,
+    bench_dir: str | Path,
+    task: str = "enrichment",
+    suite: str = "standard",
+) -> Path:
+    root = Path(bench_dir)
+    if task == "enrichment" and suite == "standard":
+        return root
+    return root / "tasks" / task / suite
+
+
 def load_trace_rows(trace_path: str | Path) -> list[TraceRow]:
     rows: list[TraceRow] = []
     for path in _iter_trace_paths(Path(trace_path)):
