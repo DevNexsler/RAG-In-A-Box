@@ -5,6 +5,7 @@ from core.benchmarking.mining import (
     HUGE_PROMPT_CHARS,
     LONG_PROMPT_CHARS,
     load_trace_metadata,
+    materialize_hard_suite,
     score_hard_flags,
     select_hard_cases,
 )
@@ -176,3 +177,29 @@ def test_select_hard_cases_keeps_failure_when_duplicate_prompt_succeeds_first():
     selected = select_hard_cases([success_row, failure_after_success], limit=10)
 
     assert [row.failure_status_code for row in selected.provider_failure_cases] == [429]
+
+
+def test_materialize_hard_suite_writes_cases_manifest_and_gold_stubs(tmp_path):
+    result = materialize_hard_suite(
+        trace_dir=Path("tests/fixtures/benchmarks/hard"),
+        out_dir=tmp_path,
+        task="enrichment",
+        suite="hard",
+        limit=5,
+    )
+
+    suite_dir = tmp_path / "tasks" / "enrichment" / "hard"
+    manifest = json.loads((suite_dir / "cases" / "manifest.json").read_text())
+
+    assert result.selected_count == 1
+    assert manifest["suite"] == "hard"
+    assert manifest["task"] == "enrichment"
+    assert manifest["selection_flags"]
+    assert "prompt" not in manifest["cases"][0]
+    assert "baseline_response" not in manifest["cases"][0]
+    assert (suite_dir / "cases" / "case_0001.json").is_file()
+    assert (suite_dir / "gold" / "case_0001.json").is_file()
+    provider_failure = json.loads((suite_dir / "provider_failures.jsonl").read_text().strip())
+    assert provider_failure["failure_status_code"] == 402
+    assert "prompt" not in provider_failure
+    assert "response" not in provider_failure
