@@ -4,6 +4,7 @@ import json
 from core.benchmarking.mining import (
     HUGE_PROMPT_CHARS,
     LONG_PROMPT_CHARS,
+    VERY_SLOW_SUCCESS_MS,
     load_trace_metadata,
     materialize_hard_suite,
     score_hard_flags,
@@ -71,6 +72,7 @@ def test_load_trace_metadata_skips_malformed_jsonl_lines(tmp_path):
     assert len(rows) == 1
     assert rows[0].trace_line == 2
     assert rows[0].title == "Valid row"
+    assert rows[0].response_looks_parseable is False
 
 
 def test_load_trace_metadata_tolerates_bad_nested_shapes(tmp_path):
@@ -108,6 +110,28 @@ def test_score_hard_flags_detects_real_hard_patterns():
     assert "business_critical" in scored.flags
     assert "slow_success" in scored.flags
     assert scored.hard_score > 0
+
+
+def test_score_hard_flags_detects_business_critical_property_terms():
+    row = TraceMetadata(
+        trace_file="synthetic.jsonl",
+        trace_line=1,
+        timestamp="2026-05-06T00:00:00+00:00",
+        provider="openrouter",
+        model="openai/gpt-4.1-mini",
+        success=True,
+        latency_ms=1,
+        title="Urgent tenant lease maintenance scam warning",
+        source_type="pg_message",
+        prompt_length=100,
+        text_length=100,
+        prompt_hash="synthetic-business-critical",
+        response_looks_parseable=True,
+    )
+
+    scored = score_hard_flags(row)
+
+    assert "business_critical" in scored.flags
 
 
 def test_score_hard_flags_detects_threshold_and_parse_patterns():
@@ -186,6 +210,47 @@ def test_select_hard_cases_keeps_failure_when_duplicate_prompt_succeeds_first():
     assert [row.failure_status_code for row in selected.provider_failure_cases] == [429]
 
 
+def test_select_hard_cases_keeps_rare_flags_before_extra_high_score_cases():
+    high_score_rows = [
+        TraceMetadata(
+            trace_file="synthetic.jsonl",
+            trace_line=index,
+            timestamp="2026-05-06T00:00:00+00:00",
+            provider="openrouter",
+            model="openai/gpt-4.1-mini",
+            success=True,
+            latency_ms=VERY_SLOW_SUCCESS_MS + 1,
+            title=f"Payment lease row {index}",
+            source_type="pg_message",
+            prompt_length=HUGE_PROMPT_CHARS,
+            text_length=HUGE_PROMPT_CHARS,
+            prompt_hash=f"high-{index}",
+            response_looks_parseable=True,
+        )
+        for index in range(1, 4)
+    ]
+    rare_parse_row = TraceMetadata(
+        trace_file="synthetic.jsonl",
+        trace_line=99,
+        timestamp="2026-05-06T00:00:00+00:00",
+        provider="openrouter",
+        model="openai/gpt-4.1-mini",
+        success=True,
+        latency_ms=1,
+        title="Routine parse issue",
+        source_type="pg_message",
+        prompt_length=100,
+        text_length=100,
+        prompt_hash="rare-parse",
+        response_looks_parseable=False,
+    )
+
+    selected = select_hard_cases([*high_score_rows, rare_parse_row], limit=2)
+    selected_flags = {flag for candidate in selected.hard_cases for flag in candidate.flags}
+
+    assert "parse_suspect" in selected_flags
+
+
 def test_materialize_hard_suite_writes_cases_manifest_and_gold_stubs(tmp_path):
     result = materialize_hard_suite(
         trace_dir=Path("tests/fixtures/benchmarks/hard"),
@@ -223,6 +288,32 @@ def test_materialize_hard_suite_writes_cases_manifest_and_gold_stubs(tmp_path):
     for provider_failure in provider_failures:
         assert "prompt" not in provider_failure
         assert "response" not in provider_failure
+
+
+def test_materialize_hard_suite_preserves_existing_gold_labels_on_rerun(tmp_path):
+    materialize_hard_suite(
+        trace_dir=Path("tests/fixtures/benchmarks/hard"),
+        out_dir=tmp_path,
+        task="enrichment",
+        suite="hard",
+        limit=5,
+    )
+    suite_dir = tmp_path / "tasks" / "enrichment" / "hard"
+    gold_path = suite_dir / "gold" / "case_0001.json"
+    gold = json.loads(gold_path.read_text(encoding="utf-8"))
+    gold["canonical"]["summary"] = "manual label survives"
+    gold_path.write_text(json.dumps(gold, indent=2), encoding="utf-8")
+
+    materialize_hard_suite(
+        trace_dir=Path("tests/fixtures/benchmarks/hard"),
+        out_dir=tmp_path,
+        task="enrichment",
+        suite="hard",
+        limit=5,
+    )
+
+    rerun_gold = json.loads(gold_path.read_text(encoding="utf-8"))
+    assert rerun_gold["canonical"]["summary"] == "manual label survives"
 
 
 def test_synthetic_hard_suite_mine_run_report_e2e(tmp_path, capsys):

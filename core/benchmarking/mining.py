@@ -36,9 +36,24 @@ _TEXT_RE = re.compile(
 )
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _BUSINESS_CRITICAL_RE = re.compile(
-    r"\b(payment|billing|rent|collection|cleared|failed|invoice|charge)\b",
+    r"\b(payment|billing|rent|collection|cleared|failed|invoice|charge|tenant|lease|"
+    r"eviction|maintenance|damage|urgent|scam)\b",
     re.IGNORECASE,
 )
+_ENRICHMENT_OUTPUT_FIELDS = {
+    "summary",
+    "doc_type",
+    "entities_people",
+    "entities_places",
+    "entities_orgs",
+    "entities_dates",
+    "topics",
+    "keywords",
+    "key_facts",
+    "suggested_tags",
+    "suggested_folder",
+    "importance",
+}
 
 _PROMPT_FEATURES_BY_HASH: dict[str, frozenset[str]] = {}
 
@@ -137,9 +152,9 @@ def select_hard_cases(rows: list[TraceMetadata], *, limit: int = 50) -> HardCase
         if candidate.hard_score > 0:
             candidates.append(candidate)
 
-    candidates.sort(key=lambda item: (-item.hard_score, item.trace.trace_file, item.trace.trace_line))
+    candidates.sort(key=_candidate_sort_key)
     return HardCaseSelection(
-        hard_cases=candidates[:limit],
+        hard_cases=_select_balanced_candidates(candidates, limit=limit),
         provider_failure_cases=provider_failure_cases[:limit],
     )
 
@@ -163,7 +178,6 @@ def materialize_hard_suite(
     cases_dir.mkdir(parents=True, exist_ok=True)
     gold_dir.mkdir(parents=True, exist_ok=True)
     _remove_stale_case_files(cases_dir)
-    _remove_stale_gold_files(gold_dir)
 
     cases: list[BenchmarkCase] = []
     manifest_cases: list[dict[str, Any]] = []
@@ -201,6 +215,7 @@ def materialize_hard_suite(
         manifest_cases.append(_build_manifest_case(case, candidate))
         case_index += 1
 
+    _remove_unselected_gold_files(gold_dir, selected_case_ids={case.case_id for case in cases})
     _write_provider_failures(suite_dir / "provider_failures.jsonl", selection.provider_failure_cases)
 
     manifest = {
@@ -304,6 +319,56 @@ def _write_provider_failures(path: Path, rows: list[TraceMetadata]) -> None:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
+def _candidate_sort_key(candidate: HardCaseCandidate) -> tuple[int, str, int]:
+    return (-candidate.hard_score, candidate.trace.trace_file, candidate.trace.trace_line)
+
+
+def _select_balanced_candidates(
+    candidates: list[HardCaseCandidate],
+    *,
+    limit: int,
+) -> list[HardCaseCandidate]:
+    if limit <= 0:
+        return []
+
+    selected: list[HardCaseCandidate] = []
+    selected_hashes: set[str] = set()
+    remaining = list(candidates)
+
+    while len(selected) < limit and remaining:
+        progressed = False
+        flag_counts = {
+            flag: sum(1 for candidate in remaining if flag in candidate.flags)
+            for flag in {flag for candidate in remaining for flag in candidate.flags}
+        }
+        flags = sorted(flag_counts, key=lambda flag: (flag_counts[flag], flag))
+        for flag in flags:
+            candidate = next((item for item in remaining if flag in item.flags), None)
+            if candidate is None:
+                continue
+            selected.append(candidate)
+            selected_hashes.add(candidate.trace.prompt_hash)
+            remaining = [item for item in remaining if item.trace.prompt_hash not in selected_hashes]
+            progressed = True
+            if len(selected) == limit:
+                break
+        if not progressed:
+            break
+
+    for candidate in remaining:
+        if len(selected) == limit:
+            break
+        selected.append(candidate)
+
+    return selected
+
+
+def _remove_unselected_gold_files(gold_dir: Path, *, selected_case_ids: set[str]) -> None:
+    for path in gold_dir.glob("case_*.json"):
+        if path.stem not in selected_case_ids:
+            path.unlink()
+
+
 def _extract_user_prompt(raw: dict[str, Any]) -> str:
     request = raw.get("request")
     if not isinstance(request, dict):
@@ -354,10 +419,12 @@ def _response_looks_parseable(raw: dict[str, Any]) -> bool:
     if not content:
         return False
     try:
-        json.loads(content)
+        payload = json.loads(content)
     except json.JSONDecodeError:
         return False
-    return True
+    return isinstance(payload, dict) and bool(
+        _ENRICHMENT_OUTPUT_FIELDS.intersection(payload)
+    )
 
 
 def _extract_response_content(raw: dict[str, Any]) -> str:
