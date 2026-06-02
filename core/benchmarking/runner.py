@@ -7,8 +7,9 @@ from typing import Any
 
 import httpx
 
-from core.benchmarking.cases import load_case
-from core.benchmarking.scoring import score_audit_raw_case, score_failed_case, score_raw_case
+from core.benchmarking.cases import load_case, resolve_bench_path
+from core.benchmarking.scoring import score_failed_case
+from core.benchmarking.tasks import BenchmarkTask, get_task
 from providers.llm.openrouter_llm import OpenRouterGenerator
 
 
@@ -31,13 +32,17 @@ def run_benchmark(
     run_id: str,
     max_cases: int | None = None,
     replay_client: Any | None = None,
-    score_mode: str = "standard",
+    score_mode: str | None = None,
+    task: str = "enrichment",
+    suite: str = "standard",
 ) -> BenchmarkRunResult:
-    bench_path = Path(bench_dir)
+    bench_task = get_task(task)
+    bench_path = resolve_bench_path(bench_dir=bench_dir, task=task, suite=suite)
     run_dir = bench_path / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    _validate_score_mode(score_mode)
+    score_mode = score_mode or bench_task.default_score_mode
+    _validate_score_mode(score_mode, score_modes=bench_task.score_modes)
     client = replay_client or OpenRouterGenerator(model=model)
     case_ids = sorted(path.stem for path in (bench_path / "cases").glob("case_*.json"))
     if max_cases is not None:
@@ -47,7 +52,14 @@ def run_benchmark(
     for case_id in case_ids:
         case = load_case(bench_dir=bench_path, case_id=case_id)
         gold = _load_gold_record(bench_path=bench_path, case_id=case_id)
-        result = _run_case(case=case, gold=gold, client=client, model=model, score_mode=score_mode)
+        result = _run_case(
+            case=case,
+            gold=gold,
+            client=client,
+            model=model,
+            score_mode=score_mode,
+            bench_task=bench_task,
+        )
         results.append(result)
 
     per_case_path = run_dir / "per_case.jsonl"
@@ -56,7 +68,14 @@ def run_benchmark(
         encoding="utf-8",
     )
 
-    summary = _build_summary(results=results, model=model, run_id=run_id, score_mode=score_mode)
+    summary = _build_summary(
+        results=results,
+        model=model,
+        run_id=run_id,
+        score_mode=score_mode,
+        task=task,
+        suite=suite,
+    )
     summary_path = run_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -70,14 +89,12 @@ def _run_case(
     client: Any,
     model: str,
     score_mode: str,
+    bench_task: BenchmarkTask,
 ) -> dict[str, Any]:
     replay: dict[str, Any] | None = None
     try:
         replay = client.generate_with_metadata(case.prompt, max_tokens=512)
-        if score_mode == "audit":
-            normalized_output, score = score_audit_raw_case(replay["content"], gold)
-        else:
-            normalized_output, score = score_raw_case(replay["content"], gold)
+        normalized_output, score = bench_task.score_raw_output(replay["content"], gold, score_mode)
         return {
             "case_id": case.case_id,
             "model": model,
@@ -158,6 +175,8 @@ def _build_summary(
     model: str,
     run_id: str,
     score_mode: str,
+    task: str,
+    suite: str,
 ) -> dict[str, Any]:
     case_count = len(results)
     parse_failures = sum(1 for item in results if item["score"]["reliability"].get("parse_failed"))
@@ -182,6 +201,8 @@ def _build_summary(
 
     summary = {
         "run_id": run_id,
+        "task": task,
+        "suite": suite,
         "model": model,
         "score_mode": score_mode,
         "case_count": case_count,
@@ -222,8 +243,8 @@ def _average_subscores(*, results: list[dict[str, Any]], case_count: int) -> dic
     }
 
 
-def _validate_score_mode(score_mode: str) -> None:
-    if score_mode not in {"standard", "audit"}:
+def _validate_score_mode(score_mode: str, *, score_modes: frozenset[str]) -> None:
+    if score_mode not in score_modes:
         raise ValueError(f"unsupported benchmark score_mode: {score_mode}")
 
 

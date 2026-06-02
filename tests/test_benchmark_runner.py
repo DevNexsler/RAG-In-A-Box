@@ -309,6 +309,30 @@ def test_run_benchmark_persists_per_case_results_and_summary(tmp_path):
     assert fake_client.calls[0]["user_prompt"] == "Prompt text for case_0001"
 
 
+def test_run_benchmark_accepts_task_and_suite_nested_layout(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    suite_dir = fixture_bench_dir / "tasks" / "enrichment" / "hard"
+    suite_dir.mkdir(parents=True)
+    _write_case_and_gold(suite_dir, case_id="case_0001")
+
+    fake_client = FakeReplayClient(
+        content='{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
+    )
+
+    run = run_benchmark(
+        bench_dir=fixture_bench_dir,
+        task="enrichment",
+        suite="hard",
+        model="openai/gpt-4.1-mini",
+        run_id="hard-baseline",
+        replay_client=fake_client,
+    )
+
+    assert run.run_dir == suite_dir / "runs" / "hard-baseline"
+    assert run.summary["task"] == "enrichment"
+    assert run.summary["suite"] == "hard"
+
+
 def test_run_benchmark_records_parse_failures_per_case(tmp_path):
     fixture_bench_dir = tmp_path / "benchmarks"
     fixture_bench_dir.mkdir(parents=True)
@@ -343,7 +367,7 @@ def test_run_benchmark_classifies_internal_value_error_separately(tmp_path, monk
     def explode(*args, **kwargs):
         raise ValueError("gold data mismatch")
 
-    monkeypatch.setattr("core.benchmarking.runner.score_raw_case", explode)
+    monkeypatch.setattr("core.benchmarking.tasks.enrichment.score_raw_case", explode)
 
     run = run_benchmark(
         bench_dir=fixture_bench_dir,
