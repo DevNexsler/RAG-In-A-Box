@@ -10,8 +10,8 @@ from core.benchmarking.mining import (
     select_hard_cases,
 )
 from core.benchmarking.models import TraceMetadata
-from core.benchmarking.reporting import write_reports
 from core.benchmarking.runner import run_benchmark
+from scripts.enrichment_benchmark import main as benchmark_main
 from tests.test_benchmark_runner import FakeReplayClient
 
 HARD_TRACES = Path("tests/fixtures/benchmarks/hard/hard_traces.jsonl")
@@ -225,15 +225,39 @@ def test_materialize_hard_suite_writes_cases_manifest_and_gold_stubs(tmp_path):
         assert "response" not in provider_failure
 
 
-def test_synthetic_hard_suite_mine_run_report_e2e(tmp_path):
-    materialize_hard_suite(
-        trace_dir=Path("tests/fixtures/benchmarks/hard"),
-        out_dir=tmp_path,
-        task="enrichment",
-        suite="hard",
-        limit=5,
+def test_synthetic_hard_suite_mine_run_report_e2e(tmp_path, capsys):
+    assert (
+        benchmark_main(
+            [
+                "mine-hard",
+                "--trace-dir",
+                "tests/fixtures/benchmarks/hard",
+                "--bench-dir",
+                str(tmp_path),
+                "--task",
+                "enrichment",
+                "--suite",
+                "hard",
+                "--limit",
+                "5",
+            ]
+        )
+        == 0
     )
+    mine_output = capsys.readouterr().out
     suite_dir = tmp_path / "tasks" / "enrichment" / "hard"
+    manifest = json.loads((suite_dir / "cases" / "manifest.json").read_text())
+    provider_failures_path = suite_dir / "provider_failures.jsonl"
+    assert provider_failures_path.is_file()
+    provider_failures = [
+        json.loads(line)
+        for line in provider_failures_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert "Prepared 2 hard cases" in mine_output
+    assert manifest["selected_count"] == 2
+    assert len(manifest["cases"]) == 2
+    assert provider_failures
 
     fake_client = FakeReplayClient(
         content='{"summary":"Payment cleared notice.","doc_type":["pg_message"],"entities_people":["Brianna Reaver"],"entities_places":[],"entities_orgs":["Pinefield Group"],"entities_dates":["2026-05-01"],"topics":["rent payment"],"keywords":["payment cleared"],"key_facts":["A payment cleared."],"suggested_tags":["TenantCloud"],"suggested_folder":"1-Projects/Rent-Collection/","importance":0.8}'
@@ -247,8 +271,43 @@ def test_synthetic_hard_suite_mine_run_report_e2e(tmp_path):
         run_id="synthetic-hard",
         replay_client=fake_client,
     )
-    paths = write_reports(run_dir=run.run_dir)
+    assert (
+        benchmark_main(
+            [
+                "report",
+                "--bench-dir",
+                str(tmp_path),
+                "--task",
+                "enrichment",
+                "--suite",
+                "hard",
+                "--run-id",
+                "synthetic-hard",
+            ]
+        )
+        == 0
+    )
+    report_output = capsys.readouterr().out
+    report_json_path = run.run_dir / "report.json"
+    report_csv_path = run.run_dir / "field_scores.csv"
+    report_markdown_path = run.run_dir / "leaderboard.md"
+    assert report_json_path.is_file()
+    assert report_csv_path.is_file()
+    assert report_markdown_path.is_file()
+    report = json.loads(report_json_path.read_text(encoding="utf-8"))
 
+    assert len(fake_client.calls) == manifest["selected_count"]
+    assert run.summary["case_count"] == manifest["selected_count"]
+    assert run.summary["task"] == "enrichment"
     assert run.summary["suite"] == "hard"
-    assert paths["json"].is_file()
-    assert (suite_dir / "provider_failures.jsonl").is_file()
+    assert "summary" in report
+    assert "leaderboard" in report
+    assert report["summary"]["case_count"] == manifest["selected_count"]
+    assert report["summary"]["task"] == "enrichment"
+    assert report["summary"]["suite"] == "hard"
+    assert report["leaderboard"][0]["model"] == "openai/gpt-4.1-mini"
+    if "hard_case_breakdown" in report:
+        assert report["hard_case_breakdown"]
+    assert f"JSON: {report_json_path}" in report_output
+    assert f"CSV: {report_csv_path}" in report_output
+    assert f"Markdown: {report_markdown_path}" in report_output
