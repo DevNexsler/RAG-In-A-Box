@@ -164,6 +164,20 @@ def _run_case(
             "score": score.to_dict(),
             "error": str(exc),
         }
+    except (AttributeError, KeyError, TypeError) as exc:
+        score = score_failed_case(error="transport_error")
+        return {
+            "case_id": case.case_id,
+            "model": model,
+            "status": "transport_failed",
+            "raw_output": replay.get("content", "") if replay else "",
+            "normalized_output": None,
+            "request": replay.get("request", {}) if replay else {},
+            "response": replay.get("response", {}) if replay else {},
+            "latency_ms": replay.get("latency_ms") if replay else None,
+            "score": score.to_dict(),
+            "error": str(exc),
+        }
 
 
 def _load_gold_record(*, bench_path: Path, case_id: str) -> dict[str, Any]:

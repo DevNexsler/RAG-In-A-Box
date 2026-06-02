@@ -436,6 +436,28 @@ def test_run_benchmark_classifies_internal_value_error_separately(tmp_path, monk
     assert run.per_case[0]["score"]["reliability"]["internal_failed"] is True
 
 
+def test_run_benchmark_records_provider_response_exceptions_as_transport_failures(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+
+    fake_client = SequencedReplayClient(AttributeError("'NoneType' object has no attribute 'strip'"))
+
+    run = run_benchmark(
+        bench_dir=fixture_bench_dir,
+        model="deepseek/deepseek-v4-pro",
+        run_id="provider-response-error",
+        replay_client=fake_client,
+    )
+
+    assert run.summary["case_count"] == 1
+    assert run.summary["request_failures"] == 1
+    assert run.summary["transport_failure_rate"] == 1.0
+    assert run.summary["success_rate"] == 0.0
+    assert run.per_case[0]["status"] == "transport_failed"
+    assert run.per_case[0]["score"]["reliability"]["transport_failed"] is True
+
+
 def test_run_benchmark_summary_includes_transport_latency_and_token_aggregates(tmp_path):
     fixture_bench_dir = tmp_path / "benchmarks"
     fixture_bench_dir.mkdir(parents=True)
