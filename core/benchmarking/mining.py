@@ -37,7 +37,13 @@ def load_trace_metadata(trace_path: str | Path) -> list[TraceMetadata]:
             if not line.strip():
                 continue
 
-            raw = json.loads(line)
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+
             prompt = _extract_user_prompt(raw)
             prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
 
@@ -98,15 +104,19 @@ def select_hard_cases(rows: list[TraceMetadata], *, limit: int = 50) -> HardCase
     provider_failure_cases: list[TraceMetadata] = []
     candidates: list[HardCaseCandidate] = []
     seen_hashes: set[str] = set()
+    seen_failure_keys: set[tuple[str, str, int]] = set()
 
     for row in rows:
+        if not row.success and row.failure_type and row.failure_status_code is not None:
+            failure_key = (row.prompt_hash, row.failure_type, row.failure_status_code)
+            if failure_key not in seen_failure_keys:
+                seen_failure_keys.add(failure_key)
+                provider_failure_cases.append(row)
+            continue
+
         if row.prompt_hash in seen_hashes:
             continue
         seen_hashes.add(row.prompt_hash)
-
-        if not row.success and row.failure_type and row.failure_status_code is not None:
-            provider_failure_cases.append(row)
-            continue
 
         candidate = score_hard_flags(row)
         if candidate.hard_score > 0:
@@ -120,7 +130,12 @@ def select_hard_cases(rows: list[TraceMetadata], *, limit: int = 50) -> HardCase
 
 
 def _extract_user_prompt(raw: dict[str, Any]) -> str:
-    payload = raw.get("request", {}).get("payload", {})
+    request = raw.get("request")
+    if not isinstance(request, dict):
+        return ""
+    payload = request.get("payload", {})
+    if not isinstance(payload, dict):
+        return ""
     messages = payload.get("messages", [])
     if not isinstance(messages, list):
         return ""
@@ -171,13 +186,19 @@ def _response_looks_parseable(raw: dict[str, Any]) -> bool:
 
 
 def _extract_response_content(raw: dict[str, Any]) -> str:
-    choices = raw.get("response", {}).get("choices", [])
+    response = raw.get("response")
+    if not isinstance(response, dict):
+        return ""
+    choices = response.get("choices", [])
     if not isinstance(choices, list) or not choices:
         return ""
     first = choices[0]
     if not isinstance(first, dict):
         return ""
-    content = first.get("message", {}).get("content")
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
     return content if isinstance(content, str) else ""
 
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from core.benchmarking.mining import (
     HUGE_PROMPT_CHARS,
@@ -27,6 +28,67 @@ def test_load_trace_metadata_preserves_duplicate_prompt_lines():
     assert len(rows) == 5
     assert rows[0].prompt_hash == rows[2].prompt_hash
     assert rows[2].trace_line == 3
+
+
+def test_load_trace_metadata_skips_malformed_jsonl_lines(tmp_path):
+    trace_path = tmp_path / "mixed.jsonl"
+    trace_path.write_text(
+        "\n".join(
+            [
+                "{not-json",
+                json.dumps(
+                    {
+                        "ts": "2026-05-07T00:00:00+00:00",
+                        "provider": "openrouter",
+                        "model": "openai/gpt-4.1-mini",
+                        "success": True,
+                        "request": {
+                            "payload": {
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": "Document title: Valid row\nDocument type: pg_message",
+                                    }
+                                ]
+                            }
+                        },
+                        "response": {"choices": [{"message": {"content": "{}"}}]},
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    rows = load_trace_metadata(trace_path)
+
+    assert len(rows) == 1
+    assert rows[0].trace_line == 2
+    assert rows[0].title == "Valid row"
+
+
+def test_load_trace_metadata_tolerates_bad_nested_shapes(tmp_path):
+    trace_path = tmp_path / "bad_shapes.jsonl"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "ts": "2026-05-08T00:00:00+00:00",
+                "provider": "openrouter",
+                "model": "openai/gpt-4.1-mini",
+                "success": False,
+                "request": [],
+                "response": [],
+                "error": "not-an-error-object",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = load_trace_metadata(trace_path)
+
+    assert len(rows) == 1
+    assert rows[0].prompt_hash
+    assert rows[0].failure_type is None
 
 
 def test_score_hard_flags_detects_real_hard_patterns():
@@ -87,3 +149,28 @@ def test_select_hard_cases_requires_provider_failure_type_and_status_code():
     selected = select_hard_cases(rows, limit=10)
 
     assert [row.failure_type for row in selected.provider_failure_cases] == ["HTTPStatusError"]
+
+
+def test_select_hard_cases_keeps_failure_when_duplicate_prompt_succeeds_first():
+    success_row, _, failure_row = load_trace_metadata(Path("tests/fixtures/benchmarks/hard_traces.jsonl"))[:3]
+    failure_after_success = TraceMetadata(
+        trace_file=failure_row.trace_file,
+        trace_line=99,
+        timestamp=failure_row.timestamp,
+        provider=failure_row.provider,
+        model=failure_row.model,
+        success=False,
+        latency_ms=50,
+        title=failure_row.title,
+        source_type=failure_row.source_type,
+        prompt_length=failure_row.prompt_length,
+        text_length=failure_row.text_length,
+        prompt_hash=success_row.prompt_hash,
+        response_looks_parseable=False,
+        failure_type="HTTPStatusError",
+        failure_status_code=429,
+    )
+
+    selected = select_hard_cases([success_row, failure_after_success], limit=10)
+
+    assert [row.failure_status_code for row in selected.provider_failure_cases] == [429]
