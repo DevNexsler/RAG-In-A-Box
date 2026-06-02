@@ -10,6 +10,9 @@ from core.benchmarking.mining import (
     select_hard_cases,
 )
 from core.benchmarking.models import TraceMetadata
+from core.benchmarking.reporting import write_reports
+from core.benchmarking.runner import run_benchmark
+from tests.test_benchmark_runner import FakeReplayClient
 
 HARD_TRACES = Path("tests/fixtures/benchmarks/hard/hard_traces.jsonl")
 
@@ -220,3 +223,32 @@ def test_materialize_hard_suite_writes_cases_manifest_and_gold_stubs(tmp_path):
     for provider_failure in provider_failures:
         assert "prompt" not in provider_failure
         assert "response" not in provider_failure
+
+
+def test_synthetic_hard_suite_mine_run_report_e2e(tmp_path):
+    materialize_hard_suite(
+        trace_dir=Path("tests/fixtures/benchmarks/hard"),
+        out_dir=tmp_path,
+        task="enrichment",
+        suite="hard",
+        limit=5,
+    )
+    suite_dir = tmp_path / "tasks" / "enrichment" / "hard"
+
+    fake_client = FakeReplayClient(
+        content='{"summary":"Payment cleared notice.","doc_type":["pg_message"],"entities_people":["Brianna Reaver"],"entities_places":[],"entities_orgs":["Pinefield Group"],"entities_dates":["2026-05-01"],"topics":["rent payment"],"keywords":["payment cleared"],"key_facts":["A payment cleared."],"suggested_tags":["TenantCloud"],"suggested_folder":"1-Projects/Rent-Collection/","importance":0.8}'
+    )
+
+    run = run_benchmark(
+        bench_dir=tmp_path,
+        task="enrichment",
+        suite="hard",
+        model="openai/gpt-4.1-mini",
+        run_id="synthetic-hard",
+        replay_client=fake_client,
+    )
+    paths = write_reports(run_dir=run.run_dir)
+
+    assert run.summary["suite"] == "hard"
+    assert paths["json"].is_file()
+    assert (suite_dir / "provider_failures.jsonl").is_file()
