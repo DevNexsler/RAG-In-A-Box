@@ -36,7 +36,7 @@ def write_reports(*, run_dir: str | Path) -> dict[str, Path]:
         _write_subscores_csv(path=subscores_csv_path, subscores=report["subscore_averages"])
         extra_paths["subscores_csv"] = subscores_csv_path
 
-    if report.get("hard_case_breakdown"):
+    if isinstance(report.get("hard_case_breakdown"), dict):
         hard_case_breakdown_csv_path = run_path / "hard_case_breakdown.csv"
         _write_hard_case_breakdown_csv(
             path=hard_case_breakdown_csv_path,
@@ -44,7 +44,7 @@ def write_reports(*, run_dir: str | Path) -> dict[str, Path]:
         )
         extra_paths["hard_case_breakdown_csv"] = hard_case_breakdown_csv_path
 
-    if report.get("provider_failure_breakdown"):
+    if isinstance(report.get("provider_failure_breakdown"), dict):
         provider_failures_csv_path = run_path / "provider_failures.csv"
         _write_provider_failures_csv(
             path=provider_failures_csv_path,
@@ -208,7 +208,7 @@ def _build_markdown(*, report: dict[str, Any]) -> str:
         for field, score in sorted(report["subscore_averages"].items()):
             lines.append(f"| {field} | {score} |")
 
-    if report.get("hard_case_breakdown"):
+    if isinstance(report.get("hard_case_breakdown"), dict):
         hard_case_breakdown = report["hard_case_breakdown"]
         metric_headers = sorted(
             {
@@ -236,7 +236,7 @@ def _build_markdown(*, report: dict[str, Any]) -> str:
             ]
         )
 
-    if report.get("provider_failure_breakdown"):
+    if isinstance(report.get("provider_failure_breakdown"), dict):
         lines.extend(
             [
                 "",

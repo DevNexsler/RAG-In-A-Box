@@ -263,6 +263,30 @@ def test_build_report_includes_task_suite_and_hard_breakdown(tmp_path):
     ]
 
 
+def test_build_report_includes_empty_present_breakdown_sections(tmp_path):
+    run_dir = _write_run_artifacts(
+        tmp_path,
+        summary_overrides={
+            "hard_case_breakdown": {},
+            "provider_failure_breakdown": {},
+        },
+    )
+
+    paths = write_reports(run_dir=run_dir)
+    report = json.loads(paths["json"].read_text())
+    markdown = paths["markdown"].read_text()
+
+    assert report["hard_case_breakdown"] == {}
+    assert report["provider_failure_breakdown"] == {}
+    assert paths["hard_case_breakdown_csv"].exists()
+    assert paths["provider_failures_csv"].exists()
+    assert "## Hard Case Breakdown" in markdown
+    assert "## Provider Failure Breakdown" in markdown
+
+    assert paths["hard_case_breakdown_csv"].read_text(encoding="utf-8") == "hard_case\n"
+    assert paths["provider_failures_csv"].read_text(encoding="utf-8") == "failure,count\n"
+
+
 def test_build_parser_registers_audit_commands():
     parser = build_parser()
 
