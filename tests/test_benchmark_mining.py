@@ -269,11 +269,22 @@ def test_materialize_hard_suite_writes_cases_manifest_and_gold_stubs(tmp_path):
     assert manifest["selection_flags"]
     assert "prompt" not in manifest["cases"][0]
     assert "baseline_response" not in manifest["cases"][0]
-    assert (suite_dir / "cases" / "case_0001.json").is_file()
-    assert (suite_dir / "cases" / "case_0002.json").is_file()
-    assert (suite_dir / "gold" / "case_0001.json").is_file()
-    assert (suite_dir / "gold" / "case_0002.json").is_file()
-    parse_case = json.loads((suite_dir / "cases" / "case_0002.json").read_text())
+    case_ids = [case["case_id"] for case in manifest["cases"]]
+    assert all(case_id.startswith("case_") for case_id in case_ids)
+    assert all(
+        (suite_dir / "cases" / f"{case_id}.json").is_file()
+        for case_id in case_ids
+    )
+    assert all(
+        (suite_dir / "gold" / f"{case_id}.json").is_file()
+        for case_id in case_ids
+    )
+    parse_case_id = next(
+        case["case_id"]
+        for case in manifest["cases"]
+        if case["title"] == "Slow parse suspect"
+    )
+    parse_case = json.loads((suite_dir / "cases" / f"{parse_case_id}.json").read_text())
     assert parse_case["title"] == "Slow parse suspect"
     assert parse_case["baseline_response"] == "not json"
     provider_failures = [
@@ -291,7 +302,7 @@ def test_materialize_hard_suite_writes_cases_manifest_and_gold_stubs(tmp_path):
 
 
 def test_materialize_hard_suite_preserves_existing_gold_labels_on_rerun(tmp_path):
-    materialize_hard_suite(
+    first_result = materialize_hard_suite(
         trace_dir=Path("tests/fixtures/benchmarks/hard"),
         out_dir=tmp_path,
         task="enrichment",
@@ -299,7 +310,8 @@ def test_materialize_hard_suite_preserves_existing_gold_labels_on_rerun(tmp_path
         limit=5,
     )
     suite_dir = tmp_path / "tasks" / "enrichment" / "hard"
-    gold_path = suite_dir / "gold" / "case_0001.json"
+    case_id = first_result.cases[0].case_id
+    gold_path = suite_dir / "gold" / f"{case_id}.json"
     gold = json.loads(gold_path.read_text(encoding="utf-8"))
     gold["canonical"]["summary"] = "manual label survives"
     gold_path.write_text(json.dumps(gold, indent=2), encoding="utf-8")
@@ -314,6 +326,31 @@ def test_materialize_hard_suite_preserves_existing_gold_labels_on_rerun(tmp_path
 
     rerun_gold = json.loads(gold_path.read_text(encoding="utf-8"))
     assert rerun_gold["canonical"]["summary"] == "manual label survives"
+
+
+def test_materialize_hard_suite_uses_stable_case_ids_when_limit_changes(tmp_path):
+    first_result = materialize_hard_suite(
+        trace_dir=Path("tests/fixtures/benchmarks/hard"),
+        out_dir=tmp_path,
+        task="enrichment",
+        suite="hard",
+        limit=5,
+    )
+    first_ids_by_trace = {
+        (case.trace_file, case.trace_line): case.case_id
+        for case in first_result.cases
+    }
+
+    second_result = materialize_hard_suite(
+        trace_dir=Path("tests/fixtures/benchmarks/hard"),
+        out_dir=tmp_path,
+        task="enrichment",
+        suite="hard",
+        limit=1,
+    )
+
+    for case in second_result.cases:
+        assert case.case_id == first_ids_by_trace[(case.trace_file, case.trace_line)]
 
 
 def test_synthetic_hard_suite_mine_run_report_e2e(tmp_path, capsys):

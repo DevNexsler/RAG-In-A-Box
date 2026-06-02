@@ -183,7 +183,6 @@ def materialize_hard_suite(
     manifest_cases: list[dict[str, Any]] = []
     skipped_cases: list[dict[str, Any]] = []
     selection_flags: set[str] = set()
-    case_index = 1
     for candidate in selection.hard_cases:
         full_row = full_rows.get((candidate.trace.trace_file, candidate.trace.trace_line))
         if full_row is None:
@@ -191,7 +190,7 @@ def materialize_hard_suite(
             continue
 
         case = BenchmarkCase(
-            case_id=f"case_{case_index:04d}",
+            case_id=_case_id_for_candidate(candidate),
             prompt=full_row["prompt"],
             baseline_response=full_row["baseline_response"],
             title=candidate.trace.title,
@@ -213,7 +212,6 @@ def materialize_hard_suite(
         )
         write_gold_stub(case, bench_dir=suite_dir)
         manifest_cases.append(_build_manifest_case(case, candidate))
-        case_index += 1
 
     _remove_unselected_gold_files(gold_dir, selected_case_ids={case.case_id for case in cases})
     _write_provider_failures(suite_dir / "provider_failures.jsonl", selection.provider_failure_cases)
@@ -299,6 +297,10 @@ def _build_skipped_manifest_case(candidate: HardCaseCandidate, *, reason: str) -
         "hard_score": candidate.hard_score,
         "skip_reason": reason,
     }
+
+
+def _case_id_for_candidate(candidate: HardCaseCandidate) -> str:
+    return f"case_{candidate.trace.prompt_hash[:12]}"
 
 
 def _write_provider_failures(path: Path, rows: list[TraceMetadata]) -> None:
