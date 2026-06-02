@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import threading
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,82 @@ _RUNTIME: dict[str, Any] = {}
 
 
 # --- Helpers ---
+
+
+class TaxonomyUsageAccumulator:
+    """Thread-safe in-memory queue for taxonomy usage increments."""
+
+    def __init__(self) -> None:
+        self._counts: Counter[str] = Counter()
+        self._lock = threading.Lock()
+
+    def add(self, entry_id: str) -> None:
+        entry_id = (entry_id or "").strip()
+        if not entry_id:
+            return
+        with self._lock:
+            self._counts[entry_id] += 1
+
+    def add_many(self, entry_ids) -> None:
+        for entry_id in entry_ids:
+            self.add(str(entry_id))
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(sorted(self._counts.items()))
+
+    def drain(self) -> dict[str, int]:
+        with self._lock:
+            counts = dict(sorted(self._counts.items()))
+            self._counts.clear()
+            return counts
+
+    def discard(self, counts: dict[str, int]) -> None:
+        """Remove counts only after the external taxonomy write succeeds."""
+        with self._lock:
+            for entry_id, delta in counts.items():
+                remaining = self._counts.get(entry_id, 0) - int(delta)
+                if remaining > 0:
+                    self._counts[entry_id] = remaining
+                else:
+                    self._counts.pop(entry_id, None)
+
+
+def _taxonomy_usage_ids_from_enrichment(enrichment: dict[str, str]) -> list[str]:
+    ids: list[str] = []
+    for tag in (enrichment.get("enr_suggested_tags") or "").split(","):
+        tag = tag.strip()
+        if tag:
+            ids.append(f"tag:{tag}")
+    folder = (enrichment.get("enr_suggested_folder") or "").strip()
+    if folder:
+        ids.append(f"folder:{folder}")
+    return ids
+
+
+def _queue_taxonomy_usage(enrichment: dict[str, str], accumulator: TaxonomyUsageAccumulator | None) -> None:
+    if accumulator is not None:
+        accumulator.add_many(_taxonomy_usage_ids_from_enrichment(enrichment))
+
+
+def _flush_taxonomy_usage(taxonomy_store, accumulator: TaxonomyUsageAccumulator | None, logger) -> None:
+    if taxonomy_store is None or accumulator is None:
+        return
+    counts = accumulator.snapshot()
+    if not counts:
+        return
+    try:
+        if hasattr(taxonomy_store, "increment_usage_many"):
+            taxonomy_store.increment_usage_many(counts)
+        else:
+            for entry_id, delta in counts.items():
+                for _ in range(delta):
+                    taxonomy_store.increment_usage(entry_id)
+        accumulator.discard(counts)
+        logger.info("Taxonomy usage updated for %d entries", len(counts))
+    except Exception as exc:
+        _RUNTIME.setdefault("_warnings", []).append(f"taxonomy_usage_failed:{exc}")
+        logger.warning("Failed to flush taxonomy usage: %s", exc)
 
 
 _SOURCE_TYPE_MAP = SOURCE_TYPE_BY_EXTENSION
@@ -564,8 +641,10 @@ def process_doc_task(doc: dict) -> None:
             max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
             taxonomy_store=taxonomy_store,
             context_text=context_text,
+            record_taxonomy_usage=False,
         )
-        if enrichment.get("_enrichment_failed"):
+        enrichment_failed = bool(enrichment.get("_enrichment_failed"))
+        if enrichment_failed:
             reason = enrichment.pop("_enrichment_failed")
             logger.warning("Enrichment failed for '%s': %s", doc_id, reason)
             _RUNTIME.setdefault("_warnings", []).append(
@@ -573,6 +652,8 @@ def process_doc_task(doc: dict) -> None:
             )
         elif not enrichment.get("enr_summary"):
             logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
+        if not enrichment_failed:
+            _queue_taxonomy_usage(enrichment, _RUNTIME.get("taxonomy_usage"))
         enrichment.pop("_enrichment_failed", None)
         doc_meta.update(enrichment)
     else:
@@ -1109,6 +1190,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     _RUNTIME["media_provider"] = media_provider
     _RUNTIME["llm_generator"] = llm_generator
     _RUNTIME["taxonomy_store"] = taxonomy_store
+    _RUNTIME["taxonomy_usage"] = TaxonomyUsageAccumulator() if taxonomy_store is not None else None
     _RUNTIME["config"] = config
     _RUNTIME["sources_by_name"] = {s.name: s for s in all_sources}
 
@@ -1186,6 +1268,8 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
 
     if failed_docs:
         logger.warning("Failed to process %d docs: %s", len(failed_docs), failed_docs[:20])
+
+    _flush_taxonomy_usage(taxonomy_store, _RUNTIME.get("taxonomy_usage"), logger)
 
     delete_docs_task(to_delete)
 

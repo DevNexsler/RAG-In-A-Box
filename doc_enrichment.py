@@ -618,6 +618,7 @@ def enrich_document(
     max_output_tokens: int = 512,
     taxonomy_store: "TaxonomyStore | None" = None,
     context_text: str = "",
+    record_taxonomy_usage: bool = True,
 ) -> dict[str, str]:
     """Extract structured metadata from document text using an LLM.
 
@@ -670,7 +671,7 @@ def enrich_document(
             )
 
         # Increment usage_count for matched taxonomy entries
-        if taxonomy_store is not None:
+        if taxonomy_store is not None and record_taxonomy_usage:
             try:
                 for tag in (enrichment.get("enr_suggested_tags") or "").split(","):
                     tag = tag.strip()

@@ -324,6 +324,30 @@ class TestEnrichDocument:
         assert "## Available Tags" in call_args
         assert "work: Work stuff" in call_args
 
+    def test_taxonomy_usage_writes_can_be_disabled_for_index_workers(self):
+        """Concurrent index workers should read taxonomy for prompts without writing usage."""
+        gen = self._make_generator(json.dumps({
+            "summary": "test",
+            "suggested_tags": ["work", "urgent"],
+            "suggested_folder": "Projects/Renovation",
+        }))
+        mock_taxonomy = MagicMock()
+        mock_taxonomy.format_for_prompt.return_value = "## Available Tags\n- work: Work stuff"
+        mock_taxonomy.increment_usage = MagicMock()
+
+        result = enrich_document(
+            "Some text",
+            "doc.md",
+            "md",
+            gen,
+            taxonomy_store=mock_taxonomy,
+            record_taxonomy_usage=False,
+        )
+
+        assert result["enr_suggested_tags"] == "work, urgent"
+        assert result["enr_suggested_folder"] == "Projects/Renovation"
+        mock_taxonomy.increment_usage.assert_not_called()
+
     def test_no_taxonomy_no_block(self):
         """Without taxonomy_store, no taxonomy block in prompt."""
         gen = self._make_generator('{"summary": "test"}')

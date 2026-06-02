@@ -273,6 +273,15 @@ class TaxonomyStore:
         if existing is not None:
             self.update(entry_id, usage_count=existing.get("usage_count", 0) + 1)
 
+    def increment_usage_many(self, counts: dict[str, int]) -> None:
+        """Apply queued usage_count increments serially."""
+        for entry_id, delta in sorted(counts.items()):
+            if delta <= 0:
+                continue
+            existing = self.get(entry_id)
+            if existing is not None:
+                self.update(entry_id, usage_count=existing.get("usage_count", 0) + int(delta))
+
     # --- Query ---
 
     def list_by_kind(self, kind: str, status: str = "active") -> list[dict]:

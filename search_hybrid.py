@@ -18,7 +18,7 @@ and individual Rank Learning Methods" (SIGIR 2009).
 Enhancements inspired by memory-lancedb-pro (win4r/memory-lancedb-pro):
   - Length normalization: log-based penalty for overly long chunks
   - Importance weighting: score *= (1 - w + w * importance) based on metadata field
-  - MMR diversity: cosine similarity deduplication (threshold 0.85)
+  - MMR diversity: conservative cosine deduplication (threshold 0.95)
   - Cross-encoder blend: 60/40 reranker/original score preservation
   - Cosine fallback: lightweight rerank when cross-encoder fails
   - Time decay floor: old docs never lose more than 50% relevance
@@ -488,39 +488,69 @@ def _apply_recency_boost(
 def _apply_mmr_diversity(
     hits: list[SearchHit],
     store: "LanceDBStore",
-    similarity_threshold: float = 0.85,
-) -> list[SearchHit]:
+    similarity_threshold: float = 0.95,
+    protected_top_k: int = 3,
+    pool_limit: int | None = None,
+    return_deferred: bool = False,
+) -> list[SearchHit] | tuple[list[SearchHit], list[dict]]:
     """Remove near-duplicate chunks using Maximal Marginal Relevance.
 
-    Greedy selection: for each candidate (in score order), compute cosine
-    similarity against all already-selected results. If similarity > threshold
-    to any selected result, defer it (append at end). This prevents
-    near-duplicate chunks from consuming all top-K slots.
+    Greedy selection after a protected top band: for each later candidate,
+    compute cosine similarity against selected results. If similarity is above
+    threshold, defer it (append at end). This reduces duplicate spam without
+    hiding the strongest few matches.
 
     Falls back silently to original order if vectors can't be retrieved.
 
     Inspired by memory-lancedb-pro's MMR diversity approach.
     """
     if len(hits) <= 1:
-        return hits
+        return (hits, []) if return_deferred else hits
+
+    def _chunk_uid(hit: SearchHit) -> str:
+        return f"{hit.doc_id}::{hit.loc}"
+
+    def _deferred_record(hit: SearchHit, similar_to: SearchHit, similarity: float) -> dict:
+        record_uuid = _chunk_uid(hit)
+        return {
+            "uuid": record_uuid,
+            "record_uuid": record_uuid,
+            "doc_id": hit.doc_id,
+            "loc": hit.loc,
+            "similar_to_uuid": _chunk_uid(similar_to),
+            "similarity": similarity,
+            "score": hit.score,
+            "title": hit.title,
+            "rel_path": hit.rel_path,
+        }
 
     try:
-        # Retrieve vectors for all hits
+        active_hits = hits[:pool_limit] if pool_limit else list(hits)
+        tail_hits = hits[len(active_hits):]
+
         vectors: dict[str, list[float]] = {}
-        for hit in hits:
-            chunk_uid = f"{hit.doc_id}::{hit.loc}"
-            vec = store.get_vector(chunk_uid)
+        missing_uids: list[str] = []
+        for hit in active_hits:
+            chunk_uid = _chunk_uid(hit)
+            vec = getattr(hit, "vector", None)
             if vec is not None:
                 vectors[chunk_uid] = vec
+            else:
+                missing_uids.append(chunk_uid)
+
+        if missing_uids and hasattr(store, "get_vectors"):
+            vectors.update(store.get_vectors(missing_uids))
 
         if not vectors:
-            return hits
+            return (hits, []) if return_deferred else hits
 
-        selected: list[SearchHit] = []
+        protected_count = max(0, min(protected_top_k, len(active_hits)))
+        selected: list[SearchHit] = list(active_hits[:protected_count])
         deferred: list[SearchHit] = []
+        deferred_records: list[dict] = []
 
-        for hit in hits:
-            chunk_uid = f"{hit.doc_id}::{hit.loc}"
+        for hit in active_hits[protected_count:]:
+            chunk_uid = _chunk_uid(hit)
             hit_vec = vectors.get(chunk_uid)
 
             if hit_vec is None:
@@ -528,31 +558,37 @@ def _apply_mmr_diversity(
                 continue
 
             too_similar = False
+            similar_to: SearchHit | None = None
+            similarity = 0.0
             for sel_hit in selected:
-                sel_uid = f"{sel_hit.doc_id}::{sel_hit.loc}"
+                sel_uid = _chunk_uid(sel_hit)
                 sel_vec = vectors.get(sel_uid)
                 if sel_vec is not None:
                     sim = _cosine_similarity(hit_vec, sel_vec)
                     if sim > similarity_threshold:
                         too_similar = True
+                        similar_to = sel_hit
+                        similarity = sim
                         break
 
             if too_similar:
                 deferred.append(hit)
+                if similar_to is not None:
+                    deferred_records.append(_deferred_record(hit, similar_to, similarity))
             else:
                 selected.append(hit)
 
-        result = selected + deferred
+        result = selected + deferred + tail_hits
         if deferred:
             logger.info(
                 "MMR diversity: %d selected, %d deferred (threshold=%.2f)",
                 len(selected), len(deferred), similarity_threshold,
             )
-        return result
+        return (result, deferred_records) if return_deferred else result
 
     except Exception as e:
         logger.warning("MMR diversity failed (using original order): %s", e)
-        return hits
+        return (hits, []) if return_deferred else hits
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +660,8 @@ def hybrid_search(
             "keyword_search_active": True,
             "reranker_applied": False,
             "degraded": False,
+            "mmr_deferred_count": 0,
+            "similar_deferred_results": [],
             "timing_ms": timing_ms,
             "candidate_counts": candidate_counts,
         }
@@ -634,6 +672,8 @@ def hybrid_search(
         "keyword_search_active": True,
         "reranker_applied": False,
         "degraded": False,
+        "mmr_deferred_count": 0,
+        "similar_deferred_results": [],
         "timing_ms": timing_ms,
         "candidate_counts": candidate_counts,
     }
@@ -759,10 +799,23 @@ def hybrid_search(
 
     # 8. MMR diversity (remove near-duplicate chunks)
     stage_started = time.perf_counter()
-    fused = _apply_mmr_diversity(fused, store)
+    fused, deferred_results = _apply_mmr_diversity(
+        fused,
+        store,
+        protected_top_k=3,
+        pool_limit=max(final_top_k * 2, 3),
+        return_deferred=True,
+    )
 
     # 9. Minimum score threshold (discard noise)
+    if min_score_threshold > 0.0:
+        deferred_results = [
+            record for record in deferred_results
+            if float(record.get("score", 0.0)) >= min_score_threshold
+        ]
     fused = _apply_min_score_threshold(fused, threshold=min_score_threshold)
+    diagnostics["mmr_deferred_count"] = len(deferred_results)
+    diagnostics["similar_deferred_results"] = deferred_results
     timing_ms["mmr"] = round((time.perf_counter() - stage_started) * 1000, 3)
 
     # 10. Compute degraded flag

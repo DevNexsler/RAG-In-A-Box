@@ -14,6 +14,8 @@ from flow_index_vault import (
     _build_chunk_context,
     _split_section,
     _RUNTIME,
+    TaxonomyUsageAccumulator,
+    _flush_taxonomy_usage,
     write_index_metadata_task,
 )
 
@@ -116,6 +118,50 @@ def test_scan_skips_zero_byte_files():
         doc_ids = {r["doc_id"] for r in records}
         assert doc_ids == {"note.md"}
         assert (root / "empty.pdf").exists()
+
+
+def test_taxonomy_usage_accumulator_flushes_once_serially():
+    """Index workers queue taxonomy usage; one writer drains it after the batch."""
+    accumulator = TaxonomyUsageAccumulator()
+    accumulator.add("tag:urgent")
+    accumulator.add("tag:urgent")
+    accumulator.add("folder:Projects/Renovation")
+
+    class FakeTaxonomyStore:
+        def __init__(self):
+            self.calls = []
+
+        def increment_usage_many(self, counts):
+            self.calls.append(dict(counts))
+
+    taxonomy_store = FakeTaxonomyStore()
+    logger = MagicMock()
+
+    _flush_taxonomy_usage(taxonomy_store, accumulator, logger)
+
+    assert taxonomy_store.calls == [
+        {"folder:Projects/Renovation": 1, "tag:urgent": 2}
+    ]
+    assert accumulator.snapshot() == {}
+    logger.warning.assert_not_called()
+
+
+def test_taxonomy_usage_accumulator_retains_counts_when_flush_fails():
+    accumulator = TaxonomyUsageAccumulator()
+    accumulator.add("tag:urgent")
+
+    class FailingTaxonomyStore:
+        def increment_usage_many(self, counts):
+            raise RuntimeError("taxonomy writer busy")
+
+    logger = MagicMock()
+
+    _RUNTIME.clear()
+    _flush_taxonomy_usage(FailingTaxonomyStore(), accumulator, logger)
+
+    assert accumulator.snapshot() == {"tag:urgent": 1}
+    assert _RUNTIME["_warnings"] == ["taxonomy_usage_failed:taxonomy writer busy"]
+    logger.warning.assert_called_once()
 
 
 # --- _split_markdown_by_headings ---
@@ -591,6 +637,92 @@ def test_process_doc_task_includes_attachment_message_body_in_enrichment(monkeyp
     assert "image shows a kitchen wall" in captured["enrichment_text"]
     assert captured["metadata"]["message_body"] == "163 washington # 2"
     assert "163 washington # 2" in captured["embedded_text"]
+
+
+def test_process_doc_task_queues_taxonomy_usage_without_worker_write(monkeypatch):
+    """Document workers queue taxonomy usage instead of writing taxonomy.lance."""
+    from extractors import ExtractionResult
+    from flow_index_vault import process_doc_task
+    from sources.base import SourceRecord
+
+    captured = {}
+    accumulator = TaxonomyUsageAccumulator()
+
+    class FakeSource:
+        name = "documents"
+
+        def extract(self, record):
+            return ExtractionResult.from_text("renovation photo", frontmatter={})
+
+    class FakeStore:
+        def upsert_nodes(self, nodes):
+            captured["metadata"] = nodes[0].metadata
+
+    class FakeEmbed:
+        def embed_texts(self, texts):
+            return [[0.1] * 768 for _ in texts]
+
+    def fake_enrich_document(*args, **kwargs):
+        captured["record_taxonomy_usage"] = kwargs.get("record_taxonomy_usage")
+        return {
+            "enr_summary": "",
+            "enr_doc_type": "image",
+            "enr_entities_people": "",
+            "enr_entities_places": "",
+            "enr_entities_orgs": "",
+            "enr_entities_dates": "",
+            "enr_topics": "",
+            "enr_keywords": "",
+            "enr_key_facts": "",
+            "enr_suggested_tags": "renovation, urgent",
+            "enr_suggested_folder": "Projects/Renovation",
+            "enr_importance": "0.5",
+        }
+
+    monkeypatch.setattr("flow_index_vault.enrich_document", fake_enrich_document)
+    monkeypatch.setattr("flow_index_vault.get_run_logger", lambda: MagicMock())
+    _RUNTIME.clear()
+    _RUNTIME.update(
+        {
+            "store": FakeStore(),
+            "embed_provider": FakeEmbed(),
+            "splitter": _FakeSplitter(),
+            "config": {},
+            "sources_by_name": {"documents": FakeSource()},
+            "source_records_by_ns_doc_id": {
+                "documents::photo": SourceRecord(
+                    doc_id="photo",
+                    source_type="img",
+                    natural_key="photo.jpg",
+                    mtime=1.0,
+                    size=10,
+                    metadata={},
+                )
+            },
+            "llm_generator": object(),
+            "taxonomy_store": object(),
+            "taxonomy_usage": accumulator,
+        }
+    )
+
+    process_doc_task.fn(
+        {
+            "doc_id": "documents::photo",
+            "rel_path": "photo.jpg",
+            "mtime": 1.0,
+            "size": 10,
+            "source_type": "img",
+            "source_name": "documents",
+        }
+    )
+
+    assert captured["record_taxonomy_usage"] is False
+    assert accumulator.snapshot() == {
+        "folder:Projects/Renovation": 1,
+        "tag:renovation": 1,
+        "tag:urgent": 1,
+    }
+    assert captured["metadata"]["enr_suggested_folder"] == "Projects/Renovation"
 
 
 # --- Symlink cycle guard ---

@@ -1113,6 +1113,39 @@ def test_recent_provider_failures_classifies_openrouter_403_logs(tmp_path):
     assert result["by_key"]["openrouter_chat"]["operation"] == "chat"
 
 
+def test_recent_provider_failures_marks_transient_dns_recovered_after_success(tmp_path):
+    """A retryable provider failure followed by 200 OK should not stay critical."""
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 6, 1, 21, 0, 0, tzinfo=timezone.utc).timestamp()
+    (tmp_path / "indexer.log").write_text(
+        "\n".join(
+            [
+                "2026-06-01 20:37:20,319 WARNING providers.llm.openrouter_llm: "
+                "generate() attempt 1/2 failed (ConnectError: [Errno -3] "
+                "Temporary failure in name resolution), retrying in 5s...",
+                "2026-06-01 20:37:20,324 WARNING providers.embed.openrouter_embed: "
+                "embed attempt 1/2 failed (ConnectError: [Errno -3] "
+                "Temporary failure in name resolution), retrying in 5s...",
+                "2026-06-01 20:37:25,001 INFO httpx: HTTP Request: POST "
+                'https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"',
+                "2026-06-01 20:37:25,002 INFO httpx: HTTP Request: POST "
+                'https://openrouter.ai/api/v1/embeddings "HTTP/1.1 200 OK"',
+            ]
+        )
+    )
+
+    result = mcp_server._recent_provider_failures(tmp_path, now=now)
+
+    assert result["status"] == "ok"
+    assert result["total_count"] == 2
+    assert result["recovered_count"] == 2
+    assert result["by_key"]["openrouter_chat"]["recovered"] is True
+    assert result["by_key"]["openrouter_chat"]["severity"] == "ok"
+    assert result["by_key"]["openrouter_embeddings"]["recovered"] is True
+    assert result["by_key"]["openrouter_embeddings"]["severity"] == "ok"
+
+
 def test_file_status_surfaces_recent_provider_failures_from_logs(tmp_path):
     """file_status should summarize recent provider failures without live provider probes."""
     import json

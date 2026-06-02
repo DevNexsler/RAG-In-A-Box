@@ -46,6 +46,8 @@ class SearchHit:
         enr_importance_source: str = "",
         # Dynamic metadata (fields not in the hardcoded set above)
         extra_metadata: dict[str, str] | None = None,
+        # Internal use only: stored chunk embedding for MMR/cosine rerank.
+        vector: list[float] | None = None,
     ):
         self.doc_id = doc_id
         self.loc = loc
@@ -81,6 +83,7 @@ class SearchHit:
         self.enr_importance_source = enr_importance_source
         # Dynamic metadata for fields added after initial schema
         self.extra_metadata = extra_metadata or {}
+        self.vector = vector
 
     def __getattr__(self, name: str):
         """Fall through to extra_metadata for dynamic fields like 'section'."""
@@ -117,15 +120,27 @@ class StorageInterface(Protocol):
         ...
 
     def vector_search(
-        self, query_vector: list[float], top_k: int, where: str | None = None,
+        self,
+        query_vector: list[float],
+        top_k: int,
+        where: str | None = None,
+        include_vector: bool = True,
     ) -> list[SearchHit]:
         """Return top_k chunks by vector similarity, with optional SQL prefilter."""
         ...
 
     def keyword_search(
-        self, query: str, top_k: int, where: str | None = None,
+        self,
+        query: str,
+        top_k: int,
+        where: str | None = None,
+        include_vector: bool = True,
     ) -> list[SearchHit]:
         """Return top_k chunks by BM25/FTS keyword relevance, with optional SQL prefilter."""
+        ...
+
+    def get_vectors(self, chunk_uids: list[str]) -> dict[str, list[float]]:
+        """Return stored chunk vectors keyed by chunk UID."""
         ...
 
     def create_fts_index(self) -> None:

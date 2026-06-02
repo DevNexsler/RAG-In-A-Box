@@ -126,7 +126,12 @@ class TestMMRDiversity:
                 SearchHit(doc_id="a.md", loc="c:1", snippet="x", text="second cats", score=0.9),
                 SearchHit(doc_id="b.md", loc="c:0", snippet="x", text="dogs", score=0.8),
             ]
-            result = _apply_mmr_diversity(hits, store, similarity_threshold=0.85)
+            result = _apply_mmr_diversity(
+                hits,
+                store,
+                similarity_threshold=0.85,
+                protected_top_k=1,
+            )
             # a.md c:0 selected first, a.md c:1 deferred (identical vector), b.md selected
             assert result[0].doc_id == "a.md" and result[0].loc == "c:0"
             assert result[1].doc_id == "b.md"  # dogs should come before deferred cats
@@ -160,6 +165,48 @@ class TestMMRDiversity:
             hits = [SearchHit(doc_id="a.md", loc="c:0", snippet="x", text="cats", score=1.0)]
             result = _apply_mmr_diversity(hits, store)
             assert len(result) == 1
+
+    def test_conservative_mmr_protects_top_three_and_reports_deferred_uuid(self):
+        """MMR should only demote near-duplicates below protected top results."""
+        base = [1.0] + [0.0] * 767
+        other = [0.0] + [1.0] + [0.0] * 766
+        third = [0.0, 0.0] + [1.0] + [0.0] * 765
+        fourth = [0.0, 0.0, 0.0] + [1.0] + [0.0] * 764
+
+        class FakeStore:
+            def get_vector(self, chunk_uid):
+                raise AssertionError("MMR should not do per-hit vector lookups")
+
+        hits = [
+            SearchHit(doc_id="top.md", loc="c:0", snippet="x", text="top", score=1.0, vector=base),
+            SearchHit(doc_id="protected-similar.md", loc="c:0", snippet="x", text="protected", score=0.99, vector=base),
+            SearchHit(doc_id="third.md", loc="c:0", snippet="x", text="third", score=0.98, vector=third),
+            SearchHit(doc_id="late-similar.md", loc="c:0", snippet="x", text="late", score=0.97, vector=base),
+            SearchHit(doc_id="diverse.md", loc="c:0", snippet="x", text="diverse", score=0.96, vector=fourth),
+            SearchHit(doc_id="other.md", loc="c:0", snippet="x", text="other", score=0.95, vector=other),
+        ]
+
+        result, deferred = _apply_mmr_diversity(
+            hits,
+            FakeStore(),
+            similarity_threshold=0.95,
+            protected_top_k=3,
+            return_deferred=True,
+        )
+
+        assert [h.doc_id for h in result[:4]] == [
+            "top.md",
+            "protected-similar.md",
+            "third.md",
+            "diverse.md",
+        ]
+        assert deferred[0]["uuid"] == "late-similar.md::c:0"
+        assert deferred[0]["record_uuid"] == "late-similar.md::c:0"
+        assert deferred[0]["doc_id"] == "late-similar.md"
+        assert deferred[0]["loc"] == "c:0"
+        assert deferred[0]["similar_to_uuid"] == "top.md::c:0"
+        assert deferred[0]["similarity"] == pytest.approx(1.0)
+        assert deferred[0]["score"] == 0.97
 
 
 # ---------------------------------------------------------------------------
@@ -730,3 +777,53 @@ class TestPipelineIntegration:
             assert "keyword_search_active" in result.diagnostics
             assert "reranker_applied" in result.diagnostics
             assert "degraded" in result.diagnostics
+
+    def test_deferred_similar_results_are_exposed_for_followup(self):
+        """Agents need deferred chunk UUIDs so subtle similar records stay reachable."""
+        base = [1.0] + [0.0] * 767
+        other = [0.0] + [1.0] + [0.0] * 766
+        third = [0.0, 0.0] + [1.0] + [0.0] * 765
+        fourth = [0.0, 0.0, 0.0] + [1.0] + [0.0] * 764
+
+        class FakeStore:
+            def _build_where_clause(self, **kwargs):
+                return None
+
+            def vector_search(self, query_vector, top_k=50, where=None):
+                return [
+                    SearchHit("top.md", "c:0", "x", "top", 1.0, vector=base),
+                    SearchHit("protected-similar.md", "c:0", "x", "protected", 0.99, vector=base),
+                    SearchHit("third.md", "c:0", "x", "third", 0.98, vector=third),
+                    SearchHit("late-similar.md", "c:0", "x", "late", 0.97, vector=base),
+                    SearchHit("diverse.md", "c:0", "x", "diverse", 0.96, vector=fourth),
+                    SearchHit("other.md", "c:0", "x", "other", 0.95, vector=other),
+                ]
+
+            def keyword_search(self, query, top_k=50, where=None):
+                return []
+
+            def get_vector(self, chunk_uid):
+                raise AssertionError("MMR should not do per-hit vector lookups")
+
+        result = hybrid_search(
+            FakeStore(),
+            MockEmbedProvider(base),
+            "renovation photos",
+            final_top_k=3,
+        )
+
+        assert result.diagnostics["mmr_deferred_count"] == 1
+        assert result.diagnostics["similar_deferred_results"][0]["uuid"] == "late-similar.md::c:0"
+        assert result.diagnostics["similar_deferred_results"][0]["record_uuid"] == "late-similar.md::c:0"
+        assert result.diagnostics["similar_deferred_results"][0]["similar_to_uuid"] == "top.md::c:0"
+
+        cutoff_result = hybrid_search(
+            FakeStore(),
+            MockEmbedProvider(base),
+            "renovation photos",
+            final_top_k=3,
+            min_score_threshold=0.98,
+        )
+
+        assert cutoff_result.diagnostics["mmr_deferred_count"] == 0
+        assert cutoff_result.diagnostics["similar_deferred_results"] == []

@@ -568,6 +568,7 @@ def _empty_provider_failures() -> dict:
         "status": "ok",
         "lookback_seconds": _PROVIDER_FAILURE_LOOKBACK_SECONDS,
         "total_count": 0,
+        "recovered_count": 0,
         "last_seen_at": None,
         "by_key": {},
     }
@@ -658,6 +659,21 @@ def _provider_failure_kind(line: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _provider_success_kind(line: str) -> tuple[str, str, str] | None:
+    status_code = _http_status_from_log_line(line)
+    if status_code is None or not (200 <= status_code < 300):
+        return None
+    lower = line.lower()
+    if "openrouter" in lower:
+        if "embedding" in lower or "/embeddings" in lower or "openrouter_embed" in lower:
+            return "openrouter_embeddings", "openrouter", "embeddings"
+        if "chat/completions" in lower or "openrouter_llm" in lower:
+            return "openrouter_chat", "openrouter", "chat"
+    if "deepinfra" in lower or "reranker" in lower:
+        return "deepinfra_reranker", "deepinfra", "reranker"
+    return None
+
+
 def _provider_failure_severity(operation: str, http_status: int | None) -> str:
     if http_status in {401, 403}:
         return "critical"
@@ -676,9 +692,9 @@ def _recent_provider_failures(
     cutoff = now - lookback_seconds
     by_key: dict[str, dict] = {}
     last_seen_by_key: dict[str, float] = {}
+    success_seen_by_key: dict[str, float] = {}
     last_seen_at: float | None = None
     rank = {"ok": 0, "degraded": 1, "critical": 2}
-    overall_status = "ok"
 
     for log_name in _PROVIDER_FAILURE_LOG_NAMES:
         path = index_root / log_name
@@ -700,13 +716,17 @@ def _recent_provider_failures(
                 continue
             if event_ts < cutoff:
                 continue
+            success_kind = _provider_success_kind(line)
+            if success_kind:
+                key, _, _ = success_kind
+                success_seen_by_key[key] = max(success_seen_by_key.get(key, 0), event_ts)
+                continue
             kind = _provider_failure_kind(line)
             if not kind:
                 continue
             key, provider, operation = kind
             http_status = _http_status_from_log_line(line)
             severity = _provider_failure_severity(operation, http_status)
-            overall_status = max(overall_status, severity, key=lambda value: rank.get(value, 0))
             last_seen_at = max(last_seen_at or event_ts, event_ts)
 
             existing = by_key.get(key)
@@ -733,10 +753,30 @@ def _recent_provider_failures(
                 existing["last_seen_at"] = _utc_iso(event_ts)
                 existing["sample"] = line[:500]
 
+    overall_status = "ok"
+    recovered_count = 0
+    for key, item in by_key.items():
+        success_ts = success_seen_by_key.get(key)
+        failure_ts = last_seen_by_key.get(key, 0)
+        auth_failure = item.get("http_status") in {401, 403}
+        if success_ts is not None and success_ts > failure_ts and not auth_failure:
+            item["recovered"] = True
+            item["last_recovered_at"] = _utc_iso(success_ts)
+            item["severity"] = "ok"
+            recovered_count += int(item.get("count", 0))
+            continue
+        item["recovered"] = False
+        overall_status = max(
+            overall_status,
+            str(item.get("severity", "ok")),
+            key=lambda value: rank.get(value, 0),
+        )
+
     return {
         "status": overall_status,
         "lookback_seconds": lookback_seconds,
         "total_count": sum(item["count"] for item in by_key.values()),
+        "recovered_count": recovered_count,
         "last_seen_at": _utc_iso(last_seen_at) if last_seen_at is not None else None,
         "by_key": by_key,
     }

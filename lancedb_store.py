@@ -475,6 +475,7 @@ class LanceDBStore:
             rel_path=meta.get("rel_path") or row.get("rel_path", ""),
             **_extract_enrichment(combined_meta),
             extra_metadata=_extract_extra_metadata(meta),
+            vector=row.get("vector"),
         )
 
     # --- StorageInterface methods ---
@@ -668,7 +669,11 @@ class LanceDBStore:
             return 0  # Table not created yet — legitimately empty
 
     def vector_search(
-        self, query_vector: list[float], top_k: int, where: str | None = None,
+        self,
+        query_vector: list[float],
+        top_k: int,
+        where: str | None = None,
+        include_vector: bool = True,
     ) -> list[SearchHit]:
         """Vector search via direct LanceDB query with optional prefilter.
 
@@ -682,6 +687,9 @@ class LanceDBStore:
         if where:
             q = q.where(where, prefilter=True)
         rows = q.limit(top_k).to_list()
+        if not include_vector:
+            for row in rows:
+                row.pop("vector", None)
         return [self._row_to_hit(row) for row in rows]
 
     # --- Full-Text Search (BM25/tantivy) ---
@@ -707,7 +715,11 @@ class LanceDBStore:
             return False
 
     def keyword_search(
-        self, query: str, top_k: int = 50, where: str | None = None,
+        self,
+        query: str,
+        top_k: int = 50,
+        where: str | None = None,
+        include_vector: bool = True,
     ) -> list[SearchHit]:
         """BM25/FTS keyword search via LanceDB tantivy index with optional prefilter.
 
@@ -724,6 +736,9 @@ class LanceDBStore:
         if where:
             q = q.where(where, prefilter=True)
         rows = q.limit(top_k).to_list()
+        if not include_vector:
+            for row in rows:
+                row.pop("vector", None)
         return [self._row_to_hit(row) for row in rows]
 
     _RECENT_DOC_FIELDS = (
@@ -945,6 +960,36 @@ class LanceDBStore:
         if hasattr(vec, "tolist"):
             return vec.tolist()
         return list(vec)
+
+    def get_vectors(self, chunk_uids: list[str]) -> dict[str, list[float]]:
+        """Batch-load stored vectors for chunk UIDs missing from search hits."""
+        if not chunk_uids:
+            return {}
+        try:
+            table = self._vs.table
+        except TableNotFoundError:
+            return {}
+
+        unique_uids = list(dict.fromkeys(uid for uid in chunk_uids if uid))
+        if not unique_uids:
+            return {}
+        in_values = ", ".join(f"'{self._sql_escape(uid)}'" for uid in unique_uids)
+        rows = (
+            table.search(None)
+            .where(f"id IN ({in_values})", prefilter=True)
+            .select(["id", "vector"])
+            .limit(len(unique_uids))
+            .to_list()
+        )
+
+        vectors: dict[str, list[float]] = {}
+        for row in rows:
+            uid = row.get("id")
+            vec = row.get("vector")
+            if not uid or vec is None:
+                continue
+            vectors[str(uid)] = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+        return vectors
 
     def get_chunk(self, doc_id: str, loc: str) -> SearchHit | None:
         """Get a single chunk by doc_id and loc.
