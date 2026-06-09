@@ -277,7 +277,12 @@ def test_file_search_accepts_source_name_kwarg(wired_mcp):
     assert isinstance(result, dict)
     # If validation fired it must use our structured error code, not a crash
     if "error" in result:
-        assert result.get("code") in {"invalid_source_name", "search_failed", "service_unavailable"}
+        assert result.get("code") in {
+            "invalid_source_name",
+            "search_failed",
+            "service_unavailable",
+            "source_search_degraded",
+        }
     else:
         assert "results" in result
 

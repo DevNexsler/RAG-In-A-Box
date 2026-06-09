@@ -132,3 +132,14 @@ def test_communication_context_same_channel_only_must_remain_true(tmp_path):
         match="communication_context.same_channel_only must remain true",
     ):
         load_config(str(cfg_path))
+
+
+def test_project_comm_messages_config_example_exports_source_channel_id():
+    config_example = Path("config.yaml.example").read_text()
+
+    assert "c.source_channel_id" in config_example
+    assert "c.name AS channel_name" in config_example
+    assert (
+        "metadata_columns: [source, source_message_id, source_channel_id, "
+        "channel_name, sender, sent_at]"
+    ) in config_example

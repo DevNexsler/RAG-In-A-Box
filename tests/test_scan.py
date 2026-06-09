@@ -639,6 +639,96 @@ def test_process_doc_task_includes_attachment_message_body_in_enrichment(monkeyp
     assert "163 washington # 2" in captured["embedded_text"]
 
 
+def test_repair_communication_sidecars_writes_context_and_returns_doc_ids(tmp_path):
+    import json
+    import flow_index_vault as fiv
+    from communication_context import CommunicationMessage, ContextEnvelope
+    from sources.base import SourceRecord
+
+    assert hasattr(fiv, "_repair_communication_sidecars")
+
+    sidecar = tmp_path / "photo.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "source": "zoho_cliq",
+                "message": {"source_message_id": "photo-1"},
+                "channel": {"source_channel_id": "chan-1"},
+                "media": {"original_filename": "photo.jpg"},
+            }
+        )
+    )
+    scanned = [
+        {
+            "doc_id": "documents::photo",
+            "source_name": "documents",
+            "source_type": "img",
+            "rel_path": "photo.jpg",
+        }
+    ]
+    source_records = {
+        "documents::photo": SourceRecord(
+            doc_id="photo",
+            source_type="img",
+            natural_key="photo.jpg",
+            mtime=1.0,
+            size=10,
+            metadata={
+                "source": "zoho_cliq",
+                "source_message_id": "photo-1",
+                "source_channel_id": "chan-1",
+                "sent_at": "2026-01-01T10:00:10Z",
+                "sidecar_path": str(sidecar),
+            },
+        )
+    }
+
+    class FakeProvider:
+        def get_context_envelope(self, item):
+            assert item.channel_id == "chan-1"
+            return ContextEnvelope(
+                primary_item=item,
+                same_channel_before=[
+                    CommunicationMessage(
+                        source_message_id="before-1",
+                        text="before text",
+                    )
+                ],
+            )
+
+    repaired = fiv._repair_communication_sidecars(
+        scanned,
+        source_records,
+        FakeProvider(),
+    )
+
+    updated = json.loads(sidecar.read_text())
+    assert repaired == {"documents::photo"}
+    assert updated["context"]["same_channel_before"][0]["text"] == "before text"
+
+
+def test_include_repaired_sidecar_docs_forces_reindex_without_duplicates():
+    import flow_index_vault as fiv
+
+    assert hasattr(fiv, "_include_repaired_sidecar_docs")
+
+    scanned = [
+        {"doc_id": "documents::photo", "mtime": 1.0},
+        {"doc_id": "documents::note", "mtime": 1.0},
+    ]
+
+    forced = fiv._include_repaired_sidecar_docs(
+        scanned,
+        [{"doc_id": "documents::note", "mtime": 2.0}],
+        {"documents::photo", "documents::note"},
+    )
+
+    assert [record["doc_id"] for record in forced] == [
+        "documents::note",
+        "documents::photo",
+    ]
+
+
 def test_process_doc_task_queues_taxonomy_usage_without_worker_write(monkeypatch):
     """Document workers queue taxonomy usage instead of writing taxonomy.lance."""
     from extractors import ExtractionResult

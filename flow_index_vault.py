@@ -60,6 +60,7 @@ from communication_context import (
     communication_item_from_record,
     envelope_metadata,
     format_context_envelope_for_prompt,
+    repair_sidecar_context,
 )
 from core.config import load_config
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
@@ -172,6 +173,8 @@ _COMMUNICATION_METADATA_KEYS = (
     "message_id",
     "source_message_id",
     "channel_id",
+    "source_channel_id",
+    "channel_name",
     "thread_id",
     "sender",
     "sent_at",
@@ -497,6 +500,72 @@ def diff_index_task(
 
     to_delete = list(stored_ids - scanned_ids)
     return to_add_or_update, to_delete
+
+
+def _repair_communication_sidecars(
+    scanned: list[dict],
+    source_records_by_ns_doc_id: dict[str, object],
+    communication_context_provider: Any,
+    *,
+    logger: logging.Logger | None = None,
+) -> set[str]:
+    """Backfill adjacent same-channel context into attachment sidecars."""
+    if communication_context_provider is None:
+        return set()
+
+    repaired: set[str] = set()
+    logger = logger or logging.getLogger(__name__)
+    for doc in scanned:
+        doc_id = str(doc.get("doc_id", ""))
+        if not doc_id:
+            continue
+        record = source_records_by_ns_doc_id.get(doc_id)
+        if record is None:
+            continue
+        metadata = getattr(record, "metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        item = communication_item_from_record(
+            doc,
+            metadata,
+        )
+        if item is None or not item.sidecar_path:
+            continue
+
+        try:
+            envelope = communication_context_provider.get_context_envelope(item)
+            if repair_sidecar_context(Path(item.sidecar_path), envelope):
+                repaired.add(doc_id)
+        except Exception as exc:
+            logger.warning(
+                "Communication sidecar repair failed for '%s': %s",
+                doc_id,
+                exc,
+            )
+            _RUNTIME.setdefault("_warnings", []).append(
+                f"communication_sidecar_repair_failed:{doc_id}:{exc}"
+            )
+    return repaired
+
+
+def _include_repaired_sidecar_docs(
+    scanned: list[dict],
+    to_add_or_update: list[dict],
+    repaired_doc_ids: set[str],
+) -> list[dict]:
+    """Force repaired sidecar owners through processing even when media mtime is unchanged."""
+    if not repaired_doc_ids:
+        return to_add_or_update
+
+    existing_doc_ids = {str(record.get("doc_id", "")) for record in to_add_or_update}
+    records_by_doc_id = {str(record.get("doc_id", "")): record for record in scanned}
+    forced = list(to_add_or_update)
+    for doc_id in sorted(repaired_doc_ids):
+        if doc_id in existing_doc_ids:
+            continue
+        record = records_by_doc_id.get(doc_id)
+        if record is not None:
+            forced.append(record)
+    return forced
 
 
 @task(retries=1, timeout_seconds=1800)
@@ -1245,10 +1314,17 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
 
     _RUNTIME["source_records_by_ns_doc_id"] = source_records_by_ns_doc_id
     scanned = all_records
-    _RUNTIME["communication_context_provider"] = build_context_provider_from_records(
+    communication_context_provider = build_context_provider_from_records(
         scanned,
         source_records_by_ns_doc_id,
         config.get("communication_context", {}),
+    )
+    _RUNTIME["communication_context_provider"] = communication_context_provider
+    repaired_sidecar_doc_ids = _repair_communication_sidecars(
+        scanned,
+        source_records_by_ns_doc_id,
+        communication_context_provider,
+        logger=logger,
     )
 
     stored_mtimes = store.list_doc_mtimes()
@@ -1260,6 +1336,11 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
             if str(doc_id).startswith(source_prefix)
         }
     to_add_or_update, to_delete = diff_index_task(scanned, stored_mtimes)
+    to_add_or_update = _include_repaired_sidecar_docs(
+        scanned,
+        to_add_or_update,
+        repaired_sidecar_doc_ids,
+    )
 
     concurrency = int(enrichment_cfg.get("concurrency", 1) or 1)
     if concurrency > 1:
