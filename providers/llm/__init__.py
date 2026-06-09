@@ -4,6 +4,7 @@ Supports multiple backends:
   - "ollama": Qwen3-14B via Ollama /api/chat with structured JSON output
   - "baseten": Qwen3-14B-AWQ via Baseten-hosted vLLM (cloud)
   - "openrouter": Any model via OpenRouter (cloud, OpenAI-compatible)
+  - "litellm": Any model via LiteLLM proxy (OpenAI-compatible)
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ def build_llm_provider(config: dict) -> LLMGenerator | None:
       - "ollama" (default): OllamaGenerator via Ollama API
       - "baseten": BasetenGenerator via Baseten-hosted vLLM
       - "openrouter": OpenRouterGenerator via OpenRouter API
+      - "litellm": LiteLLMGenerator via OpenAI-compatible LiteLLM proxy
     """
     enrichment_cfg = config.get("enrichment", {})
     if not enrichment_cfg.get("enabled", False):
@@ -47,6 +49,26 @@ def build_llm_provider(config: dict) -> LLMGenerator | None:
         except Exception as exc:
             logger.warning(
                 "Failed to init OpenRouter LLM provider, enrichment disabled: %s", exc
+            )
+            return None
+
+    if provider in {"litellm", "openai_compatible"}:
+        try:
+            from providers.llm.litellm_llm import LiteLLMGenerator
+
+            return LiteLLMGenerator(
+                model=enrichment_cfg.get("model", "ollama-deepseek-v4-pro"),
+                base_url=enrichment_cfg.get(
+                    "base_url", "http://host.docker.internal:4000/v1"
+                ),
+                api_key=enrichment_cfg.get("api_key"),
+                timeout=enrichment_cfg.get("timeout", 600.0),
+                trace_capture=enrichment_cfg.get("trace_capture", {}),
+                temperature=enrichment_cfg.get("temperature", 0.0),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to init LiteLLM provider, enrichment disabled: %s", exc
             )
             return None
 

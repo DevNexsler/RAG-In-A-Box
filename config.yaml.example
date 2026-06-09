@@ -100,8 +100,14 @@ communication_context:
 
 enrichment:
   enabled: true
-  provider: "openrouter"                  # GPT-4.1 Mini via OpenRouter
+  provider: "openrouter"                  # openrouter | litellm | ollama | baseten
   model: "openai/gpt-4.1-mini"
+  # LiteLLM/Ollama Cloud V4 Pro example:
+  # provider: "litellm"
+  # model: "ollama-deepseek-v4-pro"
+  # base_url: "http://host.docker.internal:4000/v1"
+  # timeout: 600
+  # temperature: 0.0
   max_input_chars: 20000                  # head+tail sampling: 10000 chars from start + 10000 from end
   max_output_tokens: 5000
   concurrency: 1                          # docs processed in parallel; 1=serial, 4-8 recommended on paid OpenRouter
@@ -110,7 +116,7 @@ enrichment:
   trace_capture:
     enabled: false
     directory: ".evals/llm-traces"
-  # Alternatives: "baseten", "ollama" (local) — see config.local.yaml.example
+  # Alternatives: "litellm", "baseten", "ollama" (local) — see config.local.yaml.example
 
 search:
   mode: "hybrid"                          # parallel vector + keyword (BM25/FTS), fused with RRF
