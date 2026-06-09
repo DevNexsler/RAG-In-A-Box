@@ -180,6 +180,7 @@ def communication_metadata_from_sidecar(
         "message_id": item.message_id,
         "source_message_id": item.source_message_id,
         "channel_id": item.channel_id,
+        "source_channel_id": item.channel_id,
         "thread_id": item.thread_id,
         "sender": item.sender,
         "sent_at": item.sent_at,
@@ -417,6 +418,123 @@ def envelope_metadata(envelope: ContextEnvelope) -> dict[str, str]:
         "context_nearest_after_source_message_id": _source_message_id(nearest_after),
     }
     return {key: value for key, value in metadata.items() if value}
+
+
+def repair_sidecar_context(
+    sidecar_path: Path | str,
+    envelope: ContextEnvelope,
+    *,
+    generated_at: str | None = None,
+) -> bool:
+    """Merge same-channel context into an attachment sidecar without data loss."""
+    sidecar_path = Path(sidecar_path)
+    payload = json.loads(sidecar_path.read_text())
+    if not isinstance(payload, dict):
+        return False
+
+    existing_context = payload.get("context")
+    context = dict(existing_context) if isinstance(existing_context, dict) else {}
+    if existing_context is not None and not isinstance(existing_context, dict):
+        context["legacy_context"] = existing_context
+    context.update(_sidecar_context_payload(envelope, generated_at=generated_at))
+
+    updated_payload = dict(payload)
+    updated_payload["context"] = context
+    if _sidecar_stable_payload(updated_payload) == _sidecar_stable_payload(payload):
+        return False
+
+    rendered = json.dumps(updated_payload, indent=2, ensure_ascii=False) + "\n"
+    tmp_path = sidecar_path.with_name(f".{sidecar_path.name}.tmp")
+    try:
+        tmp_path.write_text(rendered)
+        tmp_path.replace(sidecar_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    return True
+
+
+def _sidecar_context_payload(
+    envelope: ContextEnvelope,
+    *,
+    generated_at: str | None,
+) -> dict[str, Any]:
+    nearest_before = envelope.nearest_nonempty_before or _nearest_nonempty(
+        reversed(envelope.same_channel_before)
+    )
+    nearest_after = envelope.nearest_nonempty_after or _nearest_nonempty(
+        envelope.same_channel_after
+    )
+    primary = envelope.primary_item
+    return {
+        "schema_version": 1,
+        "source": "rag-in-a-box",
+        "generated_at": generated_at or _utc_now_iso(),
+        "scope": _compact_dict(
+            {
+                "origin_source": primary.origin_source,
+                "channel_id": primary.channel_id,
+                "thread_id": primary.thread_id,
+            }
+        ),
+        "same_channel_before": _sidecar_context_messages(
+            envelope.same_channel_before
+        ),
+        "same_channel_after": _sidecar_context_messages(envelope.same_channel_after),
+        "nearest_nonempty_before": _sidecar_context_message(nearest_before),
+        "nearest_nonempty_after": _sidecar_context_message(nearest_after),
+    }
+
+
+def _sidecar_context_message(
+    message: CommunicationMessage | None,
+) -> dict[str, str] | None:
+    if message is None:
+        return None
+    rendered = _compact_dict(
+        {
+            "message_id": message.message_id,
+            "source_message_id": message.source_message_id,
+            "sender": message.sender,
+            "sent_at": message.sent_at,
+            "text": message.text,
+            "origin_source": message.origin_source,
+            "channel_id": message.channel_id,
+            "thread_id": message.thread_id,
+        }
+    )
+    return rendered or None
+
+
+def _sidecar_context_messages(
+    messages: Iterable[CommunicationMessage],
+) -> list[dict[str, str]]:
+    return [
+        rendered
+        for message in messages
+        if (rendered := _sidecar_context_message(message)) is not None
+    ]
+
+
+def _sidecar_stable_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    stable_payload = json.loads(json.dumps(payload, sort_keys=True, default=str))
+    context = stable_payload.get("context")
+    if isinstance(context, dict):
+        context.pop("generated_at", None)
+    return stable_payload
+
+
+def _compact_dict(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if _text(value)}
+
+
+def _utc_now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def _batch_key(origin_source: str, channel_id: str, sent_at: str) -> str:
