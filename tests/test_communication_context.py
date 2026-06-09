@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from communication_context import (
@@ -913,3 +914,121 @@ def test_build_context_provider_excludes_records_without_message_identity():
     )
 
     assert provider is None
+
+
+def test_repair_sidecar_context_preserves_existing_payload(tmp_path: Path):
+    import communication_context as cc
+
+    assert hasattr(cc, "repair_sidecar_context")
+
+    sidecar = tmp_path / "photo.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "source": "zoho_cliq",
+                "message": {
+                    "source_message_id": "photo-1",
+                    "sent_at": "2026-01-01T10:00:10Z",
+                },
+                "channel": {"source_channel_id": "chan-1"},
+                "media": {"original_filename": "photo.jpg"},
+                "context": {"legacy_note": {"keep": True}},
+                "custom": "keep-me",
+            }
+        )
+    )
+    envelope = ContextEnvelope(
+        primary_item=CommunicationItem(
+            source_message_id="photo-1",
+            origin_source="zoho_cliq",
+            channel_id="chan-1",
+            sent_at="2026-01-01T10:00:10Z",
+        ),
+        same_channel_before=[
+            CommunicationMessage(
+                message_id="m-before",
+                source_message_id="before-1",
+                sender="A",
+                sent_at="2026-01-01T10:00:00Z",
+                text="this explains the photo",
+                origin_source="zoho_cliq",
+                channel_id="chan-1",
+            )
+        ],
+        same_channel_after=[
+            CommunicationMessage(
+                message_id="m-after",
+                source_message_id="after-1",
+                sender="B",
+                sent_at="2026-01-01T10:00:20Z",
+                text="follow-up details",
+                origin_source="zoho_cliq",
+                channel_id="chan-1",
+            )
+        ],
+    )
+
+    changed = cc.repair_sidecar_context(
+        sidecar,
+        envelope,
+        generated_at="2026-01-01T10:01:00Z",
+    )
+
+    updated = json.loads(sidecar.read_text())
+    assert changed is True
+    assert updated["custom"] == "keep-me"
+    assert updated["message"]["source_message_id"] == "photo-1"
+    assert updated["context"]["legacy_note"] == {"keep": True}
+    assert updated["context"]["schema_version"] == 1
+    assert updated["context"]["source"] == "rag-in-a-box"
+    assert updated["context"]["same_channel_before"][0]["source_message_id"] == "before-1"
+    assert updated["context"]["same_channel_before"][0]["text"] == "this explains the photo"
+    assert updated["context"]["same_channel_after"][0]["source_message_id"] == "after-1"
+    assert updated["context"]["nearest_nonempty_before"]["source_message_id"] == "before-1"
+    assert updated["context"]["nearest_nonempty_after"]["source_message_id"] == "after-1"
+
+
+def test_repair_sidecar_context_is_idempotent(tmp_path: Path):
+    import communication_context as cc
+
+    assert hasattr(cc, "repair_sidecar_context")
+
+    sidecar = tmp_path / "photo.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "source": "zoho_mail",
+                "message": {"source_message_id": "mail-1"},
+                "channel": {"source_channel_id": "inbox"},
+                "media": {"original_filename": "invoice.pdf"},
+            }
+        )
+    )
+    envelope = ContextEnvelope(
+        primary_item=CommunicationItem(
+            source_message_id="mail-1",
+            origin_source="zoho_mail",
+            channel_id="inbox",
+        ),
+        same_channel_before=[
+            CommunicationMessage(
+                source_message_id="mail-before",
+                sent_at="2026-01-01T10:00:00Z",
+                text="invoice is for Unit E",
+            )
+        ],
+    )
+
+    assert cc.repair_sidecar_context(
+        sidecar,
+        envelope,
+        generated_at="2026-01-01T10:01:00Z",
+    )
+    first_write = sidecar.read_text()
+
+    assert not cc.repair_sidecar_context(
+        sidecar,
+        envelope,
+        generated_at="2026-01-01T10:02:00Z",
+    )
+    assert sidecar.read_text() == first_write

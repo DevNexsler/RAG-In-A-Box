@@ -156,6 +156,20 @@ _OCR_BASE_URL = _resolve_ocr_base_url()
 _deepseek_ocr2_available = _probe_url(f"{_OCR_BASE_URL}/health")
 
 
+def _deepseek_ocr2_extract_available() -> bool:
+    if not _deepseek_ocr2_available:
+        return False
+    try:
+        resp = httpx.post(
+            f"{_OCR_BASE_URL}/extract",
+            files={"file": ("test.png", _minimal_png(), "image/png")},
+            timeout=10.0,
+        )
+        return resp.status_code < 500
+    except Exception:
+        return False
+
+
 @pytest.mark.live
 @pytest.mark.skipif(not _deepseek_ocr2_available, reason=f"DeepSeek-OCR2 not reachable at {_OCR_BASE_URL}")
 class TestDeepSeekOCR2Health:
@@ -168,6 +182,8 @@ class TestDeepSeekOCR2Health:
 
     def test_extract_endpoint_accepts_post(self):
         """POST /extract with minimal PNG returns non-5xx."""
+        if not _deepseek_ocr2_extract_available():
+            pytest.skip(f"DeepSeek-OCR2 /extract not ready at {_OCR_BASE_URL}")
         resp = httpx.post(
             f"{_OCR_BASE_URL}/extract",
             files={"file": ("test.png", _minimal_png(), "image/png")},

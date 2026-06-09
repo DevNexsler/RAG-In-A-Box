@@ -8,6 +8,7 @@ Skipped unless COMM_DATA_STORE_DSN is set. Can be run locally with:
 import os
 
 import pytest
+import psycopg
 
 pytestmark = [
     pytest.mark.live,
@@ -18,10 +19,23 @@ pytestmark = [
 ]
 
 
+def _require_postgres_dsn() -> str:
+    dsn = os.environ.get("COMM_DATA_STORE_DSN")
+    if not dsn:
+        pytest.skip("COMM_DATA_STORE_DSN not set")
+    try:
+        with psycopg.connect(dsn, connect_timeout=3):
+            pass
+    except psycopg.OperationalError as exc:
+        pytest.skip(f"COMM_DATA_STORE_DSN not reachable: {exc}")
+    return dsn
+
+
 @pytest.fixture
 def pg_source():
     from sources.postgres import PostgresSource, TableSpec
 
+    dsn = _require_postgres_dsn()
     specs = [
         TableSpec(
             source_type="pg_message",
@@ -49,7 +63,7 @@ def pg_source():
     ]
     src = PostgresSource(
         name="comm_messages",
-        dsn=os.environ["COMM_DATA_STORE_DSN"],
+        dsn=dsn,
         tables=specs,
     )
     yield src
@@ -102,12 +116,9 @@ def test_close_releases_connection(pg_source):
 
 def test_scan_with_multiple_table_specs():
     """Multiple TableSpecs share one connection; both streams are readable."""
-    import os
-    if not os.environ.get("COMM_DATA_STORE_DSN"):
-        pytest.skip("COMM_DATA_STORE_DSN not set")
-
     from sources.postgres import PostgresSource, TableSpec
 
+    dsn = _require_postgres_dsn()
     messages_spec = TableSpec(
         source_type="pg_message",
         query="""
@@ -138,7 +149,7 @@ def test_scan_with_multiple_table_specs():
 
     src = PostgresSource(
         name="comm_multi",
-        dsn=os.environ["COMM_DATA_STORE_DSN"],
+        dsn=dsn,
         tables=[messages_spec, transcripts_spec],
     )
     try:

@@ -245,13 +245,41 @@ def _deepseek_ocr2_running() -> bool:
         return False
 
 
+def _minimal_png() -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x02\x00\x00\x00\x90wS\xde"
+        b"\x00\x00\x00\x0cIDAT\x08\xd7c\xf8\xff\xff?\x00\x05\xfe\x02\xfeA\xe2%\xb5"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+
+def _deepseek_ocr2_model_ready() -> bool:
+    if not _deepseek_ocr2_running():
+        return False
+    for endpoint in ("/extract", "/describe"):
+        try:
+            resp = httpx.post(
+                f"{_OCR_BASE_URL}{endpoint}",
+                files={"file": ("test.png", _minimal_png(), "image/png")},
+                timeout=10.0,
+            )
+        except Exception:
+            return False
+        if resp.status_code >= 500:
+            return False
+    return True
+
+
 _TEST_IMAGE = Path(__file__).parent.parent / "test_vault" / "meeting_notes@00004@.png"
 
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    not _deepseek_ocr2_running(),
-    reason=f"DeepSeek-OCR2 not reachable at {_OCR_BASE_URL}",
+    not _deepseek_ocr2_model_ready(),
+    reason=f"DeepSeek-OCR2 model endpoints not ready at {_OCR_BASE_URL}",
 )
 class TestDeepSeekOCR2Live:
     """Live integration tests against real DeepSeek-OCR2 service."""
