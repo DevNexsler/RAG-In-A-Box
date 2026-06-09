@@ -74,6 +74,22 @@ def test_delete_by_doc_ids():
         assert doc_ids == ["a.md"]
 
 
+def test_promote_table_swaps_shadow_into_active():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        active = LanceDBStore(tmpdir, "test_chunks")
+        shadow = LanceDBStore(tmpdir, "test_chunks__shadow")
+
+        active.upsert_nodes([_make_node("active.md", "c:0", "active", [0.1] * 768)])
+        shadow.upsert_nodes([_make_node("shadow.md", "c:0", "shadow", [0.2] * 768)])
+        shadow.create_fts_index()
+
+        active.promote_table("test_chunks__shadow")
+
+        reopened = LanceDBStore(tmpdir, "test_chunks")
+        assert reopened.list_doc_ids() == ["shadow.md"]
+        assert reopened.get_chunk("shadow.md", "c:0").text == "shadow"
+
+
 def test_list_empty():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")

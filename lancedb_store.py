@@ -184,6 +184,19 @@ class LanceDBStore:
         lance.write_dataset(clean_table, str(lance_path))
         return True
 
+    def _table_path(self, table_name: str | None = None) -> Path:
+        """Return on-disk path for a Lance table."""
+        return Path(self.index_root) / f"{table_name or self.table_name}.lance"
+
+    def _reconnect(self) -> None:
+        """Reconnect the vector store to the current on-disk table path."""
+        self._vs = LanceDBVectorStore(
+            uri=self.index_root,
+            table_name=self.table_name,
+            mode="create",
+        )
+        self._ensure_scalar_index()
+
     def _ensure_scalar_index(self) -> None:
         """Create a BTREE scalar index on doc_id for O(log n) filtered lookups."""
         try:
@@ -192,6 +205,41 @@ class LanceDBStore:
             pass  # Table not created yet on first run
         except Exception as e:
             logger.warning("Failed to create scalar index: %s", e)
+
+    def reset_table(self) -> None:
+        """Drop all data for this table so a shadow rebuild starts from a clean slate."""
+        table_path = self._table_path()
+        if table_path.exists():
+            shutil.rmtree(table_path)
+        self._reconnect()
+
+    def promote_table(self, shadow_table_name: str) -> None:
+        """Atomically replace this table with a prepared shadow table."""
+        shadow_path = self._table_path(shadow_table_name)
+        active_path = self._table_path()
+        backup_path = self._table_path(f"{self.table_name}__backup")
+
+        if not shadow_path.exists():
+            raise FileNotFoundError(f"Shadow table does not exist: {shadow_path}")
+
+        if backup_path.exists():
+            shutil.rmtree(backup_path)
+
+        active_moved = False
+        try:
+            if active_path.exists():
+                shutil.move(str(active_path), str(backup_path))
+                active_moved = True
+            shutil.move(str(shadow_path), str(active_path))
+        except Exception:
+            if active_moved and not active_path.exists() and backup_path.exists():
+                shutil.move(str(backup_path), str(active_path))
+            raise
+        else:
+            if backup_path.exists():
+                shutil.rmtree(backup_path)
+            self._reconnect()
+            logger.info("Promoted shadow table %r into %r", shadow_table_name, self.table_name)
 
     @staticmethod
     def _sql_escape(value: str) -> str:
