@@ -711,6 +711,8 @@ def process_doc_task(doc: dict) -> None:
             taxonomy_store=taxonomy_store,
             context_text=context_text,
             record_taxonomy_usage=False,
+            postprocess_enrichment=bool(enrichment_cfg.get("postprocess_enrichment", False)),
+            postprocess_rules=enrichment_cfg.get("postprocess_rules"),
         )
         enrichment_failed = bool(enrichment.get("_enrichment_failed"))
         if enrichment_failed:

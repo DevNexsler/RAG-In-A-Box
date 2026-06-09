@@ -62,12 +62,16 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--model", required=True)
     run_cmd.add_argument("--run-id", required=True)
     run_cmd.add_argument("--max-cases", type=int)
+    run_cmd.add_argument("--postprocess-enrichment", action="store_true")
+    run_cmd.add_argument("--postprocess-rules", nargs="*")
 
     audit_run_cmd = subparsers.add_parser("audit-run")
     audit_run_cmd.add_argument("--bench-dir", default=".evals/benchmarks/audit")
     audit_run_cmd.add_argument("--model", required=True)
     audit_run_cmd.add_argument("--run-id", required=True)
     audit_run_cmd.add_argument("--max-cases", type=int)
+    audit_run_cmd.add_argument("--postprocess-enrichment", action="store_true")
+    audit_run_cmd.add_argument("--postprocess-rules", nargs="*")
 
     report_cmd = subparsers.add_parser("report")
     report_cmd.add_argument("--bench-dir", default=".evals/benchmarks")
@@ -137,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 run_id=args.run_id,
                 max_cases=args.max_cases,
+                postprocess_enrichment=args.postprocess_enrichment,
+                postprocess_rules=args.postprocess_rules,
             ),
             run_id=args.run_id,
             model=args.model,
@@ -151,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
                 run_id=args.run_id,
                 max_cases=args.max_cases,
                 score_mode="audit",
+                postprocess_enrichment=args.postprocess_enrichment,
+                postprocess_rules=args.postprocess_rules,
             ),
             run_id=args.run_id,
             model=args.model,

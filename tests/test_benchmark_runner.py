@@ -407,6 +407,60 @@ def test_run_benchmark_records_parse_failures_per_case(tmp_path):
     assert run.per_case[0]["score"]["reliability"]["parse_failed"] is True
 
 
+def test_run_benchmark_can_score_repaired_enrichment(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+
+    case_path = fixture_bench_dir / "cases" / "case_0001.json"
+    case_payload = json.loads(case_path.read_text(encoding="utf-8"))
+    case_payload["prompt"] = (
+        "Document title: TenantCloud failed rent payment\n"
+        "Document type: email\n\n"
+        "Document text:\n"
+        "TenantCloud rent payment failed. Balance due is $1,250 and overdue. "
+        "Tenant requested renewal by 2026-03-01."
+    )
+    case_payload["title"] = "TenantCloud failed rent payment"
+    case_payload["source_type"] = "email"
+    case_path.write_text(json.dumps(case_payload), encoding="utf-8")
+
+    fake_content = json.dumps(
+        {
+            "summary": "TenantCloud sent a failed payment notice.",
+            "doc_type": ["message"],
+            "entities_people": [],
+            "entities_places": [],
+            "entities_orgs": ["TenantCloud"],
+            "entities_dates": ["2026-03-01"],
+            "topics": ["lease renewal"],
+            "keywords": ["renewal terms"],
+            "key_facts": ["The document contains important information."],
+            "suggested_tags": ["lease"],
+            "suggested_folder": "Housing/Leases",
+            "importance": 0.5,
+        }
+    )
+
+    raw_run = run_benchmark(
+        bench_dir=fixture_bench_dir,
+        model="deepseek/deepseek-v4-pro",
+        run_id="raw",
+        replay_client=FakeReplayClient(content=fake_content),
+    )
+    repaired_run = run_benchmark(
+        bench_dir=fixture_bench_dir,
+        model="deepseek/deepseek-v4-pro",
+        run_id="repaired",
+        replay_client=FakeReplayClient(content=fake_content),
+        postprocess_enrichment=True,
+    )
+
+    assert "payment notice" in repaired_run.per_case[0]["normalized_output"]["enr_doc_type"]
+    assert repaired_run.summary["postprocess_enrichment"] is True
+    assert repaired_run.summary["average_total_score"] > raw_run.summary["average_total_score"]
+
+
 def test_run_benchmark_classifies_internal_value_error_separately(tmp_path, monkeypatch):
     fixture_bench_dir = tmp_path / "benchmarks"
     fixture_bench_dir.mkdir(parents=True)

@@ -109,6 +109,8 @@ enrichment:
   base_url: "http://localhost:11434"
   max_input_chars: 20000
   max_output_tokens: 5000
+  postprocess_enrichment: false
+  postprocess_rules: ["importance"]
   trace_capture:
     enabled: false
     directory: ".evals/llm-traces"

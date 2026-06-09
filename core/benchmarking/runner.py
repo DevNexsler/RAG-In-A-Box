@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -8,8 +9,10 @@ from typing import Any
 import httpx
 
 from core.benchmarking.cases import load_case, resolve_bench_path
-from core.benchmarking.scoring import score_failed_case
+from core.benchmarking.scoring import score_audit_case, score_case, score_failed_case
 from core.benchmarking.tasks import BenchmarkTask, get_task
+from core.enrichment_postprocess import repair_enrichment
+from doc_enrichment import parse_enrichment_response
 from providers.llm.openrouter_llm import OpenRouterGenerator
 
 
@@ -35,6 +38,8 @@ def run_benchmark(
     score_mode: str | None = None,
     task: str = "enrichment",
     suite: str = "standard",
+    postprocess_enrichment: bool = False,
+    postprocess_rules: Iterable[str] | None = None,
 ) -> BenchmarkRunResult:
     bench_task = get_task(task)
     bench_path = resolve_bench_path(bench_dir=bench_dir, task=task, suite=suite)
@@ -60,6 +65,8 @@ def run_benchmark(
             model=model,
             score_mode=score_mode,
             bench_task=bench_task,
+            postprocess_enrichment=postprocess_enrichment,
+            postprocess_rules=postprocess_rules,
         )
         results.append(result)
 
@@ -77,6 +84,8 @@ def run_benchmark(
         task=task,
         suite=suite,
         bench_path=bench_path,
+        postprocess_enrichment=postprocess_enrichment,
+        postprocess_rules=postprocess_rules,
     )
     summary_path = run_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -92,11 +101,31 @@ def _run_case(
     model: str,
     score_mode: str,
     bench_task: BenchmarkTask,
+    postprocess_enrichment: bool,
+    postprocess_rules: Iterable[str] | None,
 ) -> dict[str, Any]:
     replay: dict[str, Any] | None = None
     try:
         replay = client.generate_with_metadata(case.prompt, max_tokens=512)
-        normalized_output, score = bench_task.score_raw_output(replay["content"], gold, score_mode)
+        if postprocess_enrichment:
+            if bench_task.name != "enrichment":
+                raise ValueError("postprocess_enrichment is only supported for enrichment benchmarks")
+            normalized_output = parse_enrichment_response(replay["content"])
+            normalized_output = repair_enrichment(
+                normalized_output,
+                text=case.prompt,
+                title=case.title,
+                source_type=case.source_type,
+                enabled=True,
+                enabled_rules=postprocess_rules,
+            )
+            score = (
+                score_audit_case(normalized_output, gold)
+                if score_mode == "audit"
+                else score_case(normalized_output, gold)
+            )
+        else:
+            normalized_output, score = bench_task.score_raw_output(replay["content"], gold, score_mode)
         return {
             "case_id": case.case_id,
             "model": model,
@@ -106,6 +135,7 @@ def _run_case(
             "request": replay.get("request", {}),
             "response": replay.get("response", {}),
             "latency_ms": replay.get("latency_ms"),
+            "postprocess_enrichment": postprocess_enrichment,
             "score": score.to_dict(),
         }
     except json.JSONDecodeError as exc:
@@ -194,6 +224,8 @@ def _build_summary(
     task: str,
     suite: str,
     bench_path: Path,
+    postprocess_enrichment: bool,
+    postprocess_rules: Iterable[str] | None,
 ) -> dict[str, Any]:
     case_count = len(results)
     parse_failures = sum(1 for item in results if item["score"]["reliability"].get("parse_failed"))
@@ -222,6 +254,8 @@ def _build_summary(
         "suite": suite,
         "model": model,
         "score_mode": score_mode,
+        "postprocess_enrichment": postprocess_enrichment,
+        "postprocess_rules": _summary_postprocess_rules(postprocess_rules),
         "case_count": case_count,
         "average_total_score": mean_total,
         "parse_failures": parse_failures,
@@ -353,6 +387,12 @@ def _average_subscores(*, results: list[dict[str, Any]], case_count: int) -> dic
 def _validate_score_mode(score_mode: str, *, score_modes: frozenset[str]) -> None:
     if score_mode not in score_modes:
         raise ValueError(f"unsupported benchmark score_mode: {score_mode}")
+
+
+def _summary_postprocess_rules(postprocess_rules: Iterable[str] | None) -> list[str] | str | None:
+    if postprocess_rules is None or isinstance(postprocess_rules, str):
+        return postprocess_rules
+    return list(postprocess_rules)
 
 
 def _extract_total_tokens(result: dict[str, Any]) -> int:

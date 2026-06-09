@@ -18,7 +18,10 @@ import copy
 import json
 import logging
 import re
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
+
+from core.enrichment_postprocess import repair_enrichment
 
 if TYPE_CHECKING:
     from providers.llm import LLMGenerator
@@ -619,6 +622,8 @@ def enrich_document(
     taxonomy_store: "TaxonomyStore | None" = None,
     context_text: str = "",
     record_taxonomy_usage: bool = True,
+    postprocess_enrichment: bool = False,
+    postprocess_rules: Iterable[str] | None = None,
 ) -> dict[str, str]:
     """Extract structured metadata from document text using an LLM.
 
@@ -663,6 +668,14 @@ def enrich_document(
 
         enrichment = parse_enrichment_response(raw_response)
         enrichment = _repair_context_omissions(enrichment, truncated, context_text)
+        enrichment = repair_enrichment(
+            enrichment,
+            text=truncated,
+            title=title,
+            source_type=source_type,
+            enabled=postprocess_enrichment,
+            enabled_rules=postprocess_rules,
+        )
 
         if not enrichment.get("enr_summary"):
             logger.warning(

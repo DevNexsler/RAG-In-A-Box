@@ -251,6 +251,33 @@ class TestEnrichDocument:
         assert result["enr_suggested_folder"] == "Financial/"
         gen.generate.assert_called_once()
 
+    def test_postprocess_flag_repairs_importance(self):
+        llm_response = json.dumps({
+            "summary": "TenantCloud sent a failed payment notice.",
+            "doc_type": ["message"],
+            "entities_people": [],
+            "entities_places": [],
+            "entities_orgs": ["TenantCloud"],
+            "entities_dates": [],
+            "topics": ["rent"],
+            "keywords": ["payment"],
+            "key_facts": ["TenantCloud sent a notice."],
+            "suggested_tags": ["housing"],
+            "suggested_folder": "Housing/Tenant Payments",
+            "importance": 0.5,
+        })
+        gen = self._make_generator(llm_response)
+
+        result = enrich_document(
+            "TenantCloud rent payment failed. Balance due is $1,250 and overdue.",
+            "TenantCloud failed rent payment",
+            "email",
+            gen,
+            postprocess_enrichment=True,
+        )
+
+        assert float(result["enr_importance"]) >= 0.8
+
     def test_empty_text_returns_empty(self):
         gen = self._make_generator("")
         result = enrich_document("", "empty.md", "md", gen)
