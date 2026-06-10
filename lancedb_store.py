@@ -771,19 +771,42 @@ class LanceDBStore:
 
         return self._run_read_with_recovery(_op, [])
 
-    # --- Full-Text Search (BM25/tantivy) ---
+    # --- Full-Text Search (BM25, Lance-native inverted index) ---
 
     def create_fts_index(self) -> None:
-        """Create or rebuild the tantivy FTS index on the text column.
+        """Create or fully rebuild the native FTS index on the text column.
 
-        Should be called after indexing completes. Uses replace=True to rebuild
-        from scratch (tantivy FTS does not support incremental updates).
+        The Lance-native index updates incrementally — rows added after index
+        creation are searchable immediately and deletes are respected without
+        a rebuild. A full rebuild is only needed for first-time creation and
+        recovery paths; routine indexing runs should call ensure_fts_index().
         Raises on failure so the caller can track the error.
         """
         table = self._vs.table
         text_key = getattr(self._vs, "text_key", "text")
-        table.create_fts_index(text_key, use_tantivy=True, replace=True)
+        table.create_fts_index(text_key, use_tantivy=False, replace=True)
         logger.info("FTS index created/rebuilt on column %r", text_key)
+
+    def ensure_fts_index(self) -> None:
+        """Make sure the native FTS index exists and is optimized.
+
+        Creates the index if missing; otherwise merges newly written rows into
+        the existing index via optimize(). Unindexed rows are still searchable
+        before the merge, so this is a performance step, not a correctness one.
+        Raises on failure so the caller can track the error.
+        """
+        table = self._vs.table
+        text_key = getattr(self._vs, "text_key", "text")
+        has_fts = any(
+            str(getattr(idx, "index_type", "")).upper() == "FTS"
+            for idx in table.list_indices()
+        )
+        if not has_fts:
+            table.create_fts_index(text_key, use_tantivy=False)
+            logger.info("FTS index created on column %r", text_key)
+            return
+        table.optimize()
+        logger.info("FTS index optimized (incremental merge)")
 
     def fts_available(self) -> bool:
         """Check if the FTS/tantivy index is operational (health check for file_status)."""
