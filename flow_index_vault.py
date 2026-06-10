@@ -1091,6 +1091,18 @@ def _recover_corrupt_table(index_root: str | Path, table_name: str, logger) -> L
     return LanceDBStore(index_root, table_name)
 
 
+def _should_use_shadow_rebuild(
+    scanned_count: int,
+    stored_doc_count: int,
+    changed_doc_count: int,
+) -> bool:
+    """Return True when a large rebuild should preserve the active searchable table."""
+    if stored_doc_count <= 0 or changed_doc_count <= 0:
+        return False
+    baseline = max(scanned_count, stored_doc_count)
+    return changed_doc_count >= 1000 or (changed_doc_count * 2) >= baseline
+
+
 # --- Flow ---
 
 
@@ -1341,18 +1353,46 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         to_add_or_update,
         repaired_sidecar_doc_ids,
     )
+    stored_doc_count = len(stored_mtimes)
+    changed_doc_count = len(to_add_or_update) + len(to_delete)
+
+    active_store = store
+    # Shadow rebuilds replace the whole table from `scanned`. A source-scoped
+    # run only scans one source, so promoting its shadow table would silently
+    # drop every other source — never shadow-rebuild unless scanning everything.
+    using_shadow_rebuild = source_name is None and _should_use_shadow_rebuild(
+        scanned_count=len(scanned),
+        stored_doc_count=stored_doc_count,
+        changed_doc_count=changed_doc_count,
+    )
+    docs_to_process = to_add_or_update
+    docs_to_delete = to_delete
+    shadow_table_name = f"{table_name}__shadow"
+    if using_shadow_rebuild:
+        logger.info(
+            "Large rebuild detected; using shadow table (stored=%d changed=%d scanned=%d)",
+            stored_doc_count,
+            changed_doc_count,
+            len(scanned),
+        )
+        store = LanceDBStore(index_root, shadow_table_name)
+        store.reset_table()
+        _RUNTIME["store"] = store
+        docs_to_process = scanned
+        docs_to_delete = []
 
     concurrency = int(enrichment_cfg.get("concurrency", 1) or 1)
     if concurrency > 1:
-        logger.info("Processing %d docs with concurrency=%d", len(to_add_or_update), concurrency)
-    failed_docs = _process_docs(to_add_or_update, concurrency=concurrency)
+        logger.info("Processing %d docs with concurrency=%d", len(docs_to_process), concurrency)
+    failed_docs = _process_docs(docs_to_process, concurrency=concurrency)
 
     if failed_docs:
         logger.warning("Failed to process %d docs: %s", len(failed_docs), failed_docs[:20])
 
     _flush_taxonomy_usage(taxonomy_store, _RUNTIME.get("taxonomy_usage"), logger)
 
-    delete_docs_task(to_delete)
+    if docs_to_delete:
+        delete_docs_task(docs_to_delete)
 
     # Clean up deleted doc IDs from the persistent registry
     if to_delete:
@@ -1362,20 +1402,47 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
             except Exception:
                 pass
 
-    # Rebuild FTS index for keyword search (BM25/tantivy) after data changes.
-    # Also self-heal no-op runs when the FTS index is missing or unusable.
-    should_rebuild_fts = bool(to_add_or_update or to_delete)
-    if not should_rebuild_fts and not store.fts_available():
+    # Keep the native FTS index current after data changes. The Lance-native
+    # index updates incrementally — ensure_fts_index() creates it if missing
+    # and otherwise merges new rows via optimize(); no full rebuild and no
+    # rebuild window where keyword search degrades.
+    # Self-heal: if the index is unusable, fall back to a full rebuild.
+    should_update_fts = bool(docs_to_process or docs_to_delete)
+    needs_full_rebuild = False
+    if not should_update_fts and not store.fts_available():
         logger.info("FTS index unavailable after no-op diff — rebuilding FTS index")
-        should_rebuild_fts = True
+        should_update_fts = True
+        needs_full_rebuild = True
 
-    if should_rebuild_fts:
-        logger.info("Rebuilding FTS index...")
+    fts_rebuild_ok = True
+    if should_update_fts:
         try:
-            store.create_fts_index()
+            if needs_full_rebuild:
+                logger.info("Rebuilding FTS index...")
+                store.create_fts_index()
+            else:
+                store.ensure_fts_index()
         except Exception as exc:
-            logger.error("FTS index rebuild failed: %s", exc)
+            fts_rebuild_ok = False
+            logger.error("FTS index update failed: %s", exc)
             _RUNTIME.setdefault("_warnings", []).append(f"fts_rebuild_failed: {exc}")
+
+    if using_shadow_rebuild:
+        if failed_docs:
+            logger.error(
+                "Shadow rebuild had %d failed docs; keeping active table in place",
+                len(failed_docs),
+            )
+            _RUNTIME.setdefault("_warnings", []).append("shadow_rebuild_incomplete")
+            store = active_store
+        elif not fts_rebuild_ok:
+            logger.error("Shadow rebuild FTS step failed; keeping active table in place")
+            _RUNTIME.setdefault("_warnings", []).append("shadow_rebuild_not_promoted")
+            store = active_store
+        else:
+            active_store.promote_table(shadow_table_name)
+            store = active_store
+        _RUNTIME["store"] = store
 
     run_seconds = time.perf_counter() - t0
     index_stats_task(len(to_add_or_update), len(to_delete), run_seconds)
