@@ -184,6 +184,64 @@ async def list_documents(request: Request) -> JSONResponse:
     })
 
 
+def _bool_param(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _int_param(value: object, default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _search_kwargs(payload: dict) -> dict:
+    return {
+        "query": payload.get("query", ""),
+        "top_k": _int_param(payload.get("top_k"), 10),
+        "doc_id_prefix": payload.get("doc_id_prefix"),
+        "source_type": payload.get("source_type"),
+        "source_name": payload.get("source_name"),
+        "tags": payload.get("tags"),
+        "status": payload.get("status"),
+        "folder": payload.get("folder"),
+        "prefer_recent": _bool_param(payload.get("prefer_recent"), False),
+        "metadata_filters": payload.get("metadata_filters"),
+        "enr_doc_type": payload.get("enr_doc_type"),
+        "enr_topics": payload.get("enr_topics"),
+        "filter": payload.get("filter"),
+    }
+
+
+async def search(request: Request) -> JSONResponse:
+    """Search the existing index via the MCP file_search implementation.
+
+    POST JSON body mirrors file_search parameters. This endpoint exists for
+    HTTP-only clients such as external LangChain retriever adapters.
+    """
+    if "application/json" not in request.headers.get("content-type", ""):
+        return _api_error("invalid_request", "Expected application/json")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return _api_error("invalid_json", "Request body must be valid JSON")
+    if not isinstance(payload, dict):
+        return _api_error("invalid_request", "JSON body must be an object")
+
+    from mcp_server import _file_search_impl
+
+    result = _file_search_impl(**_search_kwargs(payload))
+    status_code = 400 if isinstance(result, dict) and result.get("error") else 200
+    return JSONResponse(result, status_code=status_code)
+
+
 def build_api_app(documents_root: Path) -> Starlette:
     """Build the REST API Starlette app.
 
@@ -192,6 +250,7 @@ def build_api_app(documents_root: Path) -> Starlette:
     """
     routes = [
         Route("/upload", upload, methods=["POST"]),
+        Route("/search", search, methods=["POST"]),
         Route("/documents/{doc_id:path}", download, methods=["GET"]),
         Route("/documents/", list_documents, methods=["GET"]),
         Route("/documents", list_documents, methods=["GET"]),
