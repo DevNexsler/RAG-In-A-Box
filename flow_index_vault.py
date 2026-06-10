@@ -350,14 +350,22 @@ def scan_filesystem_records(
     exclude: list[str],
     doc_id_store: DocIDStore | None = None,
     logger=None,
+    no_rename_prefixes: list[str] | None = None,
 ) -> list[dict]:
     """Scan vault; return list of file records as dicts.
 
     Each file gets a persistent 5-char base-62 doc_id embedded in its filename
     as @XXXXX@. Files already carrying an ID keep it; new files get one assigned
     and are renamed on disk.
+
+    Paths under no_rename_prefixes are deposit-owned (e.g. email-attachment
+    capture dirs): an external process owns those filenames and re-deposits
+    any file it no longer sees, so renaming creates an endless duplicate loop
+    (deposit -> rename -> "missing" -> re-deposit). Those files keep their
+    names; their doc_id lives only in the registry, keyed by relative path.
     """
     root = Path(vault_root)
+    norm_prefixes = [p.strip("/") + "/" for p in (no_rename_prefixes or []) if p.strip("/")]
     if not root.exists():
         return []
 
@@ -429,7 +437,17 @@ def scan_filesystem_records(
                     if stored_path != rel_str:
                         doc_id_store.register(doc_id, rel_str)
 
-            if existing_id is None and doc_id_store:
+            if existing_id is None and doc_id_store and any(
+                rel_str.startswith(p) for p in norm_prefixes
+            ):
+                # Deposit-owned path: never rename. Identity comes from the
+                # registry keyed by relative path.
+                doc_id = doc_id_store.lookup_id(rel_str)
+                if doc_id is None:
+                    doc_id = doc_id_store.next_id()
+                    doc_id_store.register(doc_id, rel_str)
+                seen_ids[doc_id] = rel_str
+            elif existing_id is None and doc_id_store:
                 # No ID in filename (or collision stripped it) — assign one and rename
                 doc_id = doc_id_store.next_id()
                 # Strip any old @XXXXX@ from filename before injecting new one

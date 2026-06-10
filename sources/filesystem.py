@@ -40,6 +40,7 @@ class FilesystemSource:
         self._root = Path(root)
         self._include = scan_config.get("include", ["**/*.md"])
         self._exclude = scan_config.get("exclude", [])
+        self._no_rename = scan_config.get("no_rename", [])
         self._registry = registry
         self._pdf_config = pdf_config or {}
         self._ocr_provider = None  # Set by flow after instantiation; see Task 8
@@ -64,6 +65,7 @@ class FilesystemSource:
             self._include,
             self._exclude,
             doc_id_store=self._registry,
+            no_rename_prefixes=self._no_rename,
         )
 
         # Backfill source_name on rows this scan just registered.

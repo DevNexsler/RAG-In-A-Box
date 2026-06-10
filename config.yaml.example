@@ -46,6 +46,13 @@ scan:
     - "**/.DS_Store"
     - "**/node_modules/**"                # npm dependencies — not user content
     # Add your own exclude patterns here
+  # no_rename: path prefixes owned by external depositors (attachment capture,
+  # sync tools). Files here are never renamed to carry @ID@ — the depositor
+  # would re-deposit any file it no longer sees, creating duplicates. Doc IDs
+  # for these paths live only in the registry, keyed by relative path.
+  # no_rename:
+  #   - "email-attachments/"
+  #   - "quo-attachments/"
 
 pdf:
   strategy: "text_then_ocr"
