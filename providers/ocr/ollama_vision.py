@@ -70,6 +70,12 @@ class OllamaVisionOCR(OCRProvider):
                     }
                 ],
                 "stream": False,
+                # qwen3-vl defaults to thinking mode, which burned ~2 minutes
+                # per image and made most describe calls hit the 120s timeout
+                # (901 timeouts in one indexing run). Descriptions don't need
+                # deliberation; cap the output too so generation stays bounded.
+                "think": False,
+                "options": {"num_predict": 800},
             },
             timeout=self.timeout,
         )

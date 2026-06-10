@@ -25,8 +25,10 @@ DEFAULT_QUERY_INSTRUCTION = (
     "Query: "
 )
 
-MAX_RETRIES = 2
-RETRY_BACKOFF = (5.0, 15.0)
+# Nebius (the qwen3-embedding upstream) throttles aggressively under
+# sustained indexing load; 2 attempts exhausted on 71 docs in one run.
+MAX_RETRIES = 5
+RETRY_BACKOFF = (2.0, 5.0, 15.0, 30.0, 60.0)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
