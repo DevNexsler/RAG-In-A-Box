@@ -16,6 +16,7 @@ Supported formats:
 
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,27 @@ from providers.media.base import MediaProvider
 from providers.ocr.base import OCRProvider
 
 logger = logging.getLogger(__name__)
+
+# Per-thread degradation capture. The indexing flow brackets each document
+# with begin/collect; extraction failure branches note transient degradations
+# (OCR timeouts, vision failures) so degraded-but-indexed docs land in the
+# degraded-docs ledger and get re-processed on later runs instead of being
+# silently frozen by their unchanged mtime.
+_degradations = threading.local()
+
+
+def begin_degradation_capture() -> None:
+    _degradations.items = []
+
+
+def collect_degradations() -> list[str]:
+    return list(getattr(_degradations, "items", []))
+
+
+def note_degradation(reason: str) -> None:
+    items = getattr(_degradations, "items", None)
+    if items is not None:
+        items.append(reason)
 
 AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "flac", "ogg", "aac", "aiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "mkv", "webm", "avi", "m4v"}
@@ -315,6 +337,7 @@ def _ocr_page(
         text = ocr_provider.extract(tmp_path)
     except Exception as e:
         logger.warning("OCR failed for page %d: %s", page_num, e)
+        note_degradation(f"ocr_page_failed:{page_num}")
         text = ""
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -447,6 +470,7 @@ def extract_image(
         vision_text = ocr_provider.describe(str(file_path))
     except Exception as e:
         logger.warning("OCR describe failed for %s: %s", file_path, e)
+        note_degradation("ocr_describe_failed")
         vision_text = ""
     header = _format_image_metadata_header(meta)
     parts = [p for p in [header, vision_text] if p.strip()]

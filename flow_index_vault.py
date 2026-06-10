@@ -32,6 +32,7 @@ than as task arguments.  This avoids Prefect 3's input-serialisation warnings
 while keeping the flow easy to read.
 """
 
+import json
 import logging
 import os
 import re
@@ -65,7 +66,15 @@ from communication_context import (
 from core.config import load_config
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment, ENRICHMENT_FIELDS, failed_enrichment
-from extractors import extract_text, extract_title, derive_folder, normalize_tags
+from extractors import (
+    begin_degradation_capture,
+    collect_degradations,
+    derive_folder,
+    extract_text,
+    extract_title,
+    normalize_tags,
+    note_degradation,
+)
 from providers.embed import build_embed_provider
 from providers.embed.base import EmbedProvider
 from providers.media import DEFAULT_VIDEO_MODEL, build_media_provider
@@ -568,6 +577,80 @@ def _include_repaired_sidecar_docs(
     return forced
 
 
+_DEGRADED_MAX_ATTEMPTS = 5
+
+
+def _degraded_ledger_path(index_root: Path) -> Path:
+    return Path(index_root) / "degraded_docs.json"
+
+
+def _load_degraded_ledger(index_root: Path) -> dict:
+    path = _degraded_ledger_path(index_root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and isinstance(payload.get("docs"), dict):
+            return payload
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"docs": {}}
+
+
+def _save_degraded_ledger(index_root: Path, ledger: dict) -> None:
+    try:
+        _degraded_ledger_path(index_root).write_text(
+            json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Failed to save degraded ledger: %s", exc)
+
+
+def _include_degraded_docs(
+    scanned: list[dict],
+    to_add_or_update: list[dict],
+    ledger: dict,
+) -> list[dict]:
+    """Re-queue docs that previously indexed with transient degradations
+    (OCR/vision timeouts, enrichment failures) even though their mtime is
+    unchanged. Entries past _DEGRADED_MAX_ATTEMPTS are left alone — those
+    are persistent (e.g. corrupt source files), not transient."""
+    docs = ledger.get("docs", {})
+    if not docs:
+        return to_add_or_update
+    retry_ids = {
+        doc_id
+        for doc_id, entry in docs.items()
+        if int(entry.get("attempts", 0)) < _DEGRADED_MAX_ATTEMPTS
+    }
+    if not retry_ids:
+        return to_add_or_update
+    existing = {str(r.get("doc_id", "")) for r in to_add_or_update}
+    by_id = {str(r.get("doc_id", "")): r for r in scanned}
+    forced = list(to_add_or_update)
+    for doc_id in sorted(retry_ids):
+        if doc_id not in existing and doc_id in by_id:
+            forced.append(by_id[doc_id])
+    return forced
+
+
+def _merge_degraded_ledger(
+    ledger: dict,
+    degraded_now: dict[str, list[str]],
+    clean_now: set[str],
+) -> dict:
+    """Fold one run's outcomes into the ledger: clean docs drop out,
+    degraded docs accumulate attempts."""
+    docs = dict(ledger.get("docs", {}))
+    for doc_id in clean_now:
+        docs.pop(doc_id, None)
+    for doc_id, reasons in degraded_now.items():
+        prev = docs.get(doc_id, {})
+        docs[doc_id] = {
+            "reasons": sorted(set(reasons)),
+            "attempts": int(prev.get("attempts", 0)) + 1,
+        }
+    return {"docs": docs}
+
+
 @task(retries=1, timeout_seconds=1800)
 def process_doc_task(doc: dict) -> None:
     """Extract text, chunk with LlamaIndex, embed, upsert into store.
@@ -721,6 +804,7 @@ def process_doc_task(doc: dict) -> None:
             _RUNTIME.setdefault("_warnings", []).append(
                 f"enrichment_failed:{doc_id}:{reason}"
             )
+            note_degradation("enrichment_failed")
         elif not enrichment.get("enr_summary"):
             logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
         if not enrichment_failed:
@@ -915,7 +999,16 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
                 current_peak,
             )
         try:
+            begin_degradation_capture()
             process_doc_task(doc)
+            reasons = collect_degradations()
+            lock = _RUNTIME.get("degraded_lock")
+            if lock is not None:
+                with lock:
+                    if reasons:
+                        _RUNTIME.setdefault("degraded_now", {})[doc["doc_id"]] = reasons
+                    else:
+                        _RUNTIME.setdefault("degraded_clean", set()).add(doc["doc_id"])
             return None
         except Exception as exc:
             logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
@@ -1334,6 +1427,9 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         config.get("communication_context", {}),
     )
     _RUNTIME["communication_context_provider"] = communication_context_provider
+    _RUNTIME["degraded_lock"] = threading.Lock()
+    _RUNTIME["degraded_now"] = {}
+    _RUNTIME["degraded_clean"] = set()
     repaired_sidecar_doc_ids = _repair_communication_sidecars(
         scanned,
         source_records_by_ns_doc_id,
@@ -1355,6 +1451,14 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         to_add_or_update,
         repaired_sidecar_doc_ids,
     )
+    degraded_ledger = _load_degraded_ledger(index_root)
+    before_degraded = len(to_add_or_update)
+    to_add_or_update = _include_degraded_docs(scanned, to_add_or_update, degraded_ledger)
+    if len(to_add_or_update) > before_degraded:
+        logger.info(
+            "Re-queued %d degraded docs for self-heal",
+            len(to_add_or_update) - before_degraded,
+        )
     stored_doc_count = len(stored_mtimes)
     changed_doc_count = len(to_add_or_update) + len(to_delete)
 
@@ -1470,6 +1574,19 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         else:
             logger.error("Auto-recovery failed — manual intervention needed")
             raise
+
+    degraded_now = _RUNTIME.get("degraded_now", {})
+    clean_now = _RUNTIME.get("degraded_clean", set())
+    if degraded_now or clean_now:
+        updated_ledger = _merge_degraded_ledger(
+            _load_degraded_ledger(index_root), degraded_now, clean_now
+        )
+        _save_degraded_ledger(index_root, updated_ledger)
+        if degraded_now:
+            logger.warning(
+                "%d docs indexed with degradations (will self-heal next run): %s",
+                len(degraded_now), sorted(degraded_now)[:10],
+            )
 
     write_index_metadata_task(
         index_root, doc_count, chunk_count,
