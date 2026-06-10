@@ -166,6 +166,32 @@ def test_vector_search():
         assert hits[0].doc_id == "a.md"
 
 
+def test_vector_search_recovers_from_stale_store_handle():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([
+            _make_node("a.md", "c:0", "apple banana", [1.0] + [0.0] * 767),
+        ])
+
+        class _StaleTable:
+            def search(self, *args, **kwargs):
+                raise RuntimeError(
+                    "Dataset at path data/index/test_chunks.lance/_versions/4555.manifest "
+                    "was not found: Not found: data/index/test_chunks.lance/_versions/4555.manifest"
+                )
+
+        class _StaleVS:
+            @property
+            def table(self):
+                return _StaleTable()
+
+        store._vs = _StaleVS()
+
+        hits = store.vector_search([1.0] + [0.0] * 767, top_k=1)
+        assert len(hits) == 1
+        assert hits[0].doc_id == "a.md"
+
+
 def _make_node_with_meta(doc_id, loc, text, vector, **extra_meta):
     """Helper that lets tests set arbitrary metadata fields."""
     meta = {
@@ -965,6 +991,32 @@ def test_keyword_search_with_where():
         store.upsert_nodes(nodes)
         store.create_fts_index()
         hits = store.keyword_search("banana tropical", top_k=10, where="metadata.folder = 'Recipes'")
+        assert len(hits) == 1
+        assert hits[0].doc_id == "a.md"
+
+
+def test_keyword_search_recovers_from_stale_store_handle():
+    """keyword_search should reopen the table after stale file-handle errors."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana fruit tropical", vec, source_type="md"),
+        ])
+        store.create_fts_index()
+
+        class _StaleTable:
+            def search(self, *args, **kwargs):
+                raise RuntimeError("Not found: data/index/test_chunks.lance/data/abc123.lance")
+
+        class _StaleVS:
+            @property
+            def table(self):
+                return _StaleTable()
+
+        store._vs = _StaleVS()
+
+        hits = store.keyword_search("banana tropical", top_k=10)
         assert len(hits) == 1
         assert hits[0].doc_id == "a.md"
 
