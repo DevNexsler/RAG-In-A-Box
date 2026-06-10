@@ -2,6 +2,8 @@
 
 import base64
 import logging
+import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +42,35 @@ _DESCRIBE_PROMPT = (
 )
 
 
+# Ollama processes one vision request at a time per model. With the indexer
+# running 8-wide, naive concurrent calls queue server-side and expire against
+# the HTTP timeout (901 describe timeouts in one run). Serialize app-side so
+# waiting happens without burning the request timeout.
+_VISION_GATE = threading.Semaphore(int(os.environ.get("OLLAMA_VISION_CONCURRENCY", "1")))
+
+_MAX_IMAGE_DIM = 1024
+
+
+def _downscale(image_bytes: bytes) -> bytes:
+    """Resize large images before sending — vision prefill cost scales with
+    pixels and attachment photos are often full-resolution camera shots."""
+    try:
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(image_bytes))
+        if max(img.size) <= _MAX_IMAGE_DIM:
+            return image_bytes
+        img.thumbnail((_MAX_IMAGE_DIM, _MAX_IMAGE_DIM))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+    except Exception:
+        return image_bytes
+
+
 class OllamaVisionOCR(OCRProvider):
     """Use an Ollama vision model for text extraction and image description."""
 
@@ -55,8 +86,12 @@ class OllamaVisionOCR(OCRProvider):
         logger.info("OllamaVisionOCR: %s model=%s", self.base_url, self.model)
 
     def _call(self, file_path: Path, prompt: str) -> str:
-        image_bytes = file_path.read_bytes()
+        image_bytes = _downscale(file_path.read_bytes())
         b64 = base64.b64encode(image_bytes).decode("ascii")
+        with _VISION_GATE:
+            return self._request(b64, prompt)
+
+    def _request(self, b64: str, prompt: str) -> str:
 
         resp = httpx.post(
             f"{self.base_url}/api/chat",
