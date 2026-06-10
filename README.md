@@ -12,6 +12,7 @@ No infrastructure to manage. No GPU required. Works with **cloud APIs** out of t
 - **Obsidian / Markdown vault** — Works with any markdown source (Obsidian, HackMD, Notion exports, GitBook). Extracts YAML frontmatter for rich filtering.
 - **PDF-heavy workflows** — Scanned PDFs get OCR automatically. Page-aware chunking keeps context intact. Metadata (author, dates, page count) extracted from PDF properties.
 - **Multi-agent tool** — Expose your document collection as 16 MCP tools. Multiple agents can search, browse, filter, and manage taxonomy concurrently.
+- **Local Deep Research integration** — Let LDR run agentic web/academic research while searching this RAG index through a LangChain retriever. See [Local Deep Research Integration](docs/local-deep-research-integration.md).
 
 ## Why this over other RAG tools?
 

@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import mcp_server
 from api_server import build_api_app
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
@@ -356,3 +357,53 @@ async def test_list_documents_pagination(api_client, tmp_docs_root):
     assert len(body["files"]) == 2
     assert body["total"] == total
     assert body["offset"] == 1
+
+
+@pytest.mark.anyio
+async def test_search_post_returns_mcp_search_results(api_client, monkeypatch):
+    """AC-REST-5: POST /search forwards JSON body to file_search implementation."""
+    calls = []
+
+    def fake_search(**kwargs):
+        calls.append(kwargs)
+        return {
+            "results": [
+                {
+                    "doc_id": "notes/ml.md",
+                    "loc": "c:0",
+                    "snippet": "Neural search notes",
+                    "score": 0.42,
+                    "title": "ML Notes",
+                }
+            ],
+            "diagnostics": {"degraded": False},
+        }
+
+    monkeypatch.setattr(mcp_server, "_file_search_impl", fake_search)
+
+    resp = await api_client.post(
+        "/search",
+        json={"query": "neural search", "top_k": 3, "folder": "notes"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["results"][0]["doc_id"] == "notes/ml.md"
+    assert body["diagnostics"]["degraded"] is False
+    assert calls == [
+        {
+            "query": "neural search",
+            "top_k": 3,
+            "doc_id_prefix": None,
+            "source_type": None,
+            "source_name": None,
+            "tags": None,
+            "status": None,
+            "folder": "notes",
+            "prefer_recent": False,
+            "metadata_filters": None,
+            "enr_doc_type": None,
+            "enr_topics": None,
+            "filter": None,
+        }
+    ]
