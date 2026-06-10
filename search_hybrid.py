@@ -692,44 +692,55 @@ def hybrid_search(
         filter_ast=filter_ast,
     )
 
-    # 1. Embed query
-    stage_started = time.perf_counter()
-    query_vector = embed_provider.embed_query(query)
-    timing_ms["embed"] = round((time.perf_counter() - stage_started) * 1000, 3)
+    # 1. Embed query. If this fails, keep FTS/BM25 available instead of aborting.
+    query_vector: list[float] | None = None
+    vector_error: Exception | None = None
+    keyword_error: Exception | None = None
+    vector_hits: list[SearchHit] = []
+    keyword_hits: list[SearchHit] = []
 
-    # 2. Parallel retrieval: vector (semantic) + keyword (BM25/FTS)
-    def _timed_vector_search():
-        started = time.perf_counter()
-        return store.vector_search(query_vector, vector_top_k, where), round(
-            (time.perf_counter() - started) * 1000, 3
-        )
-
-    def _timed_keyword_search():
-        started = time.perf_counter()
-        return store.keyword_search(query, keyword_top_k, where), round(
-            (time.perf_counter() - started) * 1000, 3
-        )
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        vec_future = executor.submit(_timed_vector_search)
-        kw_future = executor.submit(_timed_keyword_search)
-        vector_error = None
-        keyword_error = None
+    try:
+        stage_started = time.perf_counter()
+        query_vector = embed_provider.embed_query(query)
+        timing_ms["embed"] = round((time.perf_counter() - stage_started) * 1000, 3)
+    except Exception as e:
+        vector_error = e
+        diagnostics["vector_search_active"] = False
+        logger.warning("Query embedding failed (degraded to keyword-only): %s", e)
         try:
-            vector_hits, timing_ms["vector"] = vec_future.result()
-        except Exception as e:
-            vector_hits = []
-            vector_error = e
-        try:
-            keyword_hits, timing_ms["keyword"] = kw_future.result()
-        except Exception as e:
-            keyword_hits = []
-            keyword_error = e
+            keyword_hits = store.keyword_search(query, keyword_top_k, where)
+        except Exception as kw_exc:
+            keyword_error = kw_exc
+    else:
+        # 2. Parallel retrieval: vector (semantic) + keyword (BM25/FTS)
+        def _timed_vector_search():
+            started = time.perf_counter()
+            return store.vector_search(query_vector, vector_top_k, where), round(
+                (time.perf_counter() - started) * 1000, 3
+            )
+
+        def _timed_keyword_search():
+            started = time.perf_counter()
+            return store.keyword_search(query, keyword_top_k, where), round(
+                (time.perf_counter() - started) * 1000, 3
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            vec_future = executor.submit(_timed_vector_search)
+            kw_future = executor.submit(_timed_keyword_search)
+            try:
+                vector_hits, timing_ms["vector"] = vec_future.result()
+            except Exception as e:
+                vector_error = e
+            try:
+                keyword_hits, timing_ms["keyword"] = kw_future.result()
+            except Exception as e:
+                keyword_error = e
 
     # LanceDB can intermittently fail one side of concurrent retrieval even
     # though the underlying index is healthy. Retry once serially before
     # declaring a degraded search path.
-    if vector_error is not None:
+    if query_vector is not None and vector_error is not None:
         try:
             stage_started = time.perf_counter()
             vector_hits = store.vector_search(query_vector, vector_top_k, where)
@@ -793,9 +804,10 @@ def hybrid_search(
             diagnostics["reranker_applied"] = True
         except Exception as e:
             logger.warning("Reranker failed, falling back to cosine rerank: %s", e)
-            stage_started = time.perf_counter()
-            fused = _cosine_fallback_rerank(query_vector, rerank_pool, store)
-            timing_ms["rerank"] = round((time.perf_counter() - stage_started) * 1000, 3)
+            if query_vector is not None:
+                stage_started = time.perf_counter()
+                fused = _cosine_fallback_rerank(query_vector, rerank_pool, store)
+                timing_ms["rerank"] = round((time.perf_counter() - stage_started) * 1000, 3)
 
     # 8. MMR diversity (remove near-duplicate chunks)
     stage_started = time.perf_counter()
