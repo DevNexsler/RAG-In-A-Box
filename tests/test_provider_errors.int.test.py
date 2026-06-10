@@ -125,35 +125,31 @@ def _build_store_with_nodes(tmpdir: str) -> LanceDBStore:
 
 
 def test_embed_timeout_during_search_degrades_gracefully():
-    """AC-PROV-1: Embed provider timeout during search -> degraded but not crashed.
-
-    When embed_query raises TimeoutError, hybrid_search catches it in the
-    vector search thread and degrades to keyword-only results.
-    """
+    """AC-PROV-1: Embed provider timeout during search -> degraded but not crashed."""
     with tempfile.TemporaryDirectory() as tmpdir:
         store = _build_store_with_nodes(tmpdir)
         timeout_embed = TimeoutEmbedProvider()
 
-        # hybrid_search calls embed_query which raises TimeoutError.
-        # The error happens BEFORE the vector search thread is submitted,
-        # so it propagates directly. hybrid_search does not catch embed_query errors.
-        # We verify the error surfaces clearly.
-        with pytest.raises(TimeoutError, match="Connection timed out"):
-            hybrid_search(store, timeout_embed, "machine learning")
+        result = hybrid_search(store, timeout_embed, "machine learning")
+        assert isinstance(result, SearchResult)
+        assert result.diagnostics["vector_search_active"] is False
+        assert result.diagnostics["keyword_search_active"] is True
+        assert result.diagnostics["degraded"] is True
+        assert len(result) >= 1
 
 
 def test_embed_connection_refused_during_search():
-    """AC-PROV-1: Embed provider connection refused -> error surfaced.
-
-    When embed_query raises ConnectionError, the error propagates
-    through hybrid_search. This verifies errors are not silently swallowed.
-    """
+    """AC-PROV-1: Embed provider connection refused -> degraded keyword fallback."""
     with tempfile.TemporaryDirectory() as tmpdir:
         store = _build_store_with_nodes(tmpdir)
         refused_embed = ConnectionRefusedEmbedProvider()
 
-        with pytest.raises(ConnectionError, match="Connection refused"):
-            hybrid_search(store, refused_embed, "bibimbap recipe")
+        result = hybrid_search(store, refused_embed, "bibimbap recipe")
+        assert isinstance(result, SearchResult)
+        assert result.diagnostics["vector_search_active"] is False
+        assert result.diagnostics["keyword_search_active"] is True
+        assert result.diagnostics["degraded"] is True
+        assert len(result) >= 1
 
 
 # ===================================================================

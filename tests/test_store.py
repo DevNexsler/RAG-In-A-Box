@@ -74,6 +74,22 @@ def test_delete_by_doc_ids():
         assert doc_ids == ["a.md"]
 
 
+def test_promote_table_swaps_shadow_into_active():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        active = LanceDBStore(tmpdir, "test_chunks")
+        shadow = LanceDBStore(tmpdir, "test_chunks__shadow")
+
+        active.upsert_nodes([_make_node("active.md", "c:0", "active", [0.1] * 768)])
+        shadow.upsert_nodes([_make_node("shadow.md", "c:0", "shadow", [0.2] * 768)])
+        shadow.create_fts_index()
+
+        active.promote_table("test_chunks__shadow")
+
+        reopened = LanceDBStore(tmpdir, "test_chunks")
+        assert reopened.list_doc_ids() == ["shadow.md"]
+        assert reopened.get_chunk("shadow.md", "c:0").text == "shadow"
+
+
 def test_list_empty():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
@@ -145,6 +161,32 @@ def test_vector_search():
             _make_node("b.md", "c:0", "cherry date", [0.0] + [1.0] + [0.0] * 766),
         ]
         store.upsert_nodes(nodes)
+        hits = store.vector_search([1.0] + [0.0] * 767, top_k=1)
+        assert len(hits) == 1
+        assert hits[0].doc_id == "a.md"
+
+
+def test_vector_search_recovers_from_stale_store_handle():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([
+            _make_node("a.md", "c:0", "apple banana", [1.0] + [0.0] * 767),
+        ])
+
+        class _StaleTable:
+            def search(self, *args, **kwargs):
+                raise RuntimeError(
+                    "Dataset at path data/index/test_chunks.lance/_versions/4555.manifest "
+                    "was not found: Not found: data/index/test_chunks.lance/_versions/4555.manifest"
+                )
+
+        class _StaleVS:
+            @property
+            def table(self):
+                return _StaleTable()
+
+        store._vs = _StaleVS()
+
         hits = store.vector_search([1.0] + [0.0] * 767, top_k=1)
         assert len(hits) == 1
         assert hits[0].doc_id == "a.md"
@@ -949,6 +991,32 @@ def test_keyword_search_with_where():
         store.upsert_nodes(nodes)
         store.create_fts_index()
         hits = store.keyword_search("banana tropical", top_k=10, where="metadata.folder = 'Recipes'")
+        assert len(hits) == 1
+        assert hits[0].doc_id == "a.md"
+
+
+def test_keyword_search_recovers_from_stale_store_handle():
+    """keyword_search should reopen the table after stale file-handle errors."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana fruit tropical", vec, source_type="md"),
+        ])
+        store.create_fts_index()
+
+        class _StaleTable:
+            def search(self, *args, **kwargs):
+                raise RuntimeError("Not found: data/index/test_chunks.lance/data/abc123.lance")
+
+        class _StaleVS:
+            @property
+            def table(self):
+                return _StaleTable()
+
+        store._vs = _StaleVS()
+
+        hits = store.keyword_search("banana tropical", top_k=10)
         assert len(hits) == 1
         assert hits[0].doc_id == "a.md"
 
