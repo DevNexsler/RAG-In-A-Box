@@ -82,6 +82,22 @@ class OpenRouterEmbedProvider(EmbedProvider):
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                if "data" not in data:
+                    # OpenRouter wraps upstream provider failures (e.g. Nebius
+                    # 429 quota) in an HTTP 200 with an {"error": ...} body.
+                    err = data.get("error") or {}
+                    code = err.get("code")
+                    message = str(err.get("message", data))[:300]
+                    if code == 429 or (isinstance(code, int) and 500 <= code < 600):
+                        last_exc = RuntimeError(f"OpenRouter embedded error {code}: {message}")
+                        backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                        logger.warning(
+                            "embed attempt %d/%d failed (upstream %s in 200 body), retrying in %.0fs...",
+                            attempt + 1, MAX_RETRIES, code, backoff,
+                        )
+                        time.sleep(backoff)
+                        continue
+                    raise RuntimeError(f"OpenRouter embeddings error {code}: {message}")
                 results = sorted(data["data"], key=lambda x: x["index"])
                 return [r["embedding"] for r in results]
 
