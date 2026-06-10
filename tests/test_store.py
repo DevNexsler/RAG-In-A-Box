@@ -995,6 +995,40 @@ def test_keyword_search_with_where():
         assert hits[0].doc_id == "a.md"
 
 
+def test_ensure_fts_index_creates_when_missing():
+    """ensure_fts_index on a fresh table should create the FTS index."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana fruit tropical", vec, source_type="md"),
+        ])
+        store.ensure_fts_index()
+        hits = store.keyword_search("banana", top_k=10)
+        assert len(hits) == 1
+
+
+def test_fts_finds_rows_added_after_index_creation():
+    """Native FTS should surface rows written after the index was built, no rebuild."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana fruit tropical", vec, source_type="md"),
+        ])
+        store.create_fts_index()
+        store.upsert_nodes([
+            _make_node_with_meta("b.md", "c:0", "quasar telescope astronomy", vec, source_type="md"),
+        ])
+        hits = store.keyword_search("quasar astronomy", top_k=10)
+        assert len(hits) == 1
+        assert hits[0].doc_id == "b.md"
+
+        store.ensure_fts_index()  # merges the unindexed tail; still searchable after
+        hits = store.keyword_search("quasar astronomy", top_k=10)
+        assert len(hits) == 1
+
+
 def test_keyword_search_recovers_from_stale_store_handle():
     """keyword_search should reopen the table after stale file-handle errors."""
     with tempfile.TemporaryDirectory() as tmpdir:

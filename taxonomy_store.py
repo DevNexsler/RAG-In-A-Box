@@ -335,10 +335,10 @@ class TaxonomyStore:
         return rows
 
     def create_fts_index(self) -> None:
-        """Create or rebuild the tantivy FTS index on description."""
+        """Create or rebuild the native FTS index on description."""
         if self._table is None:
             return
-        self._table.create_fts_index("description", use_tantivy=True, replace=True)
+        self._table.create_fts_index("description", use_tantivy=False, replace=True)
         logger.info("Taxonomy FTS index created on description")
 
     def resolve_aliases(self, names: list[str]) -> list[str]:

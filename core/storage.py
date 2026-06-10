@@ -146,3 +146,7 @@ class StorageInterface(Protocol):
     def create_fts_index(self) -> None:
         """Create or rebuild the full-text search index."""
         ...
+
+    def ensure_fts_index(self) -> None:
+        """Create the full-text search index if missing, else merge new rows into it."""
+        ...
