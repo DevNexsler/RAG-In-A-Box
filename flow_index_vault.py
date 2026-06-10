@@ -1357,7 +1357,10 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     changed_doc_count = len(to_add_or_update) + len(to_delete)
 
     active_store = store
-    using_shadow_rebuild = _should_use_shadow_rebuild(
+    # Shadow rebuilds replace the whole table from `scanned`. A source-scoped
+    # run only scans one source, so promoting its shadow table would silently
+    # drop every other source — never shadow-rebuild unless scanning everything.
+    using_shadow_rebuild = source_name is None and _should_use_shadow_rebuild(
         scanned_count=len(scanned),
         stored_doc_count=stored_doc_count,
         changed_doc_count=changed_doc_count,
@@ -1399,21 +1402,29 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
             except Exception:
                 pass
 
-    # Rebuild FTS index for keyword search (BM25/tantivy) after data changes.
-    # Also self-heal no-op runs when the FTS index is missing or unusable.
-    should_rebuild_fts = bool(docs_to_process or docs_to_delete)
-    if not should_rebuild_fts and not store.fts_available():
+    # Keep the native FTS index current after data changes. The Lance-native
+    # index updates incrementally — ensure_fts_index() creates it if missing
+    # and otherwise merges new rows via optimize(); no full rebuild and no
+    # rebuild window where keyword search degrades.
+    # Self-heal: if the index is unusable, fall back to a full rebuild.
+    should_update_fts = bool(docs_to_process or docs_to_delete)
+    needs_full_rebuild = False
+    if not should_update_fts and not store.fts_available():
         logger.info("FTS index unavailable after no-op diff — rebuilding FTS index")
-        should_rebuild_fts = True
+        should_update_fts = True
+        needs_full_rebuild = True
 
     fts_rebuild_ok = True
-    if should_rebuild_fts:
-        logger.info("Rebuilding FTS index...")
+    if should_update_fts:
         try:
-            store.create_fts_index()
+            if needs_full_rebuild:
+                logger.info("Rebuilding FTS index...")
+                store.create_fts_index()
+            else:
+                store.ensure_fts_index()
         except Exception as exc:
             fts_rebuild_ok = False
-            logger.error("FTS index rebuild failed: %s", exc)
+            logger.error("FTS index update failed: %s", exc)
             _RUNTIME.setdefault("_warnings", []).append(f"fts_rebuild_failed: {exc}")
 
     if using_shadow_rebuild:

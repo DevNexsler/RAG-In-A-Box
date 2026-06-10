@@ -996,19 +996,20 @@ def test_large_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
 
     with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
         with patch("flow_index_vault.load_config", return_value=config):
-            with patch("flow_index_vault.LanceDBStore", side_effect=[active_store, shadow_store]):
-                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
-                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
-                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
-                            with patch("sources.build_source", return_value=_FakeSource()):
-                                with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
-                                    with patch("flow_index_vault._process_docs", return_value=[]):
-                                        with patch("flow_index_vault.delete_docs_task") as delete_mock:
-                                            with patch("flow_index_vault.index_stats_task"):
-                                                with patch("flow_index_vault.write_index_metadata_task"):
-                                                    index_vault_flow.fn("dummy.yaml")
+            with patch("flow_index_vault.open_store_with_recovery", return_value=active_store):
+                with patch("flow_index_vault.LanceDBStore", return_value=shadow_store):
+                    with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                        with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                            with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                                with patch("sources.build_source", return_value=_FakeSource()):
+                                    with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                        with patch("flow_index_vault._process_docs", return_value=[]):
+                                            with patch("flow_index_vault.delete_docs_task") as delete_mock:
+                                                with patch("flow_index_vault.index_stats_task"):
+                                                    with patch("flow_index_vault.write_index_metadata_task"):
+                                                        index_vault_flow.fn("dummy.yaml")
 
-    shadow_store.create_fts_index.assert_called_once_with()
+    shadow_store.ensure_fts_index.assert_called_once_with()
     shadow_store.reset_table.assert_called_once_with()
     active_store.promote_table.assert_called_once_with("chunks__shadow")
     delete_mock.assert_not_called()
