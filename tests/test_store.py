@@ -995,6 +995,23 @@ def test_keyword_search_with_where():
         assert hits[0].doc_id == "a.md"
 
 
+def test_keyword_search_retries_phrase_queries_without_positions():
+    """Quoted phrase queries should fall back to plain token search when Lance lacks positions."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        nodes = [
+            _make_node_with_meta("a.md", "c:0", "banana fruit tropical", vec, source_type="md"),
+            _make_node_with_meta("b.md", "c:0", "banana split dessert tropical", vec, source_type="md"),
+        ]
+        store.upsert_nodes(nodes)
+        store.create_fts_index()
+
+        hits = store.keyword_search('"banana tropical"', top_k=10)
+
+        assert [hit.doc_id for hit in hits] == ["a.md", "b.md"]
+
+
 def test_ensure_fts_index_creates_when_missing():
     """ensure_fts_index on a fresh table should create the FTS index."""
     with tempfile.TemporaryDirectory() as tmpdir:

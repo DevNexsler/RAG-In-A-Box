@@ -284,6 +284,15 @@ class LanceDBStore:
         return re.sub(r"(?<!\\):", r"\\:", query)
 
     @staticmethod
+    def _is_phrase_query_without_positions(exc: Exception, query: str) -> bool:
+        text = str(exc).lower()
+        return '"' in query and "position is not found but required for phrase queries" in text
+
+    @staticmethod
+    def _strip_phrase_quotes(query: str) -> str:
+        return " ".join(query.replace('"', " ").split())
+
+    @staticmethod
     def _validate_identifier(key: str) -> None:
         """Raise ValueError if *key* is not a safe SQL identifier."""
         if not _SAFE_IDENTIFIER_RE.match(key):
@@ -833,11 +842,27 @@ class LanceDBStore:
         """
         if not query.strip():
             return []
-        def _op():
-            q = self._vs.table.search(self._escape_fts_query(query), query_type="fts")
+
+        def _search_rows(fts_query: str):
+            q = self._vs.table.search(fts_query, query_type="fts")
             if where:
                 q = q.where(where, prefilter=True)
-            rows = q.limit(top_k).to_list()
+            return q.limit(top_k).to_list()
+
+        def _op():
+            try:
+                rows = _search_rows(self._escape_fts_query(query))
+            except Exception as exc:
+                if not self._is_phrase_query_without_positions(exc, query):
+                    raise
+                fallback_query = self._strip_phrase_quotes(query)
+                if not fallback_query:
+                    raise
+                logger.warning(
+                    "FTS phrase query unsupported without positions; retrying without quotes: %r",
+                    query,
+                )
+                rows = _search_rows(self._escape_fts_query(fallback_query))
             if not include_vector:
                 for row in rows:
                     row.pop("vector", None)
