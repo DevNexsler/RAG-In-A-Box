@@ -669,6 +669,68 @@ def _merge_degraded_ledger(
     return {"docs": docs}
 
 
+_SIDECAR_ID_RE = re.compile(r"@[0-9A-Za-z]{5}@")
+
+
+def _annotate_canonical_sidecar(
+    docs_root: Path,
+    canonical_rel: str,
+    dup_doc: dict,
+    logger,
+) -> None:
+    """Append a duplicate-delivery note to the canonical file's sidecar JSON.
+
+    Sidecars are named like the binary with a .json suffix, possibly carrying
+    their own @ID@ tag, so match on the ID-stripped stem.
+    """
+    import json as _json
+    import time as _time
+
+    try:
+        canonical_abs = docs_root / canonical_rel
+        stem = _SIDECAR_ID_RE.sub("", canonical_abs.stem)
+        sidecar = None
+        for cand in canonical_abs.parent.glob("*.json"):
+            if _SIDECAR_ID_RE.sub("", cand.stem) == stem and cand != canonical_abs:
+                sidecar = cand
+                break
+        if sidecar is None:
+            return
+
+        payload = _json.loads(sidecar.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return
+        deliveries = payload.setdefault("duplicate_deliveries", [])
+        dup_rel = dup_doc.get("rel_path", dup_doc.get("doc_id", ""))
+        if any(d.get("rel_path") == dup_rel for d in deliveries):
+            return
+
+        entry = {"rel_path": dup_rel, "noted_at": _time.time()}
+        # If the duplicate itself has a sidecar, lift its message provenance
+        dup_abs = Path(str(dup_doc.get("abs_path", "")))
+        if dup_abs.is_file():
+            dup_stem = _SIDECAR_ID_RE.sub("", dup_abs.stem)
+            for cand in dup_abs.parent.glob("*.json"):
+                if _SIDECAR_ID_RE.sub("", cand.stem) == dup_stem and cand != dup_abs:
+                    try:
+                        dup_payload = _json.loads(cand.read_text(encoding="utf-8"))
+                        msg = dup_payload.get("message") or {}
+                        entry["message"] = {
+                            k: msg.get(k)
+                            for k in ("source_message_id", "subject", "from", "sent_at")
+                            if msg.get(k) is not None
+                        }
+                        entry["source"] = dup_payload.get("source")
+                    except Exception:
+                        pass
+                    break
+        deliveries.append(entry)
+        sidecar.write_text(_json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info("Noted duplicate delivery on canonical sidecar: %s", sidecar.name)
+    except Exception as exc:
+        logger.warning("Canonical sidecar annotation failed: %s", exc)
+
+
 @task(retries=1, timeout_seconds=1800)
 def process_doc_task(doc: dict) -> None:
     """Extract text, chunk with LlamaIndex, embed, upsert into store.
@@ -693,6 +755,63 @@ def process_doc_task(doc: dict) -> None:
     ext = doc.get("ext", "")
     source_name = doc.get("source_name", "documents")
     logger.info(f"Processing: {rel_path} (id={doc_id})")
+
+    # --- Exact-content dedupe gate (filesystem docs only) ---
+    # Same bytes arriving via different paths (e.g. one document attached to
+    # several emails) index once: first-seen path wins the canonical election,
+    # later copies skip the whole extract/enrich/embed pipeline, and the
+    # canonical doc carries the duplicates' provenance (index metadata +
+    # sidecar duplicate_deliveries note). Files stay on disk untouched —
+    # deposit dirs are externally owned and re-deposit anything missing.
+    dedupe_cfg = config.get("dedupe", {})
+    registry = _RUNTIME.get("doc_id_store")
+    abs_path_str = str(doc.get("abs_path", ""))
+    if (
+        dedupe_cfg.get("enabled")
+        and registry is not None
+        and source_name == "documents"
+        and abs_path_str
+        and os.path.isfile(abs_path_str)
+    ):
+        winner = None
+        try:
+            import blake3 as _blake3
+
+            raw_bytes = Path(abs_path_str).read_bytes()
+            digest = _blake3.blake3(raw_bytes).digest()
+            bare_id = doc_id.split("::", 1)[1] if "::" in doc_id else doc_id
+            winner = registry.claim_canonical_by_exact_hash(
+                bare_id,
+                len(raw_bytes),
+                digest,
+                hash_algo="blake3",
+                duplicate_reason="exact content match at index time",
+            )
+        except Exception as exc:
+            logger.warning("Dedupe gate failed for %s (indexing normally): %s", doc_id, exc)
+        if winner is not None and winner.get("doc_id") != bare_id:
+            canonical_ns = f"{source_name}::{winner['doc_id']}"
+            logger.info(
+                "Duplicate content: %s matches canonical %s — skipping indexing",
+                doc_id, canonical_ns,
+            )
+            if dedupe_cfg.get("skip_duplicate_indexing", True):
+                try:
+                    store.delete_by_doc_ids([doc_id])
+                except Exception as exc:
+                    logger.warning("Failed to drop stale duplicate chunks for %s: %s", doc_id, exc)
+                if dedupe_cfg.get("update_canonical_metadata", True):
+                    try:
+                        refs = registry.duplicate_refs_for_canonical(winner["doc_id"])
+                        store.update_canonical_duplicate_metadata(canonical_ns, refs)
+                    except Exception as exc:
+                        logger.warning("Canonical dup-metadata update failed for %s: %s", canonical_ns, exc)
+                canonical_rel = registry.lookup_path(winner["doc_id"])
+                rel_for_root = doc.get("rel_path", "")
+                if canonical_rel and rel_for_root and abs_path_str.endswith(rel_for_root):
+                    docs_root = Path(abs_path_str[: -len(rel_for_root)])
+                    _annotate_canonical_sidecar(docs_root, canonical_rel, doc, logger)
+                return
 
     # --- Determine source_type ---
     # Prefer explicit source_type from the record (set by SourceRecord); fall back
