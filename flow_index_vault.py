@@ -1955,3 +1955,222 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         _RUNTIME.get("_warnings") or None,
     )
     logger.info(f"index_vault_flow finished in {run_seconds:.1f}s")
+
+
+# ---------------------------------------------------------------------------
+# Targeted single-document indexing (TICKET-6)
+#
+# index_vault_flow() scans a whole source. For freshly-deposited attachments
+# we need to OCR/describe + embed + upsert ONE file within seconds, without a
+# full-source scan. These helpers reuse the exact scan/doc_id, diff, and
+# process_doc_task path, so behavior matches the full flow per document.
+# ---------------------------------------------------------------------------
+
+_SINGLE_DOC_LOCK = threading.Lock()
+
+
+def _find_source_config(config: dict, source_name: str) -> dict:
+    for s in config.get("sources", []):
+        if isinstance(s, dict) and str(s.get("name") or "").strip() == source_name:
+            return s
+    valid = [str(s.get("name") or "").strip() for s in config.get("sources", []) if isinstance(s, dict)]
+    raise ValueError(f"Unknown source_name {source_name!r}. Valid sources: {valid}")
+
+
+def _target_to_rel_path(target: str, root: Path, doc_id_store: DocIDStore) -> str | None:
+    """Resolve an index target (abs path, rel_path, or namespaced doc_id) to a
+    source-relative path."""
+    t = str(target).strip()
+    if not t:
+        return None
+    if "::" in t:  # namespaced doc_id, e.g. "documents::00abc"
+        return doc_id_store.lookup_path(t.split("::", 1)[1])
+    p = Path(t)
+    if p.is_absolute():
+        try:
+            return str(p.resolve().relative_to(root.resolve())).replace("\\", "/")
+        except ValueError:
+            return None
+    return t.replace("\\", "/")
+
+
+def resolve_single_record(
+    config: dict, source_name: str, target: str, doc_id_store: DocIDStore
+) -> dict | None:
+    """Resolve one filesystem target to an indexable record dict.
+
+    Reuses scan_filesystem_records for doc_id assignment so the deposit-owned
+    (no_rename) ID-alias convention name@<5char>@.ext is honored identically to
+    the full flow. Returns None if the file is missing or excluded/unsupported.
+    """
+    from glob import escape as glob_escape
+
+    src_cfg = _find_source_config(config, source_name)
+    if src_cfg.get("type", "filesystem") != "filesystem":
+        raise ValueError(f"source {source_name!r} is not a filesystem source")
+
+    root = Path(src_cfg["root"])
+    rel_path = _target_to_rel_path(target, root, doc_id_store)
+    if not rel_path:
+        return None
+    abs_path = root / rel_path
+    if not abs_path.is_file():
+        return None
+
+    scan_cfg = src_cfg.get("scan", {})
+    include = scan_cfg.get("include", [])
+    # Respect the source's supported file types — don't index a deposit the
+    # full scan would never pick up.
+    if include and not _matches_any(rel_path, include):
+        return None
+
+    records = scan_filesystem_records(
+        root,
+        [glob_escape(rel_path)],
+        scan_cfg.get("exclude", []),
+        doc_id_store=doc_id_store,
+        logger=_get_logger(),
+        no_rename_prefixes=scan_cfg.get("no_rename", []),
+    )
+    if not records:
+        return None
+    r = records[0]
+    ns_doc_id = f"{source_name}::{r['doc_id']}"
+    doc_id_store.register(ns_doc_id, r["rel_path"], source_name=source_name)
+    return {
+        "doc_id": ns_doc_id,
+        "rel_path": r["rel_path"],
+        "abs_path": r["abs_path"],
+        "mtime": r["mtime"],
+        "size": r["size"],
+        "ext": r["ext"],
+        "source_type": canonical_source_type(r["ext"]),
+        "source_name": source_name,
+    }
+
+
+def _build_single_doc_runtime(
+    config: dict, store, doc_id_store: DocIDStore, source_name: str, record: dict
+) -> None:
+    """Populate _RUNTIME for one document, mirroring index_vault_flow's setup
+    (same providers, same Source.extract path, same sidecar context)."""
+    from sources import build_source
+    from sources.base import SourceRecord
+    from sources.filesystem import _communication_sidecar_metadata
+
+    chunk_cfg = config.get("chunking", {})
+    embed_provider = build_embed_provider(config)
+    ocr_provider = build_ocr_provider(config)
+    media_provider = build_media_provider(config)
+    splitter = SentenceSplitter(
+        chunk_size=chunk_cfg.get("max_chars", 1800),
+        chunk_overlap=chunk_cfg.get("overlap", 200),
+    )
+
+    src_cfg = _find_source_config(config, source_name)
+    src = build_source(src_cfg, registry=doc_id_store, pdf_config=config.get("pdf", {}))
+    if hasattr(src, "set_ocr_provider"):
+        src.set_ocr_provider(ocr_provider)
+    if hasattr(src, "set_media_provider"):
+        src.set_media_provider(media_provider)
+
+    abs_path = Path(record["abs_path"])
+    metadata = {
+        "ext": record["ext"],
+        "abs_path": record["abs_path"],
+        "rel_path": record["rel_path"],
+    }
+    try:
+        metadata.update(_communication_sidecar_metadata(abs_path))
+    except Exception:  # sidecar is best-effort context only
+        pass
+    source_record = SourceRecord(
+        doc_id=record["doc_id"].split("::", 1)[1],
+        source_type=record["source_type"],
+        natural_key=record["rel_path"],
+        mtime=record["mtime"],
+        size=record["size"],
+        metadata=metadata,
+    )
+
+    llm_generator = None
+    if config.get("enrichment", {}).get("enabled"):
+        try:
+            from providers.llm import build_llm_provider
+
+            llm_generator = build_llm_provider(config)
+        except Exception:
+            llm_generator = None
+
+    _RUNTIME.clear()
+    _RUNTIME.update(
+        {
+            "store": store,
+            "doc_id_store": doc_id_store,
+            "embed_provider": embed_provider,
+            "splitter": splitter,
+            "semantic_splitter": None,
+            "semantic_threshold": 0,
+            "ocr_provider": ocr_provider,
+            "media_provider": media_provider,
+            "llm_generator": llm_generator,
+            "taxonomy_store": None,
+            "config": config,
+            "sources_by_name": {src.name: src},
+            "source_records_by_ns_doc_id": {record["doc_id"]: source_record},
+        }
+    )
+
+
+def index_document_flow(
+    config_path: str = "config.yaml",
+    target: str = "",
+    source_name: str = "documents",
+    force: bool = False,
+) -> dict:
+    """Index a single document by path/rel_path/doc_id.
+
+    Idempotent: an unchanged file (content-hash-first, mtime fallback — same
+    rule as the full flow's diff) is skipped without re-OCR unless force=True.
+    On index, process_doc_task emits the document.indexed webhook exactly as
+    the full flow does, so downstream enrichment backfill is unchanged.
+    """
+    config = load_config(config_path)
+    index_root = Path(config["index_root"])
+    index_root.mkdir(parents=True, exist_ok=True)
+    table_name = config.get("lancedb", {}).get("table", "chunks")
+
+    with _SINGLE_DOC_LOCK:
+        store = open_store_with_recovery(
+            index_root, table_name, logger_obj=_get_logger(), auto_recover=True
+        )
+        doc_id_store = DocIDStore(index_root / "doc_registry.db")
+
+        record = resolve_single_record(config, source_name, target, doc_id_store)
+        if record is None:
+            return {
+                "status": "error",
+                "reason": "not_found",
+                "target": str(target),
+                "source_name": source_name,
+            }
+
+        if not force:
+            to_process, _ = diff_index_task.fn(
+                [record], store.list_doc_mtimes(), store.list_doc_change_hashes()
+            )
+            if not to_process:
+                return {
+                    "status": "skipped",
+                    "reason": "unchanged",
+                    "doc_id": record["doc_id"],
+                    "rel_path": record["rel_path"],
+                }
+
+        _build_single_doc_runtime(config, store, doc_id_store, source_name, record)
+        process_doc_task.fn(record)
+        return {
+            "status": "indexed",
+            "doc_id": record["doc_id"],
+            "rel_path": record["rel_path"],
+        }
