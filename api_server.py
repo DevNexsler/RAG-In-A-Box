@@ -242,6 +242,54 @@ async def search(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=status_code)
 
 
+async def index_document(request: Request) -> JSONResponse:
+    """Targeted single-document index (TICKET-6).
+
+    POST JSON: {"rel_path"|"abs_path"|"doc_id": ..., "source_name"?: "documents",
+    "force"?: false}. Called by comm-data-store-hooks per newly-deposited
+    attachment so it becomes OCR'd/described/searchable within seconds without a
+    full-source scan. Inherits the server's Bearer API_KEY auth like the rest of
+    /api/*. Idempotent: an unchanged file is skipped without re-OCR.
+    """
+    if "application/json" not in request.headers.get("content-type", ""):
+        return _api_error("invalid_request", "Expected application/json")
+    try:
+        payload = await request.json()
+    except Exception:
+        return _api_error("invalid_json", "Request body must be valid JSON")
+    if not isinstance(payload, dict):
+        return _api_error("invalid_request", "JSON body must be an object")
+
+    target = payload.get("rel_path") or payload.get("abs_path") or payload.get("doc_id")
+    if not target:
+        return _api_error("missing_target", "One of rel_path, abs_path, or doc_id is required")
+    source_name = payload.get("source_name") or "documents"
+    force = bool(payload.get("force", False))
+
+    from starlette.concurrency import run_in_threadpool
+
+    import flow_index_vault
+
+    try:
+        result = await run_in_threadpool(
+            flow_index_vault.index_document_flow,
+            target=str(target),
+            source_name=str(source_name),
+            force=force,
+        )
+    except ValueError as exc:  # unknown source, etc.
+        return _api_error("invalid_request", str(exc))
+    except Exception as exc:  # noqa: BLE001 — surface as 500 with reason
+        logger.exception("index_document failed for %s", target)
+        return JSONResponse(
+            {"status": "error", "reason": "index_failed", "detail": str(exc)},
+            status_code=500,
+        )
+
+    status_code = 404 if result.get("status") == "error" else 200
+    return JSONResponse(result, status_code=status_code)
+
+
 def build_api_app(documents_root: Path) -> Starlette:
     """Build the REST API Starlette app.
 
@@ -251,6 +299,7 @@ def build_api_app(documents_root: Path) -> Starlette:
     routes = [
         Route("/upload", upload, methods=["POST"]),
         Route("/search", search, methods=["POST"]),
+        Route("/index/document", index_document, methods=["POST"]),
         Route("/documents/{doc_id:path}", download, methods=["GET"]),
         Route("/documents/", list_documents, methods=["GET"]),
         Route("/documents", list_documents, methods=["GET"]),

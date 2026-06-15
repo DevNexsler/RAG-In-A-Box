@@ -1550,6 +1550,40 @@ def _file_folders_impl() -> dict:
     }
 
 
+def _file_index_document_impl(
+    target: str,
+    source_name: str = "documents",
+    force: bool = False,
+    config_path: str = "config.yaml",
+) -> dict:
+    """Index ONE document by path/rel_path/doc_id (TICKET-6).
+
+    Unlike file_index_update (whole-source, background subprocess), this runs
+    inline and returns the result — a single attachment OCRs in seconds. Reuses
+    the same extract/embed/upsert path and is idempotent (unchanged files are
+    skipped without re-OCR unless force=True).
+    """
+    if not str(target or "").strip():
+        return _error("missing_target", "target (path/rel_path/doc_id) is required")
+    import flow_index_vault
+
+    try:
+        return flow_index_vault.index_document_flow(
+            config_path=config_path,
+            target=str(target),
+            source_name=source_name,
+            force=force,
+        )
+    except ValueError as exc:
+        return _error("invalid_source_name", str(exc))
+    except Exception as exc:  # noqa: BLE001
+        return _error(
+            "index_failed",
+            str(exc),
+            "Check config.yaml paths and ensure configured services are running.",
+        )
+
+
 def _file_index_update_impl(config_path: str = "config.yaml", source_name: str | None = None) -> dict:
     """Start the indexer in a background subprocess.
 
@@ -2289,6 +2323,40 @@ if HAS_MCP and FastMCP is not None:
         "fix": "..."} with guidance (e.g., check configured services are running, verify config paths).
         """
         return _file_index_update_impl(source_name=source_name)
+
+    @mcp.tool()
+    def file_index_document(
+        target: str, source_name: str = "documents", force: bool = False
+    ) -> dict:
+        """Index a SINGLE document immediately, without a full-source scan.
+
+        Use this when one new file (e.g. a freshly-deposited email attachment)
+        must become OCR'd / image-described / searchable within seconds.
+        file_index_update rescans an entire source in a background subprocess;
+        this processes just the one document inline and returns the result.
+
+        Args:
+            target: The document to index — an absolute path, a source-relative
+                path (e.g. "email-attachments/laura/inspection@00abc@.pdf"), or a
+                namespaced doc_id (e.g. "documents::00abc").
+            source_name: Configured filesystem source the file lives under
+                (default "documents").
+            force: Re-index even if the file is unchanged since last indexed.
+
+        Idempotent: an unchanged file is skipped without re-OCR. Honors the
+        doc-organizer ID-alias rename convention name@<5char>@.ext and never
+        renames deposit-owned (no_rename) files. On success emits the same
+        document.indexed event as the full flow.
+
+        Returns one of:
+            - {"status": "indexed", "doc_id": ..., "rel_path": ...}
+            - {"status": "skipped", "reason": "unchanged", "doc_id": ...}
+            - {"status": "error", "reason": "not_found", ...}
+            - {"error": true, "code": ..., "message": ...} on failure.
+        """
+        return _file_index_document_impl(
+            target=target, source_name=source_name, force=force
+        )
 
     def run_server(transport: str = "stdio", host: str = "127.0.0.1", port: int = 7788):
         """Run the MCP server.
