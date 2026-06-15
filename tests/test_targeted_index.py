@@ -86,6 +86,21 @@ def test_resolve_single_record_accepts_doc_id_target(tmp_path):
     assert rec["rel_path"] == "email-attachments/x@00ZZz@.pdf"
 
 
+def test_resolve_single_record_finds_alias_injected_file_from_clean_path(tmp_path):
+    """A prior full scan may have renamed the deposit to inject @id@ (when the
+    source has no `no_rename`), but the caller (comm-data-store) only knows the
+    clean pre-rename path. resolve must still find the aliased file on disk."""
+    root, f = _make_attachment(tmp_path, "email-attachments/laura/report@001Hk@.pdf")
+    store = DocIDStore(tmp_path / "reg.db")
+    cfg = _fs_config(root, tmp_path / "index")
+
+    rec = fiv.resolve_single_record(cfg, "documents", "email-attachments/laura/report.pdf", store)
+
+    assert rec is not None
+    assert rec["rel_path"] == "email-attachments/laura/report@001Hk@.pdf"
+    assert rec["doc_id"] == "documents::001Hk"
+
+
 def test_resolve_single_record_missing_file_returns_none(tmp_path):
     root, _ = _make_attachment(tmp_path, "email-attachments/real.pdf")
     store = DocIDStore(tmp_path / "reg.db")
