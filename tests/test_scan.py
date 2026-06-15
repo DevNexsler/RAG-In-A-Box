@@ -1015,6 +1015,90 @@ def test_large_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
     delete_mock.assert_not_called()
 
 
+def test_large_degraded_requeue_does_not_trigger_shadow_rebuild(tmp_path):
+    """A big degraded-docs self-heal must NOT trip the full shadow rebuild.
+
+    Re-queued degraded docs heal already-indexed rows in place; counting them
+    as 'changed' was reprocessing the whole corpus to fix a few thousand
+    transient OCR/enrichment failures. The shadow decision must use the
+    genuine diff only.
+    """
+    from sources.base import SourceRecord
+    from flow_index_vault import index_vault_flow, _save_degraded_ledger
+
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True, exist_ok=True)
+
+    # 1200 docs already stored & unchanged; 3000 of them sit in the degraded
+    # ledger (transient failures). Genuine diff is ~0.
+    stored = {f"documents::doc-{i}": float(i) for i in range(1200)}
+    _save_degraded_ledger(index_root, {
+        "docs": {f"documents::doc-{i}": {"reasons": ["ocr_describe_failed"], "attempts": 1}
+                 for i in range(3000)}  # > 1100 of these also exist in scan
+    })
+
+    active_store = MagicMock()
+    active_store.list_doc_ids.return_value = list(stored.keys())
+    active_store.list_doc_mtimes.return_value = stored
+    active_store.count_chunks.return_value = 1200
+    active_store.fts_available.return_value = True
+
+    fake_registry = MagicMock()
+    fake_registry.count.return_value = 1
+    fake_taxonomy = MagicMock()
+    fake_taxonomy.count.return_value = 0
+
+    class _FakeSource:
+        name = "documents"
+
+        def scan(self):
+            return iter([
+                SourceRecord(
+                    doc_id=f"doc-{i}", natural_key=f"doc-{i}.txt", source_type="txt",
+                    mtime=float(i), size=4,
+                    metadata={"abs_path": str(tmp_path / f"doc-{i}.txt"), "ext": "txt"},
+                )
+                for i in range(1200)  # all unchanged vs stored mtimes
+            ])
+
+        def set_ocr_provider(self, provider):
+            return None
+
+        def close(self):
+            return None
+
+    config = {
+        "index_root": str(index_root),
+        "sources": [{"type": "filesystem", "name": "documents", "root": str(tmp_path)}],
+        "chunking": {"max_chars": 1800, "overlap": 200, "semantic": {"enabled": False}},
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+
+    shadow_ctor = MagicMock()
+    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+        with patch("flow_index_vault.load_config", return_value=config):
+            with patch("flow_index_vault.open_store_with_recovery", return_value=active_store):
+                with patch("flow_index_vault.LanceDBStore", shadow_ctor):
+                    with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                        with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                            with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                                with patch("sources.build_source", return_value=_FakeSource()):
+                                    with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                        with patch("flow_index_vault._process_docs", return_value=[]):
+                                            with patch("flow_index_vault.delete_docs_task"):
+                                                with patch("flow_index_vault.index_stats_task"):
+                                                    with patch("flow_index_vault.write_index_metadata_task"):
+                                                        index_vault_flow.fn("dummy.yaml")
+
+    # No shadow table constructed, no promote — degraded heal stayed in place
+    shadow_ctor.assert_not_called()
+    active_store.promote_table.assert_not_called()
+
+
 def test_index_flow_syncs_folder_taxonomy_from_sources(tmp_path):
     """Index flow should sync real folder paths into taxonomy before enrichment."""
     from sources.base import SourceRecord

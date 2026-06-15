@@ -1603,10 +1603,17 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     # Shadow rebuilds replace the whole table from `scanned`. A source-scoped
     # run only scans one source, so promoting its shadow table would silently
     # drop every other source — never shadow-rebuild unless scanning everything.
+    #
+    # The shadow decision uses the GENUINE diff (before_degraded), not the
+    # degraded-requeue-inflated count: re-queued degraded docs are a heal-in-
+    # place of already-indexed rows, not a bulk change. Counting them was
+    # tripping a full-corpus shadow rebuild whenever the ledger had grown large
+    # (e.g. 3,900 transient OCR failures re-queued -> reprocess all 27k docs).
+    genuine_changed_count = before_degraded + len(to_delete)
     using_shadow_rebuild = source_name is None and _should_use_shadow_rebuild(
         scanned_count=len(scanned),
         stored_doc_count=stored_doc_count,
-        changed_doc_count=changed_doc_count,
+        changed_doc_count=genuine_changed_count,
     )
     docs_to_process = to_add_or_update
     docs_to_delete = to_delete
