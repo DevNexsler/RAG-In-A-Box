@@ -341,6 +341,24 @@ def _matches_any(rel_str: str, patterns: list[str]) -> bool:
     return False
 
 
+def _is_communication_sidecar(path: Path) -> bool:
+    """True if a .json file is an attachment communication sidecar.
+
+    Sidecars carry message/media/channel context for a sibling attachment and
+    are consumed by the communication-context provider, not indexed as docs.
+    Detected by the schema (a 'media' object plus 'schema_version' or
+    'message'), reading only the head of the file so the check stays cheap.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    if '"media"' not in head:
+        return False
+    return '"schema_version"' in head or '"message"' in head
+
+
 # --- Tasks (one responsibility each) ---
 
 
@@ -398,6 +416,15 @@ def scan_filesystem_records(
                 continue
             if stat.st_size == 0:
                 logger.warning("Skipping empty file: %s", rel_str)
+                continue
+
+            # Skip communication sidecars: these *.json files are attachment
+            # metadata consumed by the communication-context provider, not
+            # standalone documents. The message context they carry is already
+            # folded into their sibling attachment's enrichment, so indexing
+            # them adds nothing and re-processing thousands of them every run
+            # is pure waste.
+            if fname.lower().endswith(".json") and _is_communication_sidecar(full_path):
                 continue
 
             # --- Persistent doc_id assignment ---
