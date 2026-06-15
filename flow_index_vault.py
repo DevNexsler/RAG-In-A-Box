@@ -1998,6 +1998,27 @@ def _target_to_rel_path(target: str, root: Path, doc_id_store: DocIDStore) -> st
     return t.replace("\\", "/")
 
 
+def _find_alias_variant(abs_path: Path) -> Path | None:
+    """Find an @id@-alias-injected sibling of a clean path.
+
+    A full scan renames `report.pdf` -> `report@001Hk@.pdf`; callers that only
+    know the clean name still need to locate the file. Returns the single match,
+    or None if absent/ambiguous.
+    """
+    from glob import escape as glob_escape
+
+    parent = abs_path.parent
+    if not parent.is_dir():
+        return None
+    clean_name = _strip_id_from_filename(abs_path.name)
+    stem = Path(clean_name).stem
+    suffix = Path(clean_name).suffix
+    if not stem:
+        return None
+    matches = sorted(parent.glob(f"{glob_escape(stem)}@*@{glob_escape(suffix)}"))
+    return matches[0] if len(matches) == 1 else None
+
+
 def resolve_single_record(
     config: dict, source_name: str, target: str, doc_id_store: DocIDStore
 ) -> dict | None:
@@ -2019,7 +2040,14 @@ def resolve_single_record(
         return None
     abs_path = root / rel_path
     if not abs_path.is_file():
-        return None
+        # The caller may know only the clean pre-rename path while a prior full
+        # scan renamed the file to inject its @id@ alias (sources without
+        # no_rename). Fall back to the doc-organizer alias convention.
+        aliased = _find_alias_variant(abs_path)
+        if aliased is None:
+            return None
+        abs_path = aliased
+        rel_path = abs_path.relative_to(root).as_posix()
 
     scan_cfg = src_cfg.get("scan", {})
     include = scan_cfg.get("include", [])
