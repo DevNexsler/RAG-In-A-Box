@@ -732,21 +732,25 @@ class LanceDBStore:
     def list_doc_mtimes(self) -> dict[str, float]:
         """Return {doc_id: mtime} for all docs in the store.
 
-        Uses Lance SQL GROUP BY — reads only doc_id + metadata.mtime, no vectors or text.
-        Raises on failure so callers get a proper error (not empty results).
+        Projects ONLY doc_id + metadata.mtime and aggregates in Python. A SQL
+        GROUP BY over metadata.* decodes the whole metadata struct, whose large
+        enrichment string subfields can exceed Arrow's 2 GB per-column offset
+        limit on a big index (LanceError: Offset overflow). Reading just the
+        two needed columns sidesteps that entirely.
         """
         def _op():
             ds = self._vs.table.to_lance()
-            batches = ds.sql(
-                "SELECT doc_id, MAX(metadata.mtime) AS mtime "
-                "FROM dataset WHERE doc_id IS NOT NULL GROUP BY doc_id"
-            ).build().to_batch_records()
-            if not batches:
-                return {}
-            t = pa.Table.from_batches(batches)
-            doc_ids = t["doc_id"].to_pylist()
-            mtimes = t["mtime"].to_pylist()
-            return {d: float(m) if m is not None else 0.0 for d, m in zip(doc_ids, mtimes)}
+            t = ds.to_table(columns={"doc_id": "doc_id", "mtime": "metadata.mtime"})
+            ids = t["doc_id"].to_pylist()
+            mts = t["mtime"].to_pylist()
+            out: dict[str, float] = {}
+            for d, m in zip(ids, mts):
+                if d is None:
+                    continue
+                v = float(m) if m is not None else 0.0
+                if d not in out or v > out[d]:
+                    out[d] = v
+            return out
 
         return self._run_read_with_recovery(_op, {})
 
@@ -761,16 +765,14 @@ class LanceDBStore:
 
         def _op():
             ds = self._vs.table.to_lance()
-            batches = ds.sql(
-                "SELECT doc_id, MAX(metadata.change_hash) AS change_hash "
-                "FROM dataset WHERE doc_id IS NOT NULL GROUP BY doc_id"
-            ).build().to_batch_records()
-            if not batches:
-                return {}
-            t = pa.Table.from_batches(batches)
-            doc_ids = t["doc_id"].to_pylist()
-            hashes = t["change_hash"].to_pylist()
-            return {d: (h or "") for d, h in zip(doc_ids, hashes)}
+            t = ds.to_table(columns={"doc_id": "doc_id", "ch": "metadata.change_hash"})
+            ids = t["doc_id"].to_pylist()
+            hashes = t["ch"].to_pylist()
+            out: dict[str, str] = {}
+            for d, h in zip(ids, hashes):
+                if d is not None:
+                    out[d] = h or ""
+            return out
 
         return self._run_read_with_recovery(_op, {})
 
