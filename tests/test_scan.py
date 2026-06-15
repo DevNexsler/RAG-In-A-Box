@@ -938,8 +938,10 @@ def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
     fake_store.create_fts_index.assert_called_once_with()
 
 
-def test_large_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
-    """Large rebuilds should populate a shadow table, then swap it into place once ready."""
+def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
+    """An EXPLICIT full rebuild (safety.force_full_rebuild) populates a shadow
+    table and swaps it in once ready. Shadow is never auto-inferred from diff
+    size — only this deliberate flag triggers it."""
     from sources.base import SourceRecord
     from flow_index_vault import index_vault_flow
 
@@ -992,6 +994,7 @@ def test_large_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
         "lancedb": {"table": "chunks"},
         "pdf": {},
         "logging": {"level": "WARNING"},
+        "safety": {"force_full_rebuild": True},
     }
 
     with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):

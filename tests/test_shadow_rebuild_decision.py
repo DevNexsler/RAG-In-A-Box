@@ -1,84 +1,47 @@
 """Guards for the shadow-rebuild decision — an expensive-to-get-wrong path.
 
 A shadow rebuild reprocesses the ENTIRE corpus (re-OCR, re-enrich, re-embed
-every doc) into a fresh table. It is the right move for a genuine bulk change
-or disaster recovery, and catastrophically wasteful when triggered by routine
-work. Two real incidents motivated this file:
+every doc) into a fresh table. It must NEVER be auto-inferred from diff size:
 
-1. A degraded-docs self-heal re-queued ~3,900 transient OCR failures; counting
-   them as "changed" tripped a full 27k-doc shadow rebuild to fix a few
-   thousand docs (2026-06-14).
-2. Source-scoped runs must never shadow-rebuild — their shadow only contains
-   one source and promoting it would drop every other source.
+- A large incremental change (bulk add, mass edit) must upsert in place — only
+  the changed docs are processed and search stays live. Reprocessing untouched
+  docs is pure waste (the 2026-06-14 incident: a routine refresh + a large
+  degraded ledger reprocessed all 27k docs).
+- A config/embedding-model change that genuinely needs a full reindex does NOT
+  change file mtimes, so it could never be diff-detected anyway.
 
-These tests pin the decision boundaries directly (cheap) and the flow-level
-behavior lives in test_scan.py (integration).
+So shadow fires ONLY on an explicit request (safety.force_full_rebuild) against
+a populated table. No diff shape, scheduled refresh, partial scan, or self-heal
+can escalate to a full-corpus reprocess.
 """
 
 from flow_index_vault import _should_use_shadow_rebuild
 
 
-# --- empty / trivial cases never rebuild ---
+# --- the load-bearing guarantee: no auto-escalation, ever ---
 
-def test_no_stored_docs_never_rebuilds():
-    # First-ever index (empty store) builds directly, no shadow needed.
-    assert _should_use_shadow_rebuild(scanned_count=50000, stored_doc_count=0, changed_doc_count=50000) is False
-
-
-def test_zero_changes_never_rebuilds():
-    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=30000, changed_doc_count=0) is False
+def test_not_forced_never_rebuilds_regardless_of_diff():
+    # No diff size, corpus size, or change count can trigger it.
+    for stored in (0, 100, 1000, 23624, 100000):
+        assert _should_use_shadow_rebuild(force_full_rebuild=False, stored_doc_count=stored) is False
 
 
-def test_tiny_incremental_change_never_rebuilds():
-    # The common case: a handful of new/edited docs in a large stable corpus.
-    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=30000, changed_doc_count=5) is False
+def test_incident_numbers_never_rebuild_without_explicit_flag():
+    # 2026-06-14: 23,624 stored, scheduled unscoped refresh, large degraded
+    # ledger. Without the explicit flag, no rebuild — full stop.
+    assert _should_use_shadow_rebuild(force_full_rebuild=False, stored_doc_count=23624) is False
 
 
-# --- absolute threshold (>= 1000 changed) ---
+# --- explicit, deliberate rebuild ---
 
-# --- the load-bearing guard: a POPULATED index never shadow-rebuilds ---
-# Shadow reprocesses every scanned doc into a fresh table. Against a populated
-# index (store >= half of scanned) every change is incremental and upserts in
-# place, so shadow must NOT fire no matter how large the diff. This is what
-# makes "an unscoped run can never auto-trigger a full-corpus reprocess of a
-# healthy index" actually true.
-
-def test_populated_index_never_rebuilds_even_above_absolute_threshold():
-    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=30000, changed_doc_count=1000) is False
+def test_forced_rebuild_on_populated_table():
+    assert _should_use_shadow_rebuild(force_full_rebuild=True, stored_doc_count=23624) is True
 
 
-def test_populated_index_never_rebuilds_even_with_huge_diff():
-    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=30000, changed_doc_count=25000) is False
+def test_forced_but_empty_store_builds_in_place_not_shadow():
+    # Empty table → nothing to preserve with a shadow → build directly.
+    assert _should_use_shadow_rebuild(force_full_rebuild=True, stored_doc_count=0) is False
 
 
-def test_half_full_index_does_not_rebuild():
-    # store == half of scanned → still incremental, no shadow.
-    assert _should_use_shadow_rebuild(scanned_count=600, stored_doc_count=300, changed_doc_count=300) is False
-
-
-# --- shadow DOES fire for a genuine from-near-empty rebuild ---
-
-def test_near_empty_store_rebuilds_on_absolute_threshold():
-    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=200, changed_doc_count=1000) is True
-
-
-def test_near_empty_store_rebuilds_on_proportional_threshold():
-    assert _should_use_shadow_rebuild(scanned_count=600, stored_doc_count=100, changed_doc_count=300) is True
-
-
-def test_small_genuine_diff_near_empty_no_rebuild():
-    assert _should_use_shadow_rebuild(scanned_count=600, stored_doc_count=100, changed_doc_count=50) is False
-
-
-# --- the expensive incident, now double-protected ---
-
-def test_incident_numbers_never_rebuild():
-    """The 2026-06-14 incident: 27,512 scanned, 23,624 stored. Whether you pass
-    the genuine diff (8) OR the degraded-inflated count (3,938), a populated
-    index of this size must NEVER shadow-rebuild — both the genuine-count fix
-    and the from-near-empty guard independently prevent it.
-    """
-    for changed in (8, 3938):
-        assert _should_use_shadow_rebuild(
-            scanned_count=27512, stored_doc_count=23624, changed_doc_count=changed
-        ) is False
+def test_forced_single_doc_table_rebuilds():
+    assert _should_use_shadow_rebuild(force_full_rebuild=True, stored_doc_count=1) is True

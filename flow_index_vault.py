@@ -1324,31 +1324,27 @@ def _recover_corrupt_table(index_root: str | Path, table_name: str, logger) -> L
 
 
 def _should_use_shadow_rebuild(
-    scanned_count: int,
+    force_full_rebuild: bool,
     stored_doc_count: int,
-    changed_doc_count: int,
 ) -> bool:
-    """Return True only for a genuine from-near-empty rebuild.
+    """Shadow rebuild is an EXPLICIT, deliberate operation — never auto-inferred.
 
-    A shadow rebuild reprocesses EVERY scanned doc into a fresh table — it is
-    the right move when rebuilding from scratch (corrupt table, manual reset,
-    first index) and pure waste otherwise. A large incremental diff against an
-    already-populated index does NOT need it: those docs upsert in place and
-    search stays live (partial, never degraded) during the run.
+    A shadow rebuild reprocesses EVERY scanned doc into a fresh table. There is
+    no diff shape that should auto-trigger it:
 
-    So shadow only fires when the store holds far less than what we scanned
-    (it is genuinely being (re)built). Once the store is at least half the
-    scanned corpus, every change is incremental and handled in place — no
-    unscoped run can ever auto-trigger a full-corpus reprocess of a healthy
-    index again.
+      - A large incremental change (bulk add, mass edit) must upsert in place;
+        only the changed docs are processed and search stays live. Reprocessing
+        the untouched docs is pure waste.
+      - A config/embedding-model change that genuinely needs a full reindex does
+        NOT change file mtimes, so it can never be diff-detected anyway.
+
+    So the only correct trigger is an explicit request (safety.force_full_rebuild),
+    and only when there is an existing populated table worth preserving with a
+    shadow during the rebuild (empty store just builds in place). This makes it
+    impossible for any automatic caller — scheduled refresh, partial scan,
+    degraded self-heal — to escalate to a full-corpus reprocess.
     """
-    if stored_doc_count <= 0 or changed_doc_count <= 0:
-        return False
-    # Healthy/populated index → incremental upsert, never shadow rebuild.
-    if scanned_count > 0 and stored_doc_count >= 0.5 * scanned_count:
-        return False
-    baseline = max(scanned_count, stored_doc_count)
-    return changed_doc_count >= 1000 or (changed_doc_count * 2) >= baseline
+    return bool(force_full_rebuild) and stored_doc_count > 0
 
 
 # --- Flow ---
@@ -1637,44 +1633,46 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     changed_doc_count = len(to_add_or_update) + len(to_delete)
 
     active_store = store
-    # Shadow rebuilds replace the whole table from `scanned`. A source-scoped
-    # run only scans one source, so promoting its shadow table would silently
-    # drop every other source — never shadow-rebuild unless scanning everything.
-    #
-    # The shadow decision uses the GENUINE diff (before_degraded), not the
-    # degraded-requeue-inflated count: re-queued degraded docs are a heal-in-
-    # place of already-indexed rows, not a bulk change. Counting them was
-    # tripping a full-corpus shadow rebuild whenever the ledger had grown large
-    # (e.g. 3,900 transient OCR failures re-queued -> reprocess all 27k docs).
-    genuine_changed_count = before_degraded + len(to_delete)
-    using_shadow_rebuild = source_name is None and _should_use_shadow_rebuild(
-        scanned_count=len(scanned),
-        stored_doc_count=stored_doc_count,
-        changed_doc_count=genuine_changed_count,
-    )
-    # SAFETY: block mass deletion from an anomalous (partial/empty) scan.
-    # to_delete is everything stored-but-not-scanned. If a source momentarily
-    # returns far fewer rows than indexed (postgres down/timeout, partial
-    # result, DB mid-migration), to_delete balloons toward the whole corpus
-    # and these docs would be deleted, then fully re-enriched next run. Refuse
-    # to delete more than max_delete_ratio of a populated source in one run.
     safety_cfg = config.get("safety", {})
+    # Shadow rebuild is explicit-only — never auto-inferred from diff size. A
+    # source-scoped run also never shadow-rebuilds (its shadow holds one source;
+    # promoting it would drop the others).
+    using_shadow_rebuild = source_name is None and _should_use_shadow_rebuild(
+        force_full_rebuild=bool(safety_cfg.get("force_full_rebuild", False)),
+        stored_doc_count=stored_doc_count,
+    )
+
+    # SAFETY: block mass deletion from an anomalous (partial/empty) scan, PER
+    # SOURCE. to_delete is everything stored-but-not-scanned. If one source
+    # momentarily returns far fewer rows than indexed (postgres down/timeout,
+    # partial result, DB mid-migration), its docs balloon into to_delete and
+    # would be deleted, then fully re-enriched next run. A global ratio misses
+    # this — a source that is half-missing can still be under the whole-corpus
+    # threshold — so guard each source against ITS OWN stored count.
     max_delete_ratio = safety_cfg.get("max_delete_ratio", 0.5)
     min_docs_for_ratio = safety_cfg.get("delete_ratio_min_docs", 20)
-    if (
-        stored_doc_count >= min_docs_for_ratio
-        and len(to_delete) > stored_doc_count * max_delete_ratio
-    ):
-        logger.error(
-            "ABORTING %d deletions (> %.0f%% of %d stored docs) — scan likely "
-            "partial/empty (source unreachable?). No docs deleted this run. "
-            "Set safety.max_delete_ratio higher for a genuine bulk delete.",
-            len(to_delete), max_delete_ratio * 100, stored_doc_count,
-        )
-        _RUNTIME.setdefault("_warnings", []).append(
-            f"mass_delete_blocked:{len(to_delete)}/{stored_doc_count}"
-        )
-        to_delete = []
+    stored_by_source: Counter = Counter(
+        str(d).split("::", 1)[0] for d in stored_mtimes
+    )
+    deletes_by_source: dict[str, list[str]] = {}
+    for d in to_delete:
+        deletes_by_source.setdefault(str(d).split("::", 1)[0], []).append(d)
+    kept_deletes: list[str] = []
+    for src_name, dels in deletes_by_source.items():
+        src_stored = stored_by_source.get(src_name, 0)
+        if src_stored >= min_docs_for_ratio and len(dels) > src_stored * max_delete_ratio:
+            logger.error(
+                "ABORTING %d deletions for source '%s' (> %.0f%% of %d stored) — "
+                "scan likely partial (source unreachable?). Those docs kept. "
+                "Set safety.max_delete_ratio higher for a genuine bulk delete.",
+                len(dels), src_name, max_delete_ratio * 100, src_stored,
+            )
+            _RUNTIME.setdefault("_warnings", []).append(
+                f"mass_delete_blocked:{src_name}:{len(dels)}/{src_stored}"
+            )
+        else:
+            kept_deletes.extend(dels)
+    to_delete = kept_deletes
 
     docs_to_process = to_add_or_update
     docs_to_delete = to_delete
