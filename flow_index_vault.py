@@ -860,7 +860,11 @@ def process_doc_task(doc: dict) -> None:
     media_provider = _RUNTIME.get("media_provider")  # may be None
     config: dict = _RUNTIME.get("config", {})
 
-    logger = get_run_logger()
+    # _get_logger() returns the Prefect run logger inside a flow/task run
+    # (identical to get_run_logger there) and falls back to the stdlib logger
+    # when called standalone — e.g. targeted single-document indexing, which
+    # has no active Prefect run context.
+    logger = _get_logger()
     doc_id = doc["doc_id"]
     rel_path = doc.get("rel_path", doc_id)
     mtime = doc["mtime"]
