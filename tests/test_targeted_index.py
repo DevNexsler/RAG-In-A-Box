@@ -168,6 +168,33 @@ def test_index_document_flow_force_reindexes_unchanged(tmp_path):
     proc.fn.assert_called_once()
 
 
+def test_index_document_flow_runs_real_process_doc_task_without_prefect_context(tmp_path):
+    """Regression: standalone indexing must not require an active Prefect flow/
+    task run context. process_doc_task used get_run_logger() directly, which
+    raises 'no active flow or task run context' when called outside a flow."""
+    root, f = _make_attachment(
+        tmp_path, "email-attachments/note@00txt@.txt", data=b"hello searchable text body"
+    )
+    cfg = _fs_config(root, tmp_path / "index")
+    store = MagicMock()
+    store.list_doc_mtimes.return_value = {}
+    store.list_doc_change_hashes.return_value = {}
+    embed = MagicMock()
+    embed.embed_texts.side_effect = lambda texts: [[0.1, 0.2, 0.3] for _ in texts]
+
+    with patch("flow_index_vault.load_config", return_value=cfg), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=store), \
+         patch("flow_index_vault.build_embed_provider", return_value=embed), \
+         patch("flow_index_vault.build_ocr_provider", return_value=None), \
+         patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("flow_index_vault.dispatch_event", create=True, return_value=[]) as dispatch:
+        result = fiv.index_document_flow(target=str(f), source_name="documents")
+
+    assert result["status"] == "indexed"
+    store.upsert_nodes.assert_called_once()  # embedded chunks upserted
+    dispatch.assert_called_once()  # document.indexed webhook emitted
+
+
 def test_mcp_file_index_document_impl_wraps_flow():
     import mcp_server
 
