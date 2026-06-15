@@ -346,17 +346,21 @@ def _is_communication_sidecar(path: Path) -> bool:
 
     Sidecars carry message/media/channel context for a sibling attachment and
     are consumed by the communication-context provider, not indexed as docs.
-    Detected by the schema (a 'media' object plus 'schema_version' or
-    'message'), reading only the head of the file so the check stays cheap.
+    Detected by the schema: a top-level 'media' object plus at least one other
+    sidecar key. Parses the file (capped at 2 MB) rather than peeking a head
+    window, because the 'context' block of nearby messages can push the marker
+    keys arbitrarily far into the file.
     """
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            head = fh.read(4096)
-    except OSError:
+        if path.stat().st_size > 2_000_000:
+            return False  # sidecars are small; a huge json is real data
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return False
-    if '"media"' not in head:
+    if not isinstance(payload, dict) or "media" not in payload:
         return False
-    return '"schema_version"' in head or '"message"' in head
+    markers = ("schema_version", "message", "counterparty", "channel")
+    return any(k in payload for k in markers)
 
 
 # --- Tasks (one responsibility each) ---
