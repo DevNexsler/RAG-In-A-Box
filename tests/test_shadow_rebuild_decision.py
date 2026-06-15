@@ -36,41 +36,49 @@ def test_tiny_incremental_change_never_rebuilds():
 
 # --- absolute threshold (>= 1000 changed) ---
 
-def test_just_below_absolute_threshold_no_rebuild():
-    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=30000, changed_doc_count=999) is False
+# --- the load-bearing guard: a POPULATED index never shadow-rebuilds ---
+# Shadow reprocesses every scanned doc into a fresh table. Against a populated
+# index (store >= half of scanned) every change is incremental and upserts in
+# place, so shadow must NOT fire no matter how large the diff. This is what
+# makes "an unscoped run can never auto-trigger a full-corpus reprocess of a
+# healthy index" actually true.
+
+def test_populated_index_never_rebuilds_even_above_absolute_threshold():
+    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=30000, changed_doc_count=1000) is False
 
 
-def test_at_absolute_threshold_rebuilds():
-    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=30000, changed_doc_count=1000) is True
+def test_populated_index_never_rebuilds_even_with_huge_diff():
+    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=30000, changed_doc_count=25000) is False
 
 
-# --- proportional threshold (changed*2 >= baseline) ---
-
-def test_half_the_corpus_changed_rebuilds():
-    assert _should_use_shadow_rebuild(scanned_count=600, stored_doc_count=600, changed_doc_count=300) is True
-
-
-def test_small_fraction_changed_no_rebuild_on_small_corpus():
-    assert _should_use_shadow_rebuild(scanned_count=600, stored_doc_count=600, changed_doc_count=100) is False
+def test_half_full_index_does_not_rebuild():
+    # store == half of scanned → still incremental, no shadow.
+    assert _should_use_shadow_rebuild(scanned_count=600, stored_doc_count=300, changed_doc_count=300) is False
 
 
-# --- the expensive incident: large self-heal, small genuine diff ---
+# --- shadow DOES fire for a genuine from-near-empty rebuild ---
 
-def test_genuine_diff_must_be_used_not_inflated_count():
-    """The fix is to pass the GENUINE changed count, excluding degraded re-queue.
+def test_near_empty_store_rebuilds_on_absolute_threshold():
+    assert _should_use_shadow_rebuild(scanned_count=30000, stored_doc_count=200, changed_doc_count=1000) is True
 
-    Simulate the incident's numbers: 27,512 scanned, 23,624 stored, but only a
-    handful genuinely changed (the ~3,900 difference was degraded self-heal).
-    With the genuine count the decision must be 'no shadow rebuild'.
+
+def test_near_empty_store_rebuilds_on_proportional_threshold():
+    assert _should_use_shadow_rebuild(scanned_count=600, stored_doc_count=100, changed_doc_count=300) is True
+
+
+def test_small_genuine_diff_near_empty_no_rebuild():
+    assert _should_use_shadow_rebuild(scanned_count=600, stored_doc_count=100, changed_doc_count=50) is False
+
+
+# --- the expensive incident, now double-protected ---
+
+def test_incident_numbers_never_rebuild():
+    """The 2026-06-14 incident: 27,512 scanned, 23,624 stored. Whether you pass
+    the genuine diff (8) OR the degraded-inflated count (3,938), a populated
+    index of this size must NEVER shadow-rebuild — both the genuine-count fix
+    and the from-near-empty guard independently prevent it.
     """
-    genuine_changed = 8  # real new/edited docs
-    assert _should_use_shadow_rebuild(
-        scanned_count=27512, stored_doc_count=23624, changed_doc_count=genuine_changed
-    ) is False
-
-    # And the cautionary inverse: had we (wrongly) passed the inflated count,
-    # it WOULD have rebuilt — proving why excluding the re-queue matters.
-    inflated_changed = 3930 + 8
-    assert _should_use_shadow_rebuild(
-        scanned_count=27512, stored_doc_count=23624, changed_doc_count=inflated_changed
-    ) is True
+    for changed in (8, 3938):
+        assert _should_use_shadow_rebuild(
+            scanned_count=27512, stored_doc_count=23624, changed_doc_count=changed
+        ) is False

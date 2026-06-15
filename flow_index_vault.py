@@ -1328,8 +1328,24 @@ def _should_use_shadow_rebuild(
     stored_doc_count: int,
     changed_doc_count: int,
 ) -> bool:
-    """Return True when a large rebuild should preserve the active searchable table."""
+    """Return True only for a genuine from-near-empty rebuild.
+
+    A shadow rebuild reprocesses EVERY scanned doc into a fresh table — it is
+    the right move when rebuilding from scratch (corrupt table, manual reset,
+    first index) and pure waste otherwise. A large incremental diff against an
+    already-populated index does NOT need it: those docs upsert in place and
+    search stays live (partial, never degraded) during the run.
+
+    So shadow only fires when the store holds far less than what we scanned
+    (it is genuinely being (re)built). Once the store is at least half the
+    scanned corpus, every change is incremental and handled in place — no
+    unscoped run can ever auto-trigger a full-corpus reprocess of a healthy
+    index again.
+    """
     if stored_doc_count <= 0 or changed_doc_count <= 0:
+        return False
+    # Healthy/populated index → incremental upsert, never shadow rebuild.
+    if scanned_count > 0 and stored_doc_count >= 0.5 * scanned_count:
         return False
     baseline = max(scanned_count, stored_doc_count)
     return changed_doc_count >= 1000 or (changed_doc_count * 2) >= baseline
@@ -1518,18 +1534,39 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
                 source_name,
             )
         elif existing_doc_ids:
-            logger.info(
-                "Migration: registry empty but store has %d docs — wiping table for re-index",
-                len(existing_doc_ids),
-            )
-            import lancedb as _ldb
-            try:
-                db = _ldb.connect(str(index_root))
-                db.drop_table(table_name)
-            except Exception as exc:
-                logger.warning("Failed to drop table during migration: %s", exc)
-            store = LanceDBStore(index_root, table_name)
-            _RUNTIME["store"] = store
+            # SAFETY: an empty registry beside a populated table usually means a
+            # LOST registry (botched restore, disk issue), not the legacy
+            # path-id migration this branch was built for. Dropping the table
+            # would destroy every doc. Refuse for a non-trivial table unless
+            # explicitly opted in.
+            safety_cfg = config.get("safety", {})
+            wipe_cap = safety_cfg.get("registry_wipe_max_docs", 100)
+            if len(existing_doc_ids) > wipe_cap and not safety_cfg.get(
+                "allow_registry_empty_wipe", False
+            ):
+                logger.error(
+                    "Registry empty but table has %d docs (> %d) — REFUSING auto-wipe. "
+                    "This is likely a lost registry, not a legacy migration. "
+                    "The registry will rebuild from this scan's registrations; no data dropped. "
+                    "Set safety.allow_registry_empty_wipe=true to force a full rebuild.",
+                    len(existing_doc_ids), wipe_cap,
+                )
+                _RUNTIME.setdefault("_warnings", []).append(
+                    f"registry_empty_wipe_blocked:{len(existing_doc_ids)}"
+                )
+            else:
+                logger.info(
+                    "Migration: registry empty but store has %d docs — wiping table for re-index",
+                    len(existing_doc_ids),
+                )
+                import lancedb as _ldb
+                try:
+                    db = _ldb.connect(str(index_root))
+                    db.drop_table(table_name)
+                except Exception as exc:
+                    logger.warning("Failed to drop table during migration: %s", exc)
+                store = LanceDBStore(index_root, table_name)
+                _RUNTIME["store"] = store
 
     # --- Run pipeline ---
     t0 = time.perf_counter()
@@ -1615,6 +1652,30 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         stored_doc_count=stored_doc_count,
         changed_doc_count=genuine_changed_count,
     )
+    # SAFETY: block mass deletion from an anomalous (partial/empty) scan.
+    # to_delete is everything stored-but-not-scanned. If a source momentarily
+    # returns far fewer rows than indexed (postgres down/timeout, partial
+    # result, DB mid-migration), to_delete balloons toward the whole corpus
+    # and these docs would be deleted, then fully re-enriched next run. Refuse
+    # to delete more than max_delete_ratio of a populated source in one run.
+    safety_cfg = config.get("safety", {})
+    max_delete_ratio = safety_cfg.get("max_delete_ratio", 0.5)
+    min_docs_for_ratio = safety_cfg.get("delete_ratio_min_docs", 20)
+    if (
+        stored_doc_count >= min_docs_for_ratio
+        and len(to_delete) > stored_doc_count * max_delete_ratio
+    ):
+        logger.error(
+            "ABORTING %d deletions (> %.0f%% of %d stored docs) — scan likely "
+            "partial/empty (source unreachable?). No docs deleted this run. "
+            "Set safety.max_delete_ratio higher for a genuine bulk delete.",
+            len(to_delete), max_delete_ratio * 100, stored_doc_count,
+        )
+        _RUNTIME.setdefault("_warnings", []).append(
+            f"mass_delete_blocked:{len(to_delete)}/{stored_doc_count}"
+        )
+        to_delete = []
+
     docs_to_process = to_add_or_update
     docs_to_delete = to_delete
     shadow_table_name = f"{table_name}__shadow"
