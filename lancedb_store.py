@@ -750,6 +750,30 @@ class LanceDBStore:
 
         return self._run_read_with_recovery(_op, {})
 
+    def list_doc_change_hashes(self) -> dict[str, str]:
+        """Return {doc_id: change_hash} for content-hash change detection.
+
+        Returns {} if no doc carries a change_hash yet (old index, or before any
+        hash-aware run) — callers then fall back to mtime comparison.
+        """
+        if "change_hash" not in self._metadata_subfields():
+            return {}
+
+        def _op():
+            ds = self._vs.table.to_lance()
+            batches = ds.sql(
+                "SELECT doc_id, MAX(metadata.change_hash) AS change_hash "
+                "FROM dataset WHERE doc_id IS NOT NULL GROUP BY doc_id"
+            ).build().to_batch_records()
+            if not batches:
+                return {}
+            t = pa.Table.from_batches(batches)
+            doc_ids = t["doc_id"].to_pylist()
+            hashes = t["change_hash"].to_pylist()
+            return {d: (h or "") for d, h in zip(doc_ids, hashes)}
+
+        return self._run_read_with_recovery(_op, {})
+
     def count_chunks(self) -> int:
         """Return total number of chunks (rows) in the store. O(1) via LanceDB.
 

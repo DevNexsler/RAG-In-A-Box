@@ -25,6 +25,12 @@ class SourceRecord:
     mtime: float
     size: int
     metadata: dict = field(default_factory=dict)
+    # Optional hash of the indexable content. When a source sets this, the diff
+    # compares it instead of mtime — so a row whose timestamp field churns
+    # (e.g. an upstream job bumping updated_at without changing content) is
+    # correctly recognized as unchanged and never re-indexed. Sources that
+    # leave it empty fall back to mtime comparison.
+    change_hash: str = ""
 
 
 @runtime_checkable

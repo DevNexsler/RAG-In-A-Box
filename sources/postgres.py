@@ -7,6 +7,7 @@ Each scan() uses a server-side cursor to stream rows so large tables
 don't OOM, and yields a SourceRecord per row.
 """
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -105,6 +106,13 @@ class PostgresSource:
                     mtime = mtime_val.timestamp() if mtime_val else 0.0
                     metadata = {c: row[c] for c in spec.metadata_columns if c in row}
                     metadata["_text"] = text  # cache for zero-IO extract
+                    # Content hash for churn-proof change detection: the text is
+                    # already in hand, so hashing is free. The indexer compares
+                    # this instead of mtime, so an upstream job bumping
+                    # updated_at without changing the body never re-indexes.
+                    change_hash = hashlib.blake2b(
+                        text.encode("utf-8"), digest_size=16
+                    ).hexdigest()
                     yield SourceRecord(
                         doc_id=doc_id,
                         source_type=spec.source_type,
@@ -112,6 +120,7 @@ class PostgresSource:
                         mtime=mtime,
                         size=len(text.encode("utf-8")),
                         metadata=metadata,
+                        change_hash=change_hash,
                     )
 
     def extract(self, record: SourceRecord) -> ExtractionResult:

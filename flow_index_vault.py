@@ -503,14 +503,21 @@ def scan_vault_task(vault_root: str | Path, include: list[str], exclude: list[st
 def diff_index_task(
     scanned: list[dict],
     stored_doc_mtimes: dict[str, float],
+    stored_change_hashes: dict[str, str] | None = None,
 ) -> tuple[list[dict], list[str]]:
-    """Compare scanned files vs stored docs. Return (to_add_or_update, to_delete).
+    """Compare scanned docs vs stored docs. Return (to_add_or_update, to_delete).
 
-    A file is added/updated if:
-      - It's new (not in store), OR
-      - Its mtime has changed since last index
-    A file is deleted if it's in the store but no longer on disk.
+    Change detection is content-hash-first, mtime-fallback:
+      - New doc (not in store) -> add.
+      - If both the scanned record AND the stored doc carry a content
+        change_hash, compare ONLY the hash. This is churn-proof: an upstream
+        job that bumps a timestamp field without changing content produces the
+        same hash and is correctly skipped, no matter what mtime says.
+      - Otherwise fall back to mtime (filesystem docs, or docs not yet
+        re-indexed under the hash scheme).
+    A doc is deleted if it is stored but no longer scanned.
     """
+    stored_change_hashes = stored_change_hashes or {}
     scanned_ids = {r["doc_id"] for r in scanned}
     stored_ids = set(stored_doc_mtimes.keys())
 
@@ -518,12 +525,16 @@ def diff_index_task(
     for r in scanned:
         doc_id = r["doc_id"]
         if doc_id not in stored_ids:
-            # New file
-            to_add_or_update.append(r)
+            to_add_or_update.append(r)  # new
+            continue
+        new_hash = r.get("change_hash") or ""
+        old_hash = stored_change_hashes.get(doc_id) or ""
+        if new_hash and old_hash:
+            if new_hash != old_hash:
+                to_add_or_update.append(r)  # content genuinely changed
+            # else: identical content — skip even if mtime/updated_at moved
         elif r["mtime"] != stored_doc_mtimes.get(doc_id, 0.0):
-            # Modified file (mtime changed)
-            to_add_or_update.append(r)
-        # else: unchanged, skip
+            to_add_or_update.append(r)  # mtime fallback
 
     to_delete = list(stored_ids - scanned_ids)
     return to_add_or_update, to_delete
@@ -892,6 +903,7 @@ def process_doc_task(doc: dict) -> None:
         "source_type": source_type,
         "source_name": source_name,
         "mtime": mtime,
+        "change_hash": doc.get("change_hash", ""),
         "size": size,
         "title": title,
         "tags": tags,
@@ -1578,6 +1590,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
                 "rel_path": rec.natural_key,
                 "abs_path": rec.metadata.get("abs_path", rec.natural_key),
                 "mtime": rec.mtime,
+                "change_hash": getattr(rec, "change_hash", "") or "",
                 "size": rec.size,
                 "ext": rec.metadata.get("ext", ""),
                 "source_type": rec.source_type,
@@ -1608,6 +1621,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     )
 
     stored_mtimes = store.list_doc_mtimes()
+    stored_change_hashes = store.list_doc_change_hashes()
     if source_name:
         source_prefix = f"{source_name}::"
         stored_mtimes = {
@@ -1615,7 +1629,14 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
             for doc_id, mtime in stored_mtimes.items()
             if str(doc_id).startswith(source_prefix)
         }
-    to_add_or_update, to_delete = diff_index_task(scanned, stored_mtimes)
+        stored_change_hashes = {
+            doc_id: h
+            for doc_id, h in stored_change_hashes.items()
+            if str(doc_id).startswith(source_prefix)
+        }
+    to_add_or_update, to_delete = diff_index_task(
+        scanned, stored_mtimes, stored_change_hashes
+    )
     to_add_or_update = _include_repaired_sidecar_docs(
         scanned,
         to_add_or_update,
