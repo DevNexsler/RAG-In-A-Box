@@ -69,6 +69,8 @@ from doc_enrichment import enrich_document, empty_enrichment, ENRICHMENT_FIELDS,
 from extractors import (
     begin_degradation_capture,
     collect_degradations,
+    collect_skips,
+    note_skip,
     derive_folder,
     extract_text,
     extract_title,
@@ -711,6 +713,75 @@ def _merge_degraded_ledger(
     return {"docs": docs}
 
 
+# --- Skip ledger: docs intentionally NOT indexed (duplicate, oversized,
+# corrupt). Without this, a skip-decided doc never lands in the table, so the
+# diff sees it as "new" every run and re-processes it forever — pure waste.
+# The ledger records each skip with the file's change key (content hash, else
+# mtime); the diff excludes a skip-ledgered doc only while that key is
+# unchanged, so a genuinely modified file is re-evaluated.
+
+def _change_key(record: dict) -> str:
+    return str(record.get("change_hash") or "") or f"mtime:{record.get('mtime', 0.0)}"
+
+
+def _skip_ledger_path(index_root: Path) -> Path:
+    return Path(index_root) / "skip_docs.json"
+
+
+def _load_skip_ledger(index_root: Path) -> dict:
+    try:
+        payload = json.loads(_skip_ledger_path(index_root).read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and isinstance(payload.get("docs"), dict):
+            return payload
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"docs": {}}
+
+
+def _save_skip_ledger(index_root: Path, ledger: dict) -> None:
+    try:
+        _skip_ledger_path(index_root).write_text(
+            json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Failed to save skip ledger: %s", exc)
+
+
+def _exclude_skipped_docs(
+    to_add_or_update: list[dict],
+    ledger: dict,
+) -> tuple[list[dict], int]:
+    """Drop docs whose change key still matches a skip-ledger entry — they were
+    already decided 'do not index' and the file is unchanged. A doc whose key
+    differs (file modified) is kept, so the skip decision is re-evaluated."""
+    docs = ledger.get("docs", {})
+    if not docs:
+        return to_add_or_update, 0
+    kept, skipped = [], 0
+    for r in to_add_or_update:
+        entry = docs.get(str(r.get("doc_id", "")))
+        if entry is not None and entry.get("change_key") == _change_key(r):
+            skipped += 1
+        else:
+            kept.append(r)
+    return kept, skipped
+
+
+def _merge_skip_ledger(
+    ledger: dict,
+    skip_now: dict[str, dict],
+    skip_clean: set[str],
+) -> dict:
+    """Add this run's skip decisions; drop docs that indexed cleanly (no longer
+    skipped — e.g. a duplicate's canonical was deleted, or a file was fixed)."""
+    docs = dict(ledger.get("docs", {}))
+    for doc_id in skip_clean:
+        docs.pop(doc_id, None)
+    for doc_id, info in skip_now.items():
+        docs[doc_id] = info
+    return {"docs": docs}
+
+
 _SIDECAR_ID_RE = re.compile(r"@[0-9A-Za-z]{5}@")
 
 
@@ -853,6 +924,9 @@ def process_doc_task(doc: dict) -> None:
                 if canonical_rel and rel_for_root and abs_path_str.endswith(rel_for_root):
                     docs_root = Path(abs_path_str[: -len(rel_for_root)])
                     _annotate_canonical_sidecar(docs_root, canonical_rel, doc, logger)
+                # Record the skip so the diff stops re-processing this duplicate
+                # every run (it is never in the table, so otherwise looks "new").
+                note_skip(f"duplicate_of:{winner['doc_id']}")
                 return
 
     # --- Determine source_type ---
@@ -1182,13 +1256,24 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
             begin_degradation_capture()
             process_doc_task(doc)
             reasons = collect_degradations()
+            skips = collect_skips()
             lock = _RUNTIME.get("degraded_lock")
             if lock is not None:
                 with lock:
-                    if reasons:
-                        _RUNTIME.setdefault("degraded_now", {})[doc["doc_id"]] = reasons
+                    doc_id = doc["doc_id"]
+                    if skips:
+                        # Permanent skip (duplicate/oversized/corrupt): record
+                        # with the file's change key so the diff stops looping.
+                        _RUNTIME.setdefault("skip_now", {})[doc_id] = {
+                            "reasons": sorted(set(skips)),
+                            "change_key": _change_key(doc),
+                        }
+                    elif reasons:
+                        _RUNTIME.setdefault("degraded_now", {})[doc_id] = reasons
                     else:
-                        _RUNTIME.setdefault("degraded_clean", set()).add(doc["doc_id"])
+                        # Indexed cleanly — drop from both ledgers.
+                        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
+                        _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
             return None
         except Exception as exc:
             logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
@@ -1644,6 +1729,8 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     _RUNTIME["degraded_lock"] = threading.Lock()
     _RUNTIME["degraded_now"] = {}
     _RUNTIME["degraded_clean"] = set()
+    _RUNTIME["skip_now"] = {}
+    _RUNTIME["skip_clean"] = set()
     repaired_sidecar_doc_ids = _repair_communication_sidecars(
         scanned,
         source_records_by_ns_doc_id,
@@ -1681,6 +1768,12 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
             "Re-queued %d degraded docs for self-heal",
             len(to_add_or_update) - before_degraded,
         )
+    # Drop docs already decided 'do not index' (duplicate/oversized/corrupt)
+    # whose file is unchanged — stops the reprocess-every-run loop.
+    skip_ledger = _load_skip_ledger(index_root)
+    to_add_or_update, skipped_count = _exclude_skipped_docs(to_add_or_update, skip_ledger)
+    if skipped_count:
+        logger.info("Excluded %d unchanged skip-ledger docs (no reprocessing)", skipped_count)
     stored_doc_count = len(stored_mtimes)
     changed_doc_count = len(to_add_or_update) + len(to_delete)
 
@@ -1841,6 +1934,19 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
             logger.warning(
                 "%d docs indexed with degradations (will self-heal next run): %s",
                 len(degraded_now), sorted(degraded_now)[:10],
+            )
+
+    skip_now = _RUNTIME.get("skip_now", {})
+    skip_clean = _RUNTIME.get("skip_clean", set())
+    if skip_now or skip_clean:
+        updated_skip = _merge_skip_ledger(
+            _load_skip_ledger(index_root), skip_now, skip_clean
+        )
+        _save_skip_ledger(index_root, updated_skip)
+        if skip_now:
+            logger.info(
+                "%d docs added to skip ledger (won't reprocess until changed)",
+                len(skip_now),
             )
 
     write_index_metadata_task(

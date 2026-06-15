@@ -36,6 +36,7 @@ _degradations = threading.local()
 
 def begin_degradation_capture() -> None:
     _degradations.items = []
+    _degradations.skips = []
 
 
 def collect_degradations() -> list[str]:
@@ -46,6 +47,20 @@ def note_degradation(reason: str) -> None:
     items = getattr(_degradations, "items", None)
     if items is not None:
         items.append(reason)
+
+
+def collect_skips() -> list[str]:
+    """Skip reasons noted this capture — permanent 'do not index' decisions
+    (oversized media, unreadable/corrupt source) that should land in the skip
+    ledger so the doc is not re-extracted every run, unlike transient
+    degradations which retry."""
+    return list(getattr(_degradations, "skips", []))
+
+
+def note_skip(reason: str) -> None:
+    skips = getattr(_degradations, "skips", None)
+    if skips is not None:
+        skips.append(reason)
 
 AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "flac", "ogg", "aac", "aiff"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "mkv", "webm", "avi", "m4v"}
@@ -267,7 +282,14 @@ def extract_pdf(
     """
     import fitz  # PyMuPDF
 
-    doc = fitz.open(str(file_path))
+    try:
+        doc = fitz.open(str(file_path))
+    except Exception as e:
+        # Corrupt / encrypted / truncated PDF — won't open on retry either.
+        # Mark as a skip so it isn't re-attempted every run.
+        logger.warning("Failed to open PDF %s: %s", file_path, e)
+        note_skip("pdf_unreadable")
+        return ExtractionResult.from_text("", frontmatter={})
     pdf_meta = _extract_pdf_metadata(doc)
     pages: list[PageText] = []
 
@@ -523,6 +545,11 @@ def extract_video(
         notes = media_provider.analyze_video(file_path)
     except Exception as e:
         logger.warning("Video extraction failed for %s: %s", file_path, e)
+        # Video failures don't recover on retry (oversized > limit, unsupported
+        # codec, unreadable) — the file won't change itself. Mark as a skip so
+        # it isn't re-extracted every run; a genuinely new/re-encoded file gets
+        # a fresh change_hash and is re-evaluated.
+        note_skip("video_extract_failed")
         notes = ""
     return ExtractionResult.from_text(notes, frontmatter=fm)
 
