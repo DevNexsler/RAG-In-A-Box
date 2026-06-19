@@ -50,6 +50,16 @@ _VISION_GATE = threading.Semaphore(int(os.environ.get("OLLAMA_VISION_CONCURRENCY
 
 _MAX_IMAGE_DIM = 1024
 
+# Output token caps (a ceiling, not a target — images that finish early stop
+# early and pay nothing extra). qwen3-vl emits a hidden reasoning trace even
+# with think=False; on busier images that trace alone overran the old 800-token
+# cap, leaving content empty and the image with only a metadata stub (~8.5% of
+# images). A larger describe cap lets the answer land after the reasoning.
+# Images whose reasoning is so runaway it still overruns 2048 stay bounded in
+# both tokens and wall-clock rather than escalating into multi-minute calls.
+_EXTRACT_NUM_PREDICT = 800
+_DESCRIBE_NUM_PREDICT = 2048
+
 
 def _downscale(image_bytes: bytes) -> bytes:
     """Resize large images before sending — vision prefill cost scales with
@@ -78,20 +88,20 @@ class OllamaVisionOCR(OCRProvider):
         self,
         base_url: str = "http://localhost:11434",
         model: str = "qwen3-vl:8b",
-        timeout: float = 120.0,
+        timeout: float = 180.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         logger.info("OllamaVisionOCR: %s model=%s", self.base_url, self.model)
 
-    def _call(self, file_path: Path, prompt: str) -> str:
+    def _call(self, file_path: Path, prompt: str, num_predict: int) -> str:
         image_bytes = _downscale(file_path.read_bytes())
         b64 = base64.b64encode(image_bytes).decode("ascii")
         with _VISION_GATE:
-            return self._request(b64, prompt)
+            return self._request(b64, prompt, num_predict)
 
-    def _request(self, b64: str, prompt: str) -> str:
+    def _request(self, b64: str, prompt: str, num_predict: int) -> str:
 
         resp = httpx.post(
             f"{self.base_url}/api/chat",
@@ -108,9 +118,9 @@ class OllamaVisionOCR(OCRProvider):
                 # qwen3-vl defaults to thinking mode, which burned ~2 minutes
                 # per image and made most describe calls hit the 120s timeout
                 # (901 timeouts in one indexing run). Descriptions don't need
-                # deliberation; cap the output too so generation stays bounded.
+                # deliberation; cap the output so generation stays bounded.
                 "think": False,
-                "options": {"num_predict": 800},
+                "options": {"num_predict": num_predict},
             },
             timeout=self.timeout,
         )
@@ -122,10 +132,20 @@ class OllamaVisionOCR(OCRProvider):
         file_path = Path(file_path)
         if not file_path.exists():
             return ""
-        return self._call(file_path, _EXTRACT_PROMPT)
+        return self._call(file_path, _EXTRACT_PROMPT, _EXTRACT_NUM_PREDICT)
 
     def describe(self, file_path: str | Path) -> str:
         file_path = Path(file_path)
         if not file_path.exists():
             return ""
-        return self._call(file_path, _DESCRIBE_PROMPT)
+        text = self._call(file_path, _DESCRIBE_PROMPT, _DESCRIBE_NUM_PREDICT)
+        if not text:
+            # Empty content despite a successful call: qwen3-vl's hidden
+            # reasoning trace overran the token cap before emitting an answer.
+            # Surface it (instead of silently storing a metadata-only stub) so
+            # the gap is visible in logs without triggering an endless retry.
+            logger.warning(
+                "Vision describe returned empty (reasoning overran cap) for %s",
+                file_path,
+            )
+        return text
