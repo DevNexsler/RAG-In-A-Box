@@ -61,6 +61,14 @@ _MAX_IMAGE_DIM = 1024
 _EXTRACT_NUM_PREDICT = 800
 _DESCRIBE_NUM_PREDICT = 10240
 
+# Keep the 16.8GB model resident between calls. Without this the model unloaded
+# and cold-reloaded (~80s of load_duration) on most calls — stacked on a real
+# generation that blew past the request timeout, producing a cascade of
+# timeouts mid-backfill. Pinning it warm makes load_duration ~0 for back-to-back
+# image calls. (A PDF routed to a different OCR model can still evict it; that
+# is rare in image-heavy work.)
+_KEEP_ALIVE = "30m"
+
 
 def _downscale(image_bytes: bytes) -> bytes:
     """Resize large images before sending — vision prefill cost scales with
@@ -121,6 +129,9 @@ class OllamaVisionOCR(OCRProvider):
                 # (901 timeouts in one indexing run). Descriptions don't need
                 # deliberation; cap the output so generation stays bounded.
                 "think": False,
+                # keep the model resident so back-to-back calls skip the ~80s
+                # cold-load; see _KEEP_ALIVE.
+                "keep_alive": _KEEP_ALIVE,
                 # temperature=0 (greedy) makes extraction deterministic. At the
                 # default sampled temperature qwen3-vl occasionally emitted a
                 # degenerate/terse generation, so the SAME image would sometimes

@@ -231,6 +231,8 @@ class TestOllamaVisionBudget:
         assert _DESCRIBE_NUM_PREDICT >= 2048
         # greedy decoding — deterministic, faithful descriptions
         assert post.call_args.kwargs["json"]["options"]["temperature"] == 0
+        # model kept warm to avoid the ~80s cold-reload tax per call
+        assert post.call_args.kwargs["json"]["keep_alive"]
 
     def test_extract_keeps_default_num_predict(self, tmp_path):
         from providers.ocr.ollama_vision import OllamaVisionOCR, _EXTRACT_NUM_PREDICT
