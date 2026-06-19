@@ -51,14 +51,15 @@ _VISION_GATE = threading.Semaphore(int(os.environ.get("OLLAMA_VISION_CONCURRENCY
 _MAX_IMAGE_DIM = 1024
 
 # Output token caps (a ceiling, not a target — images that finish early stop
-# early and pay nothing extra). qwen3-vl emits a hidden reasoning trace even
-# with think=False; on busier images that trace alone overran the old 800-token
-# cap, leaving content empty and the image with only a metadata stub (~8.5% of
-# images). A larger describe cap lets the answer land after the reasoning.
-# Images whose reasoning is so runaway it still overruns 2048 stay bounded in
-# both tokens and wall-clock rather than escalating into multi-minute calls.
+# early and pay nothing extra, so this does not slow or pad normal images).
+# qwen3-vl emits a hidden reasoning trace even with think=False; on busier
+# images that trace alone overran the old 800-token cap, leaving content empty
+# and the image with only a metadata stub (~8.5% of images). A generous describe
+# cap lets the answer land after even a long reasoning trace — the worst
+# observed image needed ~4.5k tokens. The only images that take longer are the
+# ones that would otherwise have produced no description at all.
 _EXTRACT_NUM_PREDICT = 800
-_DESCRIBE_NUM_PREDICT = 2048
+_DESCRIBE_NUM_PREDICT = 10240
 
 
 def _downscale(image_bytes: bytes) -> bytes:
@@ -88,7 +89,7 @@ class OllamaVisionOCR(OCRProvider):
         self,
         base_url: str = "http://localhost:11434",
         model: str = "qwen3-vl:8b",
-        timeout: float = 180.0,
+        timeout: float = 300.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
