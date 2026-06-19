@@ -121,7 +121,13 @@ class OllamaVisionOCR(OCRProvider):
                 # (901 timeouts in one indexing run). Descriptions don't need
                 # deliberation; cap the output so generation stays bounded.
                 "think": False,
-                "options": {"num_predict": num_predict},
+                # temperature=0 (greedy) makes extraction deterministic. At the
+                # default sampled temperature qwen3-vl occasionally emitted a
+                # degenerate/terse generation, so the SAME image would sometimes
+                # describe richly and sometimes return a near-empty stub. Greedy
+                # decoding gives the faithful description every time — which is
+                # what OCR/description wants (no need for creative variety).
+                "options": {"num_predict": num_predict, "temperature": 0},
             },
             timeout=self.timeout,
         )

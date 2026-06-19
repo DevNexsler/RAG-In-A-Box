@@ -229,6 +229,8 @@ class TestOllamaVisionBudget:
             OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
         assert post.call_args.kwargs["json"]["options"]["num_predict"] == _DESCRIBE_NUM_PREDICT
         assert _DESCRIBE_NUM_PREDICT >= 2048
+        # greedy decoding — deterministic, faithful descriptions
+        assert post.call_args.kwargs["json"]["options"]["temperature"] == 0
 
     def test_extract_keeps_default_num_predict(self, tmp_path):
         from providers.ocr.ollama_vision import OllamaVisionOCR, _EXTRACT_NUM_PREDICT
