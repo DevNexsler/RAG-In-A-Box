@@ -244,14 +244,29 @@ class TestOllamaVisionBudget:
 
     def test_describe_empty_returns_empty_and_warns(self, tmp_path, caplog):
         import logging
+        from providers.ocr.ollama_vision import OllamaVisionOCR, _DESCRIBE_EMPTY_RETRIES
+
+        with patch("providers.ocr.ollama_vision.httpx.post",
+                   return_value=self._mock_post("")) as post:
+            with patch("providers.ocr.ollama_vision.time.sleep"):
+                with caplog.at_level(logging.WARNING, logger="providers.ocr.ollama_vision"):
+                    result = OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
+        assert result == ""
+        assert any("empty" in r.message.lower() for r in caplog.records)
+        # a persistently-empty describe is retried before giving up
+        assert post.call_count == 1 + _DESCRIBE_EMPTY_RETRIES
+
+    def test_describe_retries_empty_then_succeeds(self, tmp_path):
+        """An empty describe is usually transient (timeout/contention under
+        load), so describe() retries and returns the recovered description."""
         from providers.ocr.ollama_vision import OllamaVisionOCR
 
         with patch("providers.ocr.ollama_vision.httpx.post",
-                   return_value=self._mock_post("")):
-            with caplog.at_level(logging.WARNING, logger="providers.ocr.ollama_vision"):
+                   side_effect=[self._mock_post(""), self._mock_post("a real description")]) as post:
+            with patch("providers.ocr.ollama_vision.time.sleep"):
                 result = OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
-        assert result == ""
-        assert any("empty" in r.message.lower() for r in caplog.records)
+        assert result == "a real description"
+        assert post.call_count == 2
 
 
 # -----------------------------------------------------------------------

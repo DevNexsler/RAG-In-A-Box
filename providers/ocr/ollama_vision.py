@@ -4,6 +4,7 @@ import base64
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -60,6 +61,13 @@ _MAX_IMAGE_DIM = 1024
 # ones that would otherwise have produced no description at all.
 _EXTRACT_NUM_PREDICT = 800
 _DESCRIBE_NUM_PREDICT = 10240
+
+# An empty describe is almost always transient — a call that timed out or got
+# starved under concurrent indexing load, not a deterministic refusal (the same
+# image describes fine on a fresh call). Retry a few times with a short, growing
+# backoff before falling back to a metadata-only stub.
+_DESCRIBE_EMPTY_RETRIES = 2
+_DESCRIBE_RETRY_BACKOFF = 2.0
 
 # Keep the 16.8GB model resident between calls. Without this the model unloaded
 # and cold-reloaded (~80s of load_duration) on most calls — stacked on a real
@@ -157,13 +165,20 @@ class OllamaVisionOCR(OCRProvider):
         if not file_path.exists():
             return ""
         text = self._call(file_path, _DESCRIBE_PROMPT, _DESCRIBE_NUM_PREDICT)
-        if not text:
-            # Empty content despite a successful call: qwen3-vl's hidden
-            # reasoning trace overran the token cap before emitting an answer.
-            # Surface it (instead of silently storing a metadata-only stub) so
-            # the gap is visible in logs without triggering an endless retry.
+        # Empty is almost always transient (timeout/contention under load), not
+        # a deterministic refusal — retry before falling back to a metadata stub.
+        attempt = 0
+        while not text and attempt < _DESCRIBE_EMPTY_RETRIES:
+            attempt += 1
             logger.warning(
-                "Vision describe returned empty (reasoning overran cap) for %s",
-                file_path,
+                "Vision describe returned empty for %s; retrying (%d/%d)",
+                file_path, attempt, _DESCRIBE_EMPTY_RETRIES,
+            )
+            time.sleep(_DESCRIBE_RETRY_BACKOFF * attempt)
+            text = self._call(file_path, _DESCRIBE_PROMPT, _DESCRIBE_NUM_PREDICT)
+        if not text:
+            logger.warning(
+                "Vision describe still empty after %d retries for %s",
+                _DESCRIBE_EMPTY_RETRIES, file_path,
             )
         return text
