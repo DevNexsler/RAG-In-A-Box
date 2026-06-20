@@ -205,6 +205,55 @@ class TestDeepSeekOCR2Unit:
         assert ollama_post.call_args.kwargs["json"]["model"] == "qwen3-vl:8b"
 
 
+class TestOllamaVisionBudget:
+    """qwen3-vl's hidden reasoning trace starved the old 800-token cap, leaving
+    ~8.5% of images with empty descriptions. describe() now gets a larger cap
+    and surfaces the rare still-empty result instead of storing a silent stub."""
+
+    def _img(self, tmp_path):
+        img = tmp_path / "photo.jpg"
+        img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+        return img
+
+    def _mock_post(self, content):
+        resp = MagicMock()
+        resp.json.return_value = {"message": {"content": content}}
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_describe_uses_larger_num_predict(self, tmp_path):
+        from providers.ocr.ollama_vision import OllamaVisionOCR, _DESCRIBE_NUM_PREDICT
+
+        with patch("providers.ocr.ollama_vision.httpx.post",
+                   return_value=self._mock_post("a description")) as post:
+            OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
+        assert post.call_args.kwargs["json"]["options"]["num_predict"] == _DESCRIBE_NUM_PREDICT
+        assert _DESCRIBE_NUM_PREDICT >= 2048
+        # greedy decoding — deterministic, faithful descriptions
+        assert post.call_args.kwargs["json"]["options"]["temperature"] == 0
+        # model kept warm to avoid the ~80s cold-reload tax per call
+        assert post.call_args.kwargs["json"]["keep_alive"]
+
+    def test_extract_keeps_default_num_predict(self, tmp_path):
+        from providers.ocr.ollama_vision import OllamaVisionOCR, _EXTRACT_NUM_PREDICT
+
+        with patch("providers.ocr.ollama_vision.httpx.post",
+                   return_value=self._mock_post("some text")) as post:
+            OllamaVisionOCR(base_url="http://ollama:11434").extract(self._img(tmp_path))
+        assert post.call_args.kwargs["json"]["options"]["num_predict"] == _EXTRACT_NUM_PREDICT
+
+    def test_describe_empty_returns_empty_and_warns(self, tmp_path, caplog):
+        import logging
+        from providers.ocr.ollama_vision import OllamaVisionOCR
+
+        with patch("providers.ocr.ollama_vision.httpx.post",
+                   return_value=self._mock_post("")):
+            with caplog.at_level(logging.WARNING, logger="providers.ocr.ollama_vision"):
+                result = OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
+        assert result == ""
+        assert any("empty" in r.message.lower() for r in caplog.records)
+
+
 # -----------------------------------------------------------------------
 # Live integration tests (require DeepSeek-OCR2 reachable at its configured
 # base_url). Resolution order:

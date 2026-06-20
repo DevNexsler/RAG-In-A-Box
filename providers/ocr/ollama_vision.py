@@ -50,6 +50,25 @@ _VISION_GATE = threading.Semaphore(int(os.environ.get("OLLAMA_VISION_CONCURRENCY
 
 _MAX_IMAGE_DIM = 1024
 
+# Output token caps (a ceiling, not a target — images that finish early stop
+# early and pay nothing extra, so this does not slow or pad normal images).
+# qwen3-vl emits a hidden reasoning trace even with think=False; on busier
+# images that trace alone overran the old 800-token cap, leaving content empty
+# and the image with only a metadata stub (~8.5% of images). A generous describe
+# cap lets the answer land after even a long reasoning trace — the worst
+# observed image needed ~4.5k tokens. The only images that take longer are the
+# ones that would otherwise have produced no description at all.
+_EXTRACT_NUM_PREDICT = 800
+_DESCRIBE_NUM_PREDICT = 10240
+
+# Keep the 16.8GB model resident between calls. Without this the model unloaded
+# and cold-reloaded (~80s of load_duration) on most calls — stacked on a real
+# generation that blew past the request timeout, producing a cascade of
+# timeouts mid-backfill. Pinning it warm makes load_duration ~0 for back-to-back
+# image calls. (A PDF routed to a different OCR model can still evict it; that
+# is rare in image-heavy work.)
+_KEEP_ALIVE = "30m"
+
 
 def _downscale(image_bytes: bytes) -> bytes:
     """Resize large images before sending — vision prefill cost scales with
@@ -78,20 +97,20 @@ class OllamaVisionOCR(OCRProvider):
         self,
         base_url: str = "http://localhost:11434",
         model: str = "qwen3-vl:8b",
-        timeout: float = 120.0,
+        timeout: float = 300.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         logger.info("OllamaVisionOCR: %s model=%s", self.base_url, self.model)
 
-    def _call(self, file_path: Path, prompt: str) -> str:
+    def _call(self, file_path: Path, prompt: str, num_predict: int) -> str:
         image_bytes = _downscale(file_path.read_bytes())
         b64 = base64.b64encode(image_bytes).decode("ascii")
         with _VISION_GATE:
-            return self._request(b64, prompt)
+            return self._request(b64, prompt, num_predict)
 
-    def _request(self, b64: str, prompt: str) -> str:
+    def _request(self, b64: str, prompt: str, num_predict: int) -> str:
 
         resp = httpx.post(
             f"{self.base_url}/api/chat",
@@ -108,9 +127,18 @@ class OllamaVisionOCR(OCRProvider):
                 # qwen3-vl defaults to thinking mode, which burned ~2 minutes
                 # per image and made most describe calls hit the 120s timeout
                 # (901 timeouts in one indexing run). Descriptions don't need
-                # deliberation; cap the output too so generation stays bounded.
+                # deliberation; cap the output so generation stays bounded.
                 "think": False,
-                "options": {"num_predict": 800},
+                # keep the model resident so back-to-back calls skip the ~80s
+                # cold-load; see _KEEP_ALIVE.
+                "keep_alive": _KEEP_ALIVE,
+                # temperature=0 (greedy) makes extraction deterministic. At the
+                # default sampled temperature qwen3-vl occasionally emitted a
+                # degenerate/terse generation, so the SAME image would sometimes
+                # describe richly and sometimes return a near-empty stub. Greedy
+                # decoding gives the faithful description every time — which is
+                # what OCR/description wants (no need for creative variety).
+                "options": {"num_predict": num_predict, "temperature": 0},
             },
             timeout=self.timeout,
         )
@@ -122,10 +150,20 @@ class OllamaVisionOCR(OCRProvider):
         file_path = Path(file_path)
         if not file_path.exists():
             return ""
-        return self._call(file_path, _EXTRACT_PROMPT)
+        return self._call(file_path, _EXTRACT_PROMPT, _EXTRACT_NUM_PREDICT)
 
     def describe(self, file_path: str | Path) -> str:
         file_path = Path(file_path)
         if not file_path.exists():
             return ""
-        return self._call(file_path, _DESCRIBE_PROMPT)
+        text = self._call(file_path, _DESCRIBE_PROMPT, _DESCRIBE_NUM_PREDICT)
+        if not text:
+            # Empty content despite a successful call: qwen3-vl's hidden
+            # reasoning trace overran the token cap before emitting an answer.
+            # Surface it (instead of silently storing a metadata-only stub) so
+            # the gap is visible in logs without triggering an endless retry.
+            logger.warning(
+                "Vision describe returned empty (reasoning overran cap) for %s",
+                file_path,
+            )
+        return text
