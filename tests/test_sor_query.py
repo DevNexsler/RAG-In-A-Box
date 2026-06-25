@@ -114,3 +114,54 @@ def test_get_sor_schema_caches(monkeypatch):
     assert s1 == s2
     assert calls["n"] == 1
     assert s1["Contacts"] == [("id", "integer")]
+
+
+def _fake_conn(rows):
+    class FakeCur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *_): pass
+        def fetchall(self): return rows
+    class FakeConn:
+        def cursor(self): return FakeCur()
+        def rollback(self): pass
+    return FakeConn()
+
+
+def test_sor_query_impl_happy_path(monkeypatch):
+    monkeypatch.setattr(sor_query, "_get_readonly_conn",
+                        lambda: _fake_conn([{"id": 1, "Status": "Open"}]))
+    out = sor_query.sor_query_impl('SELECT id, "Status" FROM "Collection Tickets"')
+    assert out.splitlines()[0] == "id\tStatus"
+    assert "1\tOpen" in out
+
+
+def test_sor_query_impl_rejects_write(monkeypatch):
+    out = sor_query.sor_query_impl("DELETE FROM x")
+    assert out.startswith("ERROR")
+
+
+def test_sor_query_impl_db_error_is_returned(monkeypatch):
+    import psycopg
+
+    class BoomConn:
+        def cursor(self): raise psycopg.Error("relation \"Nope\" does not exist")
+        def rollback(self): pass
+
+    monkeypatch.setattr(sor_query, "_get_readonly_conn", lambda: BoomConn())
+    out = sor_query.sor_query_impl("SELECT * FROM \"Nope\"")
+    assert "SOR query error" in out and "Nope" in out
+
+
+def test_sor_schema_impl_unknown_table(monkeypatch):
+    monkeypatch.setattr(sor_query, "get_sor_schema",
+                        lambda **k: {"Contacts": [("id", "integer")]})
+    out = sor_query.sor_schema_impl("Missing")
+    assert "Unknown table" in out and "Contacts" in out
+
+
+def test_build_description_falls_back_on_db_down(monkeypatch):
+    def boom(**k): raise RuntimeError("db down")
+    monkeypatch.setattr(sor_query, "get_sor_schema", boom)
+    desc = sor_query.build_sor_query_description()
+    assert "SELECT" in desc  # still returns usable static guidance

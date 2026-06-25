@@ -191,3 +191,53 @@ def format_schema_text(schema: dict, tables: list[str] | None = None) -> str:
         col_str = ", ".join(f'"{c}"' for c, _ in cols)
         lines.append(f"{_q(t)}({col_str})")
     return "\n".join(lines)
+
+
+_DESCRIPTION_INTRO = (
+    "Run a READ-ONLY SQL query against the SOR Postgres (NocoDB-backed; "
+    "identifiers are quoted CamelCase, e.g. \"Building Units\", \"Nick_Name\", "
+    "\"Status\"). SELECT/WITH only. Results are capped (default LIMIT 50) and "
+    "returned as TSV. Use joins and COUNT/SUM/GROUP BY freely. Call sor_schema "
+    "for tables not listed below or to see all columns."
+)
+
+
+def sor_query_impl(sql: str, limit: int = 50, fmt: str = "tsv") -> str:
+    err = validate_select(sql)
+    if err:
+        return f"ERROR: {err}"
+    wrapped, eff = wrap_with_limit(sql, limit)
+    try:
+        conn = _get_readonly_conn()
+        with conn.cursor() as cur:
+            cur.execute(wrapped)
+            rows = cur.fetchall()
+        conn.rollback()  # close the read-only txn cleanly
+    except psycopg.Error as e:
+        try:
+            _get_readonly_conn().rollback()
+        except Exception:
+            pass
+        return f"SOR query error: {str(e).strip()}"
+    return serialize(rows, fmt, eff)
+
+
+def sor_schema_impl(table: str | None = None) -> str:
+    try:
+        schema = get_sor_schema()
+    except Exception as e:
+        return f"SOR schema error: {str(e).strip()}"
+    if table:
+        if table not in schema:
+            return (f"Unknown table {table!r}. Available: "
+                    + ", ".join(sorted(schema)))
+        return format_schema_text(schema, [table])
+    return "\n".join(sorted(schema))
+
+
+def build_sor_query_description() -> str:
+    try:
+        tables = format_schema_text(get_sor_schema())
+    except Exception:
+        tables = "(schema unavailable at startup; call sor_schema to list tables)"
+    return f"{_DESCRIPTION_INTRO}\n\nTables and key columns:\n{tables}"
