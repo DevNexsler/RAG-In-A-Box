@@ -1,8 +1,10 @@
 """OCR via Ollama vision-language models (e.g. qwen3-vl:8b)."""
 
 import base64
+import json
 import logging
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -60,7 +62,12 @@ _MAX_IMAGE_DIM = 1024
 # observed image needed ~4.5k tokens. The only images that take longer are the
 # ones that would otherwise have produced no description at all.
 _EXTRACT_NUM_PREDICT = 800
-_DESCRIBE_NUM_PREDICT = 10240
+# 5120 comfortably covers the ~4.5k-token worst case described above while
+# bounding the worst generation to ~4-5 min. The old 10240 let pathological
+# generations run ~9-10 min — the main driver of the ~300s describe stalls
+# (one slow describe holding the vision gate stalls the whole indexer). Floor
+# is intentionally NOT 1500-2000 (that produced metadata-only stubs). Env-tunable.
+_DESCRIBE_NUM_PREDICT = int(os.environ.get("OLLAMA_DESCRIBE_NUM_PREDICT", "5120"))
 
 # An empty describe is almost always transient — a call that timed out or got
 # starved under concurrent indexing load, not a deterministic refusal (the same
@@ -68,6 +75,22 @@ _DESCRIBE_NUM_PREDICT = 10240
 # backoff before falling back to a metadata-only stub.
 _DESCRIBE_EMPTY_RETRIES = 2
 _DESCRIBE_RETRY_BACKOFF = 2.0
+
+# --- Hang guards ---
+# Root cause of indexer freezes: every describe funnels through the single-permit
+# _VISION_GATE, and the old stream=False call blocked in ONE recv for the entire
+# generation (Ollama sends no bytes until done). One slow/stuck describe holding
+# the gate froze all 8 worker threads. These bound it so a bad describe degrades
+# one doc instead of freezing the run.
+#
+# Max silence between streamed chunks before httpx aborts the read. Covers
+# time-to-first-token (image decode + prompt eval, ~15s warm); afterward tokens
+# flow ~55ms apart, so a longer gap means a genuinely stuck generation.
+_VISION_READ_GAP = float(os.environ.get("OLLAMA_VISION_READ_GAP", "90"))
+# Bounded wait to ACQUIRE the vision gate — a backstop so that if a holder ever
+# fails to release within its wall-clock deadline, waiters degrade their image
+# rather than block forever. Must exceed the per-call wall deadline (self.timeout).
+_VISION_GATE_TIMEOUT = float(os.environ.get("OLLAMA_VISION_GATE_TIMEOUT", "600"))
 
 # Keep the 16.8GB model resident between calls. Without this the model unloaded
 # and cold-reloaded (~80s of load_duration) on most calls — stacked on a real
@@ -115,44 +138,77 @@ class OllamaVisionOCR(OCRProvider):
     def _call(self, file_path: Path, prompt: str, num_predict: int) -> str:
         image_bytes = _downscale(file_path.read_bytes())
         b64 = base64.b64encode(image_bytes).decode("ascii")
-        with _VISION_GATE:
+        # Bounded acquire: a stuck prior describe can no longer freeze this
+        # worker (and the whole pool) indefinitely. On timeout we raise, which
+        # propagates to extractors' except-block -> note_degradation -> the
+        # image is degraded to a metadata stub and indexing continues.
+        if not _VISION_GATE.acquire(timeout=_VISION_GATE_TIMEOUT):
+            raise TimeoutError(
+                f"vision gate not acquired within {_VISION_GATE_TIMEOUT}s "
+                f"(a prior describe is stuck); degrading {file_path.name}"
+            )
+        try:
             return self._request(b64, prompt, num_predict)
+        finally:
+            _VISION_GATE.release()
 
     def _request(self, b64: str, prompt: str, num_predict: int) -> str:
-
-        resp = httpx.post(
-            f"{self.base_url}/api/chat",
-            json={
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt,
-                        "images": [b64],
-                    }
-                ],
-                "stream": False,
-                # qwen3-vl defaults to thinking mode, which burned ~2 minutes
-                # per image and made most describe calls hit the 120s timeout
-                # (901 timeouts in one indexing run). Descriptions don't need
-                # deliberation; cap the output so generation stays bounded.
-                "think": False,
-                # keep the model resident so back-to-back calls skip the ~80s
-                # cold-load; see _KEEP_ALIVE.
-                "keep_alive": _KEEP_ALIVE,
-                # temperature=0 (greedy) makes extraction deterministic. At the
-                # default sampled temperature qwen3-vl occasionally emitted a
-                # degenerate/terse generation, so the SAME image would sometimes
-                # describe richly and sometimes return a near-empty stub. Greedy
-                # decoding gives the faithful description every time — which is
-                # what OCR/description wants (no need for creative variety).
-                "options": {"num_predict": num_predict, "temperature": 0},
-            },
-            timeout=self.timeout,
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+            # Stream so httpx's read timeout becomes an inter-token gap (resets
+            # per chunk) AND so we can enforce a hard wall-clock deadline by
+            # checking elapsed time per chunk and closing the socket. With
+            # stream=False, Ollama sent zero bytes until the ENTIRE generation
+            # finished, so the call blocked in one recv for the whole generation
+            # (~300s on verbose images) — and one such call holding _VISION_GATE
+            # froze the whole 8-worker indexer.
+            "stream": True,
+            # think=False: skip qwen3-vl's deliberation trace (it burned ~2 min
+            # per image). keep_alive: pin the model warm (~80s cold-load avoided).
+            "think": False,
+            "keep_alive": _KEEP_ALIVE,
+            # temperature=0 (greedy) -> deterministic, faithful description every
+            # time (sampled decoding occasionally produced near-empty stubs).
+            "options": {"num_predict": num_predict, "temperature": 0},
+        }
+        # connect short so a dead host can't hang; read = max silence BETWEEN
+        # chunks (NOT a total bound). The total bound is the wall deadline below.
+        timeout = httpx.Timeout(
+            connect=10.0, read=_VISION_READ_GAP, write=30.0, pool=10.0
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("message", {}).get("content", "").strip()
+        # SO_KEEPALIVE (tuned low) detects a half-open socket — peer gone without
+        # FIN/RST — instead of blocking forever (the rare infinite-hang class).
+        transport = httpx.HTTPTransport(
+            socket_options=[
+                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+                (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPIDLE", 4), 30),
+                (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPINTVL", 5), 10),
+                (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPCNT", 6), 3),
+            ]
+        )
+        deadline = time.monotonic() + self.timeout
+        parts: list[str] = []
+        with httpx.Client(transport=transport, timeout=timeout) as client:
+            with client.stream(
+                "POST", f"{self.base_url}/api/chat", json=payload
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if time.monotonic() > deadline:
+                        # Raising exits the context manager, which closes the
+                        # socket and aborts the server-side generation.
+                        raise TimeoutError(
+                            f"ollama describe exceeded wall deadline "
+                            f"{self.timeout:.0f}s"
+                        )
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    parts.append(obj.get("message", {}).get("content", ""))
+                    if obj.get("done"):
+                        break
+        return "".join(parts).strip()
 
     def extract(self, file_path: str | Path, page: Optional[int] = None) -> str:
         file_path = Path(file_path)
