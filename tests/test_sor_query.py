@@ -108,6 +108,7 @@ def test_get_sor_schema_caches(monkeypatch):
 
     class FakeConn:
         def cursor(self): return FakeCur()
+        def rollback(self): pass
 
     monkeypatch.setattr(sor_query, "_get_readonly_conn", lambda: FakeConn())
     sor_query._SCHEMA_CACHE["data"] = None
@@ -153,6 +154,45 @@ def test_sor_query_impl_db_error_is_returned(monkeypatch):
     monkeypatch.setattr(sor_query, "_get_readonly_conn", lambda: BoomConn())
     out = sor_query.sor_query_impl("SELECT * FROM \"Nope\"")
     assert "SOR query error" in out and "Nope" in out
+
+
+def test_sor_query_impl_retries_once_on_stale_connection(monkeypatch):
+    """A connection reaped server-side (OperationalError on first use) is
+    transparently reconnected and retried, so the caller sees a clean result."""
+    import psycopg
+
+    calls = {"n": 0}
+
+    class StaleConn:
+        def cursor(self):
+            raise psycopg.OperationalError("server closed the connection unexpectedly")
+        def rollback(self): pass
+
+    def get_conn():
+        calls["n"] += 1
+        return StaleConn() if calls["n"] == 1 else _fake_conn([{"id": 7}])
+
+    monkeypatch.setattr(sor_query, "_get_readonly_conn", get_conn)
+    monkeypatch.setattr(sor_query, "_reset_conn", lambda: None)
+    out = sor_query.sor_query_impl('SELECT id FROM "X"')
+    assert calls["n"] == 2          # reconnected exactly once
+    assert "7" in out               # second attempt's rows returned
+
+
+def test_sor_query_impl_persistent_operational_error_returns_error(monkeypatch):
+    """If the DB stays unreachable, retry is bounded (no infinite loop) and the
+    error is reported rather than raised."""
+    import psycopg
+
+    class StaleConn:
+        def cursor(self):
+            raise psycopg.OperationalError("connection refused")
+        def rollback(self): pass
+
+    monkeypatch.setattr(sor_query, "_get_readonly_conn", lambda: StaleConn())
+    monkeypatch.setattr(sor_query, "_reset_conn", lambda: None)
+    out = sor_query.sor_query_impl("SELECT 1")
+    assert out.startswith("SOR query error")
 
 
 def test_sor_schema_impl_unknown_table(monkeypatch):

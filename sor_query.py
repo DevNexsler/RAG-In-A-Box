@@ -133,6 +133,42 @@ def _get_readonly_conn() -> "psycopg.Connection":
     return _CONN
 
 
+def _reset_conn() -> None:
+    """Drop the cached connection so the next call opens a fresh one."""
+    global _CONN
+    if _CONN is not None and not _CONN.closed:
+        try:
+            _CONN.close()
+        except Exception:
+            pass
+    _CONN = None
+
+
+def _run_readonly(sql: str) -> list[dict]:
+    """Execute a read-only query, fetch all rows, and close the txn cleanly.
+
+    A cached connection can be reaped server-side while idle (Postgres
+    idle-in-transaction timeout, or a dropped socket after the MCP server
+    restarts); the client only discovers this on the next use, raising an
+    OperationalError. Transparently discard the dead connection and retry once
+    so that one-shot staleness never reaches the caller. Real SQL errors (bad
+    table/column) are not OperationalErrors and propagate on the first attempt.
+    """
+    last_exc: "psycopg.OperationalError | None" = None
+    for _attempt in range(2):
+        try:
+            conn = _get_readonly_conn()
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            conn.rollback()  # close the read-only txn cleanly
+            return rows
+        except psycopg.OperationalError as e:
+            last_exc = e
+            _reset_conn()  # force a fresh connection on the retry
+    raise last_exc  # both attempts failed — DB genuinely unreachable
+
+
 _SCHEMA_CACHE: dict = {"data": None, "ts": 0.0}
 _SCHEMA_TTL_SECONDS = 600.0
 
@@ -163,10 +199,7 @@ def get_sor_schema(refresh: bool = False) -> dict[str, list[tuple[str, str]]]:
     if (not refresh and _SCHEMA_CACHE["data"] is not None
             and now - _SCHEMA_CACHE["ts"] < _SCHEMA_TTL_SECONDS):
         return _SCHEMA_CACHE["data"]
-    conn = _get_readonly_conn()
-    with conn.cursor() as cur:
-        cur.execute(_SCHEMA_SQL)
-        rows = cur.fetchall()
+    rows = _run_readonly(_SCHEMA_SQL)
     schema: dict[str, list[tuple[str, str]]] = {}
     for r in rows:
         schema.setdefault(r["table_name"], []).append(
@@ -208,12 +241,9 @@ def sor_query_impl(sql: str, limit: int = 50, fmt: str = "tsv") -> str:
         return f"ERROR: {err}"
     wrapped, eff = wrap_with_limit(sql, limit)
     try:
-        conn = _get_readonly_conn()
-        with conn.cursor() as cur:
-            cur.execute(wrapped)
-            rows = cur.fetchall()
-        conn.rollback()  # close the read-only txn cleanly
+        rows = _run_readonly(wrapped)
     except psycopg.Error as e:
+        # Clear any lingering error state so the next call starts clean.
         try:
             _get_readonly_conn().rollback()
         except Exception:
