@@ -21,3 +21,19 @@ def validate_select(sql: str) -> str | None:
     if not (low.startswith("select") or low.startswith("with")):
         return "sor_query is read-only; pass a single SELECT or WITH query"
     return None
+
+
+HARD_MAX_ROWS = 1000
+
+
+def wrap_with_limit(sql: str, limit: int) -> tuple[str, int]:
+    """Wrap an arbitrary SELECT in an outer LIMIT so unbounded queries can't dump.
+
+    Always wraps (no fragile LIMIT-parsing): an outer LIMIT caps everything,
+    including queries that already have their own inner LIMIT. We request eff+1
+    rows so the caller can detect truncation.
+    """
+    eff = max(1, min(int(limit), HARD_MAX_ROWS))
+    inner = (sql or "").strip().rstrip(";").strip()
+    wrapped = f"SELECT * FROM (\n{inner}\n) AS _sub LIMIT {eff + 1}"
+    return wrapped, eff
