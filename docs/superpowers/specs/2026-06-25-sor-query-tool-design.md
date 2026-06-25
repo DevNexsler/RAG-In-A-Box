@@ -191,3 +191,48 @@ agent (mcporter call doc-organizer.sor_query)
 - Re-run the LiteLLM spend-log analysis after a usage window: expect SOR-related
   `execute_code` turn counts and average result-byte size to drop, and
   `information_schema` probe frequency to fall to ~0 for core tables.
+
+## Post-launch watch / v2 candidates
+
+These were scoped out of v1 (see Non-goals). Watch for the signals; if a signal
+fires, the named v2 is the response.
+
+### 1. Fuzzy entity resolution (primary watch)
+`file_search` and `sor_query` are separate tools. A chained
+`file_search` → `sor_query` collapses to **one** agent turn when the hand-off is
+programmatic (extract an id from the search hit, plug into SQL inside one
+`execute_code` block). It costs **two** turns only when the model must *read*
+several semantic hits and *judge* which entity is correct before querying.
+
+- **Signal to watch:** in the LiteLLM spend logs, count chained
+  `doc-organizer.file_search` → `doc-organizer.sor_query` sequences where query 2
+  is NOT programmatically derivable from query 1 (i.e. an LLM round-trip sits
+  between them). If this judgment-requiring chain is common, the 2-turn cost is
+  recurring.
+- **v2 response:** add fuzzy entity resolution — a combined call that resolves a
+  fuzzy reference (`"Rosado"`, `"54 S Broad"`) to the exact contact/unit/ticket
+  rows and returns them, collapsing the judgment chain into one call. (Note this
+  reintroduces semantic ranking into the structured path, so design it as its own
+  tool/mode, not a change to `sor_query`'s deterministic contract.)
+
+### 2. Canned / parameterized query library
+If usage shows a clear top-N of near-identical `sor_query` SQL shapes (e.g. a
+tenant ledger, tickets-by-status, a building roster), add named convenience
+queries (`tenant_ledger(contact)`, `tickets_by_status(status)`).
+
+- **Signal:** high frequency of near-duplicate SQL bodies in the spend logs.
+- **v2 response:** a small set of named parameterized queries (tiniest tokens,
+  safest). Keep `sor_query` for the long tail.
+
+### 3. Read-only role hardening (ops)
+v1 enforces read-only via `default_transaction_read_only=on` + statement
+validation (psycopg3's extended protocol already blocks multi-statement). For
+defense in depth, provision a dedicated `sor_readonly` Postgres role with
+`SELECT`-only grants and point this tool's DSN at it. Not required for v1
+correctness — track as an ops follow-up.
+
+### 4. Externalized-ref durability (cross-project note)
+Unrelated to this tool but adjacent: hermes-lcm `/lcm doctor` flagged orphaned
+externalized payload refs (missing JSON files) — mostly pre-v0.18 legacy.
+v0.18 #265 hardens this going forward. Mentioned only so it isn't mistaken for a
+`sor_query` issue if it surfaces.
