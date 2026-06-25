@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 
 import psycopg
 from psycopg.rows import dict_row
@@ -129,3 +131,63 @@ def _get_readonly_conn() -> "psycopg.Connection":
             options="-c default_transaction_read_only=on -c statement_timeout=15000",
         )
     return _CONN
+
+
+_SCHEMA_CACHE: dict = {"data": None, "ts": 0.0}
+_SCHEMA_TTL_SECONDS = 600.0
+
+_SCHEMA_SQL = (
+    "SELECT table_name, column_name, data_type "
+    "FROM information_schema.columns "
+    "WHERE table_schema = 'public' "
+    "ORDER BY table_name, ordinal_position"
+)
+
+# Hot tables shown inline in the sor_query description (Tier 1). Authoritative
+# identifiers always come from the live schema; this is only an ordering hint.
+CORE_TABLES = [
+    "Buildings", "Building Units", "Contacts",
+    "Collection Tickets", "Tasks", "Legal Entities",
+]
+
+_IDENT_OK = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def _q(ident: str) -> str:
+    """Quote an identifier unless it's already a safe lowercase snake_case name."""
+    return ident if _IDENT_OK.match(ident) else f'"{ident}"'
+
+
+def get_sor_schema(refresh: bool = False) -> dict[str, list[tuple[str, str]]]:
+    now = time.monotonic()
+    if (not refresh and _SCHEMA_CACHE["data"] is not None
+            and now - _SCHEMA_CACHE["ts"] < _SCHEMA_TTL_SECONDS):
+        return _SCHEMA_CACHE["data"]
+    conn = _get_readonly_conn()
+    with conn.cursor() as cur:
+        cur.execute(_SCHEMA_SQL)
+        rows = cur.fetchall()
+    schema: dict[str, list[tuple[str, str]]] = {}
+    for r in rows:
+        schema.setdefault(r["table_name"], []).append(
+            (r["column_name"], r["data_type"])
+        )
+    _SCHEMA_CACHE["data"] = schema
+    _SCHEMA_CACHE["ts"] = now
+    return schema
+
+
+def format_schema_text(schema: dict, tables: list[str] | None = None) -> str:
+    if tables is None:
+        ordered = [t for t in CORE_TABLES if t in schema]
+        ordered += [t for t in sorted(schema) if t not in CORE_TABLES]
+        tables = ordered
+    lines = []
+    for t in tables:
+        cols = schema.get(t, [])
+        # Columns are always quoted so the agent can copy them verbatim (NocoDB
+        # exposes CamelCase columns like "Unit_Name"/"Status"). Table names are
+        # quoted only when they need it (a plain snake_case table reads cleaner).
+        col_str = ", ".join(f'"{c}"' for c, _ in cols)
+        lines.append(f"{_q(t)}({col_str})")
+    return "\n".join(lines)

@@ -81,3 +81,36 @@ def test_resolve_dsn_missing_raises(monkeypatch):
         import pytest
         with pytest.raises(ValueError):
             sor_query.resolve_sor_dsn()
+
+
+def test_format_schema_text_quotes_camelcase():
+    schema = {
+        "Building Units": [("id", "integer"), ("Unit_Name", "text")],
+        "collection_tickets": [("id", "integer"), ("Status", "text")],
+    }
+    txt = sor_query.format_schema_text(schema, ["Building Units", "collection_tickets"])
+    assert '"Building Units"("id", "Unit_Name")' in txt
+    assert 'collection_tickets("id", "Status")' in txt   # snake table unquoted
+
+
+def test_get_sor_schema_caches(monkeypatch):
+    calls = {"n": 0}
+
+    class FakeCur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *_): calls["n"] += 1
+        def fetchall(self):
+            return [{"table_name": "Contacts", "column_name": "id",
+                     "data_type": "integer"}]
+
+    class FakeConn:
+        def cursor(self): return FakeCur()
+
+    monkeypatch.setattr(sor_query, "_get_readonly_conn", lambda: FakeConn())
+    sor_query._SCHEMA_CACHE["data"] = None
+    s1 = sor_query.get_sor_schema(refresh=True)
+    s2 = sor_query.get_sor_schema()           # cached, no 2nd execute
+    assert s1 == s2
+    assert calls["n"] == 1
+    assert s1["Contacts"] == [("id", "integer")]
