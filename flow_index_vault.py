@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -642,6 +643,23 @@ def _include_repaired_sidecar_docs(
 _DEGRADED_MAX_ATTEMPTS = 5
 
 
+def _heartbeat_path(index_root: Path) -> Path:
+    return Path(index_root) / "indexer.heartbeat"
+
+
+def _write_heartbeat(index_root) -> None:
+    """Stamp the indexer progress heartbeat. The /health endpoint reports the
+    indexer as frozen (HTTP 503) when this file's age exceeds
+    INDEXER_HEARTBEAT_MAX_AGE while an indexer pid is still alive — catching a
+    silent stall that the log scanner can't see (a freeze logs nothing)."""
+    if index_root is None:
+        return
+    try:
+        _heartbeat_path(index_root).write_text(str(time.time()))
+    except Exception:
+        pass
+
+
 def _degraded_ledger_path(index_root: Path) -> Path:
     return Path(index_root) / "degraded_docs.json"
 
@@ -1243,6 +1261,9 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
 
     def _run_one(doc: dict) -> str | None:
         nonlocal active_workers, peak_active_workers
+        # Heartbeat: a worker picking up a doc means the indexer is progressing.
+        # When all workers are stuck (a freeze) this stops, and /health flips to 503.
+        _write_heartbeat(_RUNTIME.get("index_root"))
         if debug_concurrency:
             with active_lock:
                 active_workers += 1
@@ -1490,6 +1511,8 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     logger = get_run_logger()
     config = load_config(config_path)
     index_root = Path(config["index_root"])
+    _RUNTIME["index_root"] = index_root
+    _write_heartbeat(index_root)  # mark the run alive before the (possibly slow) scan
     chunk_cfg = config.get("chunking", {})
 
     # --- Build components from config (stored in _RUNTIME for tasks) ---
