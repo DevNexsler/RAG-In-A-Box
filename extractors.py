@@ -290,6 +290,20 @@ def extract_pdf(
         logger.warning("Failed to open PDF %s: %s", file_path, e)
         note_skip("pdf_unreadable")
         return ExtractionResult.from_text("", frontmatter={})
+
+    # Password-protected PDFs open() fine but raise "document closed or
+    # encrypted" on the first page read — which the open() guard above never
+    # sees, so without this they re-throw on every scan and masquerade as
+    # unindexed backlog. Detect up front and flag as a skip, mirroring
+    # pdf_unreadable. needs_pass is True only when a password is actually
+    # required to read content (owner-only encryption with an empty user
+    # password reads fine, so those are left to index normally).
+    if doc.needs_pass:
+        logger.warning("Encrypted PDF (password required) %s — skipping", file_path)
+        note_skip("encrypted_pdf")
+        doc.close()
+        return ExtractionResult.from_text("", frontmatter={})
+
     pdf_meta = _extract_pdf_metadata(doc)
     pages: list[PageText] = []
 

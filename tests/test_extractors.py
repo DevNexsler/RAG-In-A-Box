@@ -227,6 +227,27 @@ def test_extract_pdf_text_only(tmp_path):
     assert not any(p.was_ocr for p in result.pages)
 
 
+def test_extract_pdf_encrypted_is_skipped(tmp_path):
+    """A password-protected PDF opens but raises on page read; it must be flagged
+    as an 'encrypted_pdf' skip (so it lands in the skip ledger and isn't
+    re-extracted/re-thrown every run) rather than bubbling an exception."""
+    import fitz
+    from extractors import begin_degradation_capture, collect_skips, extract_pdf
+
+    pdf_path = tmp_path / "encrypted.pdf"
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 100), "secret content", fontsize=12)
+    doc.save(str(pdf_path), encryption=fitz.PDF_ENCRYPT_AES_256,
+             user_pw="pw", owner_pw="pw")
+    doc.close()
+
+    begin_degradation_capture()
+    result = extract_pdf(pdf_path, strategy="text_then_ocr")
+
+    assert result.full_text == ""
+    assert "encrypted_pdf" in collect_skips()
+
+
 def test_extract_pdf_text_then_ocr_sufficient_text(tmp_path):
     """text_then_ocr doesn't call OCR when there's enough native text."""
     import fitz
