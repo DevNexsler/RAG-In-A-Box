@@ -1,5 +1,7 @@
 from unittest.mock import patch
 
+import pytest
+
 import sor_query
 
 
@@ -165,3 +167,22 @@ def test_build_description_falls_back_on_db_down(monkeypatch):
     monkeypatch.setattr(sor_query, "get_sor_schema", boom)
     desc = sor_query.build_sor_query_description()
     assert "SELECT" in desc  # still returns usable static guidance
+
+
+@pytest.mark.anyio
+async def test_sor_tools_registered():
+    import mcp_server
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp not installed")
+    names = {t.name for t in await mcp_server.mcp.list_tools()}
+    assert {"sor_query", "sor_schema"} <= names
+
+
+@pytest.mark.anyio
+async def test_sor_query_tool_dispatches(monkeypatch):
+    import mcp_server
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp not installed")
+    with patch("sor_query.sor_query_impl", return_value="id\n1") as mock:
+        await mcp_server.mcp.call_tool("sor_query", {"sql": "SELECT 1"})
+    mock.assert_called_once()

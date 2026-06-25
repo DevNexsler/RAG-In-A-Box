@@ -15,6 +15,7 @@ from core.storage import SearchHit
 from lancedb_store import LanceDBStore, open_store_with_recovery
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
+import sor_query as sorq
 
 logger = logging.getLogger(__name__)
 
@@ -1917,6 +1918,23 @@ if HAS_MCP and FastMCP is not None:
             return_mode=return_mode,
             content_max_character=content_max_character,
         )
+
+    @mcp.tool(description=sorq.build_sor_query_description())
+    def sor_query(sql: str, limit: int = 50, format: str = "tsv") -> str:
+        # Delegates to the module (imported as `sorq`) so the inner function name
+        # `sor_query` doesn't shadow it, and so a patched sorq.sor_query_impl is
+        # resolved at call time (live attribute lookup).
+        return sorq.sor_query_impl(sql, limit, format)
+
+    @mcp.tool()
+    def sor_schema(table: str | None = None) -> str:
+        """Return the SOR Postgres schema (tables -> columns with types).
+
+        Args:
+            table: A table name to get its columns, or omit for a list of all
+                SOR table names. Use this instead of querying information_schema.
+        """
+        return sorq.sor_schema_impl(table)
 
     @mcp.tool()
     def file_get_chunk(doc_id: str, loc: str) -> dict:
