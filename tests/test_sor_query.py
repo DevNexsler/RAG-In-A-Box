@@ -31,3 +31,36 @@ def test_wrap_clamps_to_hard_max():
 def test_wrap_floor_of_one():
     _, eff = sor_query.wrap_with_limit("SELECT 1", 0)
     assert eff == 1
+
+
+def test_serialize_tsv_basic():
+    rows = [{"id": 1, "name": "Rosado"}, {"id": 2, "name": "Fedak"}]
+    out = sor_query.serialize(rows, "tsv", eff=50)
+    assert out.splitlines()[0] == "id\tname"
+    assert "1\tRosado" in out
+    assert "of >" not in out             # not truncated
+
+
+def test_serialize_truncation_notice():
+    rows = [{"id": i} for i in range(51)]   # eff+1 fetched
+    out = sor_query.serialize(rows, "tsv", eff=50)
+    assert out.startswith("[50 of >50 rows")
+    assert len(out.splitlines()) == 1 + 1 + 50   # notice + header + 50 rows
+
+
+def test_serialize_cell_capping():
+    rows = [{"notes": "x" * 1000}]
+    out = sor_query.serialize(rows, "tsv", eff=50, cell_cap=100)
+    assert "…" in out
+    assert "x" * 1000 not in out
+
+
+def test_serialize_json_format():
+    import json
+    rows = [{"id": 1, "name": "Rosado"}]
+    out = sor_query.serialize(rows, "json", eff=50)
+    assert json.loads(out) == [{"id": 1, "name": "Rosado"}]
+
+
+def test_serialize_empty():
+    assert "0 rows" in sor_query.serialize([], "tsv", eff=50)

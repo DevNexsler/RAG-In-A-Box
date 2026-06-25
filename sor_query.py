@@ -11,6 +11,8 @@ Safety is layered, not regex-based:
 
 from __future__ import annotations
 
+import json
+
 
 def validate_select(sql: str) -> str | None:
     """Return an error string if the query is not a single SELECT/WITH, else None."""
@@ -37,3 +39,38 @@ def wrap_with_limit(sql: str, limit: int) -> tuple[str, int]:
     inner = (sql or "").strip().rstrip(";").strip()
     wrapped = f"SELECT * FROM (\n{inner}\n) AS _sub LIMIT {eff + 1}"
     return wrapped, eff
+
+
+DEFAULT_CELL_CAP = 500
+
+
+def _cap_cell(value, cell_cap: int) -> str:
+    s = "" if value is None else str(value)
+    s = s.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    if len(s) > cell_cap:
+        s = s[:cell_cap] + "…"
+    return s
+
+
+def serialize(rows: list[dict], fmt: str, eff: int,
+              cell_cap: int = DEFAULT_CELL_CAP) -> str:
+    truncated = len(rows) > eff
+    rows = rows[:eff]
+    if fmt == "json":
+        body = json.dumps(
+            [{k: _cap_cell(v, cell_cap) if isinstance(v, str) else v
+              for k, v in r.items()} for r in rows],
+            default=str, ensure_ascii=False,
+        )
+    else:
+        if not rows:
+            body = "(0 rows)"
+        else:
+            cols = list(rows[0].keys())
+            lines = ["\t".join(cols)]
+            for r in rows:
+                lines.append("\t".join(_cap_cell(r.get(c), cell_cap) for c in cols))
+            body = "\n".join(lines)
+    if truncated:
+        return f"[{eff} of >{eff} rows shown — add LIMIT or narrow the WHERE]\n" + body
+    return body
