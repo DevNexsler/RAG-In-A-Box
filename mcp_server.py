@@ -2378,7 +2378,7 @@ if HAS_MCP and FastMCP is not None:
                 import uvicorn
                 from starlette.applications import Starlette
                 from starlette.responses import JSONResponse
-                from starlette.routing import Mount
+                from starlette.routing import Mount, Route
 
                 from api_server import build_api_app
 
@@ -2405,8 +2405,46 @@ if HAS_MCP and FastMCP is not None:
                     async with mcp.session_manager.run():
                         yield
 
-                # Compose: /api/* → REST API, everything else → MCP
+                # Unauthenticated liveness/progress probe (for docker-health etc.).
+                # Returns 503 when an indexer is RUNNING but its heartbeat has gone
+                # stale (a silent freeze); 200 when healthy or idle. A freeze logs
+                # nothing, so this is the only thing that can catch it.
+                async def _health(request):
+                    try:
+                        ir = Path(config["index_root"])
+                        running, pid = _resolve_indexer_pid(ir / "indexer.pid")
+                        if not running:
+                            return JSONResponse({"status": "ok", "indexer": "idle"})
+                        hb = ir / "indexer.heartbeat"
+                        pidf = ir / "indexer.pid"
+                        max_age = float(os.environ.get("INDEXER_HEARTBEAT_MAX_AGE", "1800"))
+                        # Heartbeat age. Until the first heartbeat is written (indexer
+                        # still in Prefect/flow setup), fall back to the pid-file mtime
+                        # (~= start time) so a just-started run isn't a false stall.
+                        ref = hb if hb.exists() else pidf
+                        age = (time.time() - ref.stat().st_mtime) if ref.exists() else None
+                        if age is None or age > max_age:
+                            return JSONResponse(
+                                {
+                                    "status": "stalled",
+                                    "indexer_pid": pid,
+                                    "heartbeat_age_s": round(age) if age is not None else None,
+                                    "max_age_s": max_age,
+                                    "detail": "indexer running but not progressing (frozen?)",
+                                },
+                                status_code=503,
+                            )
+                        return JSONResponse(
+                            {"status": "ok", "indexer": "running",
+                             "indexer_pid": pid, "heartbeat_age_s": round(age)}
+                        )
+                    except Exception as exc:
+                        # Never let a health-check bug cause a false outage.
+                        return JSONResponse({"status": "ok", "health_check_error": str(exc)})
+
+                # Compose: /health → probe, /api/* → REST API, everything else → MCP
                 app = Starlette(routes=[
+                    Route("/health", _health, methods=["GET"]),
                     Mount("/api", app=api_app),
                     Mount("/", app=mcp_app),
                 ], lifespan=lifespan)
@@ -2421,6 +2459,11 @@ if HAS_MCP and FastMCP is not None:
 
                         async def __call__(self, scope, receive, send):
                             if scope["type"] in ("http", "websocket"):
+                                # Liveness probe is unauthenticated (docker-health
+                                # sends no Bearer token).
+                                if scope.get("path") == "/health":
+                                    await self.app(scope, receive, send)
+                                    return
                                 auth_value = b""
                                 user_agent = b""
                                 for name, value in scope.get("headers", []):
