@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import sor_query
 
 
@@ -64,3 +66,18 @@ def test_serialize_json_format():
 
 def test_serialize_empty():
     assert "0 rows" in sor_query.serialize([], "tsv", eff=50)
+
+
+def test_resolve_dsn_from_config_env(monkeypatch):
+    monkeypatch.setenv("SOR_DSN", "postgresql://u@localhost/sor")
+    fake = {"sources": [{"type": "postgres", "name": "sor", "dsn": "${SOR_DSN}"}]}
+    with patch("sor_query.load_config", return_value=fake):
+        assert sor_query.resolve_sor_dsn() == "postgresql://u@localhost/sor"
+
+
+def test_resolve_dsn_missing_raises(monkeypatch):
+    monkeypatch.delenv("SOR_DSN", raising=False)
+    with patch("sor_query.load_config", return_value={"sources": []}):
+        import pytest
+        with pytest.raises(ValueError):
+            sor_query.resolve_sor_dsn()

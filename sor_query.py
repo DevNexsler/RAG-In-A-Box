@@ -12,6 +12,12 @@ Safety is layered, not regex-based:
 from __future__ import annotations
 
 import json
+import os
+
+import psycopg
+from psycopg.rows import dict_row
+
+from core.config import load_config
 
 
 def validate_select(sql: str) -> str | None:
@@ -74,3 +80,52 @@ def serialize(rows: list[dict], fmt: str, eff: int,
     if truncated:
         return f"[{eff} of >{eff} rows shown — add LIMIT or narrow the WHERE]\n" + body
     return body
+
+
+_CONN: "psycopg.Connection | None" = None
+
+
+def resolve_sor_dsn(config_path: str = "config.yaml") -> str:
+    dsn = ""
+    try:
+        config = load_config(config_path)
+        for src in config.get("sources", []):
+            if src.get("type") == "postgres" and src.get("name") == "sor":
+                dsn = src.get("dsn", "") or ""
+                break
+    except Exception:
+        dsn = ""
+    if not dsn:
+        dsn = os.environ.get("SOR_DSN", "")
+    if dsn.startswith("${") and dsn.endswith("}"):
+        dsn = os.environ.get(dsn[2:-1], "")
+    if not dsn:
+        raise ValueError("SOR DSN not configured (sources['sor'].dsn / $SOR_DSN)")
+    return dsn
+
+
+def _get_readonly_conn() -> "psycopg.Connection":
+    """Lazy, recovering, read-only connection in the MCP process.
+
+    Read-only + a 15s statement timeout are enforced at the libpq level via
+    connection options, so they apply to every query and survive reconnects.
+    """
+    global _CONN
+    from psycopg.pq import TransactionStatus
+    stale = (
+        _CONN is None
+        or _CONN.closed
+        or _CONN.pgconn.transaction_status == TransactionStatus.INERROR
+    )
+    if stale:
+        if _CONN is not None and not _CONN.closed:
+            try:
+                _CONN.close()
+            except Exception:
+                pass
+        _CONN = psycopg.connect(
+            resolve_sor_dsn(),
+            row_factory=dict_row,
+            options="-c default_transaction_read_only=on -c statement_timeout=15000",
+        )
+    return _CONN
