@@ -41,7 +41,7 @@ def test_quota_429_in_200_body_retries_then_succeeds():
     responses = [_FakeResponse(quota_err), _FakeResponse(_ok_payload())]
 
     with patch("providers.embed.openrouter_embed.httpx.post", side_effect=responses):
-        with patch("providers.embed.openrouter_embed.time.sleep"):
+        with patch("core.resilience.time.sleep"):
             vectors = _provider()._call_embeddings(["hello"])
 
     assert len(vectors) == 1
@@ -56,7 +56,7 @@ def test_quota_429_exhausting_retries_raises_clear_error():
         "providers.embed.openrouter_embed.httpx.post",
         return_value=_FakeResponse(quota_err),
     ):
-        with patch("providers.embed.openrouter_embed.time.sleep"):
+        with patch("core.resilience.time.sleep"):
             with pytest.raises(RuntimeError, match="429"):
                 _provider()._call_embeddings(["hello"])
 
