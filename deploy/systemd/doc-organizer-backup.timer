@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily 04:30 trigger for the doc-organizer index backup
+
+[Timer]
+# Replaces the loose crontab line: 30 4 * * * scripts/backup_index.sh
+OnCalendar=*-*-* 04:30:00
+# Run a missed backup on next boot if the machine was off at 04:30 (cron could
+# not do this) — strictly safer for backups.
+Persistent=true
+Unit=doc-organizer-backup.service
+
+[Install]
+WantedBy=timers.target
