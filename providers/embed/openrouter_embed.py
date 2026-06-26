@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 
 import httpx
 
+from core.resilience import TransientError, call_with_retry
 from providers.embed.base import EmbedProvider
 
 logger = logging.getLogger(__name__)
@@ -67,72 +67,38 @@ class OpenRouterEmbedProvider(EmbedProvider):
         )
 
     def _call_embeddings(self, texts: list[str]) -> list[list[float]]:
-        """Call /v1/embeddings with retry and backoff."""
+        """Call /v1/embeddings via the shared resilience layer (retries transient
+        5xx/429/timeouts; permanent 4xx raise straight through)."""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        last_exc: Exception | None = None
 
-        for attempt in range(MAX_RETRIES):
-            try:
-                resp = httpx.post(
-                    f"{OPENROUTER_BASE_URL}/embeddings",
-                    json={"model": self.model, "input": texts},
-                    headers=headers,
-                    timeout=self.timeout,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if "data" not in data:
-                    # OpenRouter wraps upstream provider failures (e.g. Nebius
-                    # 429 quota) in an HTTP 200 with an {"error": ...} body.
-                    err = data.get("error") or {}
-                    code = err.get("code")
-                    message = str(err.get("message", data))[:300]
-                    if code == 429 or (isinstance(code, int) and 500 <= code < 600):
-                        last_exc = RuntimeError(f"OpenRouter embedded error {code}: {message}")
-                        backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                        logger.warning(
-                            "embed attempt %d/%d failed (upstream %s in 200 body), retrying in %.0fs...",
-                            attempt + 1, MAX_RETRIES, code, backoff,
-                        )
-                        time.sleep(backoff)
-                        continue
-                    raise RuntimeError(f"OpenRouter embeddings error {code}: {message}")
-                results = sorted(data["data"], key=lambda x: x["index"])
-                return [r["embedding"] for r in results]
+        def _do() -> list[list[float]]:
+            resp = httpx.post(
+                f"{OPENROUTER_BASE_URL}/embeddings",
+                json={"model": self.model, "input": texts},
+                headers=headers,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()  # 5xx/429 -> HTTPStatusError -> retried by the layer
+            data = resp.json()
+            if "data" not in data:
+                # OpenRouter wraps upstream provider failures (e.g. Nebius 429 quota)
+                # in an HTTP 200 with an {"error": ...} body — surface as a transient
+                # so the shared layer retries it (or a permanent error if it's 4xx).
+                err = data.get("error") or {}
+                code = err.get("code")
+                message = str(err.get("message", data))[:300]
+                if code == 429 or (isinstance(code, int) and 500 <= code < 600):
+                    raise TransientError(f"OpenRouter upstream {code} in 200 body: {message}")
+                raise RuntimeError(f"OpenRouter embeddings error {code}: {message}")
+            results = sorted(data["data"], key=lambda x: x["index"])
+            return [r["embedding"] for r in results]
 
-            except (httpx.TimeoutException, httpx.ConnectError) as exc:
-                last_exc = exc
-                backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                logger.warning(
-                    "embed attempt %d/%d failed (%s: %s), retrying in %.0fs...",
-                    attempt + 1, MAX_RETRIES,
-                    type(exc).__name__, exc, backoff,
-                )
-                time.sleep(backoff)
-
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code
-                if status == 429 or 500 <= status < 600:
-                    last_exc = exc
-                    retry_after = exc.response.headers.get("retry-after")
-                    try:
-                        backoff = float(retry_after) if retry_after else RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                    except ValueError:
-                        backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                    logger.warning(
-                        "embed attempt %d/%d failed (HTTP %d), retrying in %.0fs...",
-                        attempt + 1, MAX_RETRIES, status, backoff,
-                    )
-                    time.sleep(backoff)
-                    continue
-                logger.error(
-                    "OpenRouter embedding API error: %d %s",
-                    status, exc.response.text[:500],
-                )
-                raise
+        return call_with_retry(
+            _do, attempts=MAX_RETRIES, backoff=RETRY_BACKOFF, label="openrouter-embed",
+        )
 
         raise last_exc  # type: ignore[misc]
 
