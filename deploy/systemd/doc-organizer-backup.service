@@ -1,0 +1,12 @@
+[Unit]
+Description=doc-organizer LanceDB index nightly backup
+Documentation=https://github.com/DevNexsler/RAG-In-A-Box
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/RAG-in-a-Box
+ExecStart=%h/projects/RAG-in-a-Box/scripts/backup_index.sh
+# Preserve the original crontab behaviour: append stdout+stderr to the same
+# backup log the script writes its own OK/weekly lines to.
+StandardOutput=append:%h/backups/doc-organizer/backup.log
+StandardError=append:%h/backups/doc-organizer/backup.log
