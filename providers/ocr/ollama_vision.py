@@ -44,6 +44,20 @@ _DESCRIBE_PROMPT = (
     "[detailed description here]"
 )
 
+# qwen3-vl:8b IGNORES the API's think=False and still emits a long <think>
+# reasoning trace; on dense images (pay stubs, statements, busy screenshots) that
+# trace alone consumes the entire num_predict budget, so the answer ("content")
+# comes back empty (done_reason=length, content_len=0). Raising num_predict does
+# not help (the reasoning just grows). A plain-language system instruction DOES
+# suppress it — verified on a dense pay stub: content_len 0 -> 2962, done_reason
+# length -> stop, within budget. This is the actual fix for the empty-describe
+# class, distinct from the hang guards below.
+_NO_REASONING_SYSTEM = (
+    "You are a precise document OCR tool. Output ONLY the final answer in the "
+    "requested format. Do not produce any reasoning, analysis, planning, or "
+    "<think> blocks."
+)
+
 
 # Ollama processes one vision request at a time per model. With the indexer
 # running 8-wide, naive concurrent calls queue server-side and expire against
@@ -155,7 +169,10 @@ class OllamaVisionOCR(OCRProvider):
     def _request(self, b64: str, prompt: str, num_predict: int) -> str:
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+            "messages": [
+                {"role": "system", "content": _NO_REASONING_SYSTEM},
+                {"role": "user", "content": prompt, "images": [b64]},
+            ],
             # Stream so httpx's read timeout becomes an inter-token gap (resets
             # per chunk) AND so we can enforce a hard wall-clock deadline by
             # checking elapsed time per chunk and closing the socket. With
@@ -164,8 +181,9 @@ class OllamaVisionOCR(OCRProvider):
             # (~300s on verbose images) — and one such call holding _VISION_GATE
             # froze the whole 8-worker indexer.
             "stream": True,
-            # think=False: skip qwen3-vl's deliberation trace (it burned ~2 min
-            # per image). keep_alive: pin the model warm (~80s cold-load avoided).
+            # think=False is sent but qwen3-vl:8b IGNORES it (it still reasons) —
+            # _NO_REASONING_SYSTEM above is what actually forces a direct answer.
+            # Kept anyway as a no-cost hint. keep_alive: pin the model warm.
             "think": False,
             "keep_alive": _KEEP_ALIVE,
             # temperature=0 (greedy) -> deterministic, faithful description every
