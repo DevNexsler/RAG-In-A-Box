@@ -166,8 +166,9 @@ class TestDeepSeekOCR2Unit:
         from providers.ocr import build_ocr_provider
         from providers.ocr.composite import CompositeOCRProvider
 
+        from PIL import Image as _Img
         img = tmp_path / "photo.png"
-        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+        _Img.new("RGB", (8, 8), "white").save(str(img))  # real PNG for the VL downscale
         config = {
             "ocr": {
                 "enabled": True,
@@ -193,16 +194,33 @@ class TestDeepSeekOCR2Unit:
             deepseek_post.return_value = deepseek_resp
             assert provider.extract(img) == "pdf page text"
 
-        with patch("providers.ocr.ollama_vision.httpx.post") as ollama_post:
-            ollama_resp = MagicMock()
-            ollama_resp.json.return_value = {"message": {"content": "image description"}}
-            ollama_resp.raise_for_status = MagicMock()
-            ollama_post.return_value = ollama_resp
+        # ollama_vision streams via httpx.Client().stream() (not httpx.post) —
+        # capture the stream call to assert routing + payload.
+        import json as _json
+        captured = {}
+
+        class _OllamaResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def raise_for_status(self): pass
+            def iter_lines(self):
+                return iter([_json.dumps(
+                    {"message": {"content": "image description"}, "done": True})])
+
+        class _OllamaClient:
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def stream(self, method, url, json=None):
+                captured["url"], captured["payload"] = url, json
+                return _OllamaResp()
+
+        with patch("providers.ocr.ollama_vision.httpx.Client", _OllamaClient):
             assert provider.describe(img) == "image description"
 
         assert deepseek_post.call_args.args[0] == "http://deepseek:8790/extract"
-        assert ollama_post.call_args.args[0] == "http://ollama:11434/api/chat"
-        assert ollama_post.call_args.kwargs["json"]["model"] == "qwen3-vl:8b"
+        assert captured["url"] == "http://ollama:11434/api/chat"
+        assert captured["payload"]["model"] == "qwen3-vl:8b"
 
 
 class TestOllamaVisionBudget:
@@ -211,62 +229,86 @@ class TestOllamaVisionBudget:
     and surfaces the rare still-empty result instead of storing a silent stub."""
 
     def _img(self, tmp_path):
+        from PIL import Image
         img = tmp_path / "photo.jpg"
-        img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+        Image.new("RGB", (8, 8), "white").save(str(img))  # real image for downscale
         return img
 
-    def _mock_post(self, content):
-        resp = MagicMock()
-        resp.json.return_value = {"message": {"content": content}}
-        resp.raise_for_status = MagicMock()
-        return resp
+    @staticmethod
+    def _fake_client(contents):
+        """Build a fake httpx.Client whose .stream() yields contents[i] on the
+        i-th call (last value repeats). _request streams via httpx.Client, not
+        httpx.post, so we patch the client and record each call's payload/count."""
+        import json as _json
+        state = {"payloads": [], "calls": 0}
+        seq = list(contents)
+
+        class _Resp:
+            def __init__(self, content): self._c = content
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def raise_for_status(self): pass
+            def iter_lines(self):
+                return iter([_json.dumps({"message": {"content": self._c}, "done": True})])
+
+        class _Client:
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def stream(self, method, url, json=None):
+                i = state["calls"]; state["calls"] += 1
+                state["payloads"].append(json)
+                return _Resp(seq[i] if i < len(seq) else seq[-1])
+
+        return _Client, state
 
     def test_describe_uses_larger_num_predict(self, tmp_path):
         from providers.ocr.ollama_vision import OllamaVisionOCR, _DESCRIBE_NUM_PREDICT
 
-        with patch("providers.ocr.ollama_vision.httpx.post",
-                   return_value=self._mock_post("a description")) as post:
+        Client, state = self._fake_client(["a description"])
+        with patch("providers.ocr.ollama_vision.httpx.Client", Client):
             OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
-        assert post.call_args.kwargs["json"]["options"]["num_predict"] == _DESCRIBE_NUM_PREDICT
+        opts = state["payloads"][0]["options"]
+        assert opts["num_predict"] == _DESCRIBE_NUM_PREDICT
         assert _DESCRIBE_NUM_PREDICT >= 2048
         # greedy decoding — deterministic, faithful descriptions
-        assert post.call_args.kwargs["json"]["options"]["temperature"] == 0
+        assert opts["temperature"] == 0
         # model kept warm to avoid the ~80s cold-reload tax per call
-        assert post.call_args.kwargs["json"]["keep_alive"]
+        assert state["payloads"][0]["keep_alive"]
 
     def test_extract_keeps_default_num_predict(self, tmp_path):
         from providers.ocr.ollama_vision import OllamaVisionOCR, _EXTRACT_NUM_PREDICT
 
-        with patch("providers.ocr.ollama_vision.httpx.post",
-                   return_value=self._mock_post("some text")) as post:
+        Client, state = self._fake_client(["some text"])
+        with patch("providers.ocr.ollama_vision.httpx.Client", Client):
             OllamaVisionOCR(base_url="http://ollama:11434").extract(self._img(tmp_path))
-        assert post.call_args.kwargs["json"]["options"]["num_predict"] == _EXTRACT_NUM_PREDICT
+        assert state["payloads"][0]["options"]["num_predict"] == _EXTRACT_NUM_PREDICT
 
     def test_describe_empty_returns_empty_and_warns(self, tmp_path, caplog):
         import logging
         from providers.ocr.ollama_vision import OllamaVisionOCR, _DESCRIBE_EMPTY_RETRIES
 
-        with patch("providers.ocr.ollama_vision.httpx.post",
-                   return_value=self._mock_post("")) as post:
+        Client, state = self._fake_client([""])  # always empty
+        with patch("providers.ocr.ollama_vision.httpx.Client", Client):
             with patch("providers.ocr.ollama_vision.time.sleep"):
                 with caplog.at_level(logging.WARNING, logger="providers.ocr.ollama_vision"):
                     result = OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
         assert result == ""
         assert any("empty" in r.message.lower() for r in caplog.records)
         # a persistently-empty describe is retried before giving up
-        assert post.call_count == 1 + _DESCRIBE_EMPTY_RETRIES
+        assert state["calls"] == 1 + _DESCRIBE_EMPTY_RETRIES
 
     def test_describe_retries_empty_then_succeeds(self, tmp_path):
         """An empty describe is usually transient (timeout/contention under
         load), so describe() retries and returns the recovered description."""
         from providers.ocr.ollama_vision import OllamaVisionOCR
 
-        with patch("providers.ocr.ollama_vision.httpx.post",
-                   side_effect=[self._mock_post(""), self._mock_post("a real description")]) as post:
+        Client, state = self._fake_client(["", "a real description"])
+        with patch("providers.ocr.ollama_vision.httpx.Client", Client):
             with patch("providers.ocr.ollama_vision.time.sleep"):
                 result = OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
         assert result == "a real description"
-        assert post.call_count == 2
+        assert state["calls"] == 2
 
 
 # -----------------------------------------------------------------------
@@ -383,3 +425,41 @@ class TestDeepSeekOCR2Live:
 
         text = provider.extract(png_path)
         assert "12345" in text or "500" in text, f"Expected invoice content, got: {text[:200]}"
+
+
+def test_ollama_request_prepends_no_reasoning_system_message(monkeypatch):
+    """_request must send a system message suppressing qwen3-vl's reasoning trace.
+
+    qwen3-vl:8b ignores the API's think=False and emits a long <think> trace that
+    eats the whole num_predict budget, returning empty content on dense images.
+    A plain-language system instruction is what actually forces a direct answer;
+    this guards that it stays in the request payload (regression for the
+    empty-describe / done_reason=length bug)."""
+    import json as _json
+    from providers.ocr import ollama_vision as ov
+
+    captured = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def raise_for_status(self): pass
+        def iter_lines(self):
+            return iter([_json.dumps({"message": {"content": "OCR text"}, "done": True})])
+
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def stream(self, method, url, json=None):
+            captured["payload"] = json
+            return FakeResp()
+
+    monkeypatch.setattr("providers.ocr.ollama_vision.httpx.Client", FakeClient)
+    prov = ov.OllamaVisionOCR(base_url="http://x:11434", model="qwen3-vl:8b")
+    out = prov._request("B64DATA", ov._DESCRIBE_PROMPT, 5120)
+
+    assert out == "OCR text"                      # still parses the stream
+    msgs = captured["payload"]["messages"]
+    assert msgs[0] == {"role": "system", "content": ov._NO_REASONING_SYSTEM}
+    assert msgs[1]["role"] == "user" and msgs[1]["images"] == ["B64DATA"]
