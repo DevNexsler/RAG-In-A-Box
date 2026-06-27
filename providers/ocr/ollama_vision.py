@@ -106,13 +106,11 @@ _VISION_READ_GAP = float(os.environ.get("OLLAMA_VISION_READ_GAP", "90"))
 # rather than block forever. Must exceed the per-call wall deadline (self.timeout).
 _VISION_GATE_TIMEOUT = float(os.environ.get("OLLAMA_VISION_GATE_TIMEOUT", "600"))
 
-# Keep the 16.8GB model resident between calls. Without this the model unloaded
-# and cold-reloaded (~80s of load_duration) on most calls — stacked on a real
-# generation that blew past the request timeout, producing a cascade of
-# timeouts mid-backfill. Pinning it warm makes load_duration ~0 for back-to-back
-# image calls. (A PDF routed to a different OCR model can still evict it; that
-# is rare in image-heavy work.)
-_KEEP_ALIVE = "30m"
+# NOTE: model keep-alive (how long ollama keeps qwen3-vl resident) is intentionally NOT
+# set from this client. It lives on the Mac Mini as OLLAMA_KEEP_ALIVE=-1 (pin forever) —
+# the single source of truth for the vision host's memory policy, alongside deepseek's
+# idle_timeout=0. A per-request keep_alive here would OVERRIDE that server default, so we
+# omit it and defer to the host (where both vision models are pinned; 32GB fits both).
 
 
 def _downscale(image_bytes: bytes) -> bytes:
@@ -183,9 +181,9 @@ class OllamaVisionOCR(OCRProvider):
             "stream": True,
             # think=False is sent but qwen3-vl:8b IGNORES it (it still reasons) —
             # _NO_REASONING_SYSTEM above is what actually forces a direct answer.
-            # Kept anyway as a no-cost hint. keep_alive: pin the model warm.
+            # Kept anyway as a no-cost hint. (keep_alive is intentionally omitted — the
+            # Mac Mini's OLLAMA_KEEP_ALIVE=-1 pins the model; see the module note above.)
             "think": False,
-            "keep_alive": _KEEP_ALIVE,
             # temperature=0 (greedy) -> deterministic, faithful description every
             # time (sampled decoding occasionally produced near-empty stubs).
             "options": {"num_predict": num_predict, "temperature": 0},
