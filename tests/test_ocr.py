@@ -273,8 +273,10 @@ class TestOllamaVisionBudget:
         assert _DESCRIBE_NUM_PREDICT >= 2048
         # greedy decoding — deterministic, faithful descriptions
         assert opts["temperature"] == 0
-        # model kept warm to avoid the ~80s cold-reload tax per call
-        assert state["payloads"][0]["keep_alive"]
+        # keep-alive is intentionally NOT sent from the client — the vision host (Mac Mini)
+        # owns the pin-resident policy via OLLAMA_KEEP_ALIVE=-1; a per-request value here
+        # would override that server default, so we omit it.
+        assert "keep_alive" not in state["payloads"][0]
 
     def test_extract_keeps_default_num_predict(self, tmp_path):
         from providers.ocr.ollama_vision import OllamaVisionOCR, _EXTRACT_NUM_PREDICT
