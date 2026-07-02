@@ -738,6 +738,9 @@ def _merge_degraded_ledger(
 # mtime); the diff excludes a skip-ledgered doc only while that key is
 # unchanged, so a genuinely modified file is re-evaluated.
 
+_SKIP_RETRY_SECONDS = 24 * 60 * 60
+
+
 def _change_key(record: dict) -> str:
     return str(record.get("change_hash") or "") or f"mtime:{record.get('mtime', 0.0)}"
 
@@ -768,17 +771,29 @@ def _save_skip_ledger(index_root: Path, ledger: dict) -> None:
 def _exclude_skipped_docs(
     to_add_or_update: list[dict],
     ledger: dict,
+    now: float | None = None,
 ) -> tuple[list[dict], int]:
     """Drop docs whose change key still matches a skip-ledger entry — they were
     already decided 'do not index' and the file is unchanged. A doc whose key
-    differs (file modified) is kept, so the skip decision is re-evaluated."""
+    differs (file modified) is kept, so the skip decision is re-evaluated.
+
+    Exclusion is bounded: an entry older than _SKIP_RETRY_SECONDS is due for
+    one re-attempt (kept), so a skipped doc is never permanently abandoned.
+    Legacy entries with no skipped_at stamp are due immediately and get
+    stamped by their next merge."""
     docs = ledger.get("docs", {})
     if not docs:
         return to_add_or_update, 0
+    if now is None:
+        now = time.time()
     kept, skipped = [], 0
     for r in to_add_or_update:
         entry = docs.get(str(r.get("doc_id", "")))
-        if entry is not None and entry.get("change_key") == _change_key(r):
+        if (
+            entry is not None
+            and entry.get("change_key") == _change_key(r)
+            and now - float(entry.get("skipped_at") or 0.0) < _SKIP_RETRY_SECONDS
+        ):
             skipped += 1
         else:
             kept.append(r)
@@ -789,14 +804,19 @@ def _merge_skip_ledger(
     ledger: dict,
     skip_now: dict[str, dict],
     skip_clean: set[str],
+    now: float | None = None,
 ) -> dict:
     """Add this run's skip decisions; drop docs that indexed cleanly (no longer
-    skipped — e.g. a duplicate's canonical was deleted, or a file was fixed)."""
+    skipped — e.g. a duplicate's canonical was deleted, or a file was fixed).
+    Entries are stamped skipped_at so exclusion expires after
+    _SKIP_RETRY_SECONDS (bounded retry); a re-skipped doc gets a fresh stamp."""
+    if now is None:
+        now = time.time()
     docs = dict(ledger.get("docs", {}))
     for doc_id in skip_clean:
         docs.pop(doc_id, None)
     for doc_id, info in skip_now.items():
-        docs[doc_id] = info
+        docs[doc_id] = {**info, "skipped_at": now}
     return {"docs": docs}
 
 
@@ -862,7 +882,11 @@ def _annotate_canonical_sidecar(
         logger.warning("Canonical sidecar annotation failed: %s", exc)
 
 
-@task(retries=1, timeout_seconds=1800)
+# No timeout_seconds here: Prefect cannot interrupt tasks running in worker
+# threads (its own warning says so), so a timeout was a false safety net that
+# logged one warning per task (~1350/run). Freeze detection is owned by the
+# indexer heartbeat (_write_heartbeat) + the /health 503.
+@task(retries=1)
 def process_doc_task(doc: dict) -> None:
     """Extract text, chunk with LlamaIndex, embed, upsert into store.
 
@@ -988,7 +1012,18 @@ def process_doc_task(doc: dict) -> None:
     full_text = _with_communication_caption(result.full_text, source_metadata)
 
     if not full_text.strip():
-        logger.warning(f"No text extracted: {doc_id}")
+        if collect_degradations():
+            # Emptiness caused by a transient extraction failure (OCR/vision
+            # timeout, backend down) — leave it to the degraded lane, which
+            # retries with capped attempts instead of the daily skip window.
+            logger.debug(f"No text extracted (degraded, will retry): {doc_id}")
+        else:
+            # Genuinely contentless (empty transcript row, blank mail body,
+            # sidecar JSON with no text). Record a skip so the diff stops
+            # re-processing it every run; the ledger re-attempts it after
+            # _SKIP_RETRY_SECONDS or as soon as the doc changes.
+            note_skip("no_text_extracted")
+            logger.debug(f"No text extracted: {doc_id}")
         return
 
     context_text = ""
@@ -1971,9 +2006,19 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         )
         _save_skip_ledger(index_root, updated_skip)
         if skip_now:
+            # One summary line instead of a warning per doc (the per-doc
+            # "No text extracted" flood was ~1350 lines/run — see #0107).
+            # Reasons like "duplicate_of:<id>" aggregate on their prefix.
+            reason_counts = Counter(
+                reason.split(":", 1)[0]
+                for info in skip_now.values()
+                for reason in info.get("reasons", [])
+            )
             logger.info(
-                "%d docs added to skip ledger (won't reprocess until changed)",
+                "%d docs added to skip ledger (excluded while unchanged, retry in %dh): %s",
                 len(skip_now),
+                _SKIP_RETRY_SECONDS // 3600,
+                dict(reason_counts),
             )
 
     write_index_metadata_task(
