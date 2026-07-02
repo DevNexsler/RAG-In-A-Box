@@ -1600,3 +1600,82 @@ def test_file_status_ignores_non_indexer_pid_file(tmp_path):
         mcp_server._cache = old_cache
         other_proc.terminate()
         other_proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# /health probe (_health_probe) — unauthenticated docker-health endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_health_probe_ok_when_idle_and_no_warnings(tmp_path):
+    """Idle indexer with no recorded FTS failures probes healthy."""
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload == {"status": "ok", "indexer": "idle"}
+
+
+def test_health_probe_degraded_when_fts_rebuild_failed(tmp_path):
+    """A recorded fts_rebuild_failed warning must 503 the probe (#0106).
+
+    Keyword search silently going stale used to be invisible: the flow ends
+    Completed() and fts_available stays true. The probe is the one unauthenticated
+    surface docker-health can watch, so persistent FTS failure must show here.
+    """
+    import json
+
+    (tmp_path / "index_metadata.json").write_text(json.dumps({
+        "last_run_at": "2026-07-02T06:05:15+00:00",
+        "warning_counts": {"fts_rebuild_failed": 1},
+    }))
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "degraded"
+    assert payload["fts_rebuild_failed"] == 1
+
+
+def test_health_probe_running_fresh_heartbeat_is_ok(tmp_path):
+    """A live indexer with a fresh heartbeat probes healthy."""
+    (tmp_path / "indexer.heartbeat").write_text("beat")
+
+    with patch("mcp_server._resolve_indexer_pid", return_value=(True, 12345)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["indexer"] == "running"
+    assert payload["indexer_pid"] == 12345
+    assert payload["heartbeat_age_s"] == 0
+
+
+def test_health_probe_stalled_heartbeat_still_503s(tmp_path):
+    """The pre-existing frozen-indexer detection survives the FTS addition."""
+    hb = tmp_path / "indexer.heartbeat"
+    hb.write_text("beat")
+    stale = time.time() - 4000  # default max age is 1800s
+    os.utime(hb, (stale, stale))
+
+    with patch("mcp_server._resolve_indexer_pid", return_value=(True, 12345)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "stalled"
+
+
+def test_health_probe_running_with_fts_failure_degrades(tmp_path):
+    """FTS failure is surfaced even while an indexer run is in progress."""
+    import json
+
+    (tmp_path / "indexer.heartbeat").write_text("beat")
+    (tmp_path / "index_metadata.json").write_text(json.dumps({
+        "warning_counts": {"fts_rebuild_failed": 1},
+    }))
+
+    with patch("mcp_server._resolve_indexer_pid", return_value=(True, 12345)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "degraded"
+    assert payload["fts_rebuild_failed"] == 1
