@@ -938,6 +938,133 @@ def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
     fake_store.create_fts_index.assert_called_once_with()
 
 
+def _run_flow_with_fts_store(tmp_path, fake_store, diff_result):
+    """Run index_vault_flow with a mocked store and pipeline.
+
+    Returns the write_index_metadata_task mock so callers can assert on the
+    warnings recorded for the run.
+    """
+    from sources.base import SourceRecord
+    from flow_index_vault import index_vault_flow
+
+    fake_registry = MagicMock()
+    fake_registry.count.return_value = 1
+
+    fake_taxonomy = MagicMock()
+    fake_taxonomy.count.return_value = 0
+
+    class _FakeSource:
+        name = "documents"
+
+        def scan(self):
+            return iter([
+                SourceRecord(
+                    doc_id="doc-1",
+                    natural_key="doc-1.txt",
+                    source_type="txt",
+                    mtime=2.0,
+                    size=4,
+                    metadata={"abs_path": str(tmp_path / "doc-1.txt"), "ext": "txt"},
+                )
+            ])
+
+        def set_ocr_provider(self, provider):
+            return None
+
+        def close(self):
+            return None
+
+    config = {
+        "index_root": str(tmp_path / "index"),
+        "sources": [{"type": "filesystem", "name": "documents", "root": str(tmp_path)}],
+        "chunking": {"max_chars": 1800, "overlap": 200, "semantic": {"enabled": False}},
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+
+    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+        with patch("flow_index_vault.load_config", return_value=config):
+            with patch("flow_index_vault.open_store_with_recovery", return_value=fake_store):
+                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                            with patch("sources.build_source", return_value=_FakeSource()):
+                                with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                    with patch("flow_index_vault.diff_index_task", return_value=diff_result):
+                                        with patch("flow_index_vault._process_docs", return_value=[]):
+                                            with patch("flow_index_vault.delete_docs_task"):
+                                                with patch("flow_index_vault.index_stats_task"):
+                                                    with patch("flow_index_vault.write_index_metadata_task") as meta_mock:
+                                                        index_vault_flow.fn("dummy.yaml")
+    return meta_mock
+
+
+def _changed_doc_diff():
+    """diff_index_task result with one changed doc (and no deletes)."""
+    return (
+        [{
+            "doc_id": "documents::doc-1",
+            "rel_path": "doc-1.txt",
+            "abs_path": "doc-1.txt",
+            "mtime": 2.0,
+            "change_hash": "",
+            "size": 4,
+        }],
+        [],
+    )
+
+
+def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
+    """A failed incremental FTS update must self-heal via full rebuild.
+
+    The Lance-native incremental merge (table.optimize()) panics forever once
+    the on-disk inverted index is inconsistent (#0106) — retrying it next run
+    can never succeed, so the flow must fall back to create_fts_index() in the
+    same run instead of leaving keyword search silently stale.
+    """
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = ["documents::doc-1"]
+    fake_store.list_doc_mtimes.return_value = {"documents::doc-1": 1.0}
+    fake_store.list_doc_change_hashes.return_value = {}
+    fake_store.count_chunks.return_value = 1
+    fake_store.fts_available.return_value = True
+    fake_store.ensure_fts_index.side_effect = RuntimeError(
+        "rust future panicked: unknown error"
+    )
+
+    meta_mock = _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
+
+    fake_store.ensure_fts_index.assert_called_once_with()
+    fake_store.create_fts_index.assert_called_once_with()
+    warnings = meta_mock.call_args[0][4] or []
+    assert any(w.startswith("fts_incremental_update_failed:") for w in warnings)
+    # The rebuild succeeded, so the run must NOT count as an FTS failure.
+    assert not any(w.startswith("fts_rebuild_failed") for w in warnings)
+
+
+def test_fts_full_rebuild_fallback_failure_records_warning(tmp_path):
+    """If the full-rebuild fallback ALSO fails, fts_rebuild_failed is recorded."""
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = ["documents::doc-1"]
+    fake_store.list_doc_mtimes.return_value = {"documents::doc-1": 1.0}
+    fake_store.list_doc_change_hashes.return_value = {}
+    fake_store.count_chunks.return_value = 1
+    fake_store.fts_available.return_value = True
+    fake_store.ensure_fts_index.side_effect = RuntimeError(
+        "rust future panicked: unknown error"
+    )
+    fake_store.create_fts_index.side_effect = RuntimeError("still broken")
+
+    meta_mock = _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
+
+    fake_store.create_fts_index.assert_called_once_with()
+    warnings = meta_mock.call_args[0][4] or []
+    assert any(w.startswith("fts_rebuild_failed:") for w in warnings)
+
+
 def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
     """An EXPLICIT full rebuild (safety.force_full_rebuild) populates a shadow
     table and swaps it in once ready. Shadow is never auto-inferred from diff

@@ -196,6 +196,63 @@ def _resolve_indexer_pid(pid_file: Path) -> tuple[bool, int | None]:
     return True, pid
 
 
+def _fts_rebuild_failed_count(index_root: Path) -> int:
+    """fts_rebuild_failed count from the last indexer run's metadata.
+
+    Non-zero means the last run could not update OR fully rebuild the FTS
+    index — keyword search results are silently going stale (#0106).
+    """
+    import json
+
+    try:
+        meta = json.loads((index_root / "index_metadata.json").read_text())
+        return int(meta.get("warning_counts", {}).get("fts_rebuild_failed", 0) or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+def _health_probe(config: dict) -> tuple[dict, int]:
+    """Payload and HTTP status for the unauthenticated /health probe.
+
+    503 is reserved for states that need operator attention: an indexer that
+    is running but frozen (stale heartbeat — a freeze logs nothing, so this
+    probe is the only thing that can catch it), and an FTS index whose last
+    rebuild failed (keyword search silently going stale, #0106).
+    """
+    index_root = Path(config["index_root"])
+    running, pid = _resolve_indexer_pid(index_root / "indexer.pid")
+    payload: dict = {"status": "ok", "indexer": "running" if running else "idle"}
+    if running:
+        hb = index_root / "indexer.heartbeat"
+        pidf = index_root / "indexer.pid"
+        max_age = float(os.environ.get("INDEXER_HEARTBEAT_MAX_AGE", "1800"))
+        # Heartbeat age. Until the first heartbeat is written (indexer
+        # still in Prefect/flow setup), fall back to the pid-file mtime
+        # (~= start time) so a just-started run isn't a false stall.
+        ref = hb if hb.exists() else pidf
+        age = (time.time() - ref.stat().st_mtime) if ref.exists() else None
+        if age is None or age > max_age:
+            return (
+                {
+                    "status": "stalled",
+                    "indexer_pid": pid,
+                    "heartbeat_age_s": round(age) if age is not None else None,
+                    "max_age_s": max_age,
+                    "detail": "indexer running but not progressing (frozen?)",
+                },
+                503,
+            )
+        payload["indexer_pid"] = pid
+        payload["heartbeat_age_s"] = round(age)
+    fts_failed = _fts_rebuild_failed_count(index_root)
+    if fts_failed:
+        payload["status"] = "degraded"
+        payload["fts_rebuild_failed"] = fts_failed
+        payload["detail"] = "FTS index rebuild failing — keyword search is going stale"
+        return payload, 503
+    return payload, 200
+
+
 def _hit_to_dict(h: SearchHit, include_text: bool = False) -> dict:
     """Convert a SearchHit to a response dict."""
     d: dict = {
@@ -2424,38 +2481,14 @@ if HAS_MCP and FastMCP is not None:
                         yield
 
                 # Unauthenticated liveness/progress probe (for docker-health etc.).
-                # Returns 503 when an indexer is RUNNING but its heartbeat has gone
-                # stale (a silent freeze); 200 when healthy or idle. A freeze logs
-                # nothing, so this is the only thing that can catch it.
+                # Returns 503 when an indexer is RUNNING but its heartbeat has
+                # gone stale (a silent freeze), or when the last run failed to
+                # rebuild the FTS index (keyword search silently going stale);
+                # 200 when healthy or idle. See _health_probe.
                 async def _health(request):
                     try:
-                        ir = Path(config["index_root"])
-                        running, pid = _resolve_indexer_pid(ir / "indexer.pid")
-                        if not running:
-                            return JSONResponse({"status": "ok", "indexer": "idle"})
-                        hb = ir / "indexer.heartbeat"
-                        pidf = ir / "indexer.pid"
-                        max_age = float(os.environ.get("INDEXER_HEARTBEAT_MAX_AGE", "1800"))
-                        # Heartbeat age. Until the first heartbeat is written (indexer
-                        # still in Prefect/flow setup), fall back to the pid-file mtime
-                        # (~= start time) so a just-started run isn't a false stall.
-                        ref = hb if hb.exists() else pidf
-                        age = (time.time() - ref.stat().st_mtime) if ref.exists() else None
-                        if age is None or age > max_age:
-                            return JSONResponse(
-                                {
-                                    "status": "stalled",
-                                    "indexer_pid": pid,
-                                    "heartbeat_age_s": round(age) if age is not None else None,
-                                    "max_age_s": max_age,
-                                    "detail": "indexer running but not progressing (frozen?)",
-                                },
-                                status_code=503,
-                            )
-                        return JSONResponse(
-                            {"status": "ok", "indexer": "running",
-                             "indexer_pid": pid, "heartbeat_age_s": round(age)}
-                        )
+                        payload, status_code = _health_probe(config)
+                        return JSONResponse(payload, status_code=status_code)
                     except Exception as exc:
                         # Never let a health-check bug cause a false outage.
                         return JSONResponse({"status": "ok", "health_check_error": str(exc)})

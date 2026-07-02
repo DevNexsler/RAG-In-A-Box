@@ -1902,7 +1902,20 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
                 logger.info("Rebuilding FTS index...")
                 store.create_fts_index()
             else:
-                store.ensure_fts_index()
+                try:
+                    store.ensure_fts_index()
+                except Exception as exc:
+                    # A corrupt inverted index fails the incremental merge
+                    # deterministically, so retrying next run can never succeed
+                    # — rebuild from scratch in the same run instead.
+                    logger.error(
+                        "Incremental FTS update failed: %s — falling back to full rebuild",
+                        exc,
+                    )
+                    _RUNTIME.setdefault("_warnings", []).append(
+                        f"fts_incremental_update_failed: {exc}"
+                    )
+                    store.create_fts_index()
         except Exception as exc:
             fts_rebuild_ok = False
             logger.error("FTS index update failed: %s", exc)
