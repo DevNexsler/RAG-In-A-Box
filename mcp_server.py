@@ -396,6 +396,12 @@ def _slim_hit_to_dict(h: SearchHit) -> dict:
         val = extra.get(meta_key)
         if val not in (None, ""):
             d[out_key] = str(val)
+    # Drop identity echoes: comm rows carry a title/rel_path that merely
+    # repeats the message id already present in doc_id/source_id (~15%/hit).
+    if d.get("rel_path") and h.doc_id.endswith(d["rel_path"]):
+        d["rel_path"] = ""
+    if d.get("title") and (h.doc_id.endswith(d["title"]) or d.get("source_id") == d["title"]):
+        d["title"] = ""
     return {k: v for k, v in d.items() if v not in (None, "")}
 
 
