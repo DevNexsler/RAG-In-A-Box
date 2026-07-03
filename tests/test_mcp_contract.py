@@ -117,7 +117,8 @@ def _comm_hit(**extra):
         text="Hi, is the 2BR still available?",
         score=0.91,
         source_type="pg_message",
-        title="",
+        title="AC123abc",
+        rel_path="quo/AC123abc",
         tags="",
         extra_metadata=meta,
     )
@@ -125,7 +126,8 @@ def _comm_hit(**extra):
 
 def test_slim_hit_comm_message_flat_with_direction():
     """Slim shape for a comm hit: flat sent_at/channel/sender/direction/
-    source_id, no verbose empties, no nested custom_meta, no content blob."""
+    source_id, no verbose empties, no nested custom_meta, no content blob.
+    title/rel_path that merely repeat the message id are omitted too."""
     d = mcp_server._slim_hit_to_dict(_comm_hit())
 
     assert d["doc_id"] == "comm_messages::quo/AC123abc"
@@ -138,10 +140,13 @@ def test_slim_hit_comm_message_flat_with_direction():
 
     for verbose_key in (
         "tags", "keywords", "description", "author", "section", "size",
-        "status", "custom_meta", "content", "content_truncated", "title",
+        "status", "custom_meta", "content", "content_truncated",
         "enr_summary", "enr_topics",
     ):
         assert verbose_key not in d, f"{verbose_key!r} should not be in slim output"
+    # redundant identity echoes dropped: title == source_id, rel_path in doc_id
+    assert "title" not in d
+    assert "rel_path" not in d
 
 
 def test_slim_hit_document_keeps_title_and_path_omits_comm_fields():
