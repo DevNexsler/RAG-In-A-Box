@@ -39,6 +39,9 @@ services:
       - DOCUMENTS_ROOT=/data/documents
       - INDEX_ROOT=/data/index
       - INDEXER_DEBUG_CONCURRENCY=${INDEXER_DEBUG_CONCURRENCY:-}
+      # Prune Lance versions older than this each indexing run (#0112); keeps
+      # the index from re-accumulating dead versions. Default 30m if unset.
+      - LANCE_VERSION_RETENTION_MINUTES=${LANCE_VERSION_RETENTION_MINUTES:-30}
 
 networks:
   rag-net:

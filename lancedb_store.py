@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -57,6 +58,34 @@ _LLAMA_MANAGED_METADATA_KEYS = frozenset({
     "doc_id",
     "ref_doc_id",
 })
+
+
+_DEFAULT_LANCE_VERSION_RETENTION_MINUTES = 30.0
+
+
+def _lance_version_retention_minutes() -> float:
+    """Retention window for Lance version pruning (env-tunable).
+
+    Versions younger than this are kept so in-flight readers are never cut off;
+    older ones are reclaimed each indexing run. Non-positive/invalid disables
+    the guard band (prune everything superseded, most aggressive)."""
+    raw = os.environ.get("LANCE_VERSION_RETENTION_MINUTES")
+    if raw is None:
+        return _DEFAULT_LANCE_VERSION_RETENTION_MINUTES
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_LANCE_VERSION_RETENTION_MINUTES
+    return max(0.0, val)
+
+
+def _is_retryable_commit_conflict(exc: BaseException) -> bool:
+    """True for Lance's transient 'Retryable commit conflict' raised when a
+    prune races a concurrent write — safe to retry."""
+    text = str(exc).lower()
+    return "retryable commit conflict" in text or (
+        "conflict" in text and "retry" in text
+    )
 
 
 def _strip_llama_managed_keys(meta: dict) -> dict:
@@ -871,8 +900,42 @@ class LanceDBStore:
             table.create_fts_index(text_key, use_tantivy=False)
             logger.info("FTS index created on column %r", text_key)
             return
-        table.optimize()
+        self._optimize_and_prune(table)
         logger.info("FTS index optimized (incremental merge)")
+
+    def _optimize_and_prune(self, table) -> None:
+        """Compact + merge the index, and prune Lance versions older than the
+        retention window in the same pass.
+
+        optimize() compacts data files but leaves every superseded version on
+        disk; without a prune those dead versions accumulate unbounded (they
+        grew the index 5 GB -> 8.6 GB in ~11 h of routine indexing). Passing
+        cleanup_older_than reclaims them each run while keeping a retention
+        window so any in-flight reader on a recent version is unaffected.
+
+        The prune can hit a retryable Lance commit conflict under concurrent
+        writes; retry those, and if it still fails fall back to a plain
+        optimize() — pruning is housekeeping and must never fail an indexing
+        run (stale versions just get reclaimed on the next pass).
+        """
+        from datetime import timedelta
+
+        from core.resilience import call_with_retry
+
+        retention = timedelta(minutes=_lance_version_retention_minutes())
+        try:
+            call_with_retry(
+                lambda: table.optimize(cleanup_older_than=retention),
+                attempts=3,
+                backoff=(2.0, 5.0),
+                label="lance optimize+prune",
+                classify=_is_retryable_commit_conflict,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Version prune failed (%s); compacting without prune this run", exc
+            )
+            table.optimize()
 
     def fts_available(self) -> bool:
         """Check if the FTS/tantivy index is operational (health check for file_status)."""
