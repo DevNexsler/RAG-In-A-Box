@@ -31,7 +31,7 @@ async def test_file_search_tool_schema_includes_complex_filter():
     assert file_search.inputSchema["properties"]["filter"]["title"] == "Filter"
     assert "return" in file_search.inputSchema["properties"]
     assert "return_mode" not in file_search.inputSchema["properties"]
-    assert file_search.inputSchema["properties"]["return"]["default"] == "compact"
+    assert file_search.inputSchema["properties"]["return"]["default"] == "slim"
     assert "content_max_character" in file_search.inputSchema["properties"]
     assert "Supported operators: eq, ne, contains, prefix, in, and, or, not" in (
         file_search.description or ""
@@ -52,6 +52,133 @@ async def test_file_search_tool_dispatch_maps_return_alias():
 
     assert mock.call_args.kwargs["return_mode"] == "full"
     assert mock.call_args.kwargs["content_max_character"] == 123
+
+
+# ---------------------------------------------------------------------------
+# Slim default + top_k aliases (Hermes TICKET-docorganizer-filesearch-default-slim)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_file_search_schema_slim_default_and_topk_aliases():
+    """Default return mode is 'slim', default top_k is 8, and the common
+    result-count aliases are first-class schema params (not silently ignored)."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tools = await mcp_server.mcp.list_tools()
+    file_search = next(tool for tool in tools if tool.name == "file_search")
+    props = file_search.inputSchema["properties"]
+
+    assert props["return"]["default"] == "slim"
+    assert props["top_k"]["default"] == 8
+    for alias in ("k", "n", "max_results", "num_results", "limit"):
+        assert alias in props, f"alias {alias!r} missing from schema"
+
+
+@pytest.mark.anyio
+async def test_file_search_dispatch_maps_topk_aliases():
+    """k / n / max_results / num_results / limit act as top_k aliases; an
+    explicit top_k wins over an alias."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    for alias in ("k", "n", "max_results", "num_results", "limit"):
+        with patch(
+            "mcp_server._file_search_impl",
+            return_value={"results": [], "diagnostics": {}},
+        ) as mock:
+            await mcp_server.mcp.call_tool("file_search", {"query": "x", alias: 3})
+        assert mock.call_args.kwargs["top_k"] == 3, f"alias {alias!r} not honored"
+
+    with patch(
+        "mcp_server._file_search_impl",
+        return_value={"results": [], "diagnostics": {}},
+    ) as mock:
+        await mcp_server.mcp.call_tool(
+            "file_search", {"query": "x", "top_k": 5, "k": 3}
+        )
+    assert mock.call_args.kwargs["top_k"] == 5
+
+
+def _comm_hit(**extra):
+    meta = {
+        "sender": "Lee Donnelly",
+        "sent_at": "2026-07-01 15:04:00+00:00",
+        "channel_name": "Lee Donnelly (+1908...)",
+        "source_message_id": "AC123abc",
+        "direction": "inbound",
+        **extra,
+    }
+    return SearchHit(
+        doc_id="comm_messages::quo/AC123abc",
+        loc="c:0",
+        snippet="Hi, is the 2BR still available?",
+        text="Hi, is the 2BR still available?",
+        score=0.91,
+        source_type="pg_message",
+        title="",
+        tags="",
+        extra_metadata=meta,
+    )
+
+
+def test_slim_hit_comm_message_flat_with_direction():
+    """Slim shape for a comm hit: flat sent_at/channel/sender/direction/
+    source_id, no verbose empties, no nested custom_meta, no content blob."""
+    d = mcp_server._slim_hit_to_dict(_comm_hit())
+
+    assert d["doc_id"] == "comm_messages::quo/AC123abc"
+    assert d["snippet"] == "Hi, is the 2BR still available?"
+    assert d["direction"] == "inbound"
+    assert d["sender"] == "Lee Donnelly"
+    assert d["sent_at"] == "2026-07-01 15:04:00+00:00"
+    assert d["channel"] == "Lee Donnelly (+1908...)"
+    assert d["source_id"] == "AC123abc"
+
+    for verbose_key in (
+        "tags", "keywords", "description", "author", "section", "size",
+        "status", "custom_meta", "content", "content_truncated", "title",
+        "enr_summary", "enr_topics",
+    ):
+        assert verbose_key not in d, f"{verbose_key!r} should not be in slim output"
+
+
+def test_slim_hit_document_keeps_title_and_path_omits_comm_fields():
+    """Slim shape for a non-comm document: title/rel_path present, comm
+    fields and empty values omitted entirely."""
+    hit = SearchHit(
+        doc_id="documents::00001",
+        loc="p:0:c:1",
+        snippet="Lease agreement for 12 Main St...",
+        text="Lease agreement for 12 Main St...",
+        score=0.88,
+        source_type="pdf",
+        title="Lease Agreement",
+        rel_path="Projects/lease@00001@.pdf",
+        extra_metadata={},
+    )
+    d = mcp_server._slim_hit_to_dict(hit)
+
+    assert d["title"] == "Lease Agreement"
+    assert d["rel_path"] == "Projects/lease@00001@.pdf"
+    for comm_key in ("direction", "sender", "sent_at", "channel", "source_id"):
+        assert comm_key not in d
+
+
+def test_file_search_impl_slim_is_default_return_mode():
+    """_file_search_impl defaults to slim output."""
+    fake_result = MagicMock()
+    fake_result.hits = [_comm_hit()]
+    fake_result.diagnostics = {}
+    with patch("mcp_server._get_deps", return_value=(MagicMock(), MagicMock(), {})), \
+         patch("mcp_server.build_reranker", return_value=None), \
+         patch("mcp_server.hybrid_search", return_value=fake_result):
+        out = mcp_server._file_search_impl(query="lee donnelly")
+    assert "results" in out
+    row = out["results"][0]
+    assert row.get("direction") == "inbound"
+    assert "content" not in row
 
 
 # ---------------------------------------------------------------------------
@@ -626,8 +753,8 @@ def test_source_scoped_empty_degraded_search_fails_closed(tmp_path):
         mcp_server._cache = old_cache
 
 
-def test_file_search_compact_default_keeps_source_content_and_excludes_bloat():
-    """Default compact search response should keep source content without raw node bloat."""
+def test_file_search_compact_mode_keeps_source_content_and_excludes_bloat():
+    """return='compact' response should keep source content without raw node bloat."""
     from search_hybrid import SearchResult
 
     hit = SearchHit(
@@ -666,7 +793,7 @@ def test_file_search_compact_default_keeps_source_content_and_excludes_bloat():
         mcp_server._cache = (MagicMock(), MagicMock(), {"search": {"recency": {}}})
         with patch("mcp_server.hybrid_search", return_value=mock_result):
             with patch("mcp_server.build_reranker", return_value=None):
-                result = mcp_server._file_search_impl("lease", content_max_character=25)
+                result = mcp_server._file_search_impl("lease", return_mode="compact", content_max_character=25)
     finally:
         mcp_server._cache = old_cache
 
