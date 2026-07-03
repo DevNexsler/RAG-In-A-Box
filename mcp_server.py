@@ -1116,6 +1116,7 @@ def _file_search_impl(
     return_mode: str = "slim",
     content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
     sort: str | None = None,
+    include_diagnostics: bool = True,
 ) -> dict:
     # Validate
     if not query or not query.strip():
@@ -1296,7 +1297,14 @@ def _file_search_impl(
         results = [_compact_hit_to_dict(h, content_max_character) for h in hits]
     else:
         results = [_slim_hit_to_dict(h) for h in hits]
-    return {"results": results, "diagnostics": diagnostics}
+    payload: dict = {"results": results}
+    if include_diagnostics:
+        payload["diagnostics"] = diagnostics
+    elif diagnostics.get("degraded"):
+        # Never hide degradation: with diagnostics off, keep the one signal
+        # that says these results may be low quality (#0106 lesson).
+        payload["degraded"] = True
+    return payload
 
 
 def _file_get_chunk_impl(doc_id: str, loc: str) -> dict:
@@ -1950,6 +1958,7 @@ if HAS_MCP and FastMCP is not None:
         content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
         sort: str | None = None,
         order_by: str | None = None,
+        include_diagnostics: bool = False,
         k: int | None = None,
         n: int | None = None,
         max_results: int | None = None,
@@ -1974,6 +1983,11 @@ if HAS_MCP and FastMCP is not None:
                 unanswered?" in one call — compare the newest inbound vs
                 newest outbound in the returned set. order_by is an alias.
             order_by: Alias of sort.
+            include_diagnostics: If true, include the search-pipeline
+                diagnostics block (candidate counts, MMR dedup details,
+                stage health). Off by default — it is larger than the
+                results themselves. Even when off, a degraded pipeline is
+                surfaced as a top-level "degraded": true.
             doc_id_prefix: Filter to docs under this vault-relative path prefix
                 (e.g., "Projects/" to search only the Projects folder).
                 Filters on rel_path (the vault-relative file path), not doc_id
@@ -2030,7 +2044,11 @@ if HAS_MCP and FastMCP is not None:
                 - folder, status, tags, description, author, custom_meta,
                   enr_* enrichment fields, and (compact) content capped by
                   content_max_character plus content_truncated.
-            - diagnostics: Search pipeline health signals:
+            - degraded: (only when include_diagnostics is false) true if
+              any retrieval stage failed silently — treat results as lower
+              quality.
+            - diagnostics: (only when include_diagnostics=true) search
+              pipeline health signals:
                 - vector_search_active: true if vector (semantic) search ran successfully.
                 - keyword_search_active: true if BM25/FTS ran successfully.
                 - reranker_applied: true if cross-encoder reranking ran successfully.
@@ -2072,6 +2090,7 @@ if HAS_MCP and FastMCP is not None:
             return_mode=return_mode,
             content_max_character=content_max_character,
             sort=sort if sort is not None else order_by,
+            include_diagnostics=include_diagnostics,
         )
 
     @mcp.tool(description=sorq.build_sor_query_description())
