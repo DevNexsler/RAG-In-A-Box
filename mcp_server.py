@@ -35,7 +35,8 @@ _VALID_SOURCE_TYPES = BUILTIN_SOURCE_TYPES
 _MAX_TOP_K = 100
 _MAX_LIMIT = 200
 _DEFAULT_CONTENT_MAX_CHARACTER = 10_000
-_VALID_SEARCH_RETURN_MODES = {"compact", "full"}
+_VALID_SEARCH_RETURN_MODES = {"slim", "compact", "full"}
+_DEFAULT_SEARCH_TOP_K = 8
 _PROVIDER_FAILURE_LOOKBACK_SECONDS = 24 * 60 * 60
 _PROVIDER_FAILURE_LOG_NAMES = ("indexer.log", "indexer.log.prev")
 _PROVIDER_FAILURE_MAX_BYTES = 128 * 1024 * 1024
@@ -360,6 +361,42 @@ def _compact_hit_to_dict(h: SearchHit, content_max_character: int) -> dict:
         if k not in d and k not in _COMPACT_EXCLUDED_METADATA_KEYS:
             d[k] = v
     return d
+
+
+# Comm-message fields surfaced flat in slim results: (output_key, metadata_key).
+_SLIM_COMM_FIELD_MAP = (
+    ("sent_at", "sent_at"),
+    ("channel", "channel_name"),
+    ("sender", "sender"),
+    ("direction", "direction"),
+    ("source_id", "source_message_id"),
+)
+
+
+def _slim_hit_to_dict(h: SearchHit) -> dict:
+    """Minimal flat search result — the default return mode (#0109).
+
+    Keeps just enough to review a hit and drill in (doc_id + loc →
+    file_get_chunk). Comm-message fields (sent_at/channel/sender/direction/
+    source_id) are flattened in when present; empty values are omitted
+    entirely. The previous compact default averaged ~4.6 KB/hit of mostly
+    empty metadata, which pushed agents back to raw SQL dumps.
+    """
+    extra = h.extra_metadata or {}
+    d: dict = {
+        "doc_id": h.doc_id,
+        "loc": h.loc,
+        "score": round(h.score, 4) if isinstance(h.score, float) else h.score,
+        "snippet": h.snippet,
+        "source_type": h.source_type,
+        "title": h.title,
+        "rel_path": h.rel_path,
+    }
+    for out_key, meta_key in _SLIM_COMM_FIELD_MAP:
+        val = extra.get(meta_key)
+        if val not in (None, ""):
+            d[out_key] = str(val)
+    return {k: v for k, v in d.items() if v not in (None, "")}
 
 
 def _enrich_doc_list(docs: list[dict]) -> None:
@@ -1053,7 +1090,7 @@ def _get_deep_health(
 
 def _file_search_impl(
     query: str,
-    top_k: int = 10,
+    top_k: int = _DEFAULT_SEARCH_TOP_K,
     doc_id_prefix: str | None = None,
     source_type: str | None = None,
     source_name: str | None = None,
@@ -1065,7 +1102,7 @@ def _file_search_impl(
     enr_doc_type: str | None = None,
     enr_topics: str | None = None,
     filter: str | dict | None = None,
-    return_mode: str = "compact",
+    return_mode: str = "slim",
     content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
 ) -> dict:
     # Validate
@@ -1076,12 +1113,13 @@ def _file_search_impl(
             "Provide a natural-language search query (e.g., 'machine learning papers').",
         )
     top_k = max(1, min(top_k, _MAX_TOP_K))
-    return_mode = (return_mode or "compact").strip().lower()
+    return_mode = (return_mode or "slim").strip().lower()
     if return_mode not in _VALID_SEARCH_RETURN_MODES:
         return _error(
             "invalid_parameter",
-            "return must be either 'compact' or 'full'.",
-            "Use return='compact' for capped source content or return='full' for the legacy verbose response.",
+            "return must be 'slim', 'compact', or 'full'.",
+            "Use return='slim' (default) for minimal flat results, 'compact' for capped "
+            "source content, or 'full' for the legacy verbose response.",
         )
     try:
         content_max_character = int(content_max_character)
@@ -1223,8 +1261,10 @@ def _file_search_impl(
         )
     if return_mode == "full":
         results = [_hit_to_dict(h) for h in result.hits]
-    else:
+    elif return_mode == "compact":
         results = [_compact_hit_to_dict(h, content_max_character) for h in result.hits]
+    else:
+        results = [_slim_hit_to_dict(h) for h in result.hits]
     return {"results": results, "diagnostics": diagnostics}
 
 
@@ -1863,7 +1903,7 @@ if HAS_MCP and FastMCP is not None:
     @mcp.tool()
     def file_search(
         query: str,
-        top_k: int = 10,
+        top_k: int = _DEFAULT_SEARCH_TOP_K,
         doc_id_prefix: str | None = None,
         source_type: str | None = None,
         source_name: str | None = None,
@@ -1875,8 +1915,13 @@ if HAS_MCP and FastMCP is not None:
         filter: str | dict | None = None,
         enr_doc_type: str | None = None,
         enr_topics: str | None = None,
-        return_mode: Annotated[str, Field(validation_alias="return")] = "compact",
+        return_mode: Annotated[str, Field(validation_alias="return")] = "slim",
         content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
+        k: int | None = None,
+        n: int | None = None,
+        max_results: int | None = None,
+        num_results: int | None = None,
+        limit: int | None = None,
     ) -> dict:
         """Hybrid semantic + keyword search over the indexed documents.
 
@@ -1885,7 +1930,9 @@ if HAS_MCP and FastMCP is not None:
 
         Args:
             query: Natural-language search query (required, non-empty).
-            top_k: Max results to return (1-100, default 10).
+            top_k: Max results to return (1-100, default 8). The aliases
+                k / n / max_results / num_results / limit are also accepted;
+                an explicitly passed top_k wins over any alias.
             doc_id_prefix: Filter to docs under this vault-relative path prefix
                 (e.g., "Projects/" to search only the Projects folder).
                 Filters on rel_path (the vault-relative file path), not doc_id
@@ -1915,32 +1962,33 @@ if HAS_MCP and FastMCP is not None:
             enr_topics: Filter by LLM-enriched topic (e.g., "machine learning",
                 "Korean cooking"). Comma-separated for OR logic. Values come
                 from file_facets topics. Uses LIKE matching.
-            return: Response shape. "compact" (default) returns capped source
-                content and omits raw node internals; "full" returns the legacy
-                verbose response.
+            return: Response shape. "slim" (default) returns minimal flat
+                results; "compact" returns capped source content plus verbose
+                metadata; "full" returns the legacy verbose response.
             content_max_character: Max source-content characters in compact
-                results (default 10000). Ignored when return="full".
+                results (default 10000). Ignored when return="slim" or "full".
+            k: Alias of top_k.
+            n: Alias of top_k.
+            max_results: Alias of top_k.
+            num_results: Alias of top_k.
+            limit: Alias of top_k.
 
         Returns a dict with:
-            - results: List of result dicts, each containing:
-                - doc_id: Persistent 5-char base-62 identifier (e.g., "00001").
-                - rel_path: Vault-relative file path (e.g., "Projects/recipe@00001@.md").
-                - loc: Chunk locator within the document (e.g., "c:0" for first chunk,
-                  "p:3:c:1" for page 3 chunk 1 of a PDF).
-                - snippet: First ~200 characters of the chunk text (preview).
+            - results: List of result dicts. With return="slim" (default) each
+              contains only non-empty fields from:
+                - doc_id: Document identifier (use with file_get_chunk).
+                - loc: Chunk locator (e.g., "c:0", "p:3:c:1").
                 - score: Relevance score (higher is better).
-                - title, folder, status, source_type: Document metadata.
-                - tags: Array of tag strings from frontmatter.
-                - enr_summary, enr_doc_type, enr_topics, enr_keywords: LLM-generated
-                  enrichment (comma-separated strings; empty if not yet enriched).
-                - enr_entities_people, enr_entities_places, enr_entities_orgs,
-                  enr_entities_dates: Named entities extracted by LLM (comma-separated).
-                - enr_key_facts: Key facts from the document (comma-separated string).
-                - description, author, custom_meta: Additional frontmatter fields.
-                - content: Source chunk text capped by content_max_character
-                  when return="compact".
-                - content_truncated: True if compact content was capped.
-                - Any dynamic metadata fields (e.g., section) are also included.
+                - snippet: First ~200 characters of the chunk text.
+                - source_type: e.g. "pdf", "md", "pg_message".
+                - title, rel_path: Document identity (when present).
+                - sent_at, channel, sender, direction, source_id: Comm-message
+                  fields (when the hit is an indexed message). direction is
+                  "inbound" or "outbound" — outbound means WE sent it.
+              With return="compact"/"full", each result additionally carries:
+                - folder, status, tags, description, author, custom_meta,
+                  enr_* enrichment fields, and (compact) content capped by
+                  content_max_character plus content_truncated.
             - diagnostics: Search pipeline health signals:
                 - vector_search_active: true if vector (semantic) search ran successfully.
                 - keyword_search_active: true if BM25/FTS ran successfully.
@@ -1958,6 +2006,14 @@ if HAS_MCP and FastMCP is not None:
 
         On error, returns {"error": true, "code": "...", "message": "...", "fix": "..."}.
         """
+        # Result-count aliases: honored only when top_k was left at its
+        # default, so an explicit top_k always wins (#0109 — these used to be
+        # silently ignored, which read as "the parameter works").
+        if top_k == _DEFAULT_SEARCH_TOP_K:
+            for alias_value in (k, n, max_results, num_results, limit):
+                if alias_value is not None:
+                    top_k = alias_value
+                    break
         return _file_search_impl(
             query=query,
             top_k=top_k,
