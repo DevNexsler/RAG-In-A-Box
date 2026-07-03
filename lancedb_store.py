@@ -61,6 +61,8 @@ _LLAMA_MANAGED_METADATA_KEYS = frozenset({
 
 
 _DEFAULT_LANCE_VERSION_RETENTION_MINUTES = 30.0
+_DEFAULT_DAILY_RESTORE_POINT_DAYS = 30
+_DAILY_TAG_PREFIX = "daily-"
 
 
 def _lance_version_retention_minutes() -> float:
@@ -77,6 +79,48 @@ def _lance_version_retention_minutes() -> float:
     except (TypeError, ValueError):
         return _DEFAULT_LANCE_VERSION_RETENTION_MINUTES
     return max(0.0, val)
+
+
+def _daily_restore_point_days() -> int:
+    """How many days of daily version tags to keep as logical restore points
+    (env-tunable via LANCE_DAILY_RESTORE_POINTS). 0 disables the feature.
+
+    Each daily tag pins that day's superseded data files against the version
+    prune, so `git reset`-style rollback to a past day stays possible. Cheap
+    on an append-heavy corpus (unchanged data files are shared across tags)."""
+    raw = os.environ.get("LANCE_DAILY_RESTORE_POINTS")
+    if raw is None:
+        return _DEFAULT_DAILY_RESTORE_POINT_DAYS
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_DAILY_RESTORE_POINT_DAYS
+
+
+def _daily_tag_name(day) -> str:
+    return f"{_DAILY_TAG_PREFIX}{day.isoformat()}"
+
+
+def _parse_daily_tag_date(name: str):
+    """Return the date encoded in a `daily-YYYY-MM-DD` tag, or None if the tag
+    isn't one of ours (so we never touch tags created by anything else)."""
+    from datetime import date
+
+    if not name.startswith(_DAILY_TAG_PREFIX):
+        return None
+    try:
+        return date.fromisoformat(name[len(_DAILY_TAG_PREFIX):])
+    except ValueError:
+        return None
+
+
+def _is_retryable_commit_conflict(exc: BaseException) -> bool:
+    """True for Lance's transient 'Retryable commit conflict' raised when a
+    prune races a concurrent write — safe to retry."""
+    text = str(exc).lower()
+    return "retryable commit conflict" in text or (
+        "conflict" in text and "retry" in text
+    )
 
 
 def _is_retryable_commit_conflict(exc: BaseException) -> bool:
@@ -904,38 +948,90 @@ class LanceDBStore:
         logger.info("FTS index optimized (incremental merge)")
 
     def _optimize_and_prune(self, table) -> None:
-        """Compact + merge the index, and prune Lance versions older than the
-        retention window in the same pass.
+        """Compact + merge the index, refresh daily restore-point tags, then
+        prune superseded Lance versions older than the retention window.
 
         optimize() compacts data files but leaves every superseded version on
         disk; without a prune those dead versions accumulate unbounded (they
-        grew the index 5 GB -> 8.6 GB in ~11 h of routine indexing). Passing
-        cleanup_older_than reclaims them each run while keeping a retention
-        window so any in-flight reader on a recent version is unaffected.
+        grew the index 5 GB -> 8.6 GB in ~11 h of routine indexing). We reclaim
+        them each run while keeping a retention window so any in-flight reader
+        on a recent version is unaffected.
 
-        The prune can hit a retryable Lance commit conflict under concurrent
-        writes; retry those, and if it still fails fall back to a plain
-        optimize() — pruning is housekeeping and must never fail an indexing
-        run (stale versions just get reclaimed on the next pass).
+        Ordering matters: compact -> tag today's version -> prune. Tagging
+        before the prune protects today's version (and every retained daily
+        tag) from cleanup. The prune therefore runs via the dataset-level
+        cleanup_old_versions with error_if_tagged_old_versions=False so it
+        skips tagged restore points instead of erroring on them (plain
+        table.optimize(cleanup_older_than=...) cannot skip tags and would raise
+        every run once a daily tag exists).
+
+        Tag management and pruning are housekeeping: their failure is logged
+        but never propagated, so an indexing run always completes (stale
+        versions/tags reconcile on the next pass).
         """
-        from datetime import timedelta
+        from datetime import date, timedelta
 
         from core.resilience import call_with_retry
 
+        # 1. Compaction + FTS index merge (the part that makes search current).
+        table.optimize()
+
+        # 2. Daily restore points (protected from the prune below).
+        self._manage_restore_points(table, date.today())
+
+        # 3. Prune superseded, untagged versions older than the retention band.
         retention = timedelta(minutes=_lance_version_retention_minutes())
+        dataset_path = str(Path(self.index_root) / f"{self.table_name}.lance")
         try:
+            import lance
+
+            def _prune():
+                lance.dataset(dataset_path).cleanup_old_versions(
+                    older_than=retention,
+                    error_if_tagged_old_versions=False,
+                )
+
             call_with_retry(
-                lambda: table.optimize(cleanup_older_than=retention),
+                _prune,
                 attempts=3,
                 backoff=(2.0, 5.0),
-                label="lance optimize+prune",
+                label="lance version prune",
                 classify=_is_retryable_commit_conflict,
             )
         except Exception as exc:
             logger.warning(
-                "Version prune failed (%s); compacting without prune this run", exc
+                "Version prune failed (%s); dead versions reclaim next run", exc
             )
-            table.optimize()
+
+    def _manage_restore_points(self, table, today) -> None:
+        """Keep a rolling window of daily version tags as logical restore points.
+
+        Points today's `daily-<date>` tag at the current (just-compacted)
+        version and drops daily tags older than the retention window so their
+        versions become reclaimable. Best-effort: any failure is logged, never
+        raised (a missed tag is reconciled next run)."""
+        days = _daily_restore_point_days()
+        if days <= 0:
+            return
+        try:
+            tags = table.tags
+            existing = set(tags.list())
+            name = _daily_tag_name(today)
+            version = table.version
+            if name in existing:
+                tags.update(name, version)
+            else:
+                tags.create(name, version)
+
+            from datetime import timedelta
+
+            cutoff = today - timedelta(days=days)
+            for tag_name in existing:
+                tag_date = _parse_daily_tag_date(tag_name)
+                if tag_date is not None and tag_date < cutoff:
+                    tags.delete(tag_name)
+        except Exception as exc:
+            logger.warning("Daily restore-point tagging skipped this run: %s", exc)
 
     def fts_available(self) -> bool:
         """Check if the FTS/tantivy index is operational (health check for file_status)."""

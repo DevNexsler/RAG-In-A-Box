@@ -42,6 +42,9 @@ services:
       # Prune Lance versions older than this each indexing run (#0112); keeps
       # the index from re-accumulating dead versions. Default 30m if unset.
       - LANCE_VERSION_RETENTION_MINUTES=${LANCE_VERSION_RETENTION_MINUTES:-30}
+      # Keep this many daily version tags as logical restore points (#0113);
+      # each is an in-place rollback target protected from the prune. 0 = off.
+      - LANCE_DAILY_RESTORE_POINTS=${LANCE_DAILY_RESTORE_POINTS:-30}
 
 networks:
   rag-net:

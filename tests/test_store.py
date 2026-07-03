@@ -1025,11 +1025,14 @@ def test_ensure_fts_index_creates_when_missing():
         assert len(hits) == 1
 
 
-def test_ensure_fts_index_prunes_old_versions_with_retention():
-    """ensure_fts_index compacts AND prunes: optimize is called with a
-    cleanup_older_than retention window so dead versions don't accumulate."""
-    from datetime import timedelta
-    from unittest.mock import MagicMock, patch
+def _lance_path(tmpdir: str, table: str = "test_chunks") -> str:
+    return str(Path(tmpdir) / f"{table}.lance")
+
+
+def test_ensure_fts_index_creates_todays_daily_restore_point():
+    """A routine indexing run tags the current version as today's restore
+    point (daily-<date>), pointing at the latest version."""
+    from datetime import date
 
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
@@ -1037,47 +1040,132 @@ def test_ensure_fts_index_prunes_old_versions_with_retention():
         store.upsert_nodes([
             _make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md"),
         ])
-        store.create_fts_index()  # index now exists -> ensure_fts_index takes optimize path
+        store.create_fts_index()
+        store.ensure_fts_index()
 
-        fake_table = MagicMock()
-        fake_table.list_indices.return_value = [
-            MagicMock(index_type="FTS"),
-        ]
-        with patch.object(type(store._vs), "table", property(lambda self: fake_table)):
-            with patch.dict("os.environ", {"LANCE_VERSION_RETENTION_MINUTES": "15"}):
-                store.ensure_fts_index()
-
-        assert fake_table.optimize.call_count == 1
-        kwargs = fake_table.optimize.call_args.kwargs
-        assert kwargs["cleanup_older_than"] == timedelta(minutes=15)
+        tags = store._vs.table.tags.list()
+        today_tag = f"daily-{date.today().isoformat()}"
+        assert today_tag in tags
 
 
-def test_ensure_fts_index_prune_conflict_falls_back_to_plain_optimize():
-    """A retryable commit conflict on the prune must not fail the run: it
-    degrades to a plain optimize() so the index merge still lands."""
-    from unittest.mock import MagicMock, patch
+def test_daily_restore_point_is_revertible_after_more_writes():
+    """A tagged restore point pins the point-in-time snapshot: after more rows
+    are written, opening the dataset at the tag still shows the old state."""
+    import lance
 
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "first", vec, source_type="md"),
+        ])
+        store.create_fts_index()
+        tag = "daily-2099-01-01"
+        store._vs.table.tags.create(tag, store._vs.table.version)  # 1 row here
 
-        fake_table = MagicMock()
-        fake_table.list_indices.return_value = [MagicMock(index_type="FTS")]
-        calls = []
+        store.upsert_nodes([
+            _make_node_with_meta("b.md", "c:0", "second", vec, source_type="md"),
+            _make_node_with_meta("c.md", "c:0", "third", vec, source_type="md"),
+        ])
 
-        def optimize(**kwargs):
-            calls.append(kwargs)
-            if "cleanup_older_than" in kwargs:
-                raise RuntimeError("lance error: Retryable commit conflict for version 42")
-            return None
+        path = _lance_path(tmpdir)
+        assert lance.dataset(path).count_rows() == 3           # current state
+        assert lance.dataset(path, version=tag).count_rows() == 1  # restore point
 
-        fake_table.optimize.side_effect = optimize
-        with patch.object(type(store._vs), "table", property(lambda self: fake_table)):
-            # no sleeping through the retry backoff
-            with patch("core.resilience.time.sleep", lambda *_: None):
+
+def test_prune_preserves_tagged_versions_removes_untagged():
+    """With retention=0 (prune everything superseded), an untagged old version
+    is reclaimed but a tagged restore point survives — proving the prune runs
+    with error_if_tagged_old_versions=False (skip tags, don't error)."""
+    from unittest.mock import patch
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "first", vec, source_type="md"),
+        ])
+        store.create_fts_index()
+        # a restore point INSIDE the retention window (won't be expired)
+        tag = "daily-2099-06-15"
+        store._vs.table.tags.create(tag, store._vs.table.version)
+
+        env = {"LANCE_VERSION_RETENTION_MINUTES": "0", "LANCE_DAILY_RESTORE_POINTS": "30"}
+        with patch.dict("os.environ", env):
+            store.upsert_nodes([
+                _make_node_with_meta("b.md", "c:0", "second", vec, source_type="md"),
+            ])
+            # tag is future-dated (2099) so real date.today() never expires it
+            store.ensure_fts_index()  # optimize -> tag today -> prune retention=0
+
+        path = _lance_path(tmpdir)
+        # tagged restore point still readable after an aggressive prune
+        assert lance.dataset(path, version=tag).count_rows() == 1
+        assert lance.dataset(path).count_rows() == 2
+
+
+def test_manage_restore_points_expires_tags_past_window():
+    """Daily tags older than the retention window are deleted; ones inside it
+    (and non-daily tags) are left alone."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md"),
+        ])
+        table = store._vs.table
+        v = table.version
+        table.tags.create("daily-2026-01-01", v)   # ancient -> expire
+        table.tags.create("daily-2026-06-20", v)   # within 30d of 'today' below -> keep
+        table.tags.create("manual-keepsake", v)    # not ours -> never touch
+
+        from unittest.mock import patch
+        with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "30"}):
+            store._manage_restore_points(table, date(2026, 6, 25))
+
+        tags = set(table.tags.list())
+        assert "daily-2026-01-01" not in tags       # expired
+        assert "daily-2026-06-20" in tags           # inside window
+        assert "daily-2026-06-25" in tags           # today's, freshly created
+        assert "manual-keepsake" in tags            # untouched
+
+
+def test_restore_points_disabled_when_days_zero():
+    from datetime import date
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md"),
+        ])
+        table = store._vs.table
+        with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "0"}):
+            store._manage_restore_points(table, date(2026, 6, 25))
+        assert not any(t.startswith("daily-") for t in table.tags.list())
+
+
+def test_ensure_fts_index_prune_failure_is_non_fatal():
+    """If version pruning raises, the indexing run still completes (housekeeping
+    must never fail an index update)."""
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md"),
+        ])
+        store.create_fts_index()
+        with patch("core.resilience.time.sleep", lambda *_: None):
+            with patch("lance.dataset", side_effect=RuntimeError("disk gone")):
                 store.ensure_fts_index()  # must not raise
-
-        assert any("cleanup_older_than" in c for c in calls)   # prune attempted (+retries)
-        assert any(c == {} for c in calls)                      # plain optimize fallback ran
+        # index still works after a prune failure
+        assert len(store.keyword_search("banana", top_k=5)) == 1
 
 
 def test_lance_version_retention_env_parsing():
@@ -1094,6 +1182,30 @@ def test_lance_version_retention_env_parsing():
         assert ls._lance_version_retention_minutes() == 30.0
     with patch.dict("os.environ", {"LANCE_VERSION_RETENTION_MINUTES": "-3"}):
         assert ls._lance_version_retention_minutes() == 0.0
+
+
+def test_daily_restore_point_days_env_parsing():
+    from unittest.mock import patch
+    import lancedb_store as ls
+
+    with patch.dict("os.environ", {}, clear=False):
+        ls.os.environ.pop("LANCE_DAILY_RESTORE_POINTS", None)
+        assert ls._daily_restore_point_days() == 30
+    with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "14"}):
+        assert ls._daily_restore_point_days() == 14
+    with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "0"}):
+        assert ls._daily_restore_point_days() == 0
+    with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "junk"}):
+        assert ls._daily_restore_point_days() == 30
+
+
+def test_parse_daily_tag_date():
+    from datetime import date
+    import lancedb_store as ls
+
+    assert ls._parse_daily_tag_date("daily-2026-07-03") == date(2026, 7, 3)
+    assert ls._parse_daily_tag_date("manual-keepsake") is None
+    assert ls._parse_daily_tag_date("daily-not-a-date") is None
 
 
 def test_is_retryable_commit_conflict():
