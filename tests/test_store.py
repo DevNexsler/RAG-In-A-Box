@@ -1025,6 +1025,86 @@ def test_ensure_fts_index_creates_when_missing():
         assert len(hits) == 1
 
 
+def test_ensure_fts_index_prunes_old_versions_with_retention():
+    """ensure_fts_index compacts AND prunes: optimize is called with a
+    cleanup_older_than retention window so dead versions don't accumulate."""
+    from datetime import timedelta
+    from unittest.mock import MagicMock, patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md"),
+        ])
+        store.create_fts_index()  # index now exists -> ensure_fts_index takes optimize path
+
+        fake_table = MagicMock()
+        fake_table.list_indices.return_value = [
+            MagicMock(index_type="FTS"),
+        ]
+        with patch.object(type(store._vs), "table", property(lambda self: fake_table)):
+            with patch.dict("os.environ", {"LANCE_VERSION_RETENTION_MINUTES": "15"}):
+                store.ensure_fts_index()
+
+        assert fake_table.optimize.call_count == 1
+        kwargs = fake_table.optimize.call_args.kwargs
+        assert kwargs["cleanup_older_than"] == timedelta(minutes=15)
+
+
+def test_ensure_fts_index_prune_conflict_falls_back_to_plain_optimize():
+    """A retryable commit conflict on the prune must not fail the run: it
+    degrades to a plain optimize() so the index merge still lands."""
+    from unittest.mock import MagicMock, patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+
+        fake_table = MagicMock()
+        fake_table.list_indices.return_value = [MagicMock(index_type="FTS")]
+        calls = []
+
+        def optimize(**kwargs):
+            calls.append(kwargs)
+            if "cleanup_older_than" in kwargs:
+                raise RuntimeError("lance error: Retryable commit conflict for version 42")
+            return None
+
+        fake_table.optimize.side_effect = optimize
+        with patch.object(type(store._vs), "table", property(lambda self: fake_table)):
+            # no sleeping through the retry backoff
+            with patch("core.resilience.time.sleep", lambda *_: None):
+                store.ensure_fts_index()  # must not raise
+
+        assert any("cleanup_older_than" in c for c in calls)   # prune attempted (+retries)
+        assert any(c == {} for c in calls)                      # plain optimize fallback ran
+
+
+def test_lance_version_retention_env_parsing():
+    from unittest.mock import patch
+    import lancedb_store as ls
+
+    with patch.dict("os.environ", {}, clear=False):
+        os_environ = ls.os.environ
+        os_environ.pop("LANCE_VERSION_RETENTION_MINUTES", None)
+        assert ls._lance_version_retention_minutes() == 30.0
+    with patch.dict("os.environ", {"LANCE_VERSION_RETENTION_MINUTES": "5"}):
+        assert ls._lance_version_retention_minutes() == 5.0
+    with patch.dict("os.environ", {"LANCE_VERSION_RETENTION_MINUTES": "garbage"}):
+        assert ls._lance_version_retention_minutes() == 30.0
+    with patch.dict("os.environ", {"LANCE_VERSION_RETENTION_MINUTES": "-3"}):
+        assert ls._lance_version_retention_minutes() == 0.0
+
+
+def test_is_retryable_commit_conflict():
+    import lancedb_store as ls
+
+    assert ls._is_retryable_commit_conflict(
+        RuntimeError("lance error: Retryable commit conflict for version 24252")
+    )
+    assert not ls._is_retryable_commit_conflict(RuntimeError("offset overflow"))
+
+
 def test_fts_finds_rows_added_after_index_creation():
     """Native FTS should surface rows written after the index was built, no rebuild."""
     with tempfile.TemporaryDirectory() as tmpdir:
