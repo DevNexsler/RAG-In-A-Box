@@ -9,6 +9,8 @@ Developer-facing details about the search pipeline, storage schema, taxonomy sys
 | `GEMINI_API_KEY`     | Default cloud config — OCR via Gemini Vision (not needed if using local DeepSeek OCR2) |
 | `OPENROUTER_API_KEY` | Default cloud config — embeddings (Qwen3-Embedding-8B) + enrichment (GPT-4.1 Mini) |
 | `DEEPINFRA_API_KEY`  | Default cloud config — reranker (Qwen3-Reranker-8B via DeepInfra) |
+| `LANCE_VERSION_RETENTION_MINUTES` | Optional (default 30) — prune index versions older than this each run. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
+| `LANCE_DAILY_RESTORE_POINTS` | Optional (default 30) — days of daily version-tag restore points to keep. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
 
 Store these in a `.env` file in the project root. The MCP server and indexer load it automatically.
 
@@ -78,6 +80,10 @@ The taxonomy provides a controlled vocabulary for consistent document classifica
 The taxonomy is managed exclusively via MCP tools (`file_taxonomy_add`, `file_taxonomy_update`, `file_taxonomy_delete`). Initial data (21 tags, 62 folders) was seeded from SQLite databases (now removed). `file_taxonomy_import` is deprecated.
 
 ## LanceDB schema (per chunk)
+
+> For how the index is stored, compacted, pruned, snapshotted, and recovered
+> (copy-on-write versioning, restore points, backups), see
+> [`index-storage-lifecycle.md`](index-storage-lifecycle.md).
 
 | Field | Type | Description |
 |-------|------|-------------|
