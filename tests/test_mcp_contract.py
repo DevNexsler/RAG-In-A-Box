@@ -271,6 +271,76 @@ def test_file_search_sort_invalid_errors_not_ignored():
     assert out["code"] == "invalid_parameter"
 
 
+# ---------------------------------------------------------------------------
+# diagnostics opt-in (Hermes follow-up: block measured larger than the data)
+# ---------------------------------------------------------------------------
+
+
+def test_file_search_impl_diagnostics_opt_out_drops_block():
+    """include_diagnostics=False returns results only — no diagnostics key."""
+    fake_result = MagicMock()
+    fake_result.hits = [_comm_hit()]
+    fake_result.diagnostics = {"degraded": False, "candidate_counts": {"vector": 50}}
+    deps, rr, hs = _search_ctx(fake_result)
+    with deps, rr, hs:
+        out = mcp_server._file_search_impl(query="x", include_diagnostics=False)
+    assert "diagnostics" not in out
+    assert "degraded" not in out
+    assert len(out["results"]) == 1
+
+
+def test_file_search_impl_diagnostics_opt_out_keeps_degraded_flag():
+    """Even with diagnostics off, a degraded pipeline must stay visible —
+    silent degradation is how bad results get trusted (#0106 lesson)."""
+    fake_result = MagicMock()
+    fake_result.hits = [_comm_hit()]
+    fake_result.diagnostics = {"degraded": True}
+    deps, rr, hs = _search_ctx(fake_result)
+    with deps, rr, hs:
+        out = mcp_server._file_search_impl(query="x", include_diagnostics=False)
+    assert "diagnostics" not in out
+    assert out["degraded"] is True
+
+
+def test_file_search_impl_diagnostics_default_on_for_internal_callers():
+    """Impl-level default keeps diagnostics for internal/REST callers
+    (api_server passes payload kwargs straight through)."""
+    fake_result = MagicMock()
+    fake_result.hits = [_comm_hit()]
+    fake_result.diagnostics = {"degraded": False}
+    deps, rr, hs = _search_ctx(fake_result)
+    with deps, rr, hs:
+        out = mcp_server._file_search_impl(query="x")
+    assert "diagnostics" in out
+
+
+@pytest.mark.anyio
+async def test_file_search_tool_diagnostics_off_by_default():
+    """MCP tool layer defaults include_diagnostics to False (hot-path lean)."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tools = await mcp_server.mcp.list_tools()
+    fs = next(t for t in tools if t.name == "file_search")
+    assert fs.inputSchema["properties"]["include_diagnostics"]["default"] is False
+
+    with patch(
+        "mcp_server._file_search_impl",
+        return_value={"results": []},
+    ) as mock:
+        await mcp_server.mcp.call_tool("file_search", {"query": "x"})
+    assert mock.call_args.kwargs["include_diagnostics"] is False
+
+    with patch(
+        "mcp_server._file_search_impl",
+        return_value={"results": []},
+    ) as mock:
+        await mcp_server.mcp.call_tool(
+            "file_search", {"query": "x", "include_diagnostics": True}
+        )
+    assert mock.call_args.kwargs["include_diagnostics"] is True
+
+
 @pytest.mark.anyio
 async def test_file_search_dispatch_sort_and_order_by_alias():
     """MCP layer: sort passes through; order_by acts as an alias of sort."""
