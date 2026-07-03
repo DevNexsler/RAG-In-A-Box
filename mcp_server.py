@@ -36,7 +36,12 @@ _MAX_TOP_K = 100
 _MAX_LIMIT = 200
 _DEFAULT_CONTENT_MAX_CHARACTER = 10_000
 _VALID_SEARCH_RETURN_MODES = {"slim", "compact", "full"}
+_VALID_SEARCH_SORTS = {"relevance", "recent"}
 _DEFAULT_SEARCH_TOP_K = 8
+# sort="recent" pool: relevance ranking scopes the candidates, recency orders
+# them — the pool must be wider than top_k or the newest messages can be
+# hidden below the relevance cutoff (#0110: outbounds invisible at top_k=8).
+_RECENT_SORT_POOL = 50
 _PROVIDER_FAILURE_LOOKBACK_SECONDS = 24 * 60 * 60
 _PROVIDER_FAILURE_LOG_NAMES = ("indexer.log", "indexer.log.prev")
 _PROVIDER_FAILURE_MAX_BYTES = 128 * 1024 * 1024
@@ -1110,6 +1115,7 @@ def _file_search_impl(
     filter: str | dict | None = None,
     return_mode: str = "slim",
     content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
+    sort: str | None = None,
 ) -> dict:
     # Validate
     if not query or not query.strip():
@@ -1127,6 +1133,15 @@ def _file_search_impl(
             "Use return='slim' (default) for minimal flat results, 'compact' for capped "
             "source content, or 'full' for the legacy verbose response.",
         )
+    sort = (sort or "relevance").strip().lower()
+    if sort not in _VALID_SEARCH_SORTS:
+        return _error(
+            "invalid_parameter",
+            "sort must be 'relevance' (default) or 'recent'.",
+            "Use sort='recent' for the query-scoped newest-first view "
+            "(e.g. a prospect's latest messages with direction).",
+        )
+    recent_sort = sort == "recent"
     try:
         content_max_character = int(content_max_character)
     except (TypeError, ValueError):
@@ -1218,7 +1233,12 @@ def _file_search_impl(
         recency_cfg = search_cfg.get("recency", {})
         importance_cfg = search_cfg.get("importance", {})
 
-        reranker = build_reranker(config)
+        # sort="recent": relevance only SCOPES the candidates (which messages
+        # belong to the query), recency does the ordering. Widen the pool so
+        # the newest hits aren't lost below the relevance cutoff, and skip the
+        # reranker — its micro-ordering is discarded by the recency sort.
+        reranker = None if recent_sort else build_reranker(config)
+        pool_top_k = max(_RECENT_SORT_POOL, top_k) if recent_sort else top_k
 
         result = hybrid_search(
             store,
@@ -1226,7 +1246,7 @@ def _file_search_impl(
             query,
             vector_top_k=search_cfg.get("vector_top_k", 50),
             keyword_top_k=search_cfg.get("keyword_top_k", 50),
-            final_top_k=top_k,
+            final_top_k=pool_top_k,
             rrf_k=search_cfg.get("rrf_k", 60),
             doc_id_prefix=doc_id_prefix,
             source_type=source_type,
@@ -1257,7 +1277,7 @@ def _file_search_impl(
     except Exception as exc:
         return _error("search_failed", f"Search operation failed: {exc}",
                        "Check that the index exists (run file_index_update) and configured services are running.")
-    diagnostics = result.diagnostics or {}
+    diagnostics = dict(result.diagnostics or {})
     if source_name and not result.hits and diagnostics.get("degraded"):
         return _error(
             "source_search_degraded",
@@ -1265,12 +1285,17 @@ def _file_search_impl(
             "Treat this result as inconclusive. Do not create records from it. "
             "Run file_status/file_index_update and retry after vector and keyword search are healthy.",
         )
+    hits = result.hits
+    if recent_sort:
+        hits = sorted(hits, key=lambda h: h.mtime or 0.0, reverse=True)[:top_k]
+        diagnostics["sort"] = "recent"
+        diagnostics["scope_pool"] = len(result.hits)
     if return_mode == "full":
-        results = [_hit_to_dict(h) for h in result.hits]
+        results = [_hit_to_dict(h) for h in hits]
     elif return_mode == "compact":
-        results = [_compact_hit_to_dict(h, content_max_character) for h in result.hits]
+        results = [_compact_hit_to_dict(h, content_max_character) for h in hits]
     else:
-        results = [_slim_hit_to_dict(h) for h in result.hits]
+        results = [_slim_hit_to_dict(h) for h in hits]
     return {"results": results, "diagnostics": diagnostics}
 
 
@@ -1923,6 +1948,8 @@ if HAS_MCP and FastMCP is not None:
         enr_topics: str | None = None,
         return_mode: Annotated[str, Field(validation_alias="return")] = "slim",
         content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
+        sort: str | None = None,
+        order_by: str | None = None,
         k: int | None = None,
         n: int | None = None,
         max_results: int | None = None,
@@ -1939,6 +1966,14 @@ if HAS_MCP and FastMCP is not None:
             top_k: Max results to return (1-100, default 8). The aliases
                 k / n / max_results / num_results / limit are also accepted;
                 an explicitly passed top_k wins over any alias.
+            sort: Result ordering. "relevance" (default) ranks by hybrid
+                relevance score. "recent" returns the query-scoped messages/
+                docs strictly newest-first (by sent_at/mtime): relevance picks
+                WHICH results belong to the query, recency orders them. Use
+                sort="recent" to answer "is prospect X's latest inbound
+                unanswered?" in one call — compare the newest inbound vs
+                newest outbound in the returned set. order_by is an alias.
+            order_by: Alias of sort.
             doc_id_prefix: Filter to docs under this vault-relative path prefix
                 (e.g., "Projects/" to search only the Projects folder).
                 Filters on rel_path (the vault-relative file path), not doc_id
@@ -2036,6 +2071,7 @@ if HAS_MCP and FastMCP is not None:
             filter=filter,
             return_mode=return_mode,
             content_max_character=content_max_character,
+            sort=sort if sort is not None else order_by,
         )
 
     @mcp.tool(description=sorq.build_sor_query_description())

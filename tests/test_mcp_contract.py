@@ -187,6 +187,112 @@ def test_file_search_impl_slim_is_default_return_mode():
 
 
 # ---------------------------------------------------------------------------
+# sort="recent" — one-call "did we respond?" (Hermes follow-up, #0110)
+# ---------------------------------------------------------------------------
+
+
+def _timed_hit(doc_id: str, mtime: float, direction: str) -> SearchHit:
+    return SearchHit(
+        doc_id=doc_id,
+        loc="c:0",
+        snippet=f"message {doc_id}",
+        text=f"message {doc_id}",
+        score=0.5,
+        mtime=mtime,
+        source_type="pg_message",
+        extra_metadata={
+            "sent_at": f"2026-07-{int(mtime):02d} 12:00:00+00:00",
+            "direction": direction,
+            "sender": "X",
+            "source_message_id": doc_id.rsplit("/", 1)[-1],
+        },
+    )
+
+
+def _search_ctx(fake_result):
+    return (
+        patch("mcp_server._get_deps", return_value=(MagicMock(), MagicMock(), {})),
+        patch("mcp_server.build_reranker", return_value="RERANKER"),
+        patch("mcp_server.hybrid_search", return_value=fake_result),
+    )
+
+
+def test_file_search_sort_recent_orders_newest_first_and_truncates():
+    """sort='recent' returns the query-scoped pool sorted by mtime desc,
+    truncated to top_k — even when relevance order differs."""
+    # relevance order: oldest first (worst case for a recency verdict)
+    hits = [
+        _timed_hit("comm_messages::quo/a", 1.0, "inbound"),
+        _timed_hit("comm_messages::quo/b", 3.0, "outbound"),
+        _timed_hit("comm_messages::quo/c", 2.0, "inbound"),
+        _timed_hit("comm_messages::quo/d", 5.0, "outbound"),
+        _timed_hit("comm_messages::quo/e", 4.0, "inbound"),
+    ]
+    fake_result = MagicMock()
+    fake_result.hits = hits
+    fake_result.diagnostics = {}
+    deps, rr, hs = _search_ctx(fake_result)
+    with deps, rr, hs as mock_search:
+        out = mcp_server._file_search_impl(query="prospect", sort="recent", top_k=3)
+
+    ids = [r["doc_id"] for r in out["results"]]
+    assert ids == ["comm_messages::quo/d", "comm_messages::quo/e", "comm_messages::quo/b"]
+    assert [r["direction"] for r in out["results"]] == ["outbound", "inbound", "outbound"]
+    # pool widened beyond top_k and reranker skipped (its order is discarded)
+    assert mock_search.call_args.kwargs["final_top_k"] >= 50
+    assert mock_search.call_args.kwargs["reranker"] is None
+    assert out["diagnostics"]["sort"] == "recent"
+
+
+def test_file_search_sort_default_keeps_relevance_order():
+    """Without sort, relevance order is untouched and the reranker is used."""
+    hits = [
+        _timed_hit("comm_messages::quo/a", 1.0, "inbound"),
+        _timed_hit("comm_messages::quo/b", 3.0, "outbound"),
+    ]
+    fake_result = MagicMock()
+    fake_result.hits = hits
+    fake_result.diagnostics = {}
+    deps, rr, hs = _search_ctx(fake_result)
+    with deps, rr, hs as mock_search:
+        out = mcp_server._file_search_impl(query="prospect", top_k=2)
+
+    assert [r["doc_id"] for r in out["results"]] == [
+        "comm_messages::quo/a", "comm_messages::quo/b",
+    ]
+    assert mock_search.call_args.kwargs["reranker"] == "RERANKER"
+    assert mock_search.call_args.kwargs["final_top_k"] == 2
+
+
+def test_file_search_sort_invalid_errors_not_ignored():
+    """An unsupported sort value must error loudly, never be silently ignored."""
+    out = mcp_server._file_search_impl(query="x", sort="alphabetical")
+    assert out.get("error") is True
+    assert out["code"] == "invalid_parameter"
+
+
+@pytest.mark.anyio
+async def test_file_search_dispatch_sort_and_order_by_alias():
+    """MCP layer: sort passes through; order_by acts as an alias of sort."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    with patch(
+        "mcp_server._file_search_impl",
+        return_value={"results": [], "diagnostics": {}},
+    ) as mock:
+        await mcp_server.mcp.call_tool("file_search", {"query": "x", "sort": "recent"})
+    assert mock.call_args.kwargs["sort"] == "recent"
+
+    with patch(
+        "mcp_server._file_search_impl",
+        return_value={"results": [], "diagnostics": {}},
+    ) as mock:
+        await mcp_server.mcp.call_tool("file_search", {"query": "x", "order_by": "recent"})
+    assert mock.call_args.kwargs["sort"] == "recent"
+
+
+# ---------------------------------------------------------------------------
 # _hit_to_dict contract
 # ---------------------------------------------------------------------------
 
