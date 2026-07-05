@@ -1707,6 +1707,10 @@ def _file_index_document_impl(
     inline and returns the result — a single attachment OCRs in seconds. Reuses
     the same extract/embed/upsert path and is idempotent (unchanged files are
     skipped without re-OCR unless force=True).
+
+    Known gap: the FTS index is only rebuilt by the full sweep, so the doc is
+    vector-search visible immediately but keyword-search visibility awaits the
+    next sweep.
     """
     if not str(target or "").strip():
         return _error("missing_target", "target (path/rel_path/doc_id) is required")

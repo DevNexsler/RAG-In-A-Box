@@ -2258,6 +2258,46 @@ def _build_single_doc_runtime(
     )
 
 
+def _update_index_metadata_after_single_doc(index_root: str | Path, store) -> None:
+    """Refresh index_metadata.json after a targeted single-doc index.
+
+    Serving processes cache their LanceDB handle and reopen it only when this
+    file's (mtime, size) signature changes (mcp_server._get_deps). Without
+    this write, a single-doc index stays invisible to file_search & co. until
+    the next full sweep — breaking the "searchable within seconds" contract
+    (TICKET-6). A file-based signal is required because the indexing call may
+    run in a different process (REST api_server) than the serving MCP server.
+
+    Merge-update, never overwrite: failure/warning fields from the last full
+    sweep feed /health (fts_rebuild_failed) and file_status, so they must be
+    preserved. Only the live doc/chunk counts and a single-doc timestamp are
+    refreshed.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    path = Path(index_root) / "index_metadata.json"
+    meta: dict = {}
+    try:
+        existing = json.loads(path.read_text())
+        if isinstance(existing, dict):
+            meta = existing
+    except (OSError, ValueError):
+        meta = {}
+    try:
+        doc_count = len(store.list_doc_ids())
+        chunk_count = int(store.count_chunks())
+    except Exception as exc:  # noqa: BLE001 — counts are informational; the mtime bump is the contract
+        _get_logger().warning("single-doc metadata count refresh failed: %s", exc)
+    else:
+        meta["doc_count"] = doc_count
+        meta["chunk_count"] = chunk_count
+    meta["last_doc_indexed_at"] = datetime.now(timezone.utc).isoformat()
+    tmp_path = Path(f"{path}.tmp")
+    tmp_path.write_text(json.dumps(meta, indent=2))
+    tmp_path.replace(path)  # atomic: readers never see a partial file
+
+
 def index_document_flow(
     config_path: str = "config.yaml",
     target: str = "",
@@ -2305,6 +2345,12 @@ def index_document_flow(
 
         _build_single_doc_runtime(config, store, doc_id_store, source_name, record)
         process_doc_task.fn(record)
+        # Signal serving processes to reopen their cached store handle so the
+        # doc is searchable immediately. NOTE: the FTS index is deliberately
+        # NOT rebuilt here (it is rebuilt once per full sweep), so keyword-
+        # search visibility of this doc still awaits the next sweep; vector
+        # search sees it right away.
+        _update_index_metadata_after_single_doc(index_root, store)
         return {
             "status": "indexed",
             "doc_id": record["doc_id"],
