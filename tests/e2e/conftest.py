@@ -19,6 +19,7 @@ from tests.e2e.client import (
     E2E_BASE,
     E2E_SIM_URL,
     RecordingSession,
+    get_hook_events,
     open_mcp_session,
 )
 
@@ -150,13 +151,10 @@ async def _build_corpus() -> dict:
         assert started.get("status") == "started", f"file_index_update: {started}"
         status = await wait_for_index(session, min_docs=EXPECTED_CORPUS_DOCS)
 
-    async with httpx.AsyncClient(timeout=10) as sim:
-        hooks = (await sim.get(f"{E2E_SIM_URL}/hooks/received")).json()
-
     return {
         "uploaded": uploaded,
         "status": status,
-        "hook_events": hooks.get("events", []),
+        "hook_events": await get_hook_events(),
     }
 
 

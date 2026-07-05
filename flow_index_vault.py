@@ -2293,7 +2293,11 @@ def _update_index_metadata_after_single_doc(index_root: str | Path, store) -> No
         meta["doc_count"] = doc_count
         meta["chunk_count"] = chunk_count
     meta["last_doc_indexed_at"] = datetime.now(timezone.utc).isoformat()
-    tmp_path = Path(f"{path}.tmp")
+    # PID-salted tmp name: the REST and MCP processes share this directory but
+    # _SINGLE_DOC_LOCK is per-process, so a fixed .tmp path could be written by
+    # both at once and rename a torn JSON into place (silently dropping the
+    # sweep's warning fields on the next merge-read).
+    tmp_path = Path(f"{path}.{os.getpid()}.tmp")
     tmp_path.write_text(json.dumps(meta, indent=2))
     tmp_path.replace(path)  # atomic: readers never see a partial file
 

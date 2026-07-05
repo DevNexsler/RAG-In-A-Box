@@ -8,9 +8,12 @@ Fault notes:
     indexed_corpus itself (the per-test /admin/reset wipes the live sink, so
     asserting on a later GET /hooks/received would race with reset ordering).
 """
+import uuid
+
 import httpx
 import pytest
 
+from tests.e2e.client import get_hook_events, search_hits
 from tests.e2e.conftest import E2E_SIM_URL
 
 pytestmark = pytest.mark.anyio
@@ -25,17 +28,16 @@ async def _arm_fault(route_prefix: str, fault: str, times: int):
 
 
 async def _upload_and_index(api, mcp_session, name: str, content: bytes) -> dict:
+    # Content salting for re-run safety: a repeat run against a live stack
+    # would otherwise hit the idempotent unchanged-skip path (the previous
+    # run already indexed identical bytes) and fail the "indexed" assertion.
+    content = content + f"\nrun-salt: {uuid.uuid4().hex}\n".encode()
     resp = await api.post("/api/upload", files={"file": (name, content)})
     assert resp.status_code == 201, resp.text
     result = await mcp_session.call_tool_json("file_index_document", {
         "target": name, "source_name": "documents"})
     assert result.get("status") == "indexed", result
     return result
-
-
-def _search_hits(payload, needle: str) -> list[dict]:
-    assert not payload.get("error"), payload
-    return [r for r in payload["results"] if needle in r.get("rel_path", "")]
 
 
 async def test_hooks_delivered_for_initial_sweep(indexed_corpus):
@@ -61,8 +63,7 @@ async def test_recovery_from_embeddings_429(indexed_corpus, api, mcp_session):
     # Retry-layer proof independent of search: the full pipeline (extract →
     # enrich → embed → upsert) completed and emitted document.indexed despite
     # the two 429s (sink was reset before this test).
-    async with httpx.AsyncClient(timeout=10) as sim:
-        events = (await sim.get(f"{E2E_SIM_URL}/hooks/received")).json()["events"]
+    events = await get_hook_events()
     delivered = [e for e in events
                  if e.get("event") == "document.indexed" and e.get("doc_id") == result["doc_id"]]
     assert delivered and delivered[0]["chunks"], events
@@ -72,15 +73,15 @@ async def test_recovery_from_embeddings_429(indexed_corpus, api, mcp_session):
     # serving cache (regression test for commit 66ce76e).
     payload = await mcp_session.call_tool_json(
         "file_search", {"query": "xylophone glacier permit", "top_k": 5})
-    assert _search_hits(payload, "fault-note"), payload["results"]
+    assert search_hits(payload, "fault-note"), payload["results"]
 
     # no failure-shaped audit events for this doc (audit records ID lifecycle;
     # rename_failed / collision are the failure signals it can carry)
     log = await mcp_session.call_tool_json(
         "file_audit_log", {"doc_id": result["doc_id"], "limit": 50})
-    events = {e["event"] for e in log["entries"]}
-    assert events, log
-    assert not events & {"rename_failed", "collision"}, log["entries"]
+    audit_events = {e["event"] for e in log["entries"]}
+    assert audit_events, log
+    assert not audit_events & {"rename_failed", "collision"}, log["entries"]
 
 
 async def test_degraded_enrichment_still_indexes(indexed_corpus, api, mcp_session):
@@ -95,14 +96,13 @@ async def test_degraded_enrichment_still_indexes(indexed_corpus, api, mcp_sessio
     assert result.get("doc_id")
 
     # Degradation proof independent of search: document.indexed still fired.
-    async with httpx.AsyncClient(timeout=10) as sim:
-        events = (await sim.get(f"{E2E_SIM_URL}/hooks/received")).json()["events"]
+    events = await get_hook_events()
     assert any(e.get("event") == "document.indexed" and e.get("doc_id") == result["doc_id"]
                for e in events), events
 
     payload = await mcp_session.call_tool_json(
         "file_search", {"query": "kaleidoscope ferry timetable", "top_k": 5})
-    hits = _search_hits(payload, "degraded-note")
+    hits = search_hits(payload, "degraded-note")
     assert hits, payload["results"]
 
     # the doc round-trips fully despite the failed enrichment

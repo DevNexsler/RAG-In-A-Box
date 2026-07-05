@@ -1,11 +1,20 @@
 """Browse/observability tool surface: list, recent, facets, folders, status,
 audit log, targeted re-index, and the scoped incremental sweep."""
-import httpx
+import time
+
+import anyio
 import pytest
 
-from tests.e2e.conftest import EXPECTED_CORPUS_DOCS, E2E_SIM_URL, wait_for_index
+from tests.e2e.client import get_hook_events
+from tests.e2e.conftest import EXPECTED_CORPUS_DOCS, NOTE_PHRASE, wait_for_index
 
 pytestmark = pytest.mark.anyio
+
+SWEEP_TIMEOUT_S = 120
+# If indexer_running never flips to True within this window after "started",
+# assume the sweep finished between polls instead of waiting out the full
+# timeout — the final idle check still guards correctness.
+RUNNING_OBSERVE_GRACE_S = 20
 
 
 async def test_list_documents_pagination(indexed_corpus, mcp_session):
@@ -87,7 +96,7 @@ async def test_index_document_reindex_existing(indexed_corpus, mcp_session):
 
     # Locate note.md's current (ID-aliased) rel_path via search.
     hit = await mcp_session.call_tool_json(
-        "file_search", {"query": "quixotic manganese lighthouse", "top_k": 1})
+        "file_search", {"query": NOTE_PHRASE, "top_k": 1})
     rel_path = hit["results"][0]["rel_path"]
 
     result = await mcp_session.call_tool_json(
@@ -100,8 +109,7 @@ async def test_index_document_reindex_existing(indexed_corpus, mcp_session):
     # audit-log entry (the audit log records ID lifecycle, not indexing runs).
     # The observable side-effect is the document.indexed webhook — sim_reset
     # cleared the sink before this test, so any event here came from this call.
-    async with httpx.AsyncClient(timeout=10) as sim:
-        events = (await sim.get(f"{E2E_SIM_URL}/hooks/received")).json()["events"]
+    events = await get_hook_events()
     assert any(
         e.get("event") == "document.indexed" and e.get("doc_id") == result["doc_id"]
         for e in events
@@ -115,10 +123,6 @@ async def test_index_update_scoped_sweep(indexed_corpus, mcp_session):
     # control action — its only parameter is source_name. Exercise the benign
     # scoped form: a sor-only incremental sweep (no changes → no-op) and verify
     # the index converges back to idle with the corpus intact.
-    import time
-
-    import anyio
-
     started = await mcp_session.call_tool_json(
         "file_index_update", {"source_name": "sor"})
     assert started.get("status") == "started", started
@@ -128,15 +132,15 @@ async def test_index_update_scoped_sweep(indexed_corpus, mcp_session):
     # Wait for the background subprocess to actually finish (indexer_running
     # goes true → false), not just for doc_count — the corpus already
     # satisfies min_docs, and a still-running sweep must not leak into the
-    # next test. If we never observe "running", the sweep finished between
-    # polls; the final idle check below still guards correctness.
+    # next test.
     saw_running = False
-    deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
+    start = time.monotonic()
+    while time.monotonic() - start < SWEEP_TIMEOUT_S:
         status = await mcp_session.call_tool_json("file_status", {})
         running = bool(status.get("indexer_running"))
         saw_running = saw_running or running
-        if not running and (saw_running or time.monotonic() > deadline - 100):
+        elapsed = time.monotonic() - start
+        if not running and (saw_running or elapsed > RUNNING_OBSERVE_GRACE_S):
             break
         await anyio.sleep(2)
 

@@ -9,16 +9,10 @@ real — so assertions search for distinctive lexical markers:
 """
 import pytest
 
+from tests.e2e.client import search_hits as _hits
 from tests.e2e.conftest import NOTE_PHRASE
 
 pytestmark = pytest.mark.anyio
-
-
-def _hits(payload) -> list[dict]:
-    assert isinstance(payload, dict) and not payload.get("error"), payload
-    results = payload.get("results")
-    assert isinstance(results, list), payload
-    return results
 
 
 def _rel_paths(results: list[dict]) -> list[str]:

@@ -64,6 +64,29 @@ def tool_payload(result):
         return joined
 
 
+async def get_hook_events() -> list[dict]:
+    """Snapshot the provider-sim webhook sink (events since the last reset)."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10) as sim:
+        resp = await sim.get(f"{E2E_SIM_URL}/hooks/received")
+        resp.raise_for_status()
+        return resp.json()["events"]
+
+
+def search_hits(payload, needle: str | None = None) -> list[dict]:
+    """Assert a file_search payload is well-formed and return its results.
+
+    With needle, filter to hits whose rel_path contains it.
+    """
+    assert isinstance(payload, dict) and not payload.get("error"), payload
+    results = payload.get("results")
+    assert isinstance(results, list), payload
+    if needle is None:
+        return results
+    return [r for r in results if needle in r.get("rel_path", "")]
+
+
 @asynccontextmanager
 async def open_mcp_session(test_name: str):
     """Open a real streamable-HTTP MCP session against the staging container."""
