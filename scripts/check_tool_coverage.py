@@ -21,15 +21,20 @@ Usage: python scripts/check_tool_coverage.py --run-dir <dir>
 import argparse
 import asyncio
 import json
+import os
 import sys
 from collections import Counter
 from pathlib import Path
 
 SPAN_PREFIX = "mcp.tool."
 
-DEFAULT_COVERAGE_FILE = ".evals/e2e-tool-coverage.jsonl"
-DEFAULT_MCP_URL = "http://localhost:17788/mcp"
-DEFAULT_API_KEY = "staging-test-key"
+# Defaults mirror tests/e2e/client.py exactly: the e2e suite honors these env
+# vars, so the checker must read the SAME coverage file / endpoint — otherwise
+# an env override would make it compare against a stale default path (silent
+# false green on the client side).
+DEFAULT_COVERAGE_FILE = os.environ.get("E2E_COVERAGE_FILE", ".evals/e2e-tool-coverage.jsonl")
+DEFAULT_MCP_URL = os.environ.get("E2E_BASE_URL", "http://localhost:17788") + "/mcp"
+DEFAULT_API_KEY = os.environ.get("E2E_API_KEY", "staging-test-key")
 
 
 # --- pure logic (unit-tested) -------------------------------------------------
@@ -39,10 +44,14 @@ def check_coverage(discovered: set, covered: set) -> set:
     return set(discovered) - set(covered)
 
 
+def _strip_spans(span_names: list) -> list:
+    """Tool names extracted from mcp.tool.<name> spans (other spans dropped)."""
+    return [n[len(SPAN_PREFIX):] for n in span_names if n.startswith(SPAN_PREFIX)]
+
+
 def check_tool_spans(discovered: set, span_names: list) -> set:
     """Tools discovered on the server with no mcp.tool.<name> span on disk."""
-    traced = {n[len(SPAN_PREFIX):] for n in span_names if n.startswith(SPAN_PREFIX)}
-    return set(discovered) - traced
+    return set(discovered) - set(_strip_spans(span_names))
 
 
 def build_matrix(discovered: set, coverage_records: list, span_names: list) -> dict:
@@ -50,9 +59,7 @@ def build_matrix(discovered: set, coverage_records: list, span_names: list) -> d
     tests_by_tool = {}
     for rec in coverage_records:
         tests_by_tool.setdefault(rec["tool"], set()).add(rec.get("test", "?"))
-    span_counts = Counter(
-        n[len(SPAN_PREFIX):] for n in span_names if n.startswith(SPAN_PREFIX)
-    )
+    span_counts = Counter(_strip_spans(span_names))
     return {
         tool: {
             "tests": sorted(tests_by_tool.get(tool, ())),
@@ -116,6 +123,8 @@ def discover_tools(mcp_url: str, api_key: str) -> set:
     try:
         return asyncio.run(_list_tools(mcp_url, api_key))
     except BaseException as exc:  # anyio wraps failures in BaseExceptionGroup
+        if isinstance(exc, KeyboardInterrupt):
+            raise
         raise SystemExit(
             f"FAIL tool-coverage: cannot list tools from {mcp_url} — this check "
             f"must run inside the compose window with the staging stack up "
@@ -136,6 +145,12 @@ def main(argv=None) -> int:
 
     run_dir = Path(args.run_dir)
     discovered = discover_tools(args.mcp_url, args.api_key)
+    if not discovered:
+        # 0 discovered tools makes both checks vacuously pass ("0/0 covered")
+        # — a broken or empty list_tools must never greenlight the gate.
+        raise SystemExit(
+            f"FAIL tool-coverage: list_tools returned 0 tools from {args.mcp_url}"
+        )
     records = load_coverage(args.coverage_file)
     span_names = load_span_names(run_dir / "traces")
 

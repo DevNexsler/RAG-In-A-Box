@@ -1,5 +1,8 @@
 # NOTE: `scripts` has no __init__.py — this import works via conftest's sys.path
 # insert + namespace packages. Do not "fix" by adding __init__.py.
+import pytest
+
+import scripts.check_tool_coverage as ctc
 from scripts.check_tool_coverage import (
     build_matrix,
     check_coverage,
@@ -62,6 +65,7 @@ def test_load_coverage_skips_malformed_lines(tmp_path):
         '{"no_tool_key": 1}\n'
         "\n"
         '["a list, not a dict"]\n'
+        '{"tool": 123}\n'
         '{"tool": "b", "test": "u"}\n'
     )
     records = load_coverage(p)
@@ -88,3 +92,13 @@ def test_load_span_names_recursive_and_skips_malformed(tmp_path):
 
 def test_load_span_names_missing_dir_is_empty(tmp_path):
     assert load_span_names(tmp_path / "no-traces-here") == []
+
+
+# --- main: empty discovery must never greenlight the gate ---------------------
+
+def test_main_fails_on_zero_discovered_tools(tmp_path, monkeypatch):
+    # A broken/empty list_tools would otherwise make every check vacuously
+    # pass (0 tools -> nothing uncovered, nothing untraced).
+    monkeypatch.setattr(ctc, "discover_tools", lambda url, key: set())
+    with pytest.raises(SystemExit, match="returned 0 tools"):
+        ctc.main(["--run-dir", str(tmp_path)])
