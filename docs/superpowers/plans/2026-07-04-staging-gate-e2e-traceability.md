@@ -211,6 +211,11 @@ The `main()` (same file): create `RUN_ROOT/<YYYYmmdd-HHMMSS>/`, iterate tiers, h
 
 Compose wrapping in `main()` must be exception-safe:
 
+> **Correction (review, Task 2):** `subprocess.run(up, check=True)` belongs INSIDE the
+> `try` — otherwise a partially-started stack (up fails midway) never gets `down -v`.
+> The implementation in `scripts/gate.py` does this; the snippet below kept the
+> original (wrong) placement for the record.
+
 ```python
 if tier.needs_compose:
     up = ["docker", "compose", "-f", "docker-compose.staging.yml", "up", "-d", "--build", "--wait"]

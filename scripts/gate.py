@@ -14,7 +14,7 @@ from pathlib import Path
 @dataclasses.dataclass(frozen=True)
 class Tier:
     name: str
-    cmd: list          # command template; {run_dir} substituted
+    cmd: list[str]     # command template; {run_dir} substituted
     needs_compose: bool = False
 
 
@@ -22,17 +22,17 @@ RUN_ROOT = Path(".evals/gate-runs")
 COMPOSE_FILE = Path("docker-compose.staging.yml")
 
 # static is two commands; run_tier runs them in sequence, both must pass
-STATIC_SECOND_CMD = ["python", "-m", "pytest", "--collect-only", "-q"]
+STATIC_SECOND_CMD = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
 
 TIERS = [
     Tier("static", ["ruff", "check", "."]),
-    Tier("unit", ["python", "-m", "pytest", "-m", "unit", "-q",
+    Tier("unit", [sys.executable, "-m", "pytest", "-m", "unit", "-q",
                   "--junitxml={run_dir}/unit.xml"]),
-    Tier("integration", ["python", "-m", "pytest", "-m", "integration", "-q",
+    Tier("integration", [sys.executable, "-m", "pytest", "-m", "integration", "-q",
                          "--junitxml={run_dir}/integration.xml"]),
-    Tier("staging-e2e", ["python", "-m", "pytest", "tests/e2e", "-m", "e2e", "-q",
+    Tier("staging-e2e", [sys.executable, "-m", "pytest", "tests/e2e", "-m", "e2e", "-q",
                          "--junitxml={run_dir}/e2e.xml"], needs_compose=True),
-    Tier("live", ["python", "-m", "pytest", "-m", "live", "-q",
+    Tier("live", [sys.executable, "-m", "pytest", "-m", "live", "-q",
                   "--junitxml={run_dir}/live.xml"]),
 ]
 
@@ -46,25 +46,35 @@ def next_tier_allowed(name, results):
     return False
 
 
-def _run(cmd, run_dir):
+def _run(cmd, run_dir, tier_name):
     cmd = [part.format(run_dir=run_dir) for part in cmd]
     print(f"  $ {' '.join(cmd)}", flush=True)
-    return subprocess.run(cmd).returncode == 0
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except FileNotFoundError:
+        print(f"FAIL {tier_name}: command not found: {cmd[0]}", flush=True)
+        return False
 
 
 def run_tier(tier, run_dir):
-    ok = _run(tier.cmd, run_dir)
+    ok = _run(tier.cmd, run_dir, tier.name)
     if tier.name == "static":
-        ok = ok and _run(STATIC_SECOND_CMD, run_dir)
+        ok = ok and _run(STATIC_SECOND_CMD, run_dir, tier.name)
     return ok
 
 
 def collect_staging_traces(run_dir):
     # Stub until the staging stack settles: copy the traces volume out of the
     # app container; tolerate failure with a warning.
+    # NOTE(Task 7): service name "app" is hardcoded here — reconcile with the
+    # actual service name once docker-compose.staging.yml lands.
     cmd = ["docker", "compose", "-f", str(COMPOSE_FILE),
            "cp", "app:/traces", str(run_dir / "traces")]
-    if subprocess.run(cmd).returncode != 0:
+    try:
+        rc = subprocess.run(cmd).returncode
+    except FileNotFoundError:
+        rc = 1
+    if rc != 0:
         print("WARN: could not collect staging traces", flush=True)
 
 
@@ -74,22 +84,35 @@ def run_compose_tier(tier, run_dir):
         return False
     up = ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "--build", "--wait"]
     down = ["docker", "compose", "-f", str(COMPOSE_FILE), "down", "-v"]
-    subprocess.run(up, check=True)
+    ok = False
     try:
+        # up runs INSIDE the try: a partially-started stack must still get `down -v`
+        subprocess.run(up, check=True)
         ok = run_tier(tier, run_dir)
         collect_staging_traces(run_dir)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(f"FAIL {tier.name}: compose up failed: {exc}", flush=True)
     finally:
-        subprocess.run(down, check=False)
+        try:
+            subprocess.run(down, check=False)
+        except FileNotFoundError:
+            pass  # docker itself missing; the except above already reported it
     return ok
+
+
+def preflight_passed(rc):
+    # Strict: ONLY exit code 0 approves the real-money live tier.
+    # (Never use `rc in (0, None, True)` — True == 1 in Python, so a failing
+    # preflight exit code of 1 would silently pass.)
+    return rc == 0
 
 
 def live_preflight_ok():
     if not Path("scripts/live_preflight.py").exists():
         print("FAIL live: live preflight not implemented (Task 10 pending)", flush=True)
         return False
-    from scripts.live_preflight import main as preflight  # noqa: PLC0415
-    rc = preflight()
-    return rc in (0, None, True)
+    rc = subprocess.run([sys.executable, "scripts/live_preflight.py"]).returncode
+    return preflight_passed(rc)
 
 
 def dispatch(tier, run_dir):
