@@ -166,6 +166,15 @@ def test_indexer_heartbeat_boundary_uses_named_threshold(monkeypatch):
     assert ok
 
 
+def test_indexer_heartbeat_just_under_threshold_fails(monkeypatch):
+    # just under the threshold: still active — pins the comparison direction
+    hb = str(time.time() - (lp.HEARTBEAT_ACTIVE_THRESHOLD_S - 5))
+    monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout=hb))
+    ok, reason = lp.check_prod_indexer_idle()
+    assert not ok
+    assert "active" in reason.lower()
+
+
 def test_indexer_container_not_running_passes(monkeypatch):
     # docker exec nonzero rc: container down or heartbeat file absent
     monkeypatch.setattr(lp.subprocess, "run",

@@ -102,11 +102,15 @@ def check_prod_indexer_idle() -> tuple[bool, str]:
         return True, ("WARNING: docker binary missing — cannot check prod "
                       "indexer heartbeat; assuming idle")
     except subprocess.TimeoutExpired:
-        return True, "docker exec timed out; assuming prod indexer idle"
+        return True, ("WARNING: docker exec timed out — cannot verify prod "
+                      "indexer heartbeat; assuming idle")
     if proc.returncode != 0:
         # Container not running, or heartbeat file absent: nothing is
-        # contending for the Mac.
-        return True, "prod container not running or no heartbeat file"
+        # contending for the Mac. Surface stderr so operators can tell
+        # container-not-running vs daemon-unreachable vs file-absent apart.
+        detail = proc.stderr.strip()[:120]
+        return True, ("prod container not running or no heartbeat file"
+                      + (f" ({detail})" if detail else ""))
     try:
         age = time.time() - float(proc.stdout.strip())
     except ValueError:

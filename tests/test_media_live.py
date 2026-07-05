@@ -38,7 +38,7 @@ def _provider():
     if not (config.get("media") or {}).get("enabled"):
         config["media"] = {"enabled": True, "provider": "openrouter"}
     provider = build_media_provider(config)
-    assert provider is not None
+    assert provider is not None, "config_test.yaml media section yielded no provider"
     return provider
 
 
