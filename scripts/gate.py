@@ -79,6 +79,19 @@ def collect_staging_traces(run_dir):
         print("WARN: could not collect staging traces", flush=True)
 
 
+def check_tool_coverage(run_dir):
+    # Two-sided tool-coverage enforcement (Task 9). Needs the live MCP endpoint
+    # for list_tools, so it must run INSIDE the compose window, after
+    # collect_staging_traces has copied the span artifacts into run_dir.
+    cmd = [sys.executable, "scripts/check_tool_coverage.py", "--run-dir", str(run_dir)]
+    print(f"  $ {' '.join(cmd)}", flush=True)
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except FileNotFoundError:
+        print("FAIL staging-e2e: tool-coverage check could not run", flush=True)
+        return False
+
+
 def run_compose_tier(tier, run_dir):
     if not COMPOSE_FILE.exists():
         print(f"FAIL {tier.name}: {COMPOSE_FILE} not found", flush=True)
@@ -91,6 +104,8 @@ def run_compose_tier(tier, run_dir):
         subprocess.run(up, check=True)
         ok = run_tier(tier, run_dir)
         collect_staging_traces(run_dir)
+        if ok:
+            ok = check_tool_coverage(run_dir)
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"FAIL {tier.name}: compose up failed: {exc}", flush=True)
     finally:
