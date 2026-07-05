@@ -4,18 +4,21 @@ from pathlib import Path
 
 
 def _collect(marker):
-    # --ignore self: this file's own test IDs contain "_live" and would
-    # pollute the substring assertions below.
     # cwd is pinned to the repo root so these tests pass from any directory.
     out = subprocess.run(
         [
             sys.executable, "-m", "pytest", "--collect-only", "-q",
-            "-m", marker, "--ignore", "tests/test_tier_markers.py", "tests/",
+            "-m", marker, "tests/",
         ],
         capture_output=True, text=True,
         cwd=Path(__file__).resolve().parents[1],
     )
-    return out.stdout
+    # Markers derive from FILENAME conventions, so assert on the file-path part
+    # of each node id only — test *function* names may legitimately contain
+    # "_live" etc. (e.g. test_gate_runner.py::test_live_requires_all_prior).
+    return "\n".join(
+        line.split("::")[0] for line in out.stdout.splitlines() if "::" in line
+    )
 
 
 def test_integration_tier_matches_filenames():
