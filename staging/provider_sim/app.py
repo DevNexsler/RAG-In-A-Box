@@ -170,6 +170,8 @@ async def fault_middleware(request: Request, call_next):
             for armed in ARMED_FAULTS:
                 if armed["times"] > 0 and path.startswith(armed["route_prefix"]):
                     armed["times"] -= 1
+                    if armed["times"] <= 0:
+                        ARMED_FAULTS.remove(armed)  # keep the armed count meaningful
                     if armed["fault"] == "timeout":
                         await asyncio.sleep(armed["seconds"])
                     else:
@@ -343,7 +345,7 @@ async def hooks_sink(request: Request) -> dict:
 
 @app.get("/hooks/received")
 async def hooks_received() -> dict:
-    return {"events": SINK_EVENTS}
+    return {"events": list(SINK_EVENTS)}
 
 
 @app.post("/admin/reset")
@@ -353,15 +355,27 @@ async def admin_reset() -> dict:
     return {"ok": True}
 
 
+_KNOWN_FAULTS = {"429", "timeout", "garbage"}
+
+
 @app.post("/admin/fault")
-async def admin_fault(request: Request) -> dict:
+async def admin_fault(request: Request):
     body = await request.json()
+    fault = body.get("fault")
+    if fault not in _KNOWN_FAULTS:
+        # A typo'd fault name must not silently no-op — downstream gate tests
+        # would misread the resulting normal responses as "retry recovered".
+        return JSONResponse(
+            {"error": f"unknown fault {fault!r}; expected one of {sorted(_KNOWN_FAULTS)}"},
+            status_code=400,
+        )
     ARMED_FAULTS.append(
         {
             "route_prefix": body["route_prefix"],
-            "fault": body["fault"],
+            "fault": fault,
             "times": int(body.get("times", 1)),
             "seconds": float(body.get("seconds", 10)),
         }
     )
-    return {"ok": True, "armed": len(ARMED_FAULTS)}
+    armed = sum(1 for f in ARMED_FAULTS if f["times"] > 0)
+    return {"ok": True, "armed": armed}

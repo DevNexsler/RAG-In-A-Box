@@ -15,7 +15,15 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = ROOT / "staging" / "provider_sim" / "app.py"
-TRACES_DIR = Path("/home/danpark/projects/RAG-in-a-Box/.evals/llm-traces")
+# .evals is gitignored, so linked worktrees don't carry it — prefer the
+# repo-relative path, fall back to the main checkout's copy.
+_TRACES_CANDIDATES = (
+    ROOT / ".evals" / "llm-traces",
+    Path("/home/danpark/projects/RAG-in-a-Box/.evals/llm-traces"),
+)
+TRACES_DIR = next(
+    (p for p in _TRACES_CANDIDATES if p.is_dir()), _TRACES_CANDIDATES[0]
+)
 
 # Keys parse_enrichment_response / the enrichment JSON schema require
 # (doc_enrichment.py: _ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW).
@@ -50,16 +58,21 @@ ENRICHMENT_KEYS = [
 ]
 
 
-def _load_app():
+def _load_module():
     spec = importlib.util.spec_from_file_location("provider_sim_app", APP_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.app
+    return module
 
 
 @pytest.fixture(scope="module")
-def app():
-    return _load_app()
+def sim_module():
+    return _load_module()
+
+
+@pytest.fixture(scope="module")
+def app(sim_module):
+    return sim_module.app
 
 
 @pytest.fixture
@@ -425,6 +438,68 @@ async def test_fault_header_timeout_delays(client):
 
 
 @pytest.mark.anyio
+async def test_fault_armed_timeout_delays_then_recovers(client):
+    arm = await client.post(
+        "/admin/fault",
+        json={
+            "route_prefix": "/api/v1/embeddings",
+            "fault": "timeout",
+            "times": 1,
+            "seconds": 0.1,
+        },
+    )
+    assert arm.status_code == 200
+    payload = {"model": "m", "input": ["hello"]}
+    start = time.monotonic()
+    resp = await client.post("/api/v1/embeddings", json=payload)
+    elapsed = time.monotonic() - start
+    assert resp.status_code == 200
+    assert elapsed >= 0.1, "armed timeout fault must delay the first call"
+    start = time.monotonic()
+    resp = await client.post("/api/v1/embeddings", json=payload)
+    elapsed = time.monotonic() - start
+    assert resp.status_code == 200
+    assert elapsed < 0.1, "charge exhausted: second call must be fast again"
+
+
+@pytest.mark.anyio
+async def test_admin_fault_rejects_unknown_fault_name(client):
+    resp = await client.post(
+        "/admin/fault",
+        json={"route_prefix": "/api/v1/embeddings", "fault": "flaky", "times": 1},
+    )
+    assert resp.status_code == 400, "unknown fault names must not silently no-op"
+    # nothing was armed — traffic flows normally
+    resp = await client.post("/api/v1/embeddings", json={"model": "m", "input": ["x"]})
+    assert resp.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_admin_fault_armed_count_excludes_exhausted(client):
+    await client.post(
+        "/admin/fault",
+        json={"route_prefix": "/api/v1/embeddings", "fault": "429", "times": 1},
+    )
+    resp = await client.post("/api/v1/embeddings", json={"model": "m", "input": ["x"]})
+    assert resp.status_code == 429  # consumes the only charge
+    arm = await client.post(
+        "/admin/fault",
+        json={"route_prefix": "/v1/inference", "fault": "429", "times": 1},
+    )
+    assert arm.json()["armed"] == 1, "exhausted faults must not inflate the count"
+
+
+@pytest.mark.anyio
+async def test_hooks_received_returns_copy_not_live_list(client, sim_module):
+    # Over HTTP serialization always copies, so assert directly on the handler:
+    # it must return a snapshot, not the live SINK_EVENTS list.
+    await client.post("/hooks/sink", json={"event": "one"})
+    body = await sim_module.hooks_received()
+    assert body["events"] == [{"event": "one"}]
+    assert body["events"] is not sim_module.SINK_EVENTS
+
+
+@pytest.mark.anyio
 async def test_fault_armed_garbage_with_reset(client):
     await client.post(
         "/admin/fault",
@@ -460,7 +535,10 @@ def _load_recorded_chat_response():
         try:
             with open(trace_file) as f:
                 for line in f:
-                    entry = json.loads(line)
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue  # skip malformed production-recorded lines
                     response = entry.get("response")
                     url = entry.get("request", {}).get("url", "")
                     if (
