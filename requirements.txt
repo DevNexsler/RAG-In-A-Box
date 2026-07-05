@@ -77,3 +77,8 @@ mlx-embeddings>=0.0.5
 # Extracts summary, entities, topics, keywords from each document.
 # mlx-lm is already a dependency of mlx-embeddings, listed here explicitly.
 mlx-lm>=0.20.0
+
+# Tracing (core/tracing.py): OTEL SDK + JSONL file exporter, no collector.
+# Off unless config.yaml has tracing.enabled: true.
+opentelemetry-sdk>=1.25
+opentelemetry-instrumentation-httpx>=0.46b0

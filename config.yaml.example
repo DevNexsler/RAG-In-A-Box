@@ -210,3 +210,9 @@ event_hooks:
 mcp:
   host: "127.0.0.1"
   port: 7788
+
+# --- Tracing (optional) ---
+# OTEL spans written as JSONL files by core/tracing.py — no collector, no UI.
+# tracing:
+#   enabled: false          # spans as JSONL; no external services
+#   directory: .evals/spans # inside the container use /data/traces
