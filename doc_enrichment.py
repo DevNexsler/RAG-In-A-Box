@@ -22,12 +22,16 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from core.enrichment_postprocess import repair_enrichment
+from core.tracing import get_tracer
 
 if TYPE_CHECKING:
     from providers.llm import LLMGenerator
     from taxonomy_store import TaxonomyStore
 
 logger = logging.getLogger(__name__)
+
+# Lazy tracer (resolves provider per call); spans are no-ops when tracing is off.
+_tracer = get_tracer("pipeline")
 
 _PROMPT_TEMPLATE = """\
 Extract metadata from this document. Respond with ONLY valid JSON, no other text.
@@ -630,88 +634,89 @@ def enrich_document(
     Returns a dict with all ENRICHMENT_FIELDS populated (or empty strings
     on failure).  Never raises — logs warnings on parse errors.
     """
-    if not text or not text.strip():
-        logger.debug("Skipping enrichment for empty document: %s", title)
-        return empty_enrichment()
+    with _tracer.start_as_current_span("enrich"):
+        if not text or not text.strip():
+            logger.debug("Skipping enrichment for empty document: %s", title)
+            return empty_enrichment()
 
-    if len(text) <= max_input_chars:
-        truncated = text
-    else:
-        # Head + tail sampling: capture both opening context and late-document
-        # conclusions/facts that a simple head truncation would miss.
-        half = max_input_chars // 2
-        truncated = text[:half] + "\n\n[...]\n\n" + text[-half:]
+        if len(text) <= max_input_chars:
+            truncated = text
+        else:
+            # Head + tail sampling: capture both opening context and late-document
+            # conclusions/facts that a simple head truncation would miss.
+            half = max_input_chars // 2
+            truncated = text[:half] + "\n\n[...]\n\n" + text[-half:]
 
-    # Build taxonomy context block for the prompt
-    taxonomy_block = ""
-    if taxonomy_store is not None:
-        try:
-            raw_block = taxonomy_store.format_for_prompt()
-            if raw_block:
-                taxonomy_block = f"\n{_TAXONOMY_INSTRUCTION}\n{raw_block}\n"
-        except Exception as exc:
-            logger.warning("Failed to load taxonomy for prompt: %s", exc)
+        # Build taxonomy context block for the prompt
+        taxonomy_block = ""
+        if taxonomy_store is not None:
+            try:
+                raw_block = taxonomy_store.format_for_prompt()
+                if raw_block:
+                    taxonomy_block = f"\n{_TAXONOMY_INSTRUCTION}\n{raw_block}\n"
+            except Exception as exc:
+                logger.warning("Failed to load taxonomy for prompt: %s", exc)
 
-    normalized_context_text = (context_text or "").strip()
-    template = _CONTEXT_PROMPT_TEMPLATE if normalized_context_text else _PROMPT_TEMPLATE
-    prompt = template.format(
-        title=title,
-        source_type=source_type,
-        text=truncated,
-        taxonomy_block=taxonomy_block,
-        context_text=normalized_context_text,
-    )
-
-    try:
-        raw_response = generator.generate(prompt, max_tokens=max_output_tokens)
-        logger.debug("LLM enrichment raw response for '%s': %s", title, raw_response[:200])
-
-        enrichment = parse_enrichment_response(raw_response)
-        enrichment = _repair_context_omissions(enrichment, truncated, context_text)
-        enrichment = repair_enrichment(
-            enrichment,
-            text=truncated,
+        normalized_context_text = (context_text or "").strip()
+        template = _CONTEXT_PROMPT_TEMPLATE if normalized_context_text else _PROMPT_TEMPLATE
+        prompt = template.format(
             title=title,
             source_type=source_type,
-            enabled=postprocess_enrichment,
-            enabled_rules=postprocess_rules,
+            text=truncated,
+            taxonomy_block=taxonomy_block,
+            context_text=normalized_context_text,
         )
 
-        if not enrichment.get("enr_summary"):
-            logger.warning(
-                "LLM returned empty summary for '%s'. Raw response: %s",
-                title, raw_response[:300],
+        try:
+            raw_response = generator.generate(prompt, max_tokens=max_output_tokens)
+            logger.debug("LLM enrichment raw response for '%s': %s", title, raw_response[:200])
+
+            enrichment = parse_enrichment_response(raw_response)
+            enrichment = _repair_context_omissions(enrichment, truncated, context_text)
+            enrichment = repair_enrichment(
+                enrichment,
+                text=truncated,
+                title=title,
+                source_type=source_type,
+                enabled=postprocess_enrichment,
+                enabled_rules=postprocess_rules,
             )
 
-        # Increment usage_count for matched taxonomy entries
-        if taxonomy_store is not None and record_taxonomy_usage:
-            try:
-                for tag in (enrichment.get("enr_suggested_tags") or "").split(","):
-                    tag = tag.strip()
-                    if tag:
-                        taxonomy_store.increment_usage(f"tag:{tag}")
-                folder = (enrichment.get("enr_suggested_folder") or "").strip()
-                if folder:
-                    taxonomy_store.increment_usage(f"folder:{folder}")
-            except Exception as exc:
-                logger.warning("Failed to increment taxonomy usage: %s", exc)
+            if not enrichment.get("enr_summary"):
+                logger.warning(
+                    "LLM returned empty summary for '%s'. Raw response: %s",
+                    title, raw_response[:300],
+                )
 
-        logger.info(
-            "Enriched '%s': doc_type=%s, topics=%s",
-            title,
-            enrichment.get("enr_doc_type", ""),
-            enrichment.get("enr_topics", "")[:80],
-        )
-        return enrichment
+            # Increment usage_count for matched taxonomy entries
+            if taxonomy_store is not None and record_taxonomy_usage:
+                try:
+                    for tag in (enrichment.get("enr_suggested_tags") or "").split(","):
+                        tag = tag.strip()
+                        if tag:
+                            taxonomy_store.increment_usage(f"tag:{tag}")
+                    folder = (enrichment.get("enr_suggested_folder") or "").strip()
+                    if folder:
+                        taxonomy_store.increment_usage(f"folder:{folder}")
+                except Exception as exc:
+                    logger.warning("Failed to increment taxonomy usage: %s", exc)
 
-    except json.JSONDecodeError as exc:
-        logger.warning(
-            "Failed to parse LLM JSON for '%s': %s. Response: %s",
-            title, exc, raw_response[:300] if "raw_response" in dir() else "N/A",
-        )
-        return failed_enrichment(f"json_parse_error: {exc}")
-    except Exception as exc:
-        logger.error(
-            "LLM enrichment failed for '%s': %s: %s", title, type(exc).__name__, exc,
-        )
-        return failed_enrichment(f"{type(exc).__name__}: {exc}")
+            logger.info(
+                "Enriched '%s': doc_type=%s, topics=%s",
+                title,
+                enrichment.get("enr_doc_type", ""),
+                enrichment.get("enr_topics", "")[:80],
+            )
+            return enrichment
+
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Failed to parse LLM JSON for '%s': %s. Response: %s",
+                title, exc, raw_response[:300] if "raw_response" in dir() else "N/A",
+            )
+            return failed_enrichment(f"json_parse_error: {exc}")
+        except Exception as exc:
+            logger.error(
+                "LLM enrichment failed for '%s': %s: %s", title, type(exc).__name__, exc,
+            )
+            return failed_enrichment(f"{type(exc).__name__}: {exc}")

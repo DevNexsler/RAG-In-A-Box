@@ -10,11 +10,15 @@ import logging
 import os
 
 from core.config import load_config
+from core.tracing import setup_tracing
 
 config = load_config()
 
 log_level = config.get("logging", {}).get("level", "WARNING").upper()
 logging.basicConfig(level=getattr(logging, log_level, logging.WARNING))
+
+# No-op unless config has tracing.enabled: true; never raises.
+setup_tracing(config, "doc-organizer")
 
 from mcp_server import run_server
 

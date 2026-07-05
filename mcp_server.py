@@ -12,6 +12,7 @@ from pathlib import Path
 from core.config import load_config
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
+from core.tracing import get_tracer
 from lancedb_store import LanceDBStore, open_store_with_recovery
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
@@ -1938,6 +1939,54 @@ if HAS_MCP and FastMCP is not None:
     from pydantic import Field
 
     mcp = FastMCP("file-index-mcp", json_response=True)
+
+    # --- MCP tool-call tracing -----------------------------------------
+    # Every registered tool emits a server-side `mcp.tool.<name>` span via
+    # ONE generic wrapper composed into mcp.tool() at registration time, so
+    # the tool functions below stay untouched. Only allowlisted scalar args
+    # are recorded as attributes — NEVER full arguments or document text.
+    # Downstream spans (e.g. search.hybrid) parent under the tool span
+    # automatically via OTEL context propagation. Spans are no-ops unless
+    # setup_tracing() ran with tracing.enabled: true.
+    _TOOL_SPAN_ARG_ALLOWLIST = ("top_k", "doc_id", "source", "return_mode")
+    _mcp_tracer = get_tracer("mcp")
+
+    def _with_tool_span(fn):
+        import functools
+        import inspect
+
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)  # transparent: FastMCP schema generation sees the
+        def wrapper(*args, **kwargs):  # original signature via __wrapped__
+            attributes = {"tool": fn.__name__}
+            try:
+                bound = sig.bind_partial(*args, **kwargs)
+                for arg_name in _TOOL_SPAN_ARG_ALLOWLIST:
+                    value = bound.arguments.get(arg_name)
+                    if isinstance(value, (bool, int, float, str)):
+                        attributes[arg_name] = value
+            except TypeError:
+                pass  # attribute capture must never break a tool call
+            with _mcp_tracer.start_as_current_span(
+                f"mcp.tool.{fn.__name__}", attributes=attributes
+            ):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    _original_mcp_tool = mcp.tool
+
+    def _traced_mcp_tool(*dargs, **dkwargs):
+        register = _original_mcp_tool(*dargs, **dkwargs)
+
+        def decorator(fn):
+            return register(_with_tool_span(fn))
+
+        return decorator
+
+    mcp.tool = _traced_mcp_tool
+    # ---------------------------------------------------------------------
 
     @mcp.tool()
     def file_search(

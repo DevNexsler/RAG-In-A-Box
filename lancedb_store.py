@@ -16,9 +16,13 @@ from llama_index.vector_stores.lancedb import LanceDBVectorStore
 from llama_index.vector_stores.lancedb.base import TableNotFoundError
 
 from core.storage import SearchHit
+from core.tracing import get_tracer
 from doc_enrichment import CORE_ENRICHMENT_FIELDS
 
 logger = logging.getLogger(__name__)
+
+# Lazy tracer (resolves provider per call); spans are no-ops when tracing is off.
+_tracer = get_tracer("pipeline")
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _CORRUPT_LANCE_MARKERS = (
@@ -669,53 +673,54 @@ class LanceDBStore:
 
     def upsert_nodes(self, nodes: list[TextNode]) -> None:
         """Delete existing nodes for each doc_id, then add new ones."""
-        if not nodes:
-            return
+        with _tracer.start_as_current_span("store.upsert"):
+            if not nodes:
+                return
 
-        # Defense in depth (#0108): metadata that came from a read-back row
-        # carries LlamaIndex-managed keys; persisting them nests the stale
-        # _node_content inside the fresh serialization and it compounds on
-        # every rewrite. All of these are regenerated at write time.
-        for n in nodes:
-            if n.metadata and not _LLAMA_MANAGED_METADATA_KEYS.isdisjoint(n.metadata):
-                n.metadata = _strip_llama_managed_keys(n.metadata)
-
-        # Detect new metadata fields and evolve schema if needed
-        existing_subfields = self._metadata_subfields()
-        if existing_subfields:  # table already has data
-            incoming_keys: set[str] = set()
+            # Defense in depth (#0108): metadata that came from a read-back row
+            # carries LlamaIndex-managed keys; persisting them nests the stale
+            # _node_content inside the fresh serialization and it compounds on
+            # every rewrite. All of these are regenerated at write time.
             for n in nodes:
-                if n.metadata:
-                    incoming_keys.update(n.metadata.keys())
-            if incoming_keys:
-                # Threaded indexing shares one store instance; re-check missing
-                # fields under a lock so temp-table schema evolution is serialized.
-                with self._schema_lock:
-                    existing_subfields = self._metadata_subfields()
-                    new_fields = incoming_keys - existing_subfields
-                    if new_fields:
-                        self._evolve_metadata_schema(new_fields)
+                if n.metadata and not _LLAMA_MANAGED_METADATA_KEYS.isdisjoint(n.metadata):
+                    n.metadata = _strip_llama_managed_keys(n.metadata)
 
-        # Collect distinct doc_ids from this batch
-        doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
-        # Delete old data for those doc_ids first
-        for doc_id in doc_ids:
+            # Detect new metadata fields and evolve schema if needed
+            existing_subfields = self._metadata_subfields()
+            if existing_subfields:  # table already has data
+                incoming_keys: set[str] = set()
+                for n in nodes:
+                    if n.metadata:
+                        incoming_keys.update(n.metadata.keys())
+                if incoming_keys:
+                    # Threaded indexing shares one store instance; re-check missing
+                    # fields under a lock so temp-table schema evolution is serialized.
+                    with self._schema_lock:
+                        existing_subfields = self._metadata_subfields()
+                        new_fields = incoming_keys - existing_subfields
+                        if new_fields:
+                            self._evolve_metadata_schema(new_fields)
+
+            # Collect distinct doc_ids from this batch
+            doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
+            # Delete old data for those doc_ids first
+            for doc_id in doc_ids:
+                try:
+                    self._vs.delete(doc_id)
+                except TableNotFoundError:
+                    pass  # Table not created yet on first run
+                except Exception as e:
+                    logger.warning("Failed to delete old data for %s: %s", doc_id, e)
+            # Add new nodes
             try:
-                self._vs.delete(doc_id)
-            except TableNotFoundError:
-                pass  # Table not created yet on first run
-            except Exception as e:
-                logger.warning("Failed to delete old data for %s: %s", doc_id, e)
-        # Add new nodes
-        try:
-            self._vs.add(nodes)
-        except Exception:
-            logger.critical(
-                "Failed to add %d nodes for doc_ids=%s after old chunks were deleted; "
-                "these docs will self-heal on the next index run",
-                len(nodes), sorted(doc_ids),
-            )
-            raise
+                self._vs.add(nodes)
+            except Exception:
+                logger.critical(
+                    "Failed to add %d nodes for doc_ids=%s after old chunks were deleted; "
+                    "these docs will self-heal on the next index run",
+                    len(nodes), sorted(doc_ids),
+                )
+                raise
 
     def update_canonical_duplicate_metadata(
         self,

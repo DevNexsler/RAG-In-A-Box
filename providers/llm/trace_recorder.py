@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 from typing import Any
 
+from opentelemetry import trace as _otel_trace
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -56,6 +58,13 @@ class LLMTraceRecorder:
             "success": success,
             "error": error,
         }
+
+        # Join key to the OTEL span tree: when this LLM call happens inside a
+        # traced span (e.g. process_doc -> enrich), record its trace/span ids.
+        ctx = _otel_trace.get_current_span().get_span_context()
+        if ctx.is_valid:
+            payload["trace_id"] = format(ctx.trace_id, "032x")
+            payload["span_id"] = format(ctx.span_id, "016x")
 
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
