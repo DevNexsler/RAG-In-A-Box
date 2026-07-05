@@ -1,0 +1,44 @@
+# Staging stack — hermetic: all provider traffic terminates at provider-sim,
+# the comm store is a throwaway postgres with deterministic fixtures.
+# Isolated from the production compose (docker-compose.yml): distinct project
+# name, its own default network (prod uses external networks), distinct host
+# ports (17788/19999 vs 7788), and its own named volumes.
+name: doc-organizer-staging
+services:
+  doc-organizer-staging:
+    build: .
+    mem_limit: 4g
+    ports: ["17788:7788"]
+    environment:
+      OPENROUTER_API_KEY: sim
+      DEEPINFRA_API_KEY: sim
+      API_KEY: staging-test-key
+      COMM_DATA_STORE_DSN: postgresql://comm:comm@comm-postgres:5432/comm
+      SOR_DSN: postgresql://comm:comm@comm-postgres:5432/comm
+    volumes:
+      - ./config.staging.yaml:/app/config.yaml:ro
+      - staging-docs:/data/documents
+      - staging-index:/data/index
+      - staging-traces:/data/traces
+    depends_on:
+      provider-sim: {condition: service_started}
+      comm-postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7788/health')"]
+      interval: 5s
+      retries: 20
+  provider-sim:
+    build: ./staging/provider_sim
+    ports: ["19999:9999"]
+  comm-postgres:
+    image: postgres:16-alpine
+    environment: {POSTGRES_USER: comm, POSTGRES_PASSWORD: comm, POSTGRES_DB: comm}
+    volumes: ["./staging/comm_postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U comm"]
+      interval: 3s
+      retries: 20
+volumes:
+  staging-docs: {}
+  staging-index: {}
+  staging-traces: {}

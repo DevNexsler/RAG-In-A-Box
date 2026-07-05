@@ -5,6 +5,7 @@ Usage: python scripts/gate.py [--fast] [--only TIER] [--run-dir DIR]
 """
 import argparse
 import dataclasses
+import os
 import subprocess
 import sys
 import time
@@ -19,7 +20,9 @@ class Tier:
 
 
 RUN_ROOT = Path(".evals/gate-runs")
-COMPOSE_FILE = Path("docker-compose.staging.yml")
+# GATE_COMPOSE_FILE override exists so tests can exercise the missing-compose
+# path without touching the real stack (and without ever invoking docker).
+COMPOSE_FILE = Path(os.environ.get("GATE_COMPOSE_FILE", "docker-compose.staging.yml"))
 
 # static is two commands; run_tier runs them in sequence, both must pass
 STATIC_SECOND_CMD = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
@@ -64,12 +67,10 @@ def run_tier(tier, run_dir):
 
 
 def collect_staging_traces(run_dir):
-    # Stub until the staging stack settles: copy the traces volume out of the
-    # app container; tolerate failure with a warning.
-    # NOTE(Task 7): service name "app" is hardcoded here — reconcile with the
-    # actual service name once docker-compose.staging.yml lands.
+    # Copy the traces volume (tracing.directory in config.staging.yaml) out of
+    # the app container; tolerate failure with a warning.
     cmd = ["docker", "compose", "-f", str(COMPOSE_FILE),
-           "cp", "app:/traces", str(run_dir / "traces")]
+           "cp", "doc-organizer-staging:/data/traces", str(run_dir / "traces")]
     try:
         rc = subprocess.run(cmd).returncode
     except FileNotFoundError:
@@ -80,7 +81,7 @@ def collect_staging_traces(run_dir):
 
 def run_compose_tier(tier, run_dir):
     if not COMPOSE_FILE.exists():
-        print(f"FAIL {tier.name}: docker-compose.staging.yml not found (Task 7 pending)", flush=True)
+        print(f"FAIL {tier.name}: {COMPOSE_FILE} not found", flush=True)
         return False
     up = ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "--build", "--wait"]
     down = ["docker", "compose", "-f", str(COMPOSE_FILE), "down", "-v"]

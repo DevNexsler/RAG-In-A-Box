@@ -1534,8 +1534,13 @@ def _file_status_impl() -> dict:
             import httpx
             api_key = os.environ.get("DEEPINFRA_API_KEY", "")
             model = reranker_cfg.get("model", "Qwen/Qwen3-Reranker-8B")
+            # Honor base_url overrides (staging provider-sim) — never ping
+            # production DeepInfra when the config points elsewhere.
+            base_url = reranker_cfg.get(
+                "base_url", "https://api.deepinfra.com"
+            ).rstrip("/")
             resp = httpx.post(
-                f"https://api.deepinfra.com/v1/inference/{model}",
+                f"{base_url}/v1/inference/{model}",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
