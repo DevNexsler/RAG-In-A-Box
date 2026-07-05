@@ -80,5 +80,7 @@ mlx-lm>=0.20.0
 
 # Tracing (core/tracing.py): OTEL SDK + JSONL file exporter, no collector.
 # Off unless config.yaml has tracing.enabled: true.
+# NOTE: opentelemetry-sdk 1.x and -instrumentation-httpx 0.xb0 release in
+# lockstep pairs (e.g. 1.43 <-> 0.64b0) — always bump both together.
 opentelemetry-sdk>=1.25
 opentelemetry-instrumentation-httpx>=0.46b0
