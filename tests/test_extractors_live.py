@@ -10,7 +10,6 @@ dependencies of markitdown[all]).
 
 import csv
 import io
-import os
 import zipfile
 from pathlib import Path
 
@@ -37,7 +36,6 @@ def _create_docx(path: Path, title: str = "Test Document", body: str = "This is 
 def _create_pptx(path: Path):
     """Create a real .pptx file using python-pptx."""
     from pptx import Presentation
-    from pptx.util import Inches
 
     prs = Presentation()
     # Title slide

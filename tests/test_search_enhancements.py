@@ -25,7 +25,6 @@ from search_hybrid import (
     hybrid_search,
     reciprocal_rank_fusion,
     Reranker,
-    SearchResult,
 )
 
 

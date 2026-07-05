@@ -16,7 +16,6 @@
 
 import tempfile
 import time
-from pathlib import Path
 
 import pytest
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo

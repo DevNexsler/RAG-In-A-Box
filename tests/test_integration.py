@@ -17,11 +17,9 @@ The test flow:
 """
 
 import os
-import sys
 import tempfile
 from pathlib import Path
 
-import httpx
 import pytest
 
 try:
@@ -519,7 +517,7 @@ class TestReranker:
     def test_reranker_returns_continuous_scores(self, indexed_store):
         """Reranker should return continuous relevance scores (0.0–1.0)."""
         import time
-        from search_hybrid import hybrid_search, reciprocal_rank_fusion
+        from search_hybrid import reciprocal_rank_fusion
 
         store = indexed_store["store"]
         embed = indexed_store["embed_provider"]
@@ -887,7 +885,11 @@ class TestFullPipelineWithEnrichment:
             pipeline_result["config"],
         )
 
-        response = mcp_server._file_search_impl("insurance claim roof", top_k=3)
+        # return="compact": the slim default (#0109) deliberately omits enr_*
+        # fields; this test asserts the MCP layer can surface them.
+        response = mcp_server._file_search_impl(
+            "insurance claim roof", top_k=3, return_mode="compact"
+        )
         assert "results" in response
         results = response["results"]
         assert len(results) >= 1

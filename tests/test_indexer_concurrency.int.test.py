@@ -8,9 +8,7 @@
 # Run with: pytest tests/test_indexer_concurrency.int.test.py -v
 
 import logging
-import tempfile
 import threading
-import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,7 +20,7 @@ pytest.importorskip("llama_index")
 from llama_index.core.node_parser import SentenceSplitter
 
 from doc_id_store import DocIDStore
-from flow_index_vault import _RUNTIME, process_doc_task
+from flow_index_vault import _RUNTIME
 from lancedb_store import LanceDBStore
 from providers.embed.base import EmbedProvider
 

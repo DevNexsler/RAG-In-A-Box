@@ -249,7 +249,9 @@ async def index_document(request: Request) -> JSONResponse:
     "force"?: false}. Called by comm-data-store-hooks per newly-deposited
     attachment so it becomes OCR'd/described/searchable within seconds without a
     full-source scan. Inherits the server's Bearer API_KEY auth like the rest of
-    /api/*. Idempotent: an unchanged file is skipped without re-OCR.
+    /api/*. Idempotent: an unchanged file is skipped without re-OCR. Known gap:
+    keyword (FTS) visibility awaits the next full sweep; vector search sees the
+    doc immediately.
     """
     if "application/json" not in request.headers.get("content-type", ""):
         return _api_error("invalid_request", "Expected application/json")

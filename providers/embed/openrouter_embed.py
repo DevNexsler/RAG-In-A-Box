@@ -49,6 +49,7 @@ class OpenRouterEmbedProvider(EmbedProvider):
         query_instruction: str = DEFAULT_QUERY_INSTRUCTION,
         batch_size: int = 64,
         timeout: float = 120.0,
+        base_url: str | None = None,
     ):
         self.model = model
         self.model_name = model  # alias for SemanticEmbeddingAdapter compatibility
@@ -56,6 +57,7 @@ class OpenRouterEmbedProvider(EmbedProvider):
         self.query_instruction = query_instruction
         self.batch_size = batch_size
         self.timeout = timeout
+        self._base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
 
         if not self.api_key:
             raise ValueError(
@@ -76,7 +78,7 @@ class OpenRouterEmbedProvider(EmbedProvider):
 
         def _do() -> list[list[float]]:
             resp = httpx.post(
-                f"{OPENROUTER_BASE_URL}/embeddings",
+                f"{self._base_url}/embeddings",
                 json={"model": self.model, "input": texts},
                 headers=headers,
                 timeout=self.timeout,
@@ -99,8 +101,6 @@ class OpenRouterEmbedProvider(EmbedProvider):
         return call_with_retry(
             _do, attempts=MAX_RETRIES, backoff=RETRY_BACKOFF, label="openrouter-embed",
         )
-
-        raise last_exc  # type: ignore[misc]
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed texts for indexing (no instruction prefix). Batches automatically."""

@@ -13,7 +13,6 @@
 # Run with: pytest tests/test_indexing_roundtrip.int.test.py -v
 
 import tempfile
-import time
 from pathlib import Path
 
 import pytest

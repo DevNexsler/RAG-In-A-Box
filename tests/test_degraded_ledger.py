@@ -6,7 +6,6 @@ their mtime is unchanged — otherwise they stay silently degraded until a
 full rebuild (901 description-less images sat that way in production).
 """
 
-import json
 import threading
 
 from extractors import begin_degradation_capture, collect_degradations, note_degradation

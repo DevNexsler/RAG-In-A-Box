@@ -1,0 +1,120 @@
+# Staging config — bind-mounted over /app/config.yaml by docker-compose.staging.yml.
+# Every provider points at the provider-sim container; the "keys" are fakes
+# (the sim ignores auth), so this file is safe to commit.
+#
+# Sources-mode (NOT documents_root): the two cannot coexist (core/config.py).
+# The postgres source MUST be named "sor" — sor_query.resolve_sor_dsn() looks
+# it up by that exact name.
+
+index_root: /data/index
+
+sources:
+  - type: filesystem
+    name: documents
+    root: /data/documents
+    scan:
+      include:
+        - "**/*.md"
+        - "**/*.txt"
+        - "**/*.pdf"
+        - "**/*.png"
+        - "**/*.jpg"
+        - "**/*.jpeg"
+        - "**/*.wav"
+        - "**/*.mp3"
+        - "**/*.mp4"
+      exclude:
+        - "**/.DS_Store"
+
+  - type: postgres
+    name: sor
+    dsn: "${COMM_DATA_STORE_DSN}"
+    tables:
+      - source_type: pg_message
+        query: |
+          SELECT source, source_message_id, channel_name, sender, direction,
+                 sent_at, updated_at, body AS _text
+          FROM messages
+          WHERE body IS NOT NULL AND body <> ''
+        id_template: "{source}/{source_message_id}"
+        text_column: _text
+        mtime_column: updated_at
+        metadata_columns: [source, source_message_id, channel_name, sender, sent_at, direction]
+
+pdf:
+  strategy: "text_then_ocr"
+  ocr_page_limit: 20
+  min_text_chars_before_ocr: 200
+
+ocr:
+  enabled: true
+  provider: "deepseek_ocr2"
+  base_url: "http://provider-sim:9999"
+  timeout: 60
+  concurrency: 1   # below prod's 2 — deliberate memory-cap concession (4g mem_limit)
+
+media:
+  enabled: true
+  provider: "openrouter"
+  base_url: "http://provider-sim:9999/api/v1"
+  audio_model: "openai/whisper-1"
+  video_model: "qwen/qwen3.5-397b-a17b"
+  max_file_size_mb: 50
+  timeout: 60
+
+embeddings:
+  provider: "openrouter"
+  model: "qwen/qwen3-embedding-8b"
+  base_url: "http://provider-sim:9999/api/v1"
+  batch_size: 8    # below prod's 64 — deliberate memory-cap concession (4g mem_limit)
+  concurrency: 2   # matches prod; keeps the concurrent-batching path exercised
+
+chunking:
+  max_chars: 1800
+  overlap: 200
+  min_chars: 150
+
+enrichment:
+  enabled: true
+  provider: "openrouter"
+  model: "openai/gpt-4.1-mini"
+  base_url: "http://provider-sim:9999/api/v1"
+  max_input_chars: 20000
+  max_output_tokens: 2000
+  concurrency: 1
+
+search:
+  mode: "hybrid"
+  vector_top_k: 50
+  keyword_top_k: 50
+  final_top_k: 10
+  rrf_k: 60
+  reranker:
+    enabled: true
+    provider: "deepinfra"
+    model: "Qwen/Qwen3-Reranker-8B"
+    timeout: 30
+    base_url: "http://provider-sim:9999"
+
+lancedb:
+  table: "chunks"
+
+logging:
+  level: "INFO"
+
+event_hooks:
+  enabled: true
+  hooks:
+    - name: "staging-sink"
+      type: "http"
+      url: "http://provider-sim:9999/hooks/sink"
+      events: ["document.indexed"]
+      timeout_seconds: 5
+
+tracing:
+  enabled: true
+  directory: /data/traces
+
+mcp:
+  host: "0.0.0.0"
+  port: 7788

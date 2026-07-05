@@ -76,10 +76,12 @@ class OpenRouterGenerator:
         api_key: str | None = None,
         timeout: float = 300.0,
         trace_capture: dict | None = None,
+        base_url: str | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.timeout = timeout
+        self._base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
         trace_capture = trace_capture or {}
         self.trace_recorder = LLMTraceRecorder(
             provider="openrouter",
@@ -144,7 +146,7 @@ class OpenRouterGenerator:
             "Content-Type": "application/json",
         }
         trace_request = {
-            "url": f"{OPENROUTER_BASE_URL}/chat/completions",
+            "url": f"{self._base_url}/chat/completions",
             "timeout": {
                 "connect": request_timeout.connect,
                 "read": request_timeout.read,
@@ -162,7 +164,7 @@ class OpenRouterGenerator:
                 attempt_payload = copy.deepcopy(payload)
                 trace_request["payload"] = attempt_payload
                 resp = httpx.post(
-                    f"{OPENROUTER_BASE_URL}/chat/completions",
+                    f"{self._base_url}/chat/completions",
                     json=attempt_payload,
                     headers=headers,
                     timeout=request_timeout,

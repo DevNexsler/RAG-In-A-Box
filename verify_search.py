@@ -1,5 +1,4 @@
 """Diagnostic: full 3-stage search pipeline — vector, BM25, RRF fusion, Qwen3 rerank."""
-import sys
 import time
 from dotenv import load_dotenv
 load_dotenv()

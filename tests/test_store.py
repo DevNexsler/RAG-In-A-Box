@@ -705,7 +705,6 @@ def test_extra_metadata_filter_via_search_impl():
 
         # Use hybrid_search metadata_filters via the search impl
         # (requires embedding — test the filter logic directly)
-        from search_hybrid import reciprocal_rank_fusion
         filtered = [h for h in all_hits if getattr(h, "section", None) == "Introduction"]
         assert len(filtered) == 1
         assert filtered[0].doc_id == "a.md"

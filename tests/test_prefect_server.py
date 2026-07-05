@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from prefect_server import API_URL, HEALTH_URL, PrefectServer
+from prefect_server import API_URL, PrefectServer
 
 
 # -- Helpers --

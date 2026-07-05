@@ -66,7 +66,7 @@ from communication_context import (
 )
 from core.config import load_config
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
-from doc_enrichment import enrich_document, empty_enrichment, ENRICHMENT_FIELDS, failed_enrichment
+from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
     begin_degradation_capture,
     collect_degradations,
@@ -86,9 +86,14 @@ from doc_id_store import (
     DocIDStore, extract_id_from_filename, inject_id_into_filename,
     strip_id_from_filename as _strip_id_from_filename,
 )
+from core.tracing import get_tracer, setup_tracing
 from hooks.dispatcher import dispatch_event
 from hooks.events import build_document_indexed_event
 from lancedb_store import LanceDBStore, open_store_with_recovery
+
+# Lazy tracer: module-level caching is safe, it resolves the provider per call.
+# Spans are no-ops unless setup_tracing() ran with tracing.enabled: true.
+_tracer = get_tracer("pipeline")
 
 
 # Module-level runtime context populated by the flow, read by tasks.
@@ -524,13 +529,14 @@ def scan_filesystem_records(
 @task
 def scan_vault_task(vault_root: str | Path, include: list[str], exclude: list[str]) -> list[dict]:
     """Prefect wrapper for filesystem scan."""
-    return scan_filesystem_records(
-        vault_root,
-        include,
-        exclude,
-        doc_id_store=_RUNTIME.get("doc_id_store"),
-        logger=_get_logger(),
-    )
+    with _tracer.start_as_current_span("scan"):
+        return scan_filesystem_records(
+            vault_root,
+            include,
+            exclude,
+            doc_id_store=_RUNTIME.get("doc_id_store"),
+            logger=_get_logger(),
+        )
 
 
 @task
@@ -893,283 +899,358 @@ def process_doc_task(doc: dict) -> None:
     Reads store / embed_provider / splitter / ocr_provider / config from _RUNTIME.
     Handles Markdown, PDF, images, documents (docx/pptx/html/etc.), spreadsheets, and plain text.
     """
-    store: LanceDBStore = _RUNTIME["store"]
-    embed_provider: EmbedProvider = _RUNTIME["embed_provider"]
-    splitter: SentenceSplitter = _RUNTIME["splitter"]
-    semantic_splitter = _RUNTIME.get("semantic_splitter")
-    semantic_threshold: int = _RUNTIME.get("semantic_threshold", 0)
-    ocr_provider = _RUNTIME.get("ocr_provider")  # may be None
-    media_provider = _RUNTIME.get("media_provider")  # may be None
-    config: dict = _RUNTIME.get("config", {})
-
-    # _get_logger() returns the Prefect run logger inside a flow/task run
-    # (identical to get_run_logger there) and falls back to the stdlib logger
-    # when called standalone — e.g. targeted single-document indexing, which
-    # has no active Prefect run context.
-    logger = _get_logger()
-    doc_id = doc["doc_id"]
-    rel_path = doc.get("rel_path", doc_id)
-    mtime = doc["mtime"]
-    size = doc["size"]
-    ext = doc.get("ext", "")
-    source_name = doc.get("source_name", "documents")
-    logger.info(f"Processing: {rel_path} (id={doc_id})")
-
-    # --- Exact-content dedupe gate (filesystem docs only) ---
-    # Same bytes arriving via different paths (e.g. one document attached to
-    # several emails) index once: first-seen path wins the canonical election,
-    # later copies skip the whole extract/enrich/embed pipeline, and the
-    # canonical doc carries the duplicates' provenance (index metadata +
-    # sidecar duplicate_deliveries note). Files stay on disk untouched —
-    # deposit dirs are externally owned and re-deposit anything missing.
-    dedupe_cfg = config.get("dedupe", {})
-    registry = _RUNTIME.get("doc_id_store")
-    abs_path_str = str(doc.get("abs_path", ""))
-    if (
-        dedupe_cfg.get("enabled")
-        and registry is not None
-        and source_name == "documents"
-        and abs_path_str
-        and os.path.isfile(abs_path_str)
+    with _tracer.start_as_current_span(
+        "process_doc",
+        attributes={
+            "doc_id": doc["doc_id"],
+            "rel_path": doc.get("rel_path", doc["doc_id"]),
+            "source": doc.get("source_name", "documents"),
+        },
     ):
-        winner = None
-        try:
-            import blake3 as _blake3
+        store: LanceDBStore = _RUNTIME["store"]
+        embed_provider: EmbedProvider = _RUNTIME["embed_provider"]
+        splitter: SentenceSplitter = _RUNTIME["splitter"]
+        semantic_splitter = _RUNTIME.get("semantic_splitter")
+        semantic_threshold: int = _RUNTIME.get("semantic_threshold", 0)
+        ocr_provider = _RUNTIME.get("ocr_provider")  # may be None
+        media_provider = _RUNTIME.get("media_provider")  # may be None
+        config: dict = _RUNTIME.get("config", {})
 
-            raw_bytes = Path(abs_path_str).read_bytes()
-            digest = _blake3.blake3(raw_bytes).digest()
-            bare_id = doc_id.split("::", 1)[1] if "::" in doc_id else doc_id
-            winner = registry.claim_canonical_by_exact_hash(
-                bare_id,
-                len(raw_bytes),
-                digest,
-                hash_algo="blake3",
-                duplicate_reason="exact content match at index time",
-            )
-        except Exception as exc:
-            logger.warning("Dedupe gate failed for %s (indexing normally): %s", doc_id, exc)
-        if winner is not None and winner.get("doc_id") != bare_id:
-            canonical_ns = f"{source_name}::{winner['doc_id']}"
-            logger.info(
-                "Duplicate content: %s matches canonical %s — skipping indexing",
-                doc_id, canonical_ns,
-            )
-            if dedupe_cfg.get("skip_duplicate_indexing", True):
-                try:
-                    store.delete_by_doc_ids([doc_id])
-                except Exception as exc:
-                    logger.warning("Failed to drop stale duplicate chunks for %s: %s", doc_id, exc)
-                if dedupe_cfg.get("update_canonical_metadata", True):
+        # _get_logger() returns the Prefect run logger inside a flow/task run
+        # (identical to get_run_logger there) and falls back to the stdlib logger
+        # when called standalone — e.g. targeted single-document indexing, which
+        # has no active Prefect run context.
+        logger = _get_logger()
+        doc_id = doc["doc_id"]
+        rel_path = doc.get("rel_path", doc_id)
+        mtime = doc["mtime"]
+        size = doc["size"]
+        ext = doc.get("ext", "")
+        source_name = doc.get("source_name", "documents")
+        logger.info(f"Processing: {rel_path} (id={doc_id})")
+
+        # --- Exact-content dedupe gate (filesystem docs only) ---
+        # Same bytes arriving via different paths (e.g. one document attached to
+        # several emails) index once: first-seen path wins the canonical election,
+        # later copies skip the whole extract/enrich/embed pipeline, and the
+        # canonical doc carries the duplicates' provenance (index metadata +
+        # sidecar duplicate_deliveries note). Files stay on disk untouched —
+        # deposit dirs are externally owned and re-deposit anything missing.
+        dedupe_cfg = config.get("dedupe", {})
+        registry = _RUNTIME.get("doc_id_store")
+        abs_path_str = str(doc.get("abs_path", ""))
+        if (
+            dedupe_cfg.get("enabled")
+            and registry is not None
+            and source_name == "documents"
+            and abs_path_str
+            and os.path.isfile(abs_path_str)
+        ):
+            winner = None
+            try:
+                import blake3 as _blake3
+
+                raw_bytes = Path(abs_path_str).read_bytes()
+                digest = _blake3.blake3(raw_bytes).digest()
+                bare_id = doc_id.split("::", 1)[1] if "::" in doc_id else doc_id
+                winner = registry.claim_canonical_by_exact_hash(
+                    bare_id,
+                    len(raw_bytes),
+                    digest,
+                    hash_algo="blake3",
+                    duplicate_reason="exact content match at index time",
+                )
+            except Exception as exc:
+                logger.warning("Dedupe gate failed for %s (indexing normally): %s", doc_id, exc)
+            if winner is not None and winner.get("doc_id") != bare_id:
+                canonical_ns = f"{source_name}::{winner['doc_id']}"
+                logger.info(
+                    "Duplicate content: %s matches canonical %s — skipping indexing",
+                    doc_id, canonical_ns,
+                )
+                if dedupe_cfg.get("skip_duplicate_indexing", True):
                     try:
-                        refs = registry.duplicate_refs_for_canonical(winner["doc_id"])
-                        store.update_canonical_duplicate_metadata(canonical_ns, refs)
+                        store.delete_by_doc_ids([doc_id])
                     except Exception as exc:
-                        logger.warning("Canonical dup-metadata update failed for %s: %s", canonical_ns, exc)
-                canonical_rel = registry.lookup_path(winner["doc_id"])
-                rel_for_root = doc.get("rel_path", "")
-                if canonical_rel and rel_for_root and abs_path_str.endswith(rel_for_root):
-                    docs_root = Path(abs_path_str[: -len(rel_for_root)])
-                    _annotate_canonical_sidecar(docs_root, canonical_rel, doc, logger)
-                # Record the skip so the diff stops re-processing this duplicate
-                # every run (it is never in the table, so otherwise looks "new").
-                note_skip(f"duplicate_of:{winner['doc_id']}")
-                return
+                        logger.warning("Failed to drop stale duplicate chunks for %s: %s", doc_id, exc)
+                    if dedupe_cfg.get("update_canonical_metadata", True):
+                        try:
+                            refs = registry.duplicate_refs_for_canonical(winner["doc_id"])
+                            store.update_canonical_duplicate_metadata(canonical_ns, refs)
+                        except Exception as exc:
+                            logger.warning("Canonical dup-metadata update failed for %s: %s", canonical_ns, exc)
+                    canonical_rel = registry.lookup_path(winner["doc_id"])
+                    rel_for_root = doc.get("rel_path", "")
+                    if canonical_rel and rel_for_root and abs_path_str.endswith(rel_for_root):
+                        docs_root = Path(abs_path_str[: -len(rel_for_root)])
+                        _annotate_canonical_sidecar(docs_root, canonical_rel, doc, logger)
+                    # Record the skip so the diff stops re-processing this duplicate
+                    # every run (it is never in the table, so otherwise looks "new").
+                    note_skip(f"duplicate_of:{winner['doc_id']}")
+                    return
 
-    # --- Determine source_type ---
-    # Prefer explicit source_type from the record (set by SourceRecord); fall back
-    # to the extension-based map for backward compat.
-    source_type = canonical_source_type(doc.get("source_type") or ext)
+        # --- Determine source_type ---
+        # Prefer explicit source_type from the record (set by SourceRecord); fall back
+        # to the extension-based map for backward compat.
+        source_type = canonical_source_type(doc.get("source_type") or ext)
 
-    # --- Extract text via Source dispatch ---
-    # Look up the owning Source and original SourceRecord, then call source.extract().
-    # This is source-agnostic: FilesystemSource reads files; PostgresSource uses
-    # cached text from scan(); future sources can do whatever they need.
-    sources_by_name: dict = _RUNTIME.get("sources_by_name", {})
-    source_records_by_ns_doc_id: dict = _RUNTIME.get("source_records_by_ns_doc_id", {})
-    src = sources_by_name.get(source_name)
-    source_record = source_records_by_ns_doc_id.get(doc_id)
+        # --- Extract text via Source dispatch ---
+        # Look up the owning Source and original SourceRecord, then call source.extract().
+        # This is source-agnostic: FilesystemSource reads files; PostgresSource uses
+        # cached text from scan(); future sources can do whatever they need.
+        sources_by_name: dict = _RUNTIME.get("sources_by_name", {})
+        source_records_by_ns_doc_id: dict = _RUNTIME.get("source_records_by_ns_doc_id", {})
+        src = sources_by_name.get(source_name)
+        source_record = source_records_by_ns_doc_id.get(doc_id)
 
-    if src is not None and source_record is not None:
-        result = src.extract(source_record)
-    else:
-        # Fallback: direct extract_text for records that pre-date the source refactor
-        # (e.g., tasks spawned from a _RUNTIME that doesn't have sources_by_name yet).
-        pdf_cfg = config.get("pdf", {})
-        abs_path = doc.get("abs_path", doc_id)
-        result = extract_text(
-            file_path=abs_path,
-            ext=ext,
-            ocr_provider=ocr_provider,
-            media_provider=media_provider,
-            pdf_strategy=pdf_cfg.get("strategy", "text_then_ocr"),
-            min_text_chars=pdf_cfg.get("min_text_chars_before_ocr", 200),
-            ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
+        with _tracer.start_as_current_span("extract", attributes={"source_type": source_type}):
+            if src is not None and source_record is not None:
+                result = src.extract(source_record)
+            else:
+                # Fallback: direct extract_text for records that pre-date the source refactor
+                # (e.g., tasks spawned from a _RUNTIME that doesn't have sources_by_name yet).
+                pdf_cfg = config.get("pdf", {})
+                abs_path = doc.get("abs_path", doc_id)
+                result = extract_text(
+                    file_path=abs_path,
+                    ext=ext,
+                    ocr_provider=ocr_provider,
+                    media_provider=media_provider,
+                    pdf_strategy=pdf_cfg.get("strategy", "text_then_ocr"),
+                    min_text_chars=pdf_cfg.get("min_text_chars_before_ocr", 200),
+                    ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
+                )
+
+        source_metadata = (
+            getattr(source_record, "metadata", {}) if source_record is not None else {}
         )
+        full_text = _with_communication_caption(result.full_text, source_metadata)
 
-    source_metadata = (
-        getattr(source_record, "metadata", {}) if source_record is not None else {}
-    )
-    full_text = _with_communication_caption(result.full_text, source_metadata)
+        if not full_text.strip():
+            if collect_degradations():
+                # Emptiness caused by a transient extraction failure (OCR/vision
+                # timeout, backend down) — leave it to the degraded lane, which
+                # retries with capped attempts instead of the daily skip window.
+                logger.debug(f"No text extracted (degraded, will retry): {doc_id}")
+            else:
+                # Genuinely contentless (empty transcript row, blank mail body,
+                # sidecar JSON with no text). Record a skip so the diff stops
+                # re-processing it every run; the ledger re-attempts it after
+                # _SKIP_RETRY_SECONDS or as soon as the doc changes.
+                note_skip("no_text_extracted")
+                logger.debug(f"No text extracted: {doc_id}")
+            return
 
-    if not full_text.strip():
-        if collect_degradations():
-            # Emptiness caused by a transient extraction failure (OCR/vision
-            # timeout, backend down) — leave it to the degraded lane, which
-            # retries with capped attempts instead of the daily skip window.
-            logger.debug(f"No text extracted (degraded, will retry): {doc_id}")
+        context_text = ""
+        context_meta: dict[str, str] = {}
+        communication_context_provider = _RUNTIME.get("communication_context_provider")
+        comm_item = communication_item_from_record(doc, source_metadata, full_text)
+        if comm_item is not None and communication_context_provider is not None:
+            try:
+                envelope = communication_context_provider.get_context_envelope(comm_item)
+                context_text = format_context_envelope_for_prompt(envelope)
+                context_meta = envelope_metadata(envelope)
+            except Exception as exc:
+                logger.warning("Communication context failed for '%s': %s", doc_id, exc)
+                _RUNTIME.setdefault("_warnings", []).append(
+                    f"communication_context_failed:{doc_id}:{exc}"
+                )
+
+        # --- Extract document-level metadata ---
+        fm = result.frontmatter  # from Markdown frontmatter; empty dict for PDF/images
+        title = fm.get("title") or extract_title(full_text, doc_id)
+        tags = normalize_tags(fm.get("tags"))
+        folder = derive_folder(rel_path)
+        status = fm.get("status", "archived" if folder.lower() in ("archive", "archived") else "active")
+        created = str(fm["created"]) if "created" in fm else ""
+        description = str(fm.get("description", "")).strip()
+        author = str(fm.get("author", "")).strip()
+        keywords = normalize_tags(fm.get("keywords"))
+
+        # Collect remaining frontmatter fields into custom_meta JSON
+        _KNOWN_FM_KEYS = {"title", "tags", "status", "created", "description", "author", "keywords"}
+        extra_fm = {k: str(v) for k, v in fm.items() if k not in _KNOWN_FM_KEYS and v is not None}
+        import json as _json
+        custom_meta = _json.dumps(extra_fm, default=str) if extra_fm else ""
+
+        # Shared metadata for all chunks of this doc
+        doc_meta = {
+            "doc_id": doc_id,
+            "rel_path": rel_path,
+            "source_type": source_type,
+            "source_name": source_name,
+            "mtime": mtime,
+            "change_hash": doc.get("change_hash", ""),
+            "size": size,
+            "title": title,
+            "tags": tags,
+            "folder": folder,
+            "status": status,
+            "created": created,
+            "description": description,
+            "author": author,
+            "keywords": keywords,
+            "custom_meta": custom_meta,
+            "section": "",
+        }
+        # Promote extra frontmatter to real columns (skip collisions with reserved keys)
+        for k, v in extra_fm.items():
+            if k not in doc_meta:
+                doc_meta[k] = v
+        for k in _COMMUNICATION_METADATA_KEYS:
+            v = source_metadata.get(k)
+            if v and k not in doc_meta:
+                doc_meta[k] = str(v)
+        for k, v in context_meta.items():
+            if k not in doc_meta:
+                doc_meta[k] = v
+
+        # --- LLM document enrichment (summary, entities, topics, etc.) ---
+        llm_generator = _RUNTIME.get("llm_generator")
+        taxonomy_store = _RUNTIME.get("taxonomy_store")
+        enrichment_cfg = _RUNTIME.get("config", {}).get("enrichment", {})
+        if llm_generator:
+            enrichment = enrich_document(
+                text=full_text,
+                title=title,
+                source_type=source_type,
+                generator=llm_generator,
+                max_input_chars=enrichment_cfg.get("max_input_chars", 4000),
+                max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
+                taxonomy_store=taxonomy_store,
+                context_text=context_text,
+                record_taxonomy_usage=False,
+                postprocess_enrichment=bool(enrichment_cfg.get("postprocess_enrichment", False)),
+                postprocess_rules=enrichment_cfg.get("postprocess_rules"),
+            )
+            enrichment_failed = bool(enrichment.get("_enrichment_failed"))
+            if enrichment_failed:
+                reason = enrichment.pop("_enrichment_failed")
+                logger.warning("Enrichment failed for '%s': %s", doc_id, reason)
+                _RUNTIME.setdefault("_warnings", []).append(
+                    f"enrichment_failed:{doc_id}:{reason}"
+                )
+                note_degradation("enrichment_failed")
+            elif not enrichment.get("enr_summary"):
+                logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
+            if not enrichment_failed:
+                _queue_taxonomy_usage(enrichment, _RUNTIME.get("taxonomy_usage"))
+            enrichment.pop("_enrichment_failed", None)
+            doc_meta.update(enrichment)
         else:
-            # Genuinely contentless (empty transcript row, blank mail body,
-            # sidecar JSON with no text). Record a skip so the diff stops
-            # re-processing it every run; the ledger re-attempts it after
-            # _SKIP_RETRY_SECONDS or as soon as the doc changes.
-            note_skip("no_text_extracted")
-            logger.debug(f"No text extracted: {doc_id}")
-        return
+            doc_meta.update(empty_enrichment())
 
-    context_text = ""
-    context_meta: dict[str, str] = {}
-    communication_context_provider = _RUNTIME.get("communication_context_provider")
-    comm_item = communication_item_from_record(doc, source_metadata, full_text)
-    if comm_item is not None and communication_context_provider is not None:
-        try:
-            envelope = communication_context_provider.get_context_envelope(comm_item)
-            context_text = format_context_envelope_for_prompt(envelope)
-            context_meta = envelope_metadata(envelope)
-        except Exception as exc:
-            logger.warning("Communication context failed for '%s': %s", doc_id, exc)
-            _RUNTIME.setdefault("_warnings", []).append(
-                f"communication_context_failed:{doc_id}:{exc}"
-            )
+        # --- Importance: frontmatter overrides LLM, track source ---
+        fm_importance = fm.get("importance")
+        if fm_importance is not None:
+            # User provided importance in YAML frontmatter — use it
+            try:
+                imp_val = max(0.0, min(1.0, float(fm_importance)))
+            except (TypeError, ValueError):
+                imp_val = 0.5
+            doc_meta["enr_importance"] = str(imp_val)
+            doc_meta["enr_importance_source"] = "frontmatter"
+        elif doc_meta.get("enr_importance"):
+            # LLM generated it during enrichment
+            doc_meta["enr_importance_source"] = "llm"
+        else:
+            # No enrichment and no frontmatter — neutral default
+            doc_meta["enr_importance"] = "0.5"
+            doc_meta["enr_importance_source"] = "default"
 
-    # --- Extract document-level metadata ---
-    fm = result.frontmatter  # from Markdown frontmatter; empty dict for PDF/images
-    title = fm.get("title") or extract_title(full_text, doc_id)
-    tags = normalize_tags(fm.get("tags"))
-    folder = derive_folder(rel_path)
-    status = fm.get("status", "archived" if folder.lower() in ("archive", "archived") else "active")
-    created = str(fm["created"]) if "created" in fm else ""
-    description = str(fm.get("description", "")).strip()
-    author = str(fm.get("author", "")).strip()
-    keywords = normalize_tags(fm.get("keywords"))
+        # --- Chunk and build nodes ---
+        # Three paths:
+        #   1. Multi-page PDF  → page-aware chunks, context header per page
+        #   2. Markdown         → heading-aware sections, context header per section
+        #   3. Images / 1-page PDF → flat chunks with context header
+        # Every chunk is prepended with a contextual header before embedding
+        # so it is self-describing in isolation.
+        nodes: list[TextNode] = []
 
-    # Collect remaining frontmatter fields into custom_meta JSON
-    _KNOWN_FM_KEYS = {"title", "tags", "status", "created", "description", "author", "keywords"}
-    extra_fm = {k: str(v) for k, v in fm.items() if k not in _KNOWN_FM_KEYS and v is not None}
-    import json as _json
-    custom_meta = _json.dumps(extra_fm, default=str) if extra_fm else ""
+        if ext == "pdf" and len(result.pages) > 1:
+            for page_text in result.pages:
+                if not page_text.text.strip():
+                    continue
+                page_body = page_text.text
+                if page_text.page == 0:
+                    page_body = _with_communication_caption(page_body, source_metadata)
+                raw_chunks = _split_section(
+                    page_body, splitter, semantic_splitter, semantic_threshold
+                )
+                ctx = _build_chunk_context(doc_meta, page=page_text.page)
+                contextualized = [ctx + c for c in raw_chunks]
+                with _tracer.start_as_current_span("embed", attributes={"chunk_count": len(contextualized)}):
+                    page_vectors = embed_provider.embed_texts(contextualized)
 
-    # Shared metadata for all chunks of this doc
-    doc_meta = {
-        "doc_id": doc_id,
-        "rel_path": rel_path,
-        "source_type": source_type,
-        "source_name": source_name,
-        "mtime": mtime,
-        "change_hash": doc.get("change_hash", ""),
-        "size": size,
-        "title": title,
-        "tags": tags,
-        "folder": folder,
-        "status": status,
-        "created": created,
-        "description": description,
-        "author": author,
-        "keywords": keywords,
-        "custom_meta": custom_meta,
-        "section": "",
-    }
-    # Promote extra frontmatter to real columns (skip collisions with reserved keys)
-    for k, v in extra_fm.items():
-        if k not in doc_meta:
-            doc_meta[k] = v
-    for k in _COMMUNICATION_METADATA_KEYS:
-        v = source_metadata.get(k)
-        if v and k not in doc_meta:
-            doc_meta[k] = str(v)
-    for k, v in context_meta.items():
-        if k not in doc_meta:
-            doc_meta[k] = v
+                for i, (ctx_text, raw_text, vector) in enumerate(
+                    zip(contextualized, raw_chunks, page_vectors, strict=True)
+                ):
+                    loc = f"p:{page_text.page}:c:{i}"
+                    chunk_uid = f"{doc_id}::{loc}"
+                    snippet = (raw_text[:200] + "...") if len(raw_text) > 200 else raw_text
+                    node = TextNode(
+                        text=ctx_text,
+                        id_=chunk_uid,
+                        embedding=vector,
+                        metadata={**doc_meta, "loc": loc, "snippet": snippet},
+                    )
+                    node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
+                    nodes.append(node)
 
-    # --- LLM document enrichment (summary, entities, topics, etc.) ---
-    llm_generator = _RUNTIME.get("llm_generator")
-    taxonomy_store = _RUNTIME.get("taxonomy_store")
-    enrichment_cfg = _RUNTIME.get("config", {}).get("enrichment", {})
-    if llm_generator:
-        enrichment = enrich_document(
-            text=full_text,
-            title=title,
-            source_type=source_type,
-            generator=llm_generator,
-            max_input_chars=enrichment_cfg.get("max_input_chars", 4000),
-            max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
-            taxonomy_store=taxonomy_store,
-            context_text=context_text,
-            record_taxonomy_usage=False,
-            postprocess_enrichment=bool(enrichment_cfg.get("postprocess_enrichment", False)),
-            postprocess_rules=enrichment_cfg.get("postprocess_rules"),
-        )
-        enrichment_failed = bool(enrichment.get("_enrichment_failed"))
-        if enrichment_failed:
-            reason = enrichment.pop("_enrichment_failed")
-            logger.warning("Enrichment failed for '%s': %s", doc_id, reason)
-            _RUNTIME.setdefault("_warnings", []).append(
-                f"enrichment_failed:{doc_id}:{reason}"
-            )
-            note_degradation("enrichment_failed")
-        elif not enrichment.get("enr_summary"):
-            logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
-        if not enrichment_failed:
-            _queue_taxonomy_usage(enrichment, _RUNTIME.get("taxonomy_usage"))
-        enrichment.pop("_enrichment_failed", None)
-        doc_meta.update(enrichment)
-    else:
-        doc_meta.update(empty_enrichment())
+        elif source_type in ("md", "doc", "pres", "html", "epub", "csv"):
+            # Heading-aware: split at h1-h3 boundaries, then SentenceSplitter within.
+            sections = _split_markdown_by_headings(full_text)
+            all_raw: list[str] = []
+            all_ctx: list[str] = []
+            all_sections: list[str] = []
 
-    # --- Importance: frontmatter overrides LLM, track source ---
-    fm_importance = fm.get("importance")
-    if fm_importance is not None:
-        # User provided importance in YAML frontmatter — use it
-        try:
-            imp_val = max(0.0, min(1.0, float(fm_importance)))
-        except (TypeError, ValueError):
-            imp_val = 0.5
-        doc_meta["enr_importance"] = str(imp_val)
-        doc_meta["enr_importance_source"] = "frontmatter"
-    elif doc_meta.get("enr_importance"):
-        # LLM generated it during enrichment
-        doc_meta["enr_importance_source"] = "llm"
-    else:
-        # No enrichment and no frontmatter — neutral default
-        doc_meta["enr_importance"] = "0.5"
-        doc_meta["enr_importance_source"] = "default"
+            for heading_ctx, section_text in sections:
+                raw_chunks = _split_section(
+                    section_text, splitter, semantic_splitter, semantic_threshold
+                )
+                ctx = _build_chunk_context(
+                    doc_meta, section=heading_ctx if heading_ctx else None
+                )
+                for raw in raw_chunks:
+                    all_raw.append(raw)
+                    all_ctx.append(ctx + raw)
+                    all_sections.append(heading_ctx)
 
-    # --- Chunk and build nodes ---
-    # Three paths:
-    #   1. Multi-page PDF  → page-aware chunks, context header per page
-    #   2. Markdown         → heading-aware sections, context header per section
-    #   3. Images / 1-page PDF → flat chunks with context header
-    # Every chunk is prepended with a contextual header before embedding
-    # so it is self-describing in isolation.
-    nodes: list[TextNode] = []
+            with _tracer.start_as_current_span("embed", attributes={"chunk_count": len(all_ctx)}):
+                vectors = embed_provider.embed_texts(all_ctx)
 
-    if ext == "pdf" and len(result.pages) > 1:
-        for page_text in result.pages:
-            if not page_text.text.strip():
-                continue
-            page_body = page_text.text
-            if page_text.page == 0:
-                page_body = _with_communication_caption(page_body, source_metadata)
+            for i, (ctx_text, raw_text, sec, vector) in enumerate(
+                zip(all_ctx, all_raw, all_sections, vectors, strict=True)
+            ):
+                loc = f"c:{i}"
+                chunk_uid = f"{doc_id}::{loc}"
+                snippet = (raw_text[:200] + "...") if len(raw_text) > 200 else raw_text
+                meta = {**doc_meta, "loc": loc, "snippet": snippet}
+                meta["section"] = sec
+                node = TextNode(
+                    text=ctx_text,
+                    id_=chunk_uid,
+                    embedding=vector,
+                    metadata=meta,
+                )
+                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
+                nodes.append(node)
+
+        else:
+            # Images, media, or single-page PDFs
+            loc_prefix = source_type if source_type in ("img", "audio", "video") else ""
             raw_chunks = _split_section(
-                page_body, splitter, semantic_splitter, semantic_threshold
+                full_text, splitter, semantic_splitter, semantic_threshold
             )
-            ctx = _build_chunk_context(doc_meta, page=page_text.page)
+            ctx = _build_chunk_context(doc_meta)
             contextualized = [ctx + c for c in raw_chunks]
-            page_vectors = embed_provider.embed_texts(contextualized)
+            with _tracer.start_as_current_span("embed", attributes={"chunk_count": len(contextualized)}):
+                vectors = embed_provider.embed_texts(contextualized)
 
             for i, (ctx_text, raw_text, vector) in enumerate(
-                zip(contextualized, raw_chunks, page_vectors, strict=True)
+                zip(contextualized, raw_chunks, vectors, strict=True)
             ):
-                loc = f"p:{page_text.page}:c:{i}"
+                loc = f"{loc_prefix}:c:{i}" if loc_prefix else f"c:{i}"
                 chunk_uid = f"{doc_id}::{loc}"
                 snippet = (raw_text[:200] + "...") if len(raw_text) > 200 else raw_text
                 node = TextNode(
@@ -1181,97 +1262,34 @@ def process_doc_task(doc: dict) -> None:
                 node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
                 nodes.append(node)
 
-    elif source_type in ("md", "doc", "pres", "html", "epub", "csv"):
-        # Heading-aware: split at h1-h3 boundaries, then SentenceSplitter within.
-        sections = _split_markdown_by_headings(full_text)
-        all_raw: list[str] = []
-        all_ctx: list[str] = []
-        all_sections: list[str] = []
+        # --- Upsert into store ---
+        store.upsert_nodes(nodes)
+        logger.info(f"Upserted {len(nodes)} chunks: {doc_id}")
 
-        for heading_ctx, section_text in sections:
-            raw_chunks = _split_section(
-                section_text, splitter, semantic_splitter, semantic_threshold
-            )
-            ctx = _build_chunk_context(
-                doc_meta, section=heading_ctx if heading_ctx else None
-            )
-            for raw in raw_chunks:
-                all_raw.append(raw)
-                all_ctx.append(ctx + raw)
-                all_sections.append(heading_ctx)
+        chunks = []
+        for node in nodes:
+            node_meta = getattr(node, "metadata", {}) or {}
+            chunks.append({
+                "loc": str(node_meta.get("loc") or ""),
+                "snippet": str(node_meta.get("snippet") or ""),
+                "text": getattr(node, "text", "") or "",
+            })
 
-        vectors = embed_provider.embed_texts(all_ctx)
-
-        for i, (ctx_text, raw_text, sec, vector) in enumerate(
-            zip(all_ctx, all_raw, all_sections, vectors, strict=True)
-        ):
-            loc = f"c:{i}"
-            chunk_uid = f"{doc_id}::{loc}"
-            snippet = (raw_text[:200] + "...") if len(raw_text) > 200 else raw_text
-            meta = {**doc_meta, "loc": loc, "snippet": snippet}
-            meta["section"] = sec
-            node = TextNode(
-                text=ctx_text,
-                id_=chunk_uid,
-                embedding=vector,
-                metadata=meta,
-            )
-            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
-            nodes.append(node)
-
-    else:
-        # Images, media, or single-page PDFs
-        loc_prefix = source_type if source_type in ("img", "audio", "video") else ""
-        raw_chunks = _split_section(
-            full_text, splitter, semantic_splitter, semantic_threshold
+        event = build_document_indexed_event(
+            doc_id=doc_id,
+            source_name=source_name,
+            source_type=source_type,
+            rel_path=rel_path,
+            abs_path=str(doc.get("abs_path", "")),
+            text=result.full_text,
+            metadata=doc_meta,
+            chunks=chunks,
         )
-        ctx = _build_chunk_context(doc_meta)
-        contextualized = [ctx + c for c in raw_chunks]
-        vectors = embed_provider.embed_texts(contextualized)
-
-        for i, (ctx_text, raw_text, vector) in enumerate(
-            zip(contextualized, raw_chunks, vectors, strict=True)
-        ):
-            loc = f"{loc_prefix}:c:{i}" if loc_prefix else f"c:{i}"
-            chunk_uid = f"{doc_id}::{loc}"
-            snippet = (raw_text[:200] + "...") if len(raw_text) > 200 else raw_text
-            node = TextNode(
-                text=ctx_text,
-                id_=chunk_uid,
-                embedding=vector,
-                metadata={**doc_meta, "loc": loc, "snippet": snippet},
-            )
-            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
-            nodes.append(node)
-
-    # --- Upsert into store ---
-    store.upsert_nodes(nodes)
-    logger.info(f"Upserted {len(nodes)} chunks: {doc_id}")
-
-    chunks = []
-    for node in nodes:
-        node_meta = getattr(node, "metadata", {}) or {}
-        chunks.append({
-            "loc": str(node_meta.get("loc") or ""),
-            "snippet": str(node_meta.get("snippet") or ""),
-            "text": getattr(node, "text", "") or "",
-        })
-
-    event = build_document_indexed_event(
-        doc_id=doc_id,
-        source_name=source_name,
-        source_type=source_type,
-        rel_path=rel_path,
-        abs_path=str(doc.get("abs_path", "")),
-        text=result.full_text,
-        metadata=doc_meta,
-        chunks=chunks,
-    )
-    warnings = dispatch_event(config.get("event_hooks"), event)
-    if warnings:
-        _RUNTIME.setdefault("_warnings", []).extend(warnings)
-        for warning in warnings:
-            logger.warning(warning)
+        warnings = dispatch_event(config.get("event_hooks"), event)
+        if warnings:
+            _RUNTIME.setdefault("_warnings", []).extend(warnings)
+            for warning in warnings:
+                logger.warning(warning)
 
 
 def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
@@ -1545,6 +1563,11 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     import time
     logger = get_run_logger()
     config = load_config(config_path)
+    # Load-bearing: the full indexing flow runs as a separate subprocess
+    # (spawned via `python -c` in _file_index_update_impl, or run_index.py),
+    # so it needs its own tracing setup. No-op when tracing is disabled or
+    # when this process already set it up (e.g. in-process flow runs).
+    setup_tracing(config, "indexer")
     index_root = Path(config["index_root"])
     _RUNTIME["index_root"] = index_root
     _write_heartbeat(index_root)  # mark the run alive before the (possibly slow) scan
@@ -2235,6 +2258,50 @@ def _build_single_doc_runtime(
     )
 
 
+def _update_index_metadata_after_single_doc(index_root: str | Path, store) -> None:
+    """Refresh index_metadata.json after a targeted single-doc index.
+
+    Serving processes cache their LanceDB handle and reopen it only when this
+    file's (mtime, size) signature changes (mcp_server._get_deps). Without
+    this write, a single-doc index stays invisible to file_search & co. until
+    the next full sweep — breaking the "searchable within seconds" contract
+    (TICKET-6). A file-based signal is required because the indexing call may
+    run in a different process (REST api_server) than the serving MCP server.
+
+    Merge-update, never overwrite: failure/warning fields from the last full
+    sweep feed /health (fts_rebuild_failed) and file_status, so they must be
+    preserved. Only the live doc/chunk counts and a single-doc timestamp are
+    refreshed.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    path = Path(index_root) / "index_metadata.json"
+    meta: dict = {}
+    try:
+        existing = json.loads(path.read_text())
+        if isinstance(existing, dict):
+            meta = existing
+    except (OSError, ValueError):
+        meta = {}
+    try:
+        doc_count = len(store.list_doc_ids())
+        chunk_count = int(store.count_chunks())
+    except Exception as exc:  # noqa: BLE001 — counts are informational; the mtime bump is the contract
+        _get_logger().warning("single-doc metadata count refresh failed: %s", exc)
+    else:
+        meta["doc_count"] = doc_count
+        meta["chunk_count"] = chunk_count
+    meta["last_doc_indexed_at"] = datetime.now(timezone.utc).isoformat()
+    # PID-salted tmp name: the REST and MCP processes share this directory but
+    # _SINGLE_DOC_LOCK is per-process, so a fixed .tmp path could be written by
+    # both at once and rename a torn JSON into place (silently dropping the
+    # sweep's warning fields on the next merge-read).
+    tmp_path = Path(f"{path}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(meta, indent=2))
+    tmp_path.replace(path)  # atomic: readers never see a partial file
+
+
 def index_document_flow(
     config_path: str = "config.yaml",
     target: str = "",
@@ -2282,6 +2349,12 @@ def index_document_flow(
 
         _build_single_doc_runtime(config, store, doc_id_store, source_name, record)
         process_doc_task.fn(record)
+        # Signal serving processes to reopen their cached store handle so the
+        # doc is searchable immediately. NOTE: the FTS index is deliberately
+        # NOT rebuilt here (it is rebuilt once per full sweep), so keyword-
+        # search visibility of this doc still awaits the next sweep; vector
+        # search sees it right away.
+        _update_index_metadata_after_single_doc(index_root, store)
         return {
             "status": "indexed",
             "doc_id": record["doc_id"],

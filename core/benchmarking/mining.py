@@ -11,7 +11,6 @@ from core.benchmarking.cases import (
     _infer_category,
     _infer_difficulty,
     _remove_stale_case_files,
-    _remove_stale_gold_files,
     resolve_bench_path,
     write_gold_stub,
 )

@@ -1,0 +1,4 @@
+# e2e media/image fixtures — never diff, merge, or EOL-normalize these
+tests/fixtures/e2e/*.png binary
+tests/fixtures/e2e/*.wav binary
+tests/fixtures/e2e/*.mp4 binary

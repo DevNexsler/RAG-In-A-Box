@@ -14,7 +14,6 @@
 # Run with: pytest tests/test_provider_errors.int.test.py -v
 
 import tempfile
-from pathlib import Path
 
 import pytest
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo

@@ -12,6 +12,7 @@ from pathlib import Path
 from core.config import load_config
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
+from core.tracing import get_tracer
 from lancedb_store import LanceDBStore, open_store_with_recovery
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
@@ -1533,8 +1534,15 @@ def _file_status_impl() -> dict:
             import httpx
             api_key = os.environ.get("DEEPINFRA_API_KEY", "")
             model = reranker_cfg.get("model", "Qwen/Qwen3-Reranker-8B")
+            # Honor base_url overrides (staging provider-sim) — never ping
+            # production DeepInfra when the config points elsewhere.
+            # `or` (not a .get default): a present-but-null base_url: key must
+            # fall back too, not AttributeError into a false "unresponsive".
+            base_url = (
+                reranker_cfg.get("base_url") or "https://api.deepinfra.com"
+            ).rstrip("/")
             resp = httpx.post(
-                f"https://api.deepinfra.com/v1/inference/{model}",
+                f"{base_url}/v1/inference/{model}",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -1699,6 +1707,10 @@ def _file_index_document_impl(
     inline and returns the result — a single attachment OCRs in seconds. Reuses
     the same extract/embed/upsert path and is idempotent (unchanged files are
     skipped without re-OCR unless force=True).
+
+    Known gap: the FTS index is only rebuilt by the full sweep, so the doc is
+    vector-search visible immediately but keyword-search visibility awaits the
+    next sweep.
     """
     if not str(target or "").strip():
         return _error("missing_target", "target (path/rel_path/doc_id) is required")
@@ -1938,6 +1950,64 @@ if HAS_MCP and FastMCP is not None:
     from pydantic import Field
 
     mcp = FastMCP("file-index-mcp", json_response=True)
+
+    # --- MCP tool-call tracing -----------------------------------------
+    # Every registered tool emits a server-side `mcp.tool.<name>` span via
+    # ONE generic wrapper composed into mcp.tool() at registration time, so
+    # the tool functions below stay untouched. Only allowlisted scalar args
+    # are recorded as attributes — NEVER full arguments or document text.
+    # Downstream spans (e.g. search.hybrid) parent under the tool span
+    # automatically via OTEL context propagation. Spans are no-ops unless
+    # setup_tracing() ran with tracing.enabled: true.
+    _TOOL_SPAN_ARG_ALLOWLIST = ("top_k", "doc_id", "source", "source_name", "return_mode")
+    _mcp_tracer = get_tracer("mcp")
+
+    def _with_tool_span(fn, tool_name=None):
+        import functools
+        import inspect
+
+        # Loud registration-time guard: this wrapper is sync-only. An async
+        # tool would return an un-awaited coroutine and close its span at ~0ms.
+        assert not inspect.iscoroutinefunction(fn), (
+            "tool span wrapper is sync-only; add an async branch before "
+            "registering async tools"
+        )
+
+        tool_name = tool_name or fn.__name__
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)  # transparent: FastMCP schema generation sees the
+        def wrapper(*args, **kwargs):  # original signature via __wrapped__
+            attributes = {"tool": tool_name}
+            try:
+                bound = sig.bind_partial(*args, **kwargs)
+                for arg_name in _TOOL_SPAN_ARG_ALLOWLIST:
+                    value = bound.arguments.get(arg_name)
+                    if isinstance(value, (bool, int, float, str)):
+                        attributes[arg_name] = value
+            except TypeError:
+                pass  # attribute capture must never break a tool call
+            with _mcp_tracer.start_as_current_span(
+                f"mcp.tool.{tool_name}", attributes=attributes
+            ):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    _original_mcp_tool = mcp.tool
+
+    def _traced_mcp_tool(*dargs, **dkwargs):
+        register = _original_mcp_tool(*dargs, **dkwargs)
+
+        def decorator(fn):
+            # Honor a future mcp.tool(name=...) override so the span name
+            # can never desync from the client-visible tool name.
+            return register(_with_tool_span(fn, tool_name=dkwargs.get("name") or fn.__name__))
+
+        return decorator
+
+    mcp.tool = _traced_mcp_tool
+    # ---------------------------------------------------------------------
 
     @mcp.tool()
     def file_search(

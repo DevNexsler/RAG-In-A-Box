@@ -10,7 +10,7 @@ Supports multiple backends:
 from __future__ import annotations
 
 import logging
-from typing import Any, Protocol
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ def build_llm_provider(config: dict) -> LLMGenerator | None:
                 api_key=enrichment_cfg.get("api_key"),
                 timeout=enrichment_cfg.get("timeout", 300.0),
                 trace_capture=enrichment_cfg.get("trace_capture", {}),
+                base_url=enrichment_cfg.get("base_url"),
             )
         except Exception as exc:
             logger.warning(

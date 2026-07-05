@@ -141,5 +141,5 @@ def test_project_comm_messages_config_example_exports_source_channel_id():
     assert "c.name AS channel_name" in config_example
     assert (
         "metadata_columns: [source, source_message_id, source_channel_id, "
-        "channel_name, sender, sent_at]"
+        "channel_name, sender, sent_at, direction]"
     ) in config_example

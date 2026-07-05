@@ -99,3 +99,10 @@ To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+## Testing
+
+- `make gate-fast` during development (static → unit → integration); `make gate` before any release — all five tiers including staging-e2e (hermetic compose stack) and live (real providers, real money, preflight-guarded).
+- Full operator's manual: [docs/TESTING.md](docs/TESTING.md) (tiers, staging stack, fault injection, live preflight, gate reports).
+- Tier markers are auto-derived from filenames: `_live` → live, `tests/e2e/` → e2e, `.int.test.py` → integration, everything else → unit; explicit markers win.
+- New MCP tools are automatically REQUIRED to have e2e coverage and `mcp.tool.<name>` spans — the two-sided coverage check discovers tools via live `list_tools` and fails the gate for any tool without both.

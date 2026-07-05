@@ -3,6 +3,21 @@ name = "obsidian-vault-semantic-index"
 version = "0.1.0"
 requires-python = ">=3.10"
 
+[tool.ruff]
+line-length = 120
+# The deployed runtime is python:3.13-slim and the dev venv is 3.12; without this
+# ruff infers py310 from requires-python and flags valid 3.12 f-string syntax.
+target-version = "py312"
+
+[tool.ruff.lint]
+# Baseline: syntax errors and definite bugs only. Broaden deliberately, later.
+select = ["E9", "F63", "F7", "F82", "F401"]
+
 [tool.pytest.ini_options]
-markers = ["live: tests requiring live services (API keys, running servers)"]
+markers = [
+    "unit: fast, no network, no external services",
+    "integration: subsystems with local resources only (tmp dirs, in-process apps)",
+    "e2e: drives the staging container from outside (compose stack must be up)",
+    "live: real providers, real money (API keys, Mac Mini OCR, comm-store Postgres)",
+]
 addopts = "--import-mode=importlib"

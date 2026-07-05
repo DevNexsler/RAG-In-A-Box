@@ -12,7 +12,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 import lancedb as ldb
 import pyarrow as pa

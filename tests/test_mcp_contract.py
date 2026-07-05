@@ -779,7 +779,6 @@ def test_index_update_returns_started_status():
     whether it had failures.
     """
     import tempfile
-    from pathlib import Path
 
     with tempfile.TemporaryDirectory() as tmpdir:
         old_cache = mcp_server._cache
@@ -1559,7 +1558,7 @@ def test_file_status_reports_zombie_indexer_as_not_running():
 
 def test_search_passes_enr_doc_type():
     """_file_search_impl should pass enr_doc_type through to hybrid_search."""
-    from unittest.mock import MagicMock, call
+    from unittest.mock import MagicMock
     from search_hybrid import SearchResult
 
     mock_result = SearchResult(hits=[], diagnostics={
