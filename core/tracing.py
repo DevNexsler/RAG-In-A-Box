@@ -74,7 +74,10 @@ def setup_tracing(config: dict, service_name: str) -> None:
 
 
 def get_tracer(name: str):
-    return trace.get_tracer(name)
+    # Prefer the module provider: trace.set_tracer_provider() refuses to
+    # override the OTEL global once set, so after shutdown + re-setup the
+    # global would still point at the old, shut-down provider.
+    return (_provider or trace).get_tracer(name)
 
 
 def shutdown_tracing() -> None:

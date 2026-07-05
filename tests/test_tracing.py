@@ -3,6 +3,8 @@
 NOTE on ordering: OTEL's global tracer provider can only be set once per
 process, so the disabled test runs FIRST (pytest runs tests in definition
 order) while the global provider is still the default no-op one.
+If pytest-randomly is ever installed, it would shuffle definition order and
+break this assumption.
 """
 
 import json
@@ -36,3 +38,16 @@ def test_spans_written_as_jsonl(tmp_path):
     assert by_name["extract"]["attributes"]["doc_id"] == "d1"
     assert by_name["ocr"]["parent_span_id"] == by_name["extract"]["span_id"]
     assert by_name["ocr"]["trace_id"] == by_name["extract"]["trace_id"]
+
+
+def test_reinit_after_shutdown_writes_spans(tmp_path):
+    d1, d2 = tmp_path / "a", tmp_path / "b"
+    setup_tracing({"tracing": {"enabled": True, "directory": str(d1)}}, service_name="t1")
+    with get_tracer("p").start_as_current_span("first"):
+        pass
+    shutdown_tracing()
+    setup_tracing({"tracing": {"enabled": True, "directory": str(d2)}}, service_name="t2")
+    with get_tracer("p").start_as_current_span("second"):
+        pass
+    shutdown_tracing()
+    assert list(d2.glob("*.jsonl")), "spans lost after re-setup"
