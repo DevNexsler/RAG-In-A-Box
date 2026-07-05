@@ -398,6 +398,7 @@ Note: `SimpleSpanProcessor` (synchronous) is deliberate — spans are few (per-d
 
 **Files:**
 - Modify: `server.py` (call `setup_tracing(config, "doc-organizer")` at boot)
+- Modify: the indexing-flow subprocess entrypoint (`run_index.py` / wherever the full-flow subprocess enters — the process that writes `indexer.log`): call `setup_tracing(config, "indexer")` there too. **This is load-bearing:** the flow runs as a separate process (see indexer-two-process memory); without its own setup, the pipeline the gate most needs traced emits zero spans. The file-per-pid exporter design already handles the two processes writing concurrently.
 - Modify: `flow_index_vault.py` (`scan_vault_task` ~:525, `process_doc_task` ~:890 — the per-doc parent span; inside it, child spans around extract/OCR, enrich, embed, store call sites)
 - Modify: `doc_enrichment.py` (`enrich_document`)
 - Modify: `lancedb_store.py` (`upsert_nodes`)
