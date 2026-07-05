@@ -55,12 +55,13 @@ def _render_tiers(run_dir: Path):
     lines = ["## Tiers", "",
              "| tier | result | tests | failures | skipped | duration |",
              "|---|---|---|---|---|---|"]
-    failing, any_failed = [], False
+    failing, any_failed, files_found = [], False, 0
     for tier, fname in TIER_FILES:
         path = run_dir / fname
         if not path.exists():
             lines.append(f"| {tier} | not run | - | - | - | - |")
             continue
+        files_found += 1
         t = _parse_junit(path)
         if t is None:
             lines.append(f"| {tier} | not available | - | - | - | - |")
@@ -73,7 +74,7 @@ def _render_tiers(run_dir: Path):
         failing.extend(f"- {name}" for name in t["failing"])
     if failing:
         lines += ["", "Failing tests:", ""] + failing
-    return lines, any_failed
+    return lines, any_failed, files_found
 
 
 def _render_coverage(run_dir: Path):
@@ -113,11 +114,16 @@ def _load_spans(traces_dir: Path):
     if not traces_dir.is_dir():
         return spans
     for f in sorted(traces_dir.rglob("*.jsonl")):
-        for rec in _iter_jsonl(f):
-            if (isinstance(rec.get("name"), str) and rec.get("trace_id")
-                    and isinstance(rec.get("start_ns"), int)
-                    and isinstance(rec.get("end_ns"), int)):
-                spans.append(rec)
+        try:
+            for rec in _iter_jsonl(f):
+                if (isinstance(rec.get("name"), str) and rec.get("trace_id")
+                        and isinstance(rec.get("start_ns"), int)
+                        and isinstance(rec.get("end_ns"), int)):
+                    spans.append(rec)
+        except OSError as exc:
+            # one unreadable trace file degrades this section, not the report
+            print(f"WARN gate-report: skipping unreadable trace file {f}: "
+                  f"{exc}", file=sys.stderr)
     return spans
 
 
@@ -203,9 +209,16 @@ def _render_spend(run_dir: Path):
 
 def build_report(run_dir: Path) -> str:
     run_dir = Path(run_dir)
-    tier_lines, tiers_failed = _render_tiers(run_dir)
+    tier_lines, tiers_failed, junit_found = _render_tiers(run_dir)
     coverage_lines, coverage_failed = _render_coverage(run_dir)
-    status = "FAIL" if (tiers_failed or coverage_failed) else "PASS"
+    if tiers_failed or coverage_failed:
+        status = "FAIL"
+    elif junit_found == 0:
+        # zero junit artifacts: the run died before producing any tier
+        # evidence (static or compose-up failure) — never title it PASS
+        status = "INCOMPLETE"
+    else:
+        status = "PASS"
     sections = [[f"# Gate run {run_dir.name} — {status}"], tier_lines,
                 coverage_lines, _render_timelines(run_dir), _render_spend(run_dir)]
     return "\n\n".join("\n".join(s) for s in sections) + "\n"

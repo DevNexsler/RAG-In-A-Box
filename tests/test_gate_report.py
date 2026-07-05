@@ -210,6 +210,36 @@ def test_live_spend_none_recorded(tmp_path):
     assert "no live LLM calls recorded" in md
 
 
+# --- incomplete runs ---------------------------------------------------------------
+
+def test_empty_run_dir_titles_incomplete_not_pass(tmp_path):
+    # A run that died in static/compose-up leaves no junit at all; the report
+    # must not claim PASS for it.
+    run_dir = make_run(tmp_path)
+    md = build_report(run_dir)
+    assert md.splitlines()[0] == "# Gate run 20260705-120000 — INCOMPLETE"
+
+
+def test_coverage_fail_beats_incomplete(tmp_path):
+    # zero junit files, but a failed coverage check: FAIL wins over INCOMPLETE
+    run_dir = make_run(tmp_path)
+    (run_dir / "tool-coverage.json").write_text(json.dumps(COVERAGE_FAIL))
+    md = build_report(run_dir)
+    assert md.splitlines()[0].endswith("— FAIL")
+
+
+def test_unreadable_trace_file_skipped_with_warning(tmp_path, capsys):
+    run_dir = make_run(tmp_path)
+    spans = [_span("process_doc", "t1", 1000, 50, rel_path="ok.txt")]
+    write_spans(run_dir, spans)
+    # a directory matching *.jsonl raises IsADirectoryError (an OSError) on
+    # read — portable stand-in for an unreadable file, no chmod needed
+    (run_dir / "traces" / "bad.jsonl").mkdir()
+    md = build_report(run_dir)
+    assert "ok.txt" in md  # readable file still rendered
+    assert "bad.jsonl" in capsys.readouterr().err
+
+
 # --- generator robustness --------------------------------------------------------
 
 def test_main_writes_report_and_returns_zero(tmp_path):
