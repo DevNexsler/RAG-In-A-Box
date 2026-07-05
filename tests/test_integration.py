@@ -885,7 +885,11 @@ class TestFullPipelineWithEnrichment:
             pipeline_result["config"],
         )
 
-        response = mcp_server._file_search_impl("insurance claim roof", top_k=3)
+        # return="compact": the slim default (#0109) deliberately omits enr_*
+        # fields; this test asserts the MCP layer can surface them.
+        response = mcp_server._file_search_impl(
+            "insurance claim roof", top_k=3, return_mode="compact"
+        )
         assert "results" in response
         results = response["results"]
         assert len(results) >= 1

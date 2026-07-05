@@ -443,9 +443,11 @@ async def test_upload_index_search_download_with_real_providers(live_system):
     assert uploaded_doc_id in doc_ids, f"Uploaded doc {uploaded_doc_id} not in store: {doc_ids}"
 
     # -- Act: Step 3 -- Search via MCP handler --
+    # return="compact": the slim default (#0109) deliberately omits enr_*
+    # fields, and Step 4 asserts enrichment flows through the MCP layer.
     mcp_server._cache = (store, embed_provider, config)
     search_response = mcp_server._file_search_impl(
-        "quarterly revenue SaaS enterprise", top_k=5
+        "quarterly revenue SaaS enterprise", top_k=5, return_mode="compact"
     )
 
     assert "results" in search_response, f"Search returned error: {search_response}"
