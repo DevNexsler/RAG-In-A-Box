@@ -41,6 +41,7 @@ def build_embed_provider(config: dict) -> EmbedProvider:
                 "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
             ),
             batch_size=emb_cfg.get("batch_size", 64),
+            base_url=emb_cfg.get("base_url"),
         )
 
     if provider == "baseten":

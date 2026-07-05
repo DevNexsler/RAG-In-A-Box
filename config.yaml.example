@@ -81,12 +81,14 @@ media:
   video_model: "qwen/qwen3.5-397b-a17b"
   max_file_size_mb: 50
   timeout: 300
+  # base_url: "https://openrouter.ai/api/v1"  # override for staging/self-hosted gateways
 
 embeddings:
   provider: "openrouter"                  # Qwen3-Embedding-8B via OpenRouter
   model: "qwen/qwen3-embedding-8b"
   batch_size: 64
   concurrency: 2
+  # base_url: "https://openrouter.ai/api/v1"  # override for staging/self-hosted gateways
   # Alternatives: "baseten", "ollama" (local), "gemini" — see config.local.yaml.example
 
 chunking:
@@ -109,6 +111,7 @@ enrichment:
   enabled: true
   provider: "openrouter"                  # openrouter | litellm | ollama | baseten
   model: "openai/gpt-4.1-mini"
+  # base_url: "https://openrouter.ai/api/v1"  # override for staging/self-hosted gateways (openrouter provider)
   # LiteLLM/Ollama Cloud V4 Pro example:
   # provider: "litellm"
   # model: "ollama-deepseek-v4-pro"
@@ -143,6 +146,7 @@ search:
     provider: "deepinfra"                 # Qwen3-Reranker-8B via DeepInfra (always-on, no cold start)
     model: "Qwen/Qwen3-Reranker-8B"
     timeout: 120
+    # base_url: "https://api.deepinfra.com"  # override for staging/self-hosted gateways
 
 lancedb:
   table: "chunks"

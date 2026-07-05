@@ -288,13 +288,15 @@ class DeepInfraReranker(Reranker):
         model: str = "Qwen/Qwen3-Reranker-8B",
         api_key: str | None = None,
         timeout: float = 30.0,
+        base_url: str | None = None,
     ):
         import os
 
         self.model = model
         self.api_key = api_key or os.environ.get("DEEPINFRA_API_KEY", "")
         self.timeout = timeout
-        self.base_url = f"https://api.deepinfra.com/v1/inference/{model}"
+        self._base_url = (base_url or "https://api.deepinfra.com").rstrip("/")
+        self.base_url = f"{self._base_url}/v1/inference/{model}"
 
         if not self.api_key:
             raise ValueError(
@@ -396,6 +398,7 @@ def build_reranker(config: dict) -> Reranker | None:
             model=reranker_cfg.get("model", "Qwen/Qwen3-Reranker-8B"),
             api_key=reranker_cfg.get("api_key"),
             timeout=reranker_cfg.get("timeout", 30.0),
+            base_url=reranker_cfg.get("base_url"),
         )
     else:
         logger.warning("Unknown reranker provider: %s", provider)
