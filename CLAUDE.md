@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **RAG-in-a-Box** (2937 symbols, 7875 relationships, 245 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **staging-gate** (3239 symbols, 8618 relationships, 240 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -17,7 +17,7 @@ This project is indexed by GitNexus as **RAG-in-a-Box** (2937 symbols, 7875 rela
 
 1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
 2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
-3. `READ gitnexus://repo/RAG-in-a-Box/process/{processName}` — trace the full execution flow step by step
+3. `READ gitnexus://repo/staging-gate/process/{processName}` — trace the full execution flow step by step
 4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
 
 ## When Refactoring
@@ -56,10 +56,10 @@ This project is indexed by GitNexus as **RAG-in-a-Box** (2937 symbols, 7875 rela
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/RAG-in-a-Box/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/RAG-in-a-Box/clusters` | All functional areas |
-| `gitnexus://repo/RAG-in-a-Box/processes` | All execution flows |
-| `gitnexus://repo/RAG-in-a-Box/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/staging-gate/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/staging-gate/clusters` | All functional areas |
+| `gitnexus://repo/staging-gate/processes` | All execution flows |
+| `gitnexus://repo/staging-gate/process/{name}` | Step-by-step execution trace |
 
 ## Self-Check Before Finishing
 
@@ -99,3 +99,10 @@ To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+## Testing
+
+- `make gate-fast` during development (static → unit → integration); `make gate` before any release — all five tiers including staging-e2e (hermetic compose stack) and live (real providers, real money, preflight-guarded).
+- Full operator's manual: [docs/TESTING.md](docs/TESTING.md) (tiers, staging stack, fault injection, live preflight, gate reports).
+- Tier markers are auto-derived from filenames: `_live` → live, `tests/e2e/` → e2e, `.int.test.py` → integration, everything else → unit; explicit markers win.
+- New MCP tools are automatically REQUIRED to have e2e coverage and `mcp.tool.<name>` spans — the two-sided coverage check discovers tools via live `list_tools` and fails the gate for any tool without both.
