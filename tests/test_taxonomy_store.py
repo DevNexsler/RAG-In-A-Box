@@ -1,7 +1,5 @@
 """Tests for taxonomy_store.py — CRUD, search, alias resolution, format_for_prompt."""
 
-import tempfile
-from pathlib import Path
 
 import pytest
 

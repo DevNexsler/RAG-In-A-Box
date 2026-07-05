@@ -22,11 +22,9 @@
 #  10. rel_path filter (doc_id_prefix) works for path-based browsing
 
 import logging
-import os
-import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -34,16 +32,11 @@ import pytest
 pytest.importorskip("prefect")
 pytest.importorskip("llama_index")
 
-from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
 from llama_index.core.node_parser import SentenceSplitter
 
 from doc_id_store import (
     DocIDStore,
-    extract_id_from_filename,
-    inject_id_into_filename,
-    strip_id_from_filename,
 )
-from extractors import extract_markdown, extract_title, normalize_tags, derive_folder
 from flow_index_vault import (
     scan_vault_task,
     diff_index_task,

@@ -1,10 +1,7 @@
 """Tests for extractors.py — extraction and frontmatter parsing for all supported formats."""
 
-import tempfile
 from pathlib import Path
-from typing import Optional
 
-import pytest
 
 
 # --- Frontmatter parsing ---

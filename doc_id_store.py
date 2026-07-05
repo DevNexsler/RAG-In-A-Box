@@ -15,7 +15,6 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Literal
 
 # Base-62 charset: digits, lowercase, uppercase
 _BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"

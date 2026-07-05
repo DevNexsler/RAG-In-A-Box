@@ -14,8 +14,6 @@ Scenarios covered:
 """
 
 import os
-import stat
-import tempfile
 from pathlib import Path
 from unittest.mock import patch
 

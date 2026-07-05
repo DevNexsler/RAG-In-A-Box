@@ -15,7 +15,6 @@
 # Run with: pytest tests/test_production_readiness.e2e.test.py -v
 
 import tempfile
-import time
 from pathlib import Path
 
 import httpx
@@ -28,7 +27,6 @@ from api_server import build_api_app
 from extractors import extract_markdown, extract_title, normalize_tags, derive_folder
 from lancedb_store import LanceDBStore
 from providers.embed.base import EmbedProvider
-from search_hybrid import hybrid_search
 
 
 # ---------------------------------------------------------------------------

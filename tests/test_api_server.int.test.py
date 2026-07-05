@@ -9,8 +9,6 @@
 # Run with: pytest tests/test_api_server.int.test.py -v
 
 import hmac
-import os
-import tempfile
 from pathlib import Path
 
 import httpx

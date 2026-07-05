@@ -175,7 +175,6 @@ def live_system():
     from lancedb_store import LanceDBStore
     from providers.embed import build_embed_provider
     from providers.llm import build_llm_provider
-    from search_hybrid import build_reranker
     import mcp_server
 
     config = load_config()

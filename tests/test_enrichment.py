@@ -4,14 +4,12 @@ Unit tests mock the LLM generator.  Integration test uses the real MiniMax M2.5 
 """
 
 import json
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from doc_enrichment import (
     ENRICHMENT_FIELDS,
-    _ENRICHMENT_KEYS_RAW,
     _extract_json,
     _normalize_list,
     _normalize_enrichment,

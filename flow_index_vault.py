@@ -66,7 +66,7 @@ from communication_context import (
 )
 from core.config import load_config
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
-from doc_enrichment import enrich_document, empty_enrichment, ENRICHMENT_FIELDS, failed_enrichment
+from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
     begin_degradation_capture,
     collect_degradations,

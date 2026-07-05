@@ -17,11 +17,9 @@ The test flow:
 """
 
 import os
-import sys
 import tempfile
 from pathlib import Path
 
-import httpx
 import pytest
 
 try:
@@ -519,7 +517,7 @@ class TestReranker:
     def test_reranker_returns_continuous_scores(self, indexed_store):
         """Reranker should return continuous relevance scores (0.0–1.0)."""
         import time
-        from search_hybrid import hybrid_search, reciprocal_rank_fusion
+        from search_hybrid import reciprocal_rank_fusion
 
         store = indexed_store["store"]
         embed = indexed_store["embed_provider"]

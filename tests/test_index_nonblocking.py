@@ -9,7 +9,6 @@ import os
 import time
 from unittest.mock import patch
 
-import pytest
 
 
 def _spawn_zombie_child() -> int:
@@ -266,7 +265,6 @@ def test_pid_file_is_cleaned_up_by_subprocess(tmp_path, monkeypatch):
     subprocess exits (even if the indexer flow raises an exception)."""
     import sys
     import subprocess
-    import time
 
     # Launch the subprocess directly (mimicking what _file_index_update_impl
     # does) with a script that writes a PID file and then exits immediately.

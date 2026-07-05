@@ -13,7 +13,6 @@ scan as truth and acting destructively:
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from sources.base import SourceRecord
 from flow_index_vault import index_vault_flow, _should_use_shadow_rebuild
