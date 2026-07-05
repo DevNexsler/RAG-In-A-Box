@@ -14,9 +14,9 @@ def pytest_collection_modifyitems(config, items):
         fname = item.fspath.basename
         if item.get_closest_marker("live") or "_live" in fname:
             item.add_marker(pytest.mark.live)
-        elif ".e2e.test" in fname or "/tests/e2e/" in str(item.fspath):
+        elif item.get_closest_marker("e2e") or ".e2e.test" in fname or "/tests/e2e/" in str(item.fspath):
             item.add_marker(pytest.mark.e2e)
-        elif ".int.test" in fname:
+        elif item.get_closest_marker("integration") or ".int.test" in fname:
             item.add_marker(pytest.mark.integration)
         else:
             item.add_marker(pytest.mark.unit)

@@ -1,16 +1,19 @@
 """The tier system: markers are auto-derived from filename conventions."""
 import subprocess, sys
+from pathlib import Path
 
 
 def _collect(marker):
     # --ignore self: this file's own test IDs contain "_live" and would
     # pollute the substring assertions below.
+    # cwd is pinned to the repo root so these tests pass from any directory.
     out = subprocess.run(
         [
             sys.executable, "-m", "pytest", "--collect-only", "-q",
             "-m", marker, "--ignore", "tests/test_tier_markers.py", "tests/",
         ],
         capture_output=True, text=True,
+        cwd=Path(__file__).resolve().parents[1],
     )
     return out.stdout
 
@@ -24,6 +27,7 @@ def test_integration_tier_matches_filenames():
 
 def test_unit_tier_excludes_special_files():
     out = _collect("unit")
+    assert "test_config.py" in out     # positive check: collection is not empty
     assert ".int.test" not in out
     assert ".e2e.test" not in out
     assert "_live" not in out
