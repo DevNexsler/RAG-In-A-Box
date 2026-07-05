@@ -3,12 +3,23 @@
 # Isolated from the production compose (docker-compose.yml): distinct project
 # name, its own default network (prod uses external networks), distinct host
 # ports (17788/19999 vs 7788), and its own named volumes.
+#
+# No restart: policy anywhere (implicit "no") — deliberate fail-fast so a
+# crash-looping service fails `up --wait` immediately instead of flapping.
 name: doc-organizer-staging
+
+x-staging-logging: &staging-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   doc-organizer-staging:
     build: .
     mem_limit: 4g
     ports: ["17788:7788"]
+    logging: *staging-logging
     environment:
       OPENROUTER_API_KEY: sim
       DEEPINFRA_API_KEY: sim
@@ -21,7 +32,7 @@ services:
       - staging-index:/data/index
       - staging-traces:/data/traces
     depends_on:
-      provider-sim: {condition: service_started}
+      provider-sim: {condition: service_healthy}
       comm-postgres: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7788/health')"]
@@ -30,10 +41,19 @@ services:
   provider-sim:
     build: ./staging/provider_sim
     ports: ["19999:9999"]
+    logging: *staging-logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9999/')"]
+      interval: 3s
+      retries: 10
   comm-postgres:
     image: postgres:16-alpine
+    logging: *staging-logging
     environment: {POSTGRES_USER: comm, POSTGRES_PASSWORD: comm, POSTGRES_DB: comm}
     volumes: ["./staging/comm_postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    # PGDATA on tmpfs: every `up` reseeds fresh fixtures, and a manual `down`
+    # without -v cannot accumulate anonymous data volumes.
+    tmpfs: [/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U comm"]
       interval: 3s

@@ -1536,8 +1536,10 @@ def _file_status_impl() -> dict:
             model = reranker_cfg.get("model", "Qwen/Qwen3-Reranker-8B")
             # Honor base_url overrides (staging provider-sim) — never ping
             # production DeepInfra when the config points elsewhere.
-            base_url = reranker_cfg.get(
-                "base_url", "https://api.deepinfra.com"
+            # `or` (not a .get default): a present-but-null base_url: key must
+            # fall back too, not AttributeError into a false "unresponsive".
+            base_url = (
+                reranker_cfg.get("base_url") or "https://api.deepinfra.com"
             ).rstrip("/")
             resp = httpx.post(
                 f"{base_url}/v1/inference/{model}",

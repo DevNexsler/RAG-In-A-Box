@@ -51,7 +51,7 @@ ocr:
   provider: "deepseek_ocr2"
   base_url: "http://provider-sim:9999"
   timeout: 60
-  concurrency: 1
+  concurrency: 1   # below prod's 2 — deliberate memory-cap concession (4g mem_limit)
 
 media:
   enabled: true
@@ -66,8 +66,8 @@ embeddings:
   provider: "openrouter"
   model: "qwen/qwen3-embedding-8b"
   base_url: "http://provider-sim:9999/api/v1"
-  batch_size: 8
-  concurrency: 1
+  batch_size: 8    # below prod's 64 — deliberate memory-cap concession (4g mem_limit)
+  concurrency: 2   # matches prod; keeps the concurrent-batching path exercised
 
 chunking:
   max_chars: 1800

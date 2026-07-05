@@ -75,3 +75,14 @@ def test_health_check_defaults_to_deepinfra_when_unset(monkeypatch, tmp_path):
     assert captured["url"] == (
         "https://api.deepinfra.com/v1/inference/Qwen/Qwen3-Reranker-8B"
     )
+
+
+def test_health_check_null_base_url_key_falls_back(monkeypatch, tmp_path):
+    # A present-but-null `base_url:` key (easy to produce in YAML) must fall
+    # back to the default, not AttributeError into a false "unresponsive".
+    captured, result = _run_status_capture_url(
+        monkeypatch, tmp_path,
+        {"enabled": True, "model": "m", "base_url": None},
+    )
+    assert captured["url"] == "https://api.deepinfra.com/v1/inference/m"
+    assert result["health"]["reranker_responsive"] is True
