@@ -258,3 +258,77 @@ def test_no_wall_clock_generated_at_line(tmp_path):
     run_dir = make_run(tmp_path)
     md = build_report(run_dir)
     assert "generated at" not in md.lower()
+
+
+# --- result.json preferred when present -------------------------------------------
+
+def write_result(run_dir, overall, **tier_overrides):
+    tiers = {"static": "not_run", "unit": "not_run", "integration": "not_run",
+             "staging-e2e": "not_run", "live": "not_run"}
+    tiers.update(tier_overrides)
+    (run_dir / "result.json").write_text(
+        json.dumps({"tiers": tiers, "overall": overall}))
+
+
+def test_title_prefers_result_json_fail_over_green_junit(tmp_path):
+    # static failed (no junit artifact of its own) but unit junit is green:
+    # artifact inference alone would say PASS — result.json must win.
+    run_dir = make_run(tmp_path)
+    (run_dir / "unit.xml").write_text(UNIT_XML)
+    write_result(run_dir, "fail", static="fail", unit="pass")
+    md = build_report(run_dir)
+    assert md.splitlines()[0].endswith("— FAIL")
+
+
+def test_title_prefers_result_json_pass_over_incomplete(tmp_path):
+    # `--only static` pass: zero junit artifacts, but the run genuinely passed.
+    run_dir = make_run(tmp_path)
+    write_result(run_dir, "pass", static="pass")
+    md = build_report(run_dir)
+    assert md.splitlines()[0].endswith("— PASS")
+
+
+def test_incomplete_still_fallback_without_result_json_or_junit(tmp_path):
+    run_dir = make_run(tmp_path)
+    md = build_report(run_dir)
+    assert md.splitlines()[0].endswith("— INCOMPLETE")
+
+
+def test_static_row_rendered_from_result_json(tmp_path):
+    run_dir = make_run(tmp_path)
+    (run_dir / "unit.xml").write_text(UNIT_XML)
+    write_result(run_dir, "pass", static="pass", unit="pass")
+    md = build_report(run_dir)
+    assert "| static | pass | - | - | - | - |" in md
+    # static is the first tier: its row precedes unit's
+    assert md.index("| static |") < md.index("| unit |")
+
+
+def test_static_row_fail_and_skipped_states(tmp_path):
+    run_dir = make_run(tmp_path)
+    write_result(run_dir, "fail", static="fail")
+    md = build_report(run_dir)
+    assert "| static | FAIL | - | - | - | - |" in md
+
+    run_dir2 = make_run(tmp_path, name="20260705-130000")
+    write_result(run_dir2, "fail", static="skipped")
+    md2 = build_report(run_dir2)
+    assert "| static | skipped | - | - | - | - |" in md2
+
+
+def test_no_static_row_without_result_json(tmp_path):
+    # Old artifacts (pre-result.json runs) must render exactly as before.
+    run_dir = make_run(tmp_path)
+    (run_dir / "unit.xml").write_text(UNIT_XML)
+    md = build_report(run_dir)
+    assert "| static |" not in md
+    assert "— PASS" in md.splitlines()[0]
+
+
+def test_unreadable_result_json_falls_back_to_artifact_inference(tmp_path):
+    run_dir = make_run(tmp_path)
+    (run_dir / "unit.xml").write_text(UNIT_XML)
+    (run_dir / "result.json").write_text("not json {{{")
+    md = build_report(run_dir)
+    assert "| static |" not in md
+    assert "— PASS" in md.splitlines()[0]

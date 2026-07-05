@@ -1,10 +1,12 @@
 # NOTE: `scripts` has no __init__.py — this import works via conftest's sys.path
 # insert + namespace packages. Do not "fix" by adding __init__.py.
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import scripts.gate as gate
 from scripts.gate import TIERS, next_tier_allowed, preflight_passed
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -81,3 +83,73 @@ def test_only_live_blocked_when_preflight_fails(tmp_path):
     assert proc.returncode != 0
     assert "FAIL: live" in proc.stdout
     assert "-m pytest -m live" not in proc.stdout  # failing preflight must block the spend
+
+
+# --- result.json ---------------------------------------------------------------
+
+ALL_TIERS = ["static", "unit", "integration", "staging-e2e", "live"]
+
+
+def _read_result(run_dir):
+    return json.loads((run_dir / "result.json").read_text())
+
+
+def test_result_json_all_pass(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # no scripts/gate_report.py here — hermetic
+    monkeypatch.setattr(gate, "dispatch", lambda tier, run_dir: True)
+    run_dir = tmp_path / "run"
+    assert gate.main(["--run-dir", str(run_dir)]) == 0
+    data = _read_result(run_dir)
+    assert data["overall"] == "pass"
+    assert data["tiers"] == {name: "pass" for name in ALL_TIERS}
+
+
+def test_result_json_marks_skipped_after_failure(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gate, "dispatch",
+                        lambda tier, run_dir: tier.name != "unit")
+    run_dir = tmp_path / "run"
+    assert gate.main(["--run-dir", str(run_dir)]) == 1
+    data = _read_result(run_dir)
+    assert data["overall"] == "fail"
+    assert data["tiers"] == {
+        "static": "pass", "unit": "fail", "integration": "skipped",
+        "staging-e2e": "skipped", "live": "skipped",
+    }
+
+
+def test_result_json_only_mode_marks_unselected_not_run(tmp_path):
+    # --only staging-e2e with a nonexistent compose file: the tier fails
+    # hermetically (never invokes docker) and everything else is not_run.
+    proc = _run_gate(
+        ["--only", "staging-e2e"], tmp_path,
+        env={"GATE_COMPOSE_FILE": "docker-compose.does-not-exist.yml"},
+    )
+    assert proc.returncode != 0
+    data = _read_result(tmp_path / "run")
+    assert data["overall"] == "fail"
+    assert data["tiers"] == {
+        "static": "not_run", "unit": "not_run", "integration": "not_run",
+        "staging-e2e": "fail", "live": "not_run",
+    }
+
+
+def test_result_json_written_before_report_generator_runs(tmp_path, monkeypatch):
+    # gate_report.py must be able to prefer result.json — so the runner must
+    # write it BEFORE invoking the report. The fake report script snapshots
+    # what it can see at invocation time.
+    fake = tmp_path / "scripts" / "gate_report.py"
+    fake.parent.mkdir()
+    fake.write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "run_dir = Path(sys.argv[1])\n"
+        "path = run_dir / 'result.json'\n"
+        "seen = json.loads(path.read_text())['overall'] if path.exists() else 'MISSING'\n"
+        "(run_dir / 'seen-by-report.txt').write_text(seen)\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gate, "dispatch", lambda tier, run_dir: True)
+    run_dir = tmp_path / "run"
+    assert gate.main(["--run-dir", str(run_dir)]) == 0
+    assert (run_dir / "seen-by-report.txt").read_text() == "pass"

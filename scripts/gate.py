@@ -5,6 +5,7 @@ Usage: python scripts/gate.py [--fast] [--only TIER] [--run-dir DIR]
 """
 import argparse
 import dataclasses
+import json
 import os
 import subprocess
 import sys
@@ -159,16 +160,28 @@ def main(argv=None):
 
     results = {}
     all_ok = True
-    for tier in selected:
+    # Machine-readable per-tier states for result.json: every tier (including
+    # static, which emits no junit artifact) starts as not_run; selected tiers
+    # become pass/fail when run, or skipped when a prior tier failed.
+    states = {t.name: "not_run" for t in TIERS}
+    for i, tier in enumerate(selected):
         if not args.only and not next_tier_allowed(tier.name, results):
             print(f"STOP: {tier.name} skipped (prior tier failed)", flush=True)
+            for rest in selected[i:]:
+                states[rest.name] = "skipped"
             break
         print(f"=== {tier.name} ===", flush=True)
         ok = dispatch(tier, run_dir)
         results[tier.name] = ok
+        states[tier.name] = "pass" if ok else "fail"
         print(f"{'PASS' if ok else 'FAIL'}: {tier.name}", flush=True)
         if not ok:
             all_ok = False
+
+    # Written BEFORE gate_report.py runs so the report can prefer the runner's
+    # own verdict over artifact inference.
+    (run_dir / "result.json").write_text(json.dumps(
+        {"tiers": states, "overall": "pass" if all_ok else "fail"}, indent=2) + "\n")
 
     if Path("scripts/gate_report.py").exists():
         subprocess.run([sys.executable, "scripts/gate_report.py", str(run_dir)], check=False)

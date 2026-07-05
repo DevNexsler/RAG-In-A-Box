@@ -31,6 +31,19 @@ DOC_CAP = 20
 OK_STATUSES = {"UNSET", "OK", "", None}
 
 
+def _load_result(run_dir: Path):
+    """Parsed result.json (the gate runner's own verdict), or None.
+
+    None when absent/unreadable/not-a-dict — the report then falls back to
+    pure artifact inference, so pre-result.json run dirs render unchanged.
+    """
+    try:
+        data = json.loads((run_dir / "result.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _parse_junit(path: Path):
     """Sum testsuite attrs + collect failing testcase names; None if unreadable."""
     try:
@@ -51,11 +64,17 @@ def _parse_junit(path: Path):
     return totals
 
 
-def _render_tiers(run_dir: Path):
+def _render_tiers(run_dir: Path, result=None):
     lines = ["## Tiers", "",
              "| tier | result | tests | failures | skipped | duration |",
              "|---|---|---|---|---|---|"]
     failing, any_failed, files_found = [], False, 0
+    if result is not None:
+        # static produces no junit artifact; its state exists only in
+        # result.json (pass/fail/skipped/not_run) — counts render as "-".
+        state = str((result.get("tiers") or {}).get("static", "not_run"))
+        display = {"fail": "FAIL", "not_run": "not run"}.get(state, state)
+        lines.append(f"| static | {display} | - | - | - | - |")
     for tier, fname in TIER_FILES:
         path = run_dir / fname
         if not path.exists():
@@ -209,9 +228,17 @@ def _render_spend(run_dir: Path):
 
 def build_report(run_dir: Path) -> str:
     run_dir = Path(run_dir)
-    tier_lines, tiers_failed, junit_found = _render_tiers(run_dir)
+    result = _load_result(run_dir)
+    tier_lines, tiers_failed, junit_found = _render_tiers(run_dir, result)
     coverage_lines, coverage_failed = _render_coverage(run_dir)
-    if tiers_failed or coverage_failed:
+    overall = (result or {}).get("overall")
+    if overall in ("pass", "fail"):
+        # The runner's own verdict wins: it sees tiers with no junit artifact
+        # (static) and skipped/not_run states that artifact inference cannot.
+        # Artifact-derived failures still veto a "pass" (defense in depth).
+        status = "FAIL" if (overall == "fail" or tiers_failed
+                            or coverage_failed) else "PASS"
+    elif tiers_failed or coverage_failed:
         status = "FAIL"
     elif junit_found == 0:
         # zero junit artifacts: the run died before producing any tier
