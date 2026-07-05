@@ -402,8 +402,13 @@ Note: `SimpleSpanProcessor` (synchronous) is deliberate — spans are few (per-d
 - Modify: `doc_enrichment.py` (`enrich_document`)
 - Modify: `lancedb_store.py` (`upsert_nodes`)
 - Modify: `search_hybrid.py` (`hybrid_search`)
+- Modify: `mcp_server.py` (span per MCP tool call — see below)
 - Modify: `providers/llm/trace_recorder.py` (`record()` gains current trace/span ids)
 - Test: `tests/test_tracing_pipeline.py`
+
+**MCP tool-call spans (added per user requirement 2026-07-05):** every one of the 20 MCP tool invocations must emit a server-side span named `mcp.tool.<tool_name>`, so tool calls themselves are traceable — not just the pipeline. Implement as ONE generic wrapper applied at tool-registration time (a decorator layered with `@mcp.tool()`, or a loop wrapping the impl functions) — do not hand-instrument 20 functions. Attributes: tool name, plus an allowlist of scalar args when present (`top_k`, `doc_id`, `source`, `return_mode`); NEVER record full arguments or document text. Search-path tool spans parent the existing `search.hybrid` span automatically via context propagation. Add to Step 2's test: call one non-search tool handler (e.g. taxonomy list) and assert an `mcp.tool.*` span was written.
+
+**Gate cross-check (lands in Tasks 9/11):** e2e tool coverage is verified from BOTH sides — client-side (the recording MCP client's coverage JSONL, Task 9) and server-side (every one of the 20 tools has at least one `mcp.tool.<name>` span in the staging trace artifacts; Task 9's checker asserts this too once Task 4 lands). A tool that passes client-side but has no server-side span indicates broken instrumentation and fails the gate.
 
 **MANDATORY before edits:** run `gitnexus_impact` upstream on each of: `process_doc_task`, `scan_vault_task`, `enrich_document`, `upsert_nodes`, `hybrid_search`, `LLMTraceRecorder.record`. Report blast radius. These are hot-path symbols; expect non-trivial caller counts. If HIGH/CRITICAL → stop and warn the user before proceeding.
 
@@ -627,9 +632,11 @@ class RecordingSession:
 - Modify: `scripts/gate.py` (run the check right after the e2e tier, while the stack is still up)
 - Test: `tests/test_check_tool_coverage.py`
 
-- [ ] **Step 1: Failing tests** — `check_coverage(discovered={"a","b"}, covered={"a"})` returns the missing set `{"b"}`; empty missing set → ok; matrix rendering includes tool→tests mapping.
-- [ ] **Step 2: Implement** — the script connects to the running staging MCP endpoint, calls `list_tools()` (source of truth — new tools automatically require coverage), reads `E2E_COVERAGE_FILE`, exits 1 with a named list of uncovered tools. `gate.py` calls it inside the compose window; failure fails the staging-e2e tier.
-- [ ] **Step 3: Run `make test-e2e`** — expect 20/20 covered, exit 0. Temporarily comment one taxonomy test and re-run to see it fail with the tool named; restore.
+**Two-sided verification (per user requirement 2026-07-05):** coverage is asserted from both the client side (the recording MCP client's coverage JSONL from Task 8) and the server side (staging trace artifacts must contain at least one `mcp.tool.<name>` span per discovered tool, from Task 4's instrumentation). A tool covered client-side but missing server-side spans = broken traceability = gate failure, reported separately from "uncovered tool".
+
+- [ ] **Step 1: Failing tests** — `check_coverage(discovered={"a","b"}, covered={"a"})` returns the missing set `{"b"}`; empty missing set → ok; matrix rendering includes tool→tests mapping; `check_tool_spans(discovered, spans)` returns tools lacking any `mcp.tool.<name>` span.
+- [ ] **Step 2: Implement** — the script connects to the running staging MCP endpoint, calls `list_tools()` (source of truth — new tools automatically require coverage), reads `E2E_COVERAGE_FILE` AND the collected span JSONL (`<run_dir>/traces/`), exits 1 with named lists: uncovered tools and untraced tools. `gate.py` calls it inside the compose window (after trace collection); failure fails the staging-e2e tier.
+- [ ] **Step 3: Run `make test-e2e`** — expect 20/20 covered AND 20/20 traced, exit 0. Temporarily comment one taxonomy test and re-run to see it fail with the tool named; restore.
 - [ ] **Step 4: Commit** — `feat(gate): fail unless every MCP tool has e2e coverage`.
 
 ---
