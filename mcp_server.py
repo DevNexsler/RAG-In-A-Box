@@ -1948,18 +1948,26 @@ if HAS_MCP and FastMCP is not None:
     # Downstream spans (e.g. search.hybrid) parent under the tool span
     # automatically via OTEL context propagation. Spans are no-ops unless
     # setup_tracing() ran with tracing.enabled: true.
-    _TOOL_SPAN_ARG_ALLOWLIST = ("top_k", "doc_id", "source", "return_mode")
+    _TOOL_SPAN_ARG_ALLOWLIST = ("top_k", "doc_id", "source", "source_name", "return_mode")
     _mcp_tracer = get_tracer("mcp")
 
-    def _with_tool_span(fn):
+    def _with_tool_span(fn, tool_name=None):
         import functools
         import inspect
 
+        # Loud registration-time guard: this wrapper is sync-only. An async
+        # tool would return an un-awaited coroutine and close its span at ~0ms.
+        assert not inspect.iscoroutinefunction(fn), (
+            "tool span wrapper is sync-only; add an async branch before "
+            "registering async tools"
+        )
+
+        tool_name = tool_name or fn.__name__
         sig = inspect.signature(fn)
 
         @functools.wraps(fn)  # transparent: FastMCP schema generation sees the
         def wrapper(*args, **kwargs):  # original signature via __wrapped__
-            attributes = {"tool": fn.__name__}
+            attributes = {"tool": tool_name}
             try:
                 bound = sig.bind_partial(*args, **kwargs)
                 for arg_name in _TOOL_SPAN_ARG_ALLOWLIST:
@@ -1969,7 +1977,7 @@ if HAS_MCP and FastMCP is not None:
             except TypeError:
                 pass  # attribute capture must never break a tool call
             with _mcp_tracer.start_as_current_span(
-                f"mcp.tool.{fn.__name__}", attributes=attributes
+                f"mcp.tool.{tool_name}", attributes=attributes
             ):
                 return fn(*args, **kwargs)
 
@@ -1981,7 +1989,9 @@ if HAS_MCP and FastMCP is not None:
         register = _original_mcp_tool(*dargs, **dkwargs)
 
         def decorator(fn):
-            return register(_with_tool_span(fn))
+            # Honor a future mcp.tool(name=...) override so the span name
+            # can never desync from the client-visible tool name.
+            return register(_with_tool_span(fn, tool_name=dkwargs.get("name") or fn.__name__))
 
         return decorator
 

@@ -76,11 +76,11 @@ def span_dir(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_stages_emit_spans(tmp_path, span_dir):
+def _index_note(tmp_path):
+    """Index _MD_CONTENT through the real pipeline; return (store, embed)."""
     import flow_index_vault as fiv
     from lancedb_store import LanceDBStore
     from llama_index.core.node_parser import SentenceSplitter
-    from search_hybrid import hybrid_search
 
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -114,9 +114,16 @@ def test_pipeline_stages_emit_spans(tmp_path, span_dir):
     try:
         fiv.process_doc_task.fn(doc)
         store.create_fts_index()
-        result = hybrid_search(store, embed, "machine learning embedding", final_top_k=5)
     finally:
         fiv._RUNTIME.clear()
+    return store, embed
+
+
+def test_pipeline_stages_emit_spans(tmp_path, span_dir):
+    from search_hybrid import hybrid_search
+
+    store, embed = _index_note(tmp_path)
+    result = hybrid_search(store, embed, "machine learning embedding", final_top_k=5)
     assert len(result) > 0  # pipeline actually worked; spans were additive
 
     shutdown_tracing()
@@ -214,18 +221,47 @@ def test_mcp_tool_span_records_only_allowlisted_scalar_args(span_dir):
         pytest.skip("mcp package not installed")
 
     with patch("mcp_server._file_search_impl", return_value={"results": []}):
-        mcp_server.file_search(query="private user text", top_k=5)
+        mcp_server.file_search(
+            query="private user text", top_k=5, source_name="documents"
+        )
 
     shutdown_tracing()
     spans = _read_spans(span_dir)
     span = next((s for s in spans if s["name"] == "mcp.tool.file_search"), None)
     assert span is not None, [s["name"] for s in spans]
     assert span["attributes"]["top_k"] == 5
+    assert span["attributes"]["source_name"] == "documents"
     # NEVER record full arguments or document/query text
     assert "query" not in span["attributes"]
     assert not any(
         "private user text" in str(v) for v in span["attributes"].values()
     )
+
+
+def test_mcp_file_search_tool_span_parents_search_hybrid(tmp_path, span_dir):
+    """The linkage Task 9's server-side coverage check leans on: the
+    downstream search.hybrid span must parent under mcp.tool.file_search via
+    OTEL context propagation — asserted against the REAL registered tool
+    wrapper and the REAL hybrid search over a real store."""
+    import mcp_server
+
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    store, embed = _index_note(tmp_path)
+    with patch("mcp_server._get_deps", return_value=(store, embed, {})):
+        resp = mcp_server.file_search(query="machine learning embedding", top_k=3)
+    assert resp.get("results"), resp
+
+    shutdown_tracing()
+    spans = _read_spans(span_dir)
+    by_name = {s["name"]: s for s in spans}
+    tool_span = by_name.get("mcp.tool.file_search")
+    search_span = by_name.get("search.hybrid")
+    assert tool_span is not None, sorted(by_name)
+    assert search_span is not None, sorted(by_name)
+    assert search_span["trace_id"] == tool_span["trace_id"]
+    assert search_span["parent_span_id"] == tool_span["span_id"]
 
 
 # ---------------------------------------------------------------------------
