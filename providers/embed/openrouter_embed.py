@@ -100,8 +100,6 @@ class OpenRouterEmbedProvider(EmbedProvider):
             _do, attempts=MAX_RETRIES, backoff=RETRY_BACKOFF, label="openrouter-embed",
         )
 
-        raise last_exc  # type: ignore[misc]
-
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed texts for indexing (no instruction prefix). Batches automatically."""
         if not texts:
