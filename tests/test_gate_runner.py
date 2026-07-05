@@ -53,8 +53,31 @@ def test_only_staging_e2e_fails_without_compose_file(tmp_path):
     assert "docker-compose.does-not-exist.yml not found" in proc.stdout
 
 
-def test_only_live_fails_without_preflight(tmp_path):
-    # scripts/live_preflight.py does not exist until Task 10 lands.
-    proc = _run_gate(["--only", "live"], tmp_path)
+def _run_gate_from(cwd, args, tmp_path):
+    # Run gate.py from an arbitrary cwd: gate resolves scripts/live_preflight.py
+    # relative to cwd, so a bare tmp dir simulates "preflight missing" and a
+    # planted fake simulates any preflight exit code — hermetically. Never run
+    # `--only live` with cwd=REPO_ROOT here: the REAL preflight exists there
+    # now (Task 10), and passing preflight would start the real-money live tier.
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "gate.py"),
+         *args, "--run-dir", str(tmp_path / "run")],
+        capture_output=True, text=True, cwd=cwd, env={**os.environ},
+    )
+
+
+def test_only_live_fails_when_preflight_missing(tmp_path):
+    proc = _run_gate_from(tmp_path, ["--only", "live"], tmp_path)
     assert proc.returncode != 0
-    assert "Task 10 pending" in proc.stdout
+    assert "live preflight not implemented" in proc.stdout
+    assert "-m pytest -m live" not in proc.stdout  # live tier never launched
+
+
+def test_only_live_blocked_when_preflight_fails(tmp_path):
+    fake = tmp_path / "scripts" / "live_preflight.py"
+    fake.parent.mkdir()
+    fake.write_text("import sys\nsys.exit(1)\n")
+    proc = _run_gate_from(tmp_path, ["--only", "live"], tmp_path)
+    assert proc.returncode != 0
+    assert "FAIL: live" in proc.stdout
+    assert "-m pytest -m live" not in proc.stdout  # failing preflight must block the spend
