@@ -17,6 +17,10 @@ def _resolve_url(hook: dict[str, Any]) -> tuple[str, bool]:
     no-op), not a misconfiguration. This lets a config carry an optional
     cross-repo callback (url: ${CDS_HOOK_URL}) that stays dormant until the
     env var is set, without spamming a warning per indexed document.
+
+    Whole-string only: the url must be exactly "${VAR}" (no in-string
+    interpolation like "${VAR}/path" or "http://x${VAR}") — matches the
+    sources/postgres.py dsn convention. Put the full url in the env var.
     """
     raw = str(hook.get("url") or "").strip()
     if raw.startswith("${") and raw.endswith("}"):
