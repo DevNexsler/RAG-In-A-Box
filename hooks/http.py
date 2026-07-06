@@ -8,11 +8,33 @@ import urllib.request
 from typing import Any
 
 
+def _resolve_url(hook: dict[str, Any]) -> tuple[str, bool]:
+    """Resolve a hook url, expanding a ${ENV_VAR} reference from the environment
+    (same convention as the postgres source dsn).
+
+    Returns (url, env_driven). env_driven is True when the url was a ${VAR}
+    form — so an empty result is an intentional "disabled" state (a silent
+    no-op), not a misconfiguration. This lets a config carry an optional
+    cross-repo callback (url: ${CDS_HOOK_URL}) that stays dormant until the
+    env var is set, without spamming a warning per indexed document.
+
+    Whole-string only: the url must be exactly "${VAR}" (no in-string
+    interpolation like "${VAR}/path" or "http://x${VAR}") — matches the
+    sources/postgres.py dsn convention. Put the full url in the env var.
+    """
+    raw = str(hook.get("url") or "").strip()
+    if raw.startswith("${") and raw.endswith("}"):
+        return os.environ.get(raw[2:-1], "").strip(), True
+    return raw, False
+
+
 def send_http_event(hook: dict[str, Any], event: dict[str, Any]) -> str | None:
     """Send one event to one HTTP hook. Return warning text on failure."""
     name = str(hook.get("name") or "unnamed")
-    url = str(hook.get("url") or "").strip()
+    url, env_driven = _resolve_url(hook)
     if not url:
+        if env_driven:
+            return None  # env-driven callback, env var unset → deliberate no-op
         return f"hook {name} disabled: missing url"
 
     headers = {"Content-Type": "application/json"}

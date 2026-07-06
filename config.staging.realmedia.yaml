@@ -1,10 +1,18 @@
-# Staging config — bind-mounted over /app/config.yaml by docker-compose.staging.yml.
-# Every provider points at the provider-sim container; the "keys" are fakes
-# (the sim ignores auth), so this file is safe to commit.
+# Staging config — REAL-MEDIA variant (CDS final e2e run).
 #
-# Sources-mode (NOT documents_root): the two cannot coexist (core/config.py).
-# The postgres source MUST be named "sor" — sor_query.resolve_sor_dsn() looks
-# it up by that exact name.
+# Identical to config.staging.yaml EXCEPT: media + enrichment call the real
+# OpenRouter API instead of provider-sim. Everything else (embeddings, OCR,
+# reranker) stays on the sim — deterministic and free — because they are not
+# the media-enrichment path under test.
+#
+# Use for the FINAL end-to-end pass after the deterministic (all-sim) run is
+# green. Requires a real OPENROUTER_API_KEY in the container env (the CDS
+# override passes it through). This run SPENDS REAL MONEY.
+#
+# KEEP IN SYNC with config.staging.yaml — the only intended differences are the
+# two base_url lines (marked REAL below), the media timeout, and the audio
+# fallback chain. If you change the base config's sources/chunking/search, mirror
+# it here.
 
 index_root: /data/index
 
@@ -49,25 +57,28 @@ pdf:
 ocr:
   enabled: true
   provider: "deepseek_ocr2"
-  base_url: "http://provider-sim:9999"
+  base_url: "http://provider-sim:9999"   # sim (OCR not under test in the media path)
   timeout: 60
-  concurrency: 1   # below prod's 2 — deliberate memory-cap concession (4g mem_limit)
+  concurrency: 1
 
 media:
   enabled: true
   provider: "openrouter"
-  base_url: "http://provider-sim:9999/api/v1"
+  base_url: "https://openrouter.ai/api/v1"   # REAL — live transcription
   audio_model: "openai/whisper-1"
+  fallback_audio_models:                     # whisper-1 500s in practice; fall back
+    - "mistralai/voxtral-small-24b-2507"
+    - "google/gemini-2.5-flash-lite"
   video_model: "qwen/qwen3.5-397b-a17b"
   max_file_size_mb: 50
-  timeout: 60
+  timeout: 300   # real transcription latency (matches prod, not the sim's 60)
 
 embeddings:
   provider: "openrouter"
   model: "qwen/qwen3-embedding-8b"
-  base_url: "http://provider-sim:9999/api/v1"
-  batch_size: 8    # below prod's 64 — deliberate memory-cap concession (4g mem_limit)
-  concurrency: 2   # matches prod; keeps the concurrent-batching path exercised
+  base_url: "http://provider-sim:9999/api/v1"   # sim — deterministic vectors
+  batch_size: 8
+  concurrency: 2
 
 chunking:
   max_chars: 1800
@@ -78,7 +89,7 @@ enrichment:
   enabled: true
   provider: "openrouter"
   model: "openai/gpt-4.1-mini"
-  base_url: "http://provider-sim:9999/api/v1"
+  base_url: "https://openrouter.ai/api/v1"   # REAL — live LLM enrichment
   max_input_chars: 20000
   max_output_tokens: 2000
   concurrency: 1
@@ -94,7 +105,7 @@ search:
     provider: "deepinfra"
     model: "Qwen/Qwen3-Reranker-8B"
     timeout: 30
-    base_url: "http://provider-sim:9999"
+    base_url: "http://provider-sim:9999"   # sim (reranker not under test in the media path)
 
 lancedb:
   table: "chunks"
@@ -110,10 +121,9 @@ event_hooks:
       url: "http://provider-sim:9999/hooks/sink"
       events: ["document.indexed"]
       timeout_seconds: 5
-    # Optional cross-repo callback (Comm-Data-Store). url is env-driven and
-    # default-absent: unset CDS_HOOK_URL → silently skipped (the gate is
-    # unaffected). CDS sets it (+ extra_hosts in docker-compose.staging.cds.yml)
-    # to receive the real document.indexed event at their throwaway test hook.
+    # Optional cross-repo callback (Comm-Data-Store) — env-driven, default-absent.
+    # Unset CDS_HOOK_URL → silently skipped. This is the real prod integration CDS
+    # tests: a real document.indexed event delivered to their throwaway hook.
     - name: "cds-callback"
       type: "http"
       url: "${CDS_HOOK_URL}"

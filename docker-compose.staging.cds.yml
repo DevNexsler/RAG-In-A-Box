@@ -1,0 +1,58 @@
+# CDS cross-repo test target — overlay on docker-compose.staging.yml.
+#
+# Comm-Data-Store points its media-enrichment e2e at a PARALLEL, fully-isolated
+# copy of the staging stack — never at production. This overlay only changes
+# what's needed for two stacks to coexist:
+#   - distinct compose project (cds-doc-organizer) + its own cds-* volumes, so a
+#     `make gate` run (project doc-organizer-staging) can never collide with or
+#     tear down this stack, and vice-versa;
+#   - distinct host ports (27788 app / 29999 sim) so both can be up at once.
+# Provider wiring (sim vs real) and the real key come from the SHARED env vars
+# STAGING_CONFIG / OPENROUTER_API_KEY handled by the base compose — see below.
+#
+# Nothing here touches production: prod is a different container, a different
+# /data/documents host directory, different volumes, a different network, and
+# port 7788. This stack's /data/documents is a throwaway volume, empty each `up`
+# (or persist it with the seed script — see docs/TESTING.md).
+#
+# Usage:
+#   Deterministic (default — all providers = sim, free):
+#     docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+#
+#   Final real-API run (media + enrichment = live OpenRouter, SPENDS MONEY):
+#     export OPENROUTER_API_KEY=<real key>
+#     STAGING_CONFIG=./config.staging.realmedia.yaml \
+#       docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+#
+#   Tear down (add -v to also wipe the throwaway volumes):
+#     docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml down -v
+#
+# App:  http://127.0.0.1:27788   Sim: http://127.0.0.1:29999
+# Auth: Authorization: Bearer staging-test-key   (index: POST /api/index/document)
+name: cds-doc-organizer
+
+services:
+  doc-organizer-staging:
+    # !override replaces the base list entirely (compose would otherwise append,
+    # binding both 17788 and 27788 and colliding with a running gate stack).
+    ports: !override ["27788:7788"]
+    # Reach the CDS test hook running on the host (Linux docker). Paired with the
+    # cds-callback event hook (url: ${CDS_HOOK_URL}) in config.staging*.yaml.
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      # Passthrough (merges with base env). Unset → cds-callback hook no-ops.
+      # Set (e.g. http://host.docker.internal:8095/hooks/doc-indexed) → real callback.
+      CDS_HOOK_URL: ${CDS_HOOK_URL:-}
+    volumes: !override
+      - ${STAGING_CONFIG:-./config.staging.yaml}:/app/config.yaml:ro
+      - cds-docs:/data/documents
+      - cds-index:/data/index
+      - cds-traces:/data/traces
+
+  provider-sim:
+    ports: !override ["29999:9999"]
+
+volumes:
+  cds-docs: {}
+  cds-index: {}
+  cds-traces: {}

@@ -26,7 +26,8 @@ from check_tool_coverage import _iter_jsonl  # noqa: E402
 
 # canonical tier order; static emits no junit artifact so it has no row
 TIER_FILES = [("unit", "unit.xml"), ("integration", "integration.xml"),
-              ("staging-e2e", "e2e.xml"), ("live", "live.xml")]
+              ("staging-e2e", "e2e.xml"), ("live", "live.xml"),
+              ("e2e-real", "e2e-real.xml")]
 DOC_CAP = 20
 OK_STATUSES = {"UNSET", "OK", "", None}
 

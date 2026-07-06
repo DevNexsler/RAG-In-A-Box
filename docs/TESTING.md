@@ -241,3 +241,89 @@ papered over:
 - **`file_folders` undercounts in sources-mode.** Folder aggregation
   predates multi-source configs; counts for non-filesystem sources are
   incomplete.
+
+## Cross-repo test target (CDS)
+
+Comm-Data-Store points its media-enrichment e2e at a **parallel, fully
+isolated** copy of the staging stack — never at production. The overlay
+`docker-compose.staging.cds.yml` gives it a distinct compose project
+(`cds-doc-organizer`), distinct host ports (**27788** app / **29999**
+sim), and its own throwaway `cds-*` volumes, so it can run alongside a
+`make gate` run without either stack colliding with or tearing down the
+other. Nothing it touches reaches prod: prod is a different container, a
+different `/data/documents` host directory, different volumes, a
+different network, and port 7788. The CDS stack's `/data/documents` is a
+throwaway volume that starts **empty** every `up`.
+
+**Two-stage run — deterministic first, real API last.** Matches the
+gate's own fakes-then-live philosophy:
+
+```bash
+# 1. Deterministic (all providers = sim, free, catches wiring bugs):
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+
+# 2. Final real-API pass (media + enrichment = live OpenRouter, SPENDS MONEY) —
+#    only after stage 1 is green:
+export OPENROUTER_API_KEY=<real key>
+STAGING_CONFIG=./config.staging.realmedia.yaml \
+  docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+
+# Tear down (wipes throwaway volumes):
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml down -v
+```
+
+`STAGING_CONFIG` selects the provider wiring for any staging stack (base or
+CDS overlay); unset = the all-sim `config.staging.yaml`. The real-media config
+(`config.staging.realmedia.yaml`) repoints only `media` and `enrichment` at
+real OpenRouter (with an audio fallback chain, since `whisper-1` 500s in
+practice); embeddings, OCR, and reranker stay on the sim — deterministic and
+free — because they are not the media path under test.
+
+**Real `document.indexed` callback (the prod integration CDS tests).** Both
+staging configs carry a second, env-driven event hook `cds-callback` alongside
+the sim sink:
+
+```yaml
+- name: "cds-callback"
+  url: "${CDS_HOOK_URL}"     # unset → silently skipped (gate unaffected)
+  events: ["document.indexed"]
+```
+
+The app resolves `${CDS_HOOK_URL}` from the container env at delivery time (a
+`${VAR}` url that resolves empty is a deliberate no-op — no warning per doc).
+The CDS overlay passes `CDS_HOOK_URL` through and adds
+`extra_hosts: ["host.docker.internal:host-gateway"]` so the container can reach
+a hook on the host. To receive the real callback:
+
+```bash
+export CDS_HOOK_URL=http://host.docker.internal:8095/hooks/doc-indexed
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+# indexing any doc now POSTs document.indexed {doc_id, rel_path, metadata} to :8095
+```
+
+The payload is unchanged (`doc_id` + `rel_path` + sanitized `metadata`,
+including `enr_*` enrichment fields) — the same event the sim sink and prod's
+comm-data-store hook already consume.
+
+**Standing seeded corpus (optional).** The gate e2e always starts from an empty
+index, but for manual / CDS testing against a persistent parallel dataset, drop
+files into `staging/fixtures/corpus/` and run `scripts/seed_staging.sh` against a
+running stack — it deposits each file into `/data/documents` and indexes it. Env
+overrides (`SEED_COMPOSE`, `SEED_URL`, `SEED_API_KEY`, `SEED_CORPUS`) point it at
+the base stack (`:17788`, default) or the CDS overlay (`:27788`). This is
+testing-only data on a throwaway volume — never production. To keep the corpus
+across restarts, stop with `down` (NOT `down -v`); `down -v` wipes it.
+
+**Index contract:**
+- Endpoint: `POST http://127.0.0.1:27788/api/index/document`, body
+  `{"rel_path"|"abs_path"|"doc_id": ..., "source_name"?: "documents", "force"?: false}`.
+- Auth: `Authorization: Bearer staging-test-key` on all `/api/*` (only
+  `/health` is exempt). This key is a committed non-secret fixed literal —
+  **different from prod's real key; do not reuse across the two.**
+- The endpoint indexes a file that **must already exist** in
+  `/data/documents`. `/api/upload` rejects media extensions, so deposit
+  media first (`docker compose ... cp <file> doc-organizer-staging:/data/documents/<name>`),
+  then call the index endpoint with that `rel_path`.
+- Reads back: the doc is **vector-searchable immediately**; keyword/FTS
+  visibility waits for a full sweep (which this stack may never run), so
+  assert via semantic search.
