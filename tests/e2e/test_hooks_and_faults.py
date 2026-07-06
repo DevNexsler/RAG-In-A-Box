@@ -8,6 +8,7 @@ Fault notes:
     indexed_corpus itself (the per-test /admin/reset wipes the live sink, so
     asserting on a later GET /hooks/received would race with reset ordering).
 """
+import os
 import uuid
 
 import httpx
@@ -17,6 +18,7 @@ from tests.e2e.client import get_hook_events, search_hits
 from tests.e2e.conftest import E2E_SIM_URL
 
 pytestmark = pytest.mark.anyio
+E2E_REAL = os.environ.get("E2E_REAL") == "1"
 
 
 async def _arm_fault(route_prefix: str, fault: str, times: int):
@@ -84,6 +86,10 @@ async def test_recovery_from_embeddings_429(indexed_corpus, api, mcp_session):
     assert not audit_events & {"rename_failed", "collision"}, log["entries"]
 
 
+@pytest.mark.skipif(
+    E2E_REAL,
+    reason="enrichment is live in real mode; the sim's chat fault can't be injected into real OpenRouter",
+)
 async def test_degraded_enrichment_still_indexes(indexed_corpus, api, mcp_session):
     # Three garbage responses on chat/completions: enrichment cannot succeed,
     # but indexing must degrade gracefully — the document still gets chunked,

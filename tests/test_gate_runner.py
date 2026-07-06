@@ -88,6 +88,7 @@ def test_only_live_blocked_when_preflight_fails(tmp_path):
 # --- result.json ---------------------------------------------------------------
 
 ALL_TIERS = ["static", "unit", "integration", "staging-e2e", "live"]
+# e2e-real is opt-in (--with-real-e2e); it stays not_run in a default gate run.
 
 
 def _read_result(run_dir):
@@ -101,7 +102,7 @@ def test_result_json_all_pass(tmp_path, monkeypatch):
     assert gate.main(["--run-dir", str(run_dir)]) == 0
     data = _read_result(run_dir)
     assert data["overall"] == "pass"
-    assert data["tiers"] == {name: "pass" for name in ALL_TIERS}
+    assert data["tiers"] == {**{name: "pass" for name in ALL_TIERS}, "e2e-real": "not_run"}
 
 
 def test_result_json_marks_skipped_after_failure(tmp_path, monkeypatch):
@@ -114,7 +115,7 @@ def test_result_json_marks_skipped_after_failure(tmp_path, monkeypatch):
     assert data["overall"] == "fail"
     assert data["tiers"] == {
         "static": "pass", "unit": "fail", "integration": "skipped",
-        "staging-e2e": "skipped", "live": "skipped",
+        "staging-e2e": "skipped", "live": "skipped", "e2e-real": "not_run",
     }
 
 
@@ -130,7 +131,7 @@ def test_result_json_only_mode_marks_unselected_not_run(tmp_path):
     assert data["overall"] == "fail"
     assert data["tiers"] == {
         "static": "not_run", "unit": "not_run", "integration": "not_run",
-        "staging-e2e": "fail", "live": "not_run",
+        "staging-e2e": "fail", "live": "not_run", "e2e-real": "not_run",
     }
 
 
@@ -153,3 +154,29 @@ def test_result_json_written_before_report_generator_runs(tmp_path, monkeypatch)
     run_dir = tmp_path / "run"
     assert gate.main(["--run-dir", str(run_dir)]) == 0
     assert (run_dir / "seen-by-report.txt").read_text() == "pass"
+
+
+def test_with_real_e2e_appends_e2e_real_stage(tmp_path, monkeypatch):
+    # --with-real-e2e adds the opt-in real-API stage; it runs last and, when
+    # every prior tier passes, is exercised (here dispatch is stubbed to pass).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gate, "dispatch", lambda tier, run_dir: True)
+    run_dir = tmp_path / "run"
+    assert gate.main(["--with-real-e2e", "--run-dir", str(run_dir)]) == 0
+    data = _read_result(run_dir)
+    assert data["tiers"]["e2e-real"] == "pass"
+
+
+def test_e2e_real_preflight_requires_real_key(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    assert gate.e2e_real_preflight() is False       # unset → blocked
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sim")
+    assert gate.e2e_real_preflight() is False        # sim placeholder → blocked
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-real")
+    assert gate.e2e_real_preflight() is True          # real key → allowed
+
+
+def test_e2e_real_not_in_default_tiers():
+    # The default gate must never include the money-spending stage.
+    assert "e2e-real" not in [t.name for t in gate.TIERS]
+    assert gate.E2E_REAL_TIER.name == "e2e-real"
