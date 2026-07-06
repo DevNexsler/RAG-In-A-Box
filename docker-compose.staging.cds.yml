@@ -1,0 +1,52 @@
+# CDS cross-repo test target — overlay on docker-compose.staging.yml.
+#
+# Comm-Data-Store points its media-enrichment e2e at this instead of prod. It is
+# a PARALLEL, fully-isolated copy of the staging stack:
+#   - distinct compose project name (cds-doc-organizer) + its own volumes, so a
+#     `make gate` / `make test-e2e` run (project doc-organizer-staging) can never
+#     collide with or tear down this stack, and vice-versa;
+#   - distinct host ports (27788 / 29999) so both can be up at once;
+#   - nothing here touches production: prod is a different container, different
+#     volumes, different directory (/home/.../documents:/data/documents), a
+#     different network, and port 7788. This stack's /data/documents is a
+#     throwaway volume that starts EMPTY every `up`.
+#
+# Usage:
+#   Deterministic (default — all providers = sim, free):
+#     docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+#
+#   Final real-API run (media + enrichment = live OpenRouter, SPENDS MONEY):
+#     export OPENROUTER_API_KEY=<real key>
+#     CDS_CONFIG=./config.staging.cds-realmedia.yaml \
+#       docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+#
+#   Tear down (throwaway volumes wiped):
+#     docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml down -v
+#
+# App:  http://127.0.0.1:27788   Sim: http://127.0.0.1:29999
+# Auth: Authorization: Bearer staging-test-key   (index endpoint: POST /api/index/document)
+name: cds-doc-organizer
+
+services:
+  doc-organizer-staging:
+    # !override replaces the base list entirely (compose would otherwise append,
+    # binding both 17788 and 27788 and colliding with a running gate stack).
+    ports: !override ["27788:7788"]
+    environment:
+      # Passthrough: real key for the real-media run; "sim" (harmless) otherwise.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-sim}
+    volumes: !override
+      # CDS_CONFIG selects the provider wiring: unset = all-sim (deterministic),
+      # config.staging.cds-realmedia.yaml = live media + enrichment.
+      - ${CDS_CONFIG:-./config.staging.yaml}:/app/config.yaml:ro
+      - cds-docs:/data/documents
+      - cds-index:/data/index
+      - cds-traces:/data/traces
+
+  provider-sim:
+    ports: !override ["29999:9999"]
+
+volumes:
+  cds-docs: {}
+  cds-index: {}
+  cds-traces: {}

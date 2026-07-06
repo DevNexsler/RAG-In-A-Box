@@ -1,0 +1,131 @@
+# Staging config — REAL-MEDIA variant (CDS final e2e run).
+#
+# Identical to config.staging.yaml EXCEPT: media + enrichment call the real
+# OpenRouter API instead of provider-sim. Everything else (embeddings, OCR,
+# reranker) stays on the sim — deterministic and free — because they are not
+# the media-enrichment path under test.
+#
+# Use for the FINAL end-to-end pass after the deterministic (all-sim) run is
+# green. Requires a real OPENROUTER_API_KEY in the container env (the CDS
+# override passes it through). This run SPENDS REAL MONEY.
+#
+# KEEP IN SYNC with config.staging.yaml — the only intended differences are the
+# two base_url lines (marked REAL below), the media timeout, and the audio
+# fallback chain. If you change the base config's sources/chunking/search, mirror
+# it here.
+
+index_root: /data/index
+
+sources:
+  - type: filesystem
+    name: documents
+    root: /data/documents
+    scan:
+      include:
+        - "**/*.md"
+        - "**/*.txt"
+        - "**/*.pdf"
+        - "**/*.png"
+        - "**/*.jpg"
+        - "**/*.jpeg"
+        - "**/*.wav"
+        - "**/*.mp3"
+        - "**/*.mp4"
+      exclude:
+        - "**/.DS_Store"
+
+  - type: postgres
+    name: sor
+    dsn: "${COMM_DATA_STORE_DSN}"
+    tables:
+      - source_type: pg_message
+        query: |
+          SELECT source, source_message_id, channel_name, sender, direction,
+                 sent_at, updated_at, body AS _text
+          FROM messages
+          WHERE body IS NOT NULL AND body <> ''
+        id_template: "{source}/{source_message_id}"
+        text_column: _text
+        mtime_column: updated_at
+        metadata_columns: [source, source_message_id, channel_name, sender, sent_at, direction]
+
+pdf:
+  strategy: "text_then_ocr"
+  ocr_page_limit: 20
+  min_text_chars_before_ocr: 200
+
+ocr:
+  enabled: true
+  provider: "deepseek_ocr2"
+  base_url: "http://provider-sim:9999"   # sim (OCR not under test in the media path)
+  timeout: 60
+  concurrency: 1
+
+media:
+  enabled: true
+  provider: "openrouter"
+  base_url: "https://openrouter.ai/api/v1"   # REAL — live transcription
+  audio_model: "openai/whisper-1"
+  fallback_audio_models:                     # whisper-1 500s in practice; fall back
+    - "mistralai/voxtral-small-24b-2507"
+    - "google/gemini-2.5-flash-lite"
+  video_model: "qwen/qwen3.5-397b-a17b"
+  max_file_size_mb: 50
+  timeout: 300   # real transcription latency (matches prod, not the sim's 60)
+
+embeddings:
+  provider: "openrouter"
+  model: "qwen/qwen3-embedding-8b"
+  base_url: "http://provider-sim:9999/api/v1"   # sim — deterministic vectors
+  batch_size: 8
+  concurrency: 2
+
+chunking:
+  max_chars: 1800
+  overlap: 200
+  min_chars: 150
+
+enrichment:
+  enabled: true
+  provider: "openrouter"
+  model: "openai/gpt-4.1-mini"
+  base_url: "https://openrouter.ai/api/v1"   # REAL — live LLM enrichment
+  max_input_chars: 20000
+  max_output_tokens: 2000
+  concurrency: 1
+
+search:
+  mode: "hybrid"
+  vector_top_k: 50
+  keyword_top_k: 50
+  final_top_k: 10
+  rrf_k: 60
+  reranker:
+    enabled: true
+    provider: "deepinfra"
+    model: "Qwen/Qwen3-Reranker-8B"
+    timeout: 30
+    base_url: "http://provider-sim:9999"   # sim (reranker not under test in the media path)
+
+lancedb:
+  table: "chunks"
+
+logging:
+  level: "INFO"
+
+event_hooks:
+  enabled: true
+  hooks:
+    - name: "staging-sink"
+      type: "http"
+      url: "http://provider-sim:9999/hooks/sink"
+      events: ["document.indexed"]
+      timeout_seconds: 5
+
+tracing:
+  enabled: true
+  directory: /data/traces
+
+mcp:
+  host: "0.0.0.0"
+  port: 7788

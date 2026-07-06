@@ -241,3 +241,53 @@ papered over:
 - **`file_folders` undercounts in sources-mode.** Folder aggregation
   predates multi-source configs; counts for non-filesystem sources are
   incomplete.
+
+## Cross-repo test target (CDS)
+
+Comm-Data-Store points its media-enrichment e2e at a **parallel, fully
+isolated** copy of the staging stack — never at production. The overlay
+`docker-compose.staging.cds.yml` gives it a distinct compose project
+(`cds-doc-organizer`), distinct host ports (**27788** app / **29999**
+sim), and its own throwaway `cds-*` volumes, so it can run alongside a
+`make gate` run without either stack colliding with or tearing down the
+other. Nothing it touches reaches prod: prod is a different container, a
+different `/data/documents` host directory, different volumes, a
+different network, and port 7788. The CDS stack's `/data/documents` is a
+throwaway volume that starts **empty** every `up`.
+
+**Two-stage run — deterministic first, real API last.** Matches the
+gate's own fakes-then-live philosophy:
+
+```bash
+# 1. Deterministic (all providers = sim, free, catches wiring bugs):
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+
+# 2. Final real-API pass (media + enrichment = live OpenRouter, SPENDS MONEY) —
+#    only after stage 1 is green:
+export OPENROUTER_API_KEY=<real key>
+CDS_CONFIG=./config.staging.cds-realmedia.yaml \
+  docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+
+# Tear down (wipes throwaway volumes):
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml down -v
+```
+
+The real-media config (`config.staging.cds-realmedia.yaml`) repoints only
+`media` and `enrichment` at real OpenRouter (with an audio fallback chain,
+since `whisper-1` 500s in practice); embeddings, OCR, and reranker stay on
+the sim — deterministic and free — because they are not the media path
+under test.
+
+**Index contract:**
+- Endpoint: `POST http://127.0.0.1:27788/api/index/document`, body
+  `{"rel_path"|"abs_path"|"doc_id": ..., "source_name"?: "documents", "force"?: false}`.
+- Auth: `Authorization: Bearer staging-test-key` on all `/api/*` (only
+  `/health` is exempt). This key is a committed non-secret fixed literal —
+  **different from prod's real key; do not reuse across the two.**
+- The endpoint indexes a file that **must already exist** in
+  `/data/documents`. `/api/upload` rejects media extensions, so deposit
+  media first (`docker compose ... cp <file> doc-organizer-staging:/data/documents/<name>`),
+  then call the index endpoint with that `rel_path`.
+- Reads back: the doc is **vector-searchable immediately**; keyword/FTS
+  visibility waits for a full sweep (which this stack may never run), so
+  assert via semantic search.
