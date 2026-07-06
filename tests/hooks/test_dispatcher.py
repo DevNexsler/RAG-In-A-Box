@@ -142,3 +142,54 @@ def test_send_http_event_returns_warning_for_malformed_url():
     assert warning is not None
     assert warning.startswith("hook h failed:")
     assert "unknown url type" in warning
+
+
+def test_send_http_event_resolves_env_var_url():
+    """url: ${VAR} is expanded from the environment before POSTing."""
+    from hooks.http import send_http_event
+
+    request_holder = {}
+    response = Mock()
+    response.status = 200
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=None)
+
+    def fake_urlopen(request, timeout):
+        request_holder["url"] = request.full_url
+        return response
+
+    hook = {"name": "cds-callback", "url": "${CDS_HOOK_URL}"}
+    with patch.dict(os.environ, {"CDS_HOOK_URL": "http://host.docker.internal:8095/hooks/doc-indexed"}):
+        with patch("urllib.request.urlopen", fake_urlopen):
+            warning = send_http_event(hook, _event())
+
+    assert warning is None
+    assert request_holder["url"] == "http://host.docker.internal:8095/hooks/doc-indexed"
+
+
+def test_send_http_event_env_var_url_unset_is_silent_noop():
+    """An env-driven url whose var is unset is skipped silently — no warning,
+    no POST — so an optional callback can't spam a warning per indexed doc."""
+    from hooks.http import send_http_event
+
+    called = {"n": 0}
+
+    def fake_urlopen(request, timeout):  # pragma: no cover - must not run
+        called["n"] += 1
+        raise AssertionError("should not POST when env url is unset")
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("urllib.request.urlopen", fake_urlopen):
+            warning = send_http_event({"name": "cds-callback", "url": "${CDS_HOOK_URL}"}, _event())
+
+    assert warning is None
+    assert called["n"] == 0
+
+
+def test_send_http_event_literal_empty_url_still_warns():
+    """A genuinely missing (non-env) url is still a warning, not a silent skip."""
+    from hooks.http import send_http_event
+
+    warning = send_http_event({"name": "h", "url": ""}, _event())
+
+    assert warning == "hook h disabled: missing url"

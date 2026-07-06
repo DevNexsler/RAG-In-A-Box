@@ -265,18 +265,45 @@ docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml u
 # 2. Final real-API pass (media + enrichment = live OpenRouter, SPENDS MONEY) —
 #    only after stage 1 is green:
 export OPENROUTER_API_KEY=<real key>
-CDS_CONFIG=./config.staging.cds-realmedia.yaml \
+STAGING_CONFIG=./config.staging.realmedia.yaml \
   docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
 
 # Tear down (wipes throwaway volumes):
 docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml down -v
 ```
 
-The real-media config (`config.staging.cds-realmedia.yaml`) repoints only
-`media` and `enrichment` at real OpenRouter (with an audio fallback chain,
-since `whisper-1` 500s in practice); embeddings, OCR, and reranker stay on
-the sim — deterministic and free — because they are not the media path
-under test.
+`STAGING_CONFIG` selects the provider wiring for any staging stack (base or
+CDS overlay); unset = the all-sim `config.staging.yaml`. The real-media config
+(`config.staging.realmedia.yaml`) repoints only `media` and `enrichment` at
+real OpenRouter (with an audio fallback chain, since `whisper-1` 500s in
+practice); embeddings, OCR, and reranker stay on the sim — deterministic and
+free — because they are not the media path under test.
+
+**Real `document.indexed` callback (the prod integration CDS tests).** Both
+staging configs carry a second, env-driven event hook `cds-callback` alongside
+the sim sink:
+
+```yaml
+- name: "cds-callback"
+  url: "${CDS_HOOK_URL}"     # unset → silently skipped (gate unaffected)
+  events: ["document.indexed"]
+```
+
+The app resolves `${CDS_HOOK_URL}` from the container env at delivery time (a
+`${VAR}` url that resolves empty is a deliberate no-op — no warning per doc).
+The CDS overlay passes `CDS_HOOK_URL` through and adds
+`extra_hosts: ["host.docker.internal:host-gateway"]` so the container can reach
+a hook on the host. To receive the real callback:
+
+```bash
+export CDS_HOOK_URL=http://host.docker.internal:8095/hooks/doc-indexed
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml up -d --build --wait
+# indexing any doc now POSTs document.indexed {doc_id, rel_path, metadata} to :8095
+```
+
+The payload is unchanged (`doc_id` + `rel_path` + sanitized `metadata`,
+including `enr_*` enrichment fields) — the same event the sim sink and prod's
+comm-data-store hook already consume.
 
 **Index contract:**
 - Endpoint: `POST http://127.0.0.1:27788/api/index/document`, body

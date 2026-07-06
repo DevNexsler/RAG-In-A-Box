@@ -110,6 +110,15 @@ event_hooks:
       url: "http://provider-sim:9999/hooks/sink"
       events: ["document.indexed"]
       timeout_seconds: 5
+    # Optional cross-repo callback (Comm-Data-Store). url is env-driven and
+    # default-absent: unset CDS_HOOK_URL → silently skipped (the gate is
+    # unaffected). CDS sets it (+ extra_hosts in docker-compose.staging.cds.yml)
+    # to receive the real document.indexed event at their throwaway test hook.
+    - name: "cds-callback"
+      type: "http"
+      url: "${CDS_HOOK_URL}"
+      events: ["document.indexed"]
+      timeout_seconds: 5
 
 tracing:
   enabled: true

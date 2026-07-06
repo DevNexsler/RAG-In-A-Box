@@ -121,6 +121,14 @@ event_hooks:
       url: "http://provider-sim:9999/hooks/sink"
       events: ["document.indexed"]
       timeout_seconds: 5
+    # Optional cross-repo callback (Comm-Data-Store) — env-driven, default-absent.
+    # Unset CDS_HOOK_URL → silently skipped. This is the real prod integration CDS
+    # tests: a real document.indexed event delivered to their throwaway hook.
+    - name: "cds-callback"
+      type: "http"
+      url: "${CDS_HOOK_URL}"
+      events: ["document.indexed"]
+      timeout_seconds: 5
 
 tracing:
   enabled: true

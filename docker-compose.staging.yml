@@ -21,13 +21,20 @@ services:
     ports: ["17788:7788"]
     logging: *staging-logging
     environment:
-      OPENROUTER_API_KEY: sim
+      # sim default → all-deterministic. The opt-in real-API pass exports a real
+      # OPENROUTER_API_KEY *and* sets STAGING_CONFIG=config.staging.realmedia.yaml;
+      # with the sim config the key is never used (traffic terminates at
+      # provider-sim), so a stray real key in the env can't cause a real call.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-sim}
       DEEPINFRA_API_KEY: sim
       API_KEY: staging-test-key
       COMM_DATA_STORE_DSN: postgresql://comm:comm@comm-postgres:5432/comm
       SOR_DSN: postgresql://comm:comm@comm-postgres:5432/comm
     volumes:
-      - ./config.staging.yaml:/app/config.yaml:ro
+      # STAGING_CONFIG selects the provider wiring: unset = all-sim
+      # (deterministic, the default gate uses this); config.staging.realmedia.yaml
+      # = live media + enrichment for the opt-in real-API e2e pass.
+      - ${STAGING_CONFIG:-./config.staging.yaml}:/app/config.yaml:ro
       - staging-docs:/data/documents
       - staging-index:/data/index
       - staging-traces:/data/traces
