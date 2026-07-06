@@ -35,10 +35,17 @@ been executed to completion against real providers; keep it that way.
 |---|---|
 | `make gate` | all five tiers, fail-fast, artifacts per run |
 | `make gate-fast` | tiers 1–3 only (static, unit, integration) — the dev loop |
+| `make gate-real` | full gate **+** an opt-in real-API e2e pass (media + enrichment live; SPENDS MONEY, needs a real key) |
 | `make test-unit` | `pytest -m unit -q` directly |
 | `make test-integration` | `pytest -m integration -q` directly |
 | `make test-e2e` | gate `--only staging-e2e` (brings the compose stack up/down) |
+| `make test-e2e-real` | gate `--only e2e-real` — just the real-API e2e stage (SPENDS MONEY) |
 | `make test-live` | gate `--only live` (preflight still enforced) |
+
+The two real-API targets (`gate-real`, `test-e2e-real`) are the only ones that
+spend money, and only when explicitly invoked with a real `OPENROUTER_API_KEY`;
+a plain `make gate` never does. See "Live tier" and "Cross-repo test target"
+below for the deterministic-then-real workflow.
 
 ### Tier selection: auto-derived markers
 
