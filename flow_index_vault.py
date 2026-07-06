@@ -666,6 +666,13 @@ def _write_heartbeat(index_root) -> None:
         pass
 
 
+# How often the source scan re-stamps the heartbeat, in records. The scan is a
+# long, per-doc-heartbeat-free phase (it runs before any doc is processed), so a
+# large corpus can otherwise let the heartbeat age past INDEXER_HEARTBEAT_MAX_AGE
+# and false-503 /health while the indexer is progressing normally (#0127).
+_SCAN_HEARTBEAT_EVERY = 500
+
+
 def _degraded_ledger_path(index_root: Path) -> Path:
     return Path(index_root) / "degraded_docs.json"
 
@@ -1553,6 +1560,49 @@ def _should_use_shadow_rebuild(
     return bool(force_full_rebuild) and stored_doc_count > 0
 
 
+def _scan_and_register_sources(
+    all_sources, doc_id_store, index_root
+) -> tuple[list[dict], dict[str, object]]:
+    """Scan every configured source, build the record list + record map, and
+    register each namespaced doc_id in the persistent registry.
+
+    Registering the namespaced doc_id lets all_mappings() return
+    {namespaced_id: rel_path} for test/tool use and distinct_source_names()
+    enumerate every source that has indexed docs.
+
+    The scan runs before any doc is processed, so it is one of the flow's two
+    per-doc-heartbeat-free windows (the other is the post-processing/FTS phase).
+    On a large corpus it can dominate a run's wall-clock, so it re-stamps the
+    indexer heartbeat as it progresses — otherwise a healthy but busy scan ages
+    the heartbeat past INDEXER_HEARTBEAT_MAX_AGE and /health false-503s (#0127).
+    """
+    all_records: list[dict] = []
+    source_records_by_ns_doc_id: dict[str, object] = {}  # namespaced doc_id → SourceRecord
+    _write_heartbeat(index_root)  # scan started — progress, not a freeze
+    scanned_count = 0
+    for src in all_sources:
+        for rec in src.scan():
+            ns_doc_id = f"{src.name}::{rec.doc_id}"
+            all_records.append({
+                "doc_id": ns_doc_id,
+                "rel_path": rec.natural_key,
+                "abs_path": rec.metadata.get("abs_path", rec.natural_key),
+                "mtime": rec.mtime,
+                "change_hash": getattr(rec, "change_hash", "") or "",
+                "size": rec.size,
+                "ext": rec.metadata.get("ext", ""),
+                "source_type": rec.source_type,
+                "source_name": src.name,
+            })
+            source_records_by_ns_doc_id[ns_doc_id] = rec
+            doc_id_store.register(ns_doc_id, rec.natural_key, source_name=src.name)
+            scanned_count += 1
+            if scanned_count % _SCAN_HEARTBEAT_EVERY == 0:
+                _write_heartbeat(index_root)
+    _write_heartbeat(index_root)  # scan complete — enter diff/process
+    return all_records, source_records_by_ns_doc_id
+
+
 # --- Flow ---
 
 
@@ -1780,29 +1830,11 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     # --- Run pipeline ---
     t0 = time.perf_counter()
 
-    # Multi-source scan: iterate over all configured sources, namespace doc_ids
-    all_records: list[dict] = []
-    source_records_by_ns_doc_id: dict[str, object] = {}  # namespaced doc_id → SourceRecord
-    for src in all_sources:
-        for rec in src.scan():
-            ns_doc_id = f"{src.name}::{rec.doc_id}"
-            all_records.append({
-                "doc_id": ns_doc_id,
-                "rel_path": rec.natural_key,
-                "abs_path": rec.metadata.get("abs_path", rec.natural_key),
-                "mtime": rec.mtime,
-                "change_hash": getattr(rec, "change_hash", "") or "",
-                "size": rec.size,
-                "ext": rec.metadata.get("ext", ""),
-                "source_type": rec.source_type,
-                "source_name": src.name,
-            })
-            source_records_by_ns_doc_id[ns_doc_id] = rec
-            # Register the namespaced doc_id in the persistent registry so that:
-            # 1. all_mappings() returns {namespaced_id: rel_path} for test/tool use
-            # 2. distinct_source_names() can enumerate all sources that have indexed docs
-            doc_id_store.register(ns_doc_id, rec.natural_key, source_name=src.name)
-
+    # Multi-source scan: iterate over all configured sources, namespace doc_ids.
+    # Re-stamps the heartbeat as it goes so a long scan doesn't false-503 /health.
+    all_records, source_records_by_ns_doc_id = _scan_and_register_sources(
+        all_sources, doc_id_store, index_root
+    )
     _RUNTIME["source_records_by_ns_doc_id"] = source_records_by_ns_doc_id
     scanned = all_records
     communication_context_provider = build_context_provider_from_records(
@@ -1930,6 +1962,12 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
 
     _flush_taxonomy_usage(taxonomy_store, _RUNTIME.get("taxonomy_usage"), logger)
 
+    # Processing done — the per-doc heartbeat stops here, but finalization
+    # (deletes, FTS rebuild, shadow promote, count reads) is another long,
+    # heartbeat-free window. Stamp across its boundaries so a big finalize
+    # doesn't false-503 /health as a freeze (#0127).
+    _write_heartbeat(index_root)
+
     if docs_to_delete:
         delete_docs_task(docs_to_delete)
 
@@ -1995,6 +2033,8 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
             active_store.promote_table(shadow_table_name)
             store = active_store
         _RUNTIME["store"] = store
+
+    _write_heartbeat(index_root)  # FTS/promote done — still progressing, not frozen
 
     run_seconds = time.perf_counter() - t0
     index_stats_task(len(to_add_or_update), len(to_delete), run_seconds)
