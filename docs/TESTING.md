@@ -305,6 +305,15 @@ The payload is unchanged (`doc_id` + `rel_path` + sanitized `metadata`,
 including `enr_*` enrichment fields) — the same event the sim sink and prod's
 comm-data-store hook already consume.
 
+**Standing seeded corpus (optional).** The gate e2e always starts from an empty
+index, but for manual / CDS testing against a persistent parallel dataset, drop
+files into `staging/fixtures/corpus/` and run `scripts/seed_staging.sh` against a
+running stack — it deposits each file into `/data/documents` and indexes it. Env
+overrides (`SEED_COMPOSE`, `SEED_URL`, `SEED_API_KEY`, `SEED_CORPUS`) point it at
+the base stack (`:17788`, default) or the CDS overlay (`:27788`). This is
+testing-only data on a throwaway volume — never production. To keep the corpus
+across restarts, stop with `down` (NOT `down -v`); `down -v` wipes it.
+
 **Index contract:**
 - Endpoint: `POST http://127.0.0.1:27788/api/index/document`, body
   `{"rel_path"|"abs_path"|"doc_id": ..., "source_name"?: "documents", "force"?: false}`.
