@@ -287,9 +287,25 @@ Document Collection                    AI Assistants
 
 ## Run tests
 
+The maintained path is the **gate** — ordered, fail-fast tiers (static → unit →
+integration → staging-e2e → live) where a full pass means "this works in
+production". See [docs/TESTING.md](docs/TESTING.md) for the full runbook.
+
 ```bash
-python -m pytest tests/ -m "not live" -x    # ~370 offline tests (no API keys)
-python -m pytest tests/ -x                   # ~454 full suite (requires API keys)
+make gate-fast   # static + unit + integration (free, no services) — the dev loop
+make gate        # all five tiers, incl. a hermetic staging compose stack + live
+```
+
+`make gate-fast` needs no API keys or Docker; `make gate`'s staging-e2e tier
+brings up an isolated, memory-capped compose stack (production image + provider
+simulator + throwaway Postgres) and its live tier is preflight-guarded. Only the
+opt-in `make gate-real` / `make test-e2e-real` spend money.
+
+Raw pytest still works if you want to run a subset directly:
+
+```bash
+python -m pytest -m unit -q                  # offline, no API keys
+python -m pytest -m "unit or integration" -q # all local tiers
 ```
 
 ## Project layout

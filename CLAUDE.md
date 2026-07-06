@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **RAG-in-a-Box** (2937 symbols, 7875 relationships, 245 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **RAG-in-a-Box** (3391 symbols, 9030 relationships, 242 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -106,3 +106,4 @@ To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.
 - Full operator's manual: [docs/TESTING.md](docs/TESTING.md) (tiers, staging stack, fault injection, live preflight, gate reports).
 - Tier markers are auto-derived from filenames: `_live` → live, `tests/e2e/` → e2e, `.int.test.py` → integration, everything else → unit; explicit markers win.
 - New MCP tools are automatically REQUIRED to have e2e coverage and `mcp.tool.<name>` spans — the two-sided coverage check discovers tools via live `list_tools` and fails the gate for any tool without both.
+- Only `make gate-real` / `make test-e2e-real` spend money (opt-in real-API e2e; needs a real `OPENROUTER_API_KEY`); plain `make gate` never does. Comm-Data-Store runs its own isolated copy of the staging stack (`docker-compose.staging.cds.yml`, `:27788`) with an env-driven `document.indexed` callback — don't change the hook payload or the `${VAR}` url resolution in `hooks/http.py` without coordinating with CDS. See [docs/TESTING.md](docs/TESTING.md) → "Cross-repo test target (CDS)".
