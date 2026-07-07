@@ -11,7 +11,7 @@
 # Excluded: chunks__shadow.lance (transient rebuild table), *.corrupt
 # (already-dead data), indexer logs.
 #
-# Retention: 14 daily backups; Sunday backups are also copied to weekly/ and
+# Retention: 3 daily backups; Sunday backups are also copied to weekly/ and
 # the 8 newest weeklies are kept (~2 months of coarse physical DR). Granular
 # day-by-day rollback for the last 30 days comes from in-dataset Lance version
 # tags (#0113), which are far cheaper than full tarballs; these independent
@@ -60,8 +60,8 @@ if [ "$(date +%u)" = "7" ]; then
   log "weekly copy ${OUT}"
 fi
 
-# Retention: 14 daily, 8 weekly (find avoids ls-glob crash when empty)
+# Retention: 3 daily, 2 weekly (reduced 2026-07-07: tarballs are ~100G each, disaster-recovery only) (find avoids ls-glob crash when empty)
 find "${BACKUP_DIR}" -maxdepth 1 -name 'index-*.tar.gz' -printf '%T@ %p\n' \
-  | sort -rn | tail -n +15 | cut -d' ' -f2- | xargs -r rm -f
+  | sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -f
 find "${BACKUP_DIR}/weekly" -maxdepth 1 -name 'index-*.tar.gz' -printf '%T@ %p\n' \
-  | sort -rn | tail -n +9 | cut -d' ' -f2- | xargs -r rm -f
+  | sort -rn | tail -n +3 | cut -d' ' -f2- | xargs -r rm -f
