@@ -12,7 +12,7 @@
 # (already-dead data), indexer logs.
 #
 # Retention: 3 daily backups; Sunday backups are also copied to weekly/ and
-# the 8 newest weeklies are kept (~2 months of coarse physical DR). Granular
+# the 2 newest weeklies are kept (~2 weeks of coarse physical DR). Granular
 # day-by-day rollback for the last 30 days comes from in-dataset Lance version
 # tags (#0113), which are far cheaper than full tarballs; these independent
 # tarballs cover the "chunks.lance directory is lost/corrupt" case (#0113).
