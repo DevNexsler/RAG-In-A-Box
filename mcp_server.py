@@ -1316,13 +1316,18 @@ def _file_search_impl(
 # Comm-Data-Store SQL dumps (~70k+ chars). See docs/comm-lookup.md (#0128).
 
 _COMM_LOOKUP_DEFAULT_LIMIT = 3
-_COMM_LOOKUP_MAX_LIMIT = 10
+_COMM_LOOKUP_MAX_LIMIT = 5                  # exposed cap: agents can't over-ask into bloat
 _COMM_LOOKUP_CONTENT_MAX_CHARACTER = 600   # per-hit source content pulled from search
-_COMM_LOOKUP_OUTPUT_BUDGET = 3000          # whole-response character budget
+# Budget is enforced against the PRETTY (indent=2) serialization, because that
+# is what mcporter --output json prints — always larger than compact JSON, so
+# measuring compact let limit=20 slip to ~3.2k pretty. Guard trims to a target
+# below the ceiling to leave margin for client formatting differences.
+_COMM_LOOKUP_OUTPUT_BUDGET = 3000          # hard ceiling for pretty output
+_COMM_LOOKUP_BUDGET_TARGET = 2800          # guard trims to this (margin under ceiling)
 _COMM_LOOKUP_SNIPPET_MAX = 400
 _COMM_LOOKUP_FACT_MAX = 160
 _COMM_LOOKUP_MAX_FACTS = 5
-_COMM_LOOKUP_MAX_SOURCE_IDS = 8
+_COMM_LOOKUP_MAX_SOURCE_IDS = 5
 
 # Verdict gating (#0128 follow-up). Hybrid search always returns a nearest
 # neighbor, so "has a hit" is NOT evidence. A hit only counts as a real match
@@ -1535,32 +1540,48 @@ def _comm_lookup_response(verdict: str, **fields) -> dict:
     return resp
 
 
-def _comm_lookup_enforce_budget(resp: dict) -> dict:
-    """Guarantee the serialized response stays within the output budget by
-    progressively shedding the least-essential detail (extra hits, then facts,
-    then snippet). The verdict/top_hit/source_ids core is never dropped."""
+def _comm_lookup_pretty_size(resp: dict) -> int:
+    """Size of the PRETTY (indent=2) serialization — what mcporter prints."""
     import json
+    return len(json.dumps(resp, default=str, ensure_ascii=False, indent=2))
 
-    def size(r: dict) -> int:
-        return len(json.dumps(r, default=str, ensure_ascii=False))
 
-    if size(resp) <= _COMM_LOOKUP_OUTPUT_BUDGET:
+def _comm_lookup_enforce_budget(resp: dict) -> dict:
+    """Keep the response within budget measured against the PRETTY output
+    mcporter emits, by progressively shedding the least-essential detail. The
+    verdict/top_hit/one-source_id core is never dropped, so the answer stays
+    usable no matter how large a limit the caller asked for."""
+    target = _COMM_LOOKUP_BUDGET_TARGET
+
+    def over() -> bool:
+        return _comm_lookup_pretty_size(resp) > target
+
+    if not over():
         return resp
+    resp["truncated"] = True
     # 1. shed trailing hits (keep at least the top hit)
-    while len(resp.get("hits", [])) > 1 and size(resp) > _COMM_LOOKUP_OUTPUT_BUDGET:
+    while len(resp.get("hits", [])) > 1 and over():
         resp["hits"] = resp["hits"][:-1]
-        resp["truncated"] = True
-    # 2. trim key_facts
-    if size(resp) > _COMM_LOOKUP_OUTPUT_BUDGET and resp.get("key_facts"):
+    # 2. shed trailing source_ids (keep at least the top one)
+    while len(resp.get("source_ids", [])) > 1 and over():
+        resp["source_ids"] = resp["source_ids"][:-1]
+    # 3. trim key_facts
+    if over() and resp.get("key_facts"):
         resp["key_facts"] = resp["key_facts"][:2]
-        resp["truncated"] = True
-    # 3. shorten snippets
-    if size(resp) > _COMM_LOOKUP_OUTPUT_BUDGET:
+    # 4. shorten snippets (top-level + per-hit)
+    if over():
         resp["snippet"] = _comm_clip(resp.get("snippet", ""), 200)
         for h in resp.get("hits", []):
             if "snippet" in h:
-                h["snippet"] = _comm_clip(h["snippet"], 160)
-        resp["truncated"] = True
+                h["snippet"] = _comm_clip(h["snippet"], 140)
+    # 5. shorten the guidance note
+    if over():
+        resp["note"] = _comm_clip(resp.get("note", ""), 160)
+    # 6. last resort: a single hit + one fact + a short snippet always fits
+    if over():
+        resp["hits"] = resp.get("hits", [])[:1]
+        resp["key_facts"] = resp.get("key_facts", [])[:1]
+        resp["snippet"] = _comm_clip(resp.get("snippet", ""), 120)
     return resp
 
 
@@ -2589,7 +2610,8 @@ if HAS_MCP and FastMCP is not None:
         Args:
             query: Natural-language query — person name, phone number, topic,
                 or a phrase like "missed call voicemail" (required, non-empty).
-            limit: Max hits to consider (1-10, default 3).
+            limit: Max hits to return (1-5, default 3). Larger values are
+                clamped; output is always held within a compact byte budget.
             source_type: Optional filter, e.g. "pg_message" for comm messages.
             source_name: Optional source filter (e.g. "comm_messages", "sor").
             sort: "relevance" (default) or "recent" (newest-first, for "latest
