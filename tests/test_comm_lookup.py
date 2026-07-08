@@ -26,6 +26,11 @@ _FORBIDDEN_SUBSTRINGS = (
 _BUDGET = mcp_server._COMM_LOOKUP_OUTPUT_BUDGET
 
 
+def _pretty_len(obj) -> int:
+    """Length of the pretty (indent=2) JSON — what mcporter --output json prints."""
+    return len(json.dumps(obj, indent=2))
+
+
 def _message_hit(**over):
     """A seeded-message-style hit (msg-005): strong lexical body, no phone."""
     hit = {
@@ -215,9 +220,38 @@ def test_output_stays_under_budget_with_huge_content():
     ]
     with _patch_search({"results": hits}):
         out = mcp_server._comm_lookup_impl("periwinkle substation", limit=3)
-    assert len(json.dumps(out)) <= _BUDGET
+    # pretty output (mcporter) is the ceiling that matters, not compact JSON
+    assert _pretty_len(out) <= _BUDGET, _pretty_len(out)
     assert out["verdict"] in {"found", "ambiguous"}
     assert out["top_hit"] and out["source_ids"]
+
+
+def test_oversized_limit_stays_within_pretty_budget():
+    """Agent over-asks with limit=20 and fat hits — the PRETTY output mcporter
+    prints must still hold <=3000 (the live-reported 3225-char regression)."""
+    big = "Callback +1 484-735-8527 missed calls unclear voicemail " + "detail " * 90
+    hits = [
+        _call_task_hit(doc_id=f"sor::task/{i}", source_message_id=f"AC{i:034d}",
+                       snippet=big, content=big,
+                       enr_key_facts=json.dumps([big, big, big, big]))
+        for i in range(20)
+    ]
+    with _patch_search({"results": hits}):
+        out = mcp_server._comm_lookup_impl(
+            "Callback 4847358527 missed calls unclear voicemail Aaron Curet", limit=20)
+    assert _pretty_len(out) <= _BUDGET, _pretty_len(out)
+    # core answer survives the trimming
+    assert out["verdict"] == "found"
+    assert out["top_hit"] and out["source_ids"]
+
+
+def test_limit_is_clamped_to_exposed_max():
+    """A huge limit is clamped to the exposed cap (not silently honored)."""
+    hits = [_call_task_hit(doc_id=f"sor::task/{i}", source_message_id=f"id{i}")
+            for i in range(20)]
+    with _patch_search({"results": hits}):
+        out = mcp_server._comm_lookup_impl("4847358527 callback voicemail", limit=20)
+    assert len(out["hits"]) <= mcp_server._COMM_LOOKUP_MAX_LIMIT
 
 
 def test_source_ids_fall_back_to_doc_id_when_no_source_message_id():
