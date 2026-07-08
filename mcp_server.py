@@ -1319,11 +1319,36 @@ _COMM_LOOKUP_DEFAULT_LIMIT = 3
 _COMM_LOOKUP_MAX_LIMIT = 10
 _COMM_LOOKUP_CONTENT_MAX_CHARACTER = 600   # per-hit source content pulled from search
 _COMM_LOOKUP_OUTPUT_BUDGET = 3000          # whole-response character budget
-_COMM_LOOKUP_AMBIGUOUS_SCORE_GAP = 0.03    # top two scores within this => ambiguous
 _COMM_LOOKUP_SNIPPET_MAX = 400
 _COMM_LOOKUP_FACT_MAX = 160
 _COMM_LOOKUP_MAX_FACTS = 5
 _COMM_LOOKUP_MAX_SOURCE_IDS = 8
+
+# Verdict gating (#0128 follow-up). Hybrid search always returns a nearest
+# neighbor, so "has a hit" is NOT evidence. A hit only counts as a real match
+# when it carries actual lexical/exact evidence for the query — a matching
+# phone number, or enough of the query's salient words. Otherwise a nonsense
+# query ("zzzq unobtanium") would falsely read as `found`.
+_COMM_LOOKUP_POOL = 20                 # candidates pulled from search before rerank
+_COMM_LOOKUP_MIN_OVERLAP = 0.34        # >= this fraction of salient tokens => real match
+_COMM_LOOKUP_MIN_MATCHED = 2           # ...or at least this many distinct salient tokens
+_COMM_LOOKUP_STRONG_OVERLAP = 0.6      # a lone strong lexical match can stand as `found`
+_COMM_LOOKUP_AMBIGUOUS_SCORE_GAP = 0.03  # comparable rerank strength => ambiguous
+
+# Call-intent detection: if the query mentions any of these, a contact/name-only
+# hit must not be presented as the answer unless it also carries call evidence.
+_COMM_LOOKUP_CALL_TERMS = frozenset({
+    "call", "called", "calling", "calls", "callback", "phone", "voicemail",
+    "vm", "missed", "ring", "rang", "dial", "dialed", "message", "messages",
+    "text", "texted", "sms", "hangup",
+})
+
+# Dropped from the salient-token set: too common to be evidence of a match.
+_COMM_LOOKUP_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "from", "about", "into", "that", "this",
+    "have", "has", "was", "were", "are", "our", "their", "his", "her", "who",
+    "what", "when", "where", "why", "how", "any", "all", "did", "does",
+})
 
 # Error codes from file_search that are already small + actionable: pass them
 # straight through rather than wrapping them in a not_found envelope.
@@ -1381,6 +1406,88 @@ def _comm_parse_key_facts(raw) -> list[str]:
         if len(out) >= _COMM_LOOKUP_MAX_FACTS:
             break
     return out
+
+
+def _comm_phone_keys(text: str) -> set[str]:
+    """Canonical phone keys from a string: each phone-like run reduced to its
+    last 10 digits, so +1 484-735-8527, (484) 735 8527 and 4847358527 all match."""
+    keys: set[str] = set()
+    for run in re.findall(r"\+?\d[\d\s().\-]{5,}\d", text or ""):
+        digits = re.sub(r"\D", "", run)
+        if len(digits) >= 7:
+            keys.add(digits[-10:])
+    return keys
+
+
+def _comm_query_terms(query: str) -> dict:
+    """Split a query into the signals used for evidence gating + reranking:
+    salient word tokens (minus stopwords/pure digits), call-intent flag, and
+    canonical phone keys."""
+    words = re.findall(r"[a-z0-9]+", (query or "").lower())
+    salient = {
+        w for w in words
+        if len(w) >= 3 and not w.isdigit() and w not in _COMM_LOOKUP_STOPWORDS
+    }
+    call_intent = any(w in _COMM_LOOKUP_CALL_TERMS for w in words)
+    return {
+        "salient": salient,
+        "call_intent": call_intent,
+        "phone_keys": _comm_phone_keys(query),
+    }
+
+
+def _comm_hit_blob(hit: dict) -> str:
+    """Lower-cased searchable text for a compact hit: title + snippet + content
+    + comm fields (sender/channel/source_id). Used for lexical/call matching."""
+    parts = [
+        hit.get("title"), hit.get("snippet"), hit.get("content"),
+        _comm_field(hit, "sender"), _comm_field(hit, "channel", "channel_name"),
+        _comm_field(hit, "source_id", "source_message_id"),
+    ]
+    return " ".join(str(p) for p in parts if p).lower()
+
+
+def _comm_hit_evidence(hit: dict, terms: dict) -> dict:
+    """Score one hit's evidence for the query. `is_real_match` is the gate that
+    separates a genuine answer from search's always-present nearest neighbor."""
+    blob = _comm_hit_blob(hit)
+    blob_digits = re.sub(r"\D", "", blob)
+    matched = {t for t in terms["salient"] if re.search(r"\b" + re.escape(t), blob)}
+    salient = terms["salient"]
+    overlap = (len(matched) / len(salient)) if salient else 0.0
+    phone_match = any(k in blob_digits for k in terms["phone_keys"])
+    call_term_match = terms["call_intent"] and any(
+        c in re.findall(r"[a-z0-9]+", blob) for c in _COMM_LOOKUP_CALL_TERMS
+    )
+    is_real_match = (
+        phone_match
+        or overlap >= _COMM_LOOKUP_MIN_OVERLAP
+        or len(matched) >= _COMM_LOOKUP_MIN_MATCHED
+    )
+    return {
+        "overlap": overlap,
+        "matched": len(matched),
+        "phone_match": phone_match,
+        "call_term_match": call_term_match,
+        "is_real_match": is_real_match,
+        # Call evidence = this hit actually pertains to the call/voicemail, not
+        # just a name that happens to match a call-intent query.
+        "has_call_evidence": phone_match or call_term_match,
+    }
+
+
+def _comm_rerank_key(pair: tuple) -> tuple:
+    """Order candidates so hits with hard evidence (phone, then call terms, then
+    lexical overlap) beat a merely-semantic nearest neighbor. `pair` is
+    (hit, evidence)."""
+    hit, ev = pair
+    score = hit.get("score")
+    return (
+        ev["phone_match"],
+        ev["call_term_match"],
+        ev["overlap"],
+        score if isinstance(score, (int, float)) else 0.0,
+    )
 
 
 def _comm_lookup_hit(hit: dict) -> dict:
@@ -1473,14 +1580,18 @@ def _comm_lookup_impl(
         limit = _COMM_LOOKUP_DEFAULT_LIMIT
     limit = max(1, min(limit, _COMM_LOOKUP_MAX_LIMIT))
 
+    sort = (sort or "relevance").strip().lower()
     payload = _file_search_impl(
         query=query,
-        top_k=limit,
+        # Widen the candidate pool before reranking: the exact record (e.g. a
+        # callback/voicemail task) can sit just below a contact card in raw
+        # relevance, so pull more than `limit` and let the comm rerank surface it.
+        top_k=max(limit, _COMM_LOOKUP_POOL),
         source_type=source_type,
         source_name=source_name,
         return_mode="compact",
         content_max_character=_COMM_LOOKUP_CONTENT_MAX_CHARACTER,
-        sort=sort or "relevance",
+        sort=sort,
         include_diagnostics=False,
     )
 
@@ -1500,33 +1611,73 @@ def _comm_lookup_impl(
     results = payload.get("results", []) if isinstance(payload, dict) else []
     degraded = bool(payload.get("degraded")) if isinstance(payload, dict) else False
 
-    if not results:
+    terms = _comm_query_terms(query)
+    scored = [(r, _comm_hit_evidence(r, terms)) for r in results]
+    real = [pair for pair in scored if pair[1]["is_real_match"]]
+
+    # No hit carries real lexical/phone evidence — search only returned semantic
+    # near-neighbors (the nonsense-query false-positive). Honest not_found.
+    if not real:
         return _comm_lookup_response(
             "not_found",
             sql_needed=True,
             degraded=degraded,
-            note="No indexed comm/document match. Only if you need an exact field "
-            "not indexed here, run ONE targeted Comm-Data-Store SQL query — never a full dump.",
+            note="No indexed comm/document actually matches — only weak semantic "
+            "near-neighbors. If you need an exact record, run ONE targeted "
+            "Comm-Data-Store SQL query keyed to the person/phone — never a full dump.",
         )
 
-    hits = [_comm_lookup_hit(r) for r in results]
-    top = results[0]
-    verdict = "found"
-    if len(results) > 1:
-        s0 = results[0].get("score")
-        s1 = results[1].get("score")
-        if isinstance(s0, (int, float)) and isinstance(s1, (int, float)) and (
-            s0 - s1 < _COMM_LOOKUP_AMBIGUOUS_SCORE_GAP
-        ):
-            verdict = "ambiguous"
+    # Order real matches: relevance path reranks by comm evidence (phone, then
+    # call terms, then lexical overlap); recent path keeps search's newest-first.
+    ordered = real if sort == "recent" else sorted(real, key=_comm_rerank_key, reverse=True)
+    top, top_ev = ordered[0]
+    call_intent = terms["call_intent"]
 
+    hits = [_comm_lookup_hit(r) for r, _ in ordered[:limit]]
     source_ids: list[str] = []
-    for r in results:
+    for r, _ in ordered:
         sid = _comm_field(r, "source_id", "source_message_id") or str(r.get("doc_id") or "")
         if sid and sid not in source_ids:
             source_ids.append(sid)
         if len(source_ids) >= _COMM_LOOKUP_MAX_SOURCE_IDS:
             break
+
+    base_note = (
+        "Compact Doc-Organizer result. For an exact field not shown (e.g. a full "
+        "phone number or raw timestamp), run ONE targeted Comm-Data-Store SQL query "
+        "keyed by a source_id above — do not dump the table."
+    )
+    missing_exact_fields: list[str] = []
+
+    # --- verdict gating ---
+    if call_intent and not top_ev["has_call_evidence"]:
+        # Query is about a call/voicemail but the best match is a name/contact
+        # only — the actual call record was not surfaced. Never `found`.
+        verdict = "ambiguous"
+        sql_needed = True
+        missing_exact_fields = ["call/voicemail record"]
+        note = (
+            "Top match is a name/contact only — the exact call/voicemail record was "
+            "not found in the index. Run ONE targeted Comm-Data-Store SQL query for the "
+            "call/voicemail keyed by a source_id above; do not dump the table."
+        )
+    elif (
+        top_ev["phone_match"]
+        or top_ev["call_term_match"]
+        or top_ev["overlap"] >= _COMM_LOOKUP_STRONG_OVERLAP
+    ):
+        # Strong, specific evidence (exact phone, call term, or most of the query).
+        verdict = "found"
+        sql_needed = False
+        note = base_note
+    else:
+        # A real but only partial lexical match — not confident enough for `found`.
+        verdict = "ambiguous"
+        sql_needed = False
+        note = base_note + " Match is partial — verify before relying on it."
+
+    if degraded:
+        note += " Results are degraded — treat as lower confidence."
 
     top_hit = {
         "doc_id": top.get("doc_id"),
@@ -1541,12 +1692,10 @@ def _comm_lookup_impl(
         source_ids=source_ids,
         snippet=_comm_clip(top.get("snippet") or top.get("content"), _COMM_LOOKUP_SNIPPET_MAX),
         hits=hits,
-        sql_needed=False,
+        missing_exact_fields=missing_exact_fields,
+        sql_needed=sql_needed,
         degraded=degraded,
-        note="Compact Doc-Organizer result. For an exact field not shown (e.g. a full "
-        "phone number or raw timestamp), run ONE targeted Comm-Data-Store SQL query keyed "
-        "by a source_id above — do not dump the table."
-        + (" Results are degraded — treat as lower confidence." if degraded else ""),
+        note=note,
     )
     return _comm_lookup_enforce_budget(resp)
 
@@ -2456,9 +2605,17 @@ if HAS_MCP and FastMCP is not None:
               "hits": [ {doc_id, source_type, score, snippet, sender,
                          direction, sent_at, channel, source_id} ],
               "missing_exact_fields": [],
-              "sql_needed": false,       # true only when nothing was found
+              "sql_needed": false,       # true when nothing matched, or when the
+                                         # exact call/voicemail record wasn't found
               "note": "..."              # when/how to fall back to SQL
             }
+
+        Verdict is evidence-gated, not just "did search return anything":
+        `found` needs a matching phone number, a call term, or most of the
+        query's words in the hit; a nonsense query returns `not_found`. For a
+        call/voicemail query, a name/contact-only hit is returned as `ambiguous`
+        with sql_needed=true (the exact call record wasn't surfaced), never `found`.
+
         On invalid input, returns {"error": true, "code": ..., "message": ..., "fix": ...}.
         """
         return _comm_lookup_impl(
