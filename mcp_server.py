@@ -1308,6 +1308,249 @@ def _file_search_impl(
     return payload
 
 
+# --- comm_lookup ------------------------------------------------------------
+# One-call, compact lookup for comm / person / phone / call / voicemail /
+# message questions. It wraps file_search with safe slim-style defaults and
+# distills the hits into a small verdict envelope, so agents get an
+# info-rich answer in ~1-2k chars instead of falling back to raw
+# Comm-Data-Store SQL dumps (~70k+ chars). See docs/comm-lookup.md (#0128).
+
+_COMM_LOOKUP_DEFAULT_LIMIT = 3
+_COMM_LOOKUP_MAX_LIMIT = 10
+_COMM_LOOKUP_CONTENT_MAX_CHARACTER = 600   # per-hit source content pulled from search
+_COMM_LOOKUP_OUTPUT_BUDGET = 3000          # whole-response character budget
+_COMM_LOOKUP_AMBIGUOUS_SCORE_GAP = 0.03    # top two scores within this => ambiguous
+_COMM_LOOKUP_SNIPPET_MAX = 400
+_COMM_LOOKUP_FACT_MAX = 160
+_COMM_LOOKUP_MAX_FACTS = 5
+_COMM_LOOKUP_MAX_SOURCE_IDS = 8
+
+# Error codes from file_search that are already small + actionable: pass them
+# straight through rather than wrapping them in a not_found envelope.
+_COMM_LOOKUP_PASSTHROUGH_ERRORS = {
+    "empty_query",
+    "invalid_parameter",
+    "invalid_source_name",
+    "invalid_source_type",
+}
+
+
+def _comm_clip(text, limit: int) -> str:
+    """Trim to `limit` chars with an ellipsis; None/blank -> ''."""
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _comm_field(hit: dict, *keys: str) -> str:
+    """First non-empty value among `keys` in a compact hit dict, as a string."""
+    for k in keys:
+        v = hit.get(k)
+        if v not in (None, ""):
+            return str(v)
+    return ""
+
+
+def _comm_parse_key_facts(raw) -> list[str]:
+    """enr_key_facts is free-form: sometimes a JSON array, sometimes newline/
+    semicolon-separated prose. Return a short, capped list of clean facts."""
+    if not raw:
+        return []
+    facts: list[str]
+    if isinstance(raw, list):
+        facts = [str(x) for x in raw]
+    else:
+        text = str(raw).strip()
+        parsed = None
+        if text.startswith("["):
+            import json
+            try:
+                parsed = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+        if isinstance(parsed, list):
+            facts = [str(x) for x in parsed]
+        else:
+            facts = re.split(r"[\n;]+", text)
+    out: list[str] = []
+    for f in facts:
+        clipped = _comm_clip(f, _COMM_LOOKUP_FACT_MAX)
+        if clipped:
+            out.append(clipped)
+        if len(out) >= _COMM_LOOKUP_MAX_FACTS:
+            break
+    return out
+
+
+def _comm_lookup_hit(hit: dict) -> dict:
+    """Distill one compact file_search hit into a minimal comm hit: identity,
+    score, snippet, and flattened comm fields. Drops all noisy metadata."""
+    out: dict = {
+        "doc_id": hit.get("doc_id"),
+        "source_type": hit.get("source_type"),
+        "score": hit.get("score"),
+    }
+    title = _comm_clip(hit.get("title"), 120)
+    if title:
+        out["title"] = title
+    snippet = _comm_clip(hit.get("snippet") or hit.get("content"), _COMM_LOOKUP_SNIPPET_MAX)
+    if snippet:
+        out["snippet"] = snippet
+    comm = {
+        "sender": _comm_field(hit, "sender"),
+        "direction": _comm_field(hit, "direction"),
+        "sent_at": _comm_field(hit, "sent_at"),
+        "channel": _comm_field(hit, "channel", "channel_name"),
+        "source_id": _comm_field(hit, "source_id", "source_message_id"),
+    }
+    for k, v in comm.items():
+        if v:
+            out[k] = v
+    return {k: v for k, v in out.items() if v not in (None, "")}
+
+
+def _comm_lookup_response(verdict: str, **fields) -> dict:
+    """Assemble a comm_lookup envelope with all spec fields present + defaults."""
+    resp = {
+        "verdict": verdict,
+        "top_hit": fields.get("top_hit"),
+        "key_facts": fields.get("key_facts", []),
+        "source_ids": fields.get("source_ids", []),
+        "snippet": fields.get("snippet", ""),
+        "hits": fields.get("hits", []),
+        "missing_exact_fields": fields.get("missing_exact_fields", []),
+        "sql_needed": fields.get("sql_needed", False),
+        "note": fields.get("note", ""),
+    }
+    if fields.get("degraded"):
+        resp["degraded"] = True
+    return resp
+
+
+def _comm_lookup_enforce_budget(resp: dict) -> dict:
+    """Guarantee the serialized response stays within the output budget by
+    progressively shedding the least-essential detail (extra hits, then facts,
+    then snippet). The verdict/top_hit/source_ids core is never dropped."""
+    import json
+
+    def size(r: dict) -> int:
+        return len(json.dumps(r, default=str, ensure_ascii=False))
+
+    if size(resp) <= _COMM_LOOKUP_OUTPUT_BUDGET:
+        return resp
+    # 1. shed trailing hits (keep at least the top hit)
+    while len(resp.get("hits", [])) > 1 and size(resp) > _COMM_LOOKUP_OUTPUT_BUDGET:
+        resp["hits"] = resp["hits"][:-1]
+        resp["truncated"] = True
+    # 2. trim key_facts
+    if size(resp) > _COMM_LOOKUP_OUTPUT_BUDGET and resp.get("key_facts"):
+        resp["key_facts"] = resp["key_facts"][:2]
+        resp["truncated"] = True
+    # 3. shorten snippets
+    if size(resp) > _COMM_LOOKUP_OUTPUT_BUDGET:
+        resp["snippet"] = _comm_clip(resp.get("snippet", ""), 200)
+        for h in resp.get("hits", []):
+            if "snippet" in h:
+                h["snippet"] = _comm_clip(h["snippet"], 160)
+        resp["truncated"] = True
+    return resp
+
+
+def _comm_lookup_impl(
+    query: str,
+    limit: int = _COMM_LOOKUP_DEFAULT_LIMIT,
+    source_type: str | None = None,
+    source_name: str | None = None,
+    sort: str | None = None,
+) -> dict:
+    """Compact comm/person/phone/call/voicemail lookup. Wraps _file_search_impl
+    with safe defaults and returns the verdict envelope. Never raises: any
+    failure becomes a small structured response."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _COMM_LOOKUP_DEFAULT_LIMIT
+    limit = max(1, min(limit, _COMM_LOOKUP_MAX_LIMIT))
+
+    payload = _file_search_impl(
+        query=query,
+        top_k=limit,
+        source_type=source_type,
+        source_name=source_name,
+        return_mode="compact",
+        content_max_character=_COMM_LOOKUP_CONTENT_MAX_CHARACTER,
+        sort=sort or "relevance",
+        include_diagnostics=False,
+    )
+
+    if isinstance(payload, dict) and payload.get("error"):
+        if payload.get("code") in _COMM_LOOKUP_PASSTHROUGH_ERRORS:
+            return payload  # already small + steers the caller to a fix
+        # service_unavailable / search_failed / source_search_degraded: honest
+        # not_found so the caller can decide, but stays tiny (no stack trace).
+        return _comm_lookup_response(
+            "not_found",
+            sql_needed=True,
+            degraded=True,
+            note=_comm_clip(payload.get("message"), 200)
+            or "Doc-Organizer search is unavailable/degraded; treat as inconclusive.",
+        )
+
+    results = payload.get("results", []) if isinstance(payload, dict) else []
+    degraded = bool(payload.get("degraded")) if isinstance(payload, dict) else False
+
+    if not results:
+        return _comm_lookup_response(
+            "not_found",
+            sql_needed=True,
+            degraded=degraded,
+            note="No indexed comm/document match. Only if you need an exact field "
+            "not indexed here, run ONE targeted Comm-Data-Store SQL query — never a full dump.",
+        )
+
+    hits = [_comm_lookup_hit(r) for r in results]
+    top = results[0]
+    verdict = "found"
+    if len(results) > 1:
+        s0 = results[0].get("score")
+        s1 = results[1].get("score")
+        if isinstance(s0, (int, float)) and isinstance(s1, (int, float)) and (
+            s0 - s1 < _COMM_LOOKUP_AMBIGUOUS_SCORE_GAP
+        ):
+            verdict = "ambiguous"
+
+    source_ids: list[str] = []
+    for r in results:
+        sid = _comm_field(r, "source_id", "source_message_id") or str(r.get("doc_id") or "")
+        if sid and sid not in source_ids:
+            source_ids.append(sid)
+        if len(source_ids) >= _COMM_LOOKUP_MAX_SOURCE_IDS:
+            break
+
+    top_hit = {
+        "doc_id": top.get("doc_id"),
+        "title": _comm_clip(top.get("title"), 120),
+        "source_type": top.get("source_type"),
+        "score": top.get("score"),
+    }
+    resp = _comm_lookup_response(
+        verdict,
+        top_hit={k: v for k, v in top_hit.items() if v not in (None, "")},
+        key_facts=_comm_parse_key_facts(top.get("enr_key_facts")),
+        source_ids=source_ids,
+        snippet=_comm_clip(top.get("snippet") or top.get("content"), _COMM_LOOKUP_SNIPPET_MAX),
+        hits=hits,
+        sql_needed=False,
+        degraded=degraded,
+        note="Compact Doc-Organizer result. For an exact field not shown (e.g. a full "
+        "phone number or raw timestamp), run ONE targeted Comm-Data-Store SQL query keyed "
+        "by a source_id above — do not dump the table."
+        + (" Results are degraded — treat as lower confidence." if degraded else ""),
+    )
+    return _comm_lookup_enforce_budget(resp)
+
+
 def _file_get_chunk_impl(doc_id: str, loc: str) -> dict:
     if not doc_id or not doc_id.strip():
         return _error(
@@ -2161,6 +2404,69 @@ if HAS_MCP and FastMCP is not None:
             content_max_character=content_max_character,
             sort=sort if sort is not None else order_by,
             include_diagnostics=include_diagnostics,
+        )
+
+    @mcp.tool()
+    def comm_lookup(
+        query: str,
+        limit: int = _COMM_LOOKUP_DEFAULT_LIMIT,
+        source_type: str | None = None,
+        source_name: str | None = None,
+        sort: str | None = None,
+    ) -> dict:
+        """Compact, one-call lookup for comm / person / phone / call / voicemail /
+        message questions. USE THIS FIRST for those — before any raw
+        Comm-Data-Store SQL.
+
+        It runs a hybrid search with safe defaults (slim-style, limit 3,
+        source content capped) and returns a small verdict envelope (normally
+        1-2k chars, hard-capped ~3k) instead of a large search payload or a
+        raw SQL/table dump. Only drop to Comm-Data-Store SQL for an EXACT field
+        this doesn't surface (e.g. a full phone number or raw timestamp), and
+        then run ONE query keyed by a returned source_id — never a full dump.
+
+        Safe invocation (copy exactly — pass args as a JSON object, not
+        key=value shell tokens):
+
+            npx mcporter call doc-organizer.comm_lookup \\
+              --args '{"query":"Aaron Curet phone call voicemail","limit":3}' \\
+              --output json
+
+        Do NOT pipe MCP JSON into a `python3 - <<'PY'` heredoc: the heredoc
+        consumes stdin for the program text, so the piped JSON is discarded and
+        you get an empty-stdin parse error. If you must post-process, capture to
+        a variable/temp file and parse with `python3 -c`, `jq`, etc.
+
+        Args:
+            query: Natural-language query — person name, phone number, topic,
+                or a phrase like "missed call voicemail" (required, non-empty).
+            limit: Max hits to consider (1-10, default 3).
+            source_type: Optional filter, e.g. "pg_message" for comm messages.
+            source_name: Optional source filter (e.g. "comm_messages", "sor").
+            sort: "relevance" (default) or "recent" (newest-first, for "latest
+                message/voicemail" style questions).
+
+        Returns a compact dict:
+            {
+              "verdict": "found" | "not_found" | "ambiguous",
+              "top_hit": {"doc_id","title","source_type","score"},
+              "key_facts": [...],        # distilled from the top hit's enrichment
+              "source_ids": [...],       # doc/source ids to target a follow-up query
+              "snippet": "...",          # top hit text, capped
+              "hits": [ {doc_id, source_type, score, snippet, sender,
+                         direction, sent_at, channel, source_id} ],
+              "missing_exact_fields": [],
+              "sql_needed": false,       # true only when nothing was found
+              "note": "..."              # when/how to fall back to SQL
+            }
+        On invalid input, returns {"error": true, "code": ..., "message": ..., "fix": ...}.
+        """
+        return _comm_lookup_impl(
+            query=query,
+            limit=limit,
+            source_type=source_type,
+            source_name=source_name,
+            sort=sort,
         )
 
     @mcp.tool(description=sorq.build_sor_query_description())

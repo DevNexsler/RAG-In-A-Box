@@ -1,8 +1,12 @@
 """SOR (postgres comm-store) tool surface: schema, guarded queries, and the
 postgres-source → index sweep path."""
+import json
+
 import pytest
 
 pytestmark = pytest.mark.anyio
+
+_COMM_LOOKUP_BUDGET = 3000
 
 
 async def test_sor_schema_lists_messages_table(mcp_session):
@@ -54,3 +58,35 @@ async def test_sor_sweep_indexed_messages_searchable(indexed_corpus, mcp_session
     assert "periwinkle" in (top.get("snippet") or "").lower(), top
     assert top.get("direction") == "inbound", top
     assert top.get("sender") == "Erin Walsh", top
+
+
+async def test_comm_lookup_finds_seeded_message_compactly(indexed_corpus, mcp_session):
+    """comm_lookup returns a compact verdict envelope (not a raw dump) for a
+    person/comm query — the safe path Hermes should use instead of SQL (#0128)."""
+    payload = await mcp_session.call_tool_json(
+        "comm_lookup", {"query": "periwinkle substation inspection", "limit": 3})
+    assert isinstance(payload, dict) and not payload.get("error"), payload
+
+    assert payload["verdict"] in ("found", "ambiguous"), payload
+    assert payload["top_hit"]["source_type"] == "pg_message", payload
+    # source ids are returned so a follow-up exact query can be targeted
+    assert payload["source_ids"], payload
+    assert payload["sql_needed"] is False, payload
+
+    blob = json.dumps(payload)
+    # compact: whole response well under the 3k budget, no raw metadata blobs
+    assert len(blob) <= _COMM_LOOKUP_BUDGET, f"comm_lookup output {len(blob)} chars: {blob}"
+    for bad in ("_node_content", "embedding", "vector", "custom_meta"):
+        assert bad not in blob, f"{bad!r} leaked into comm_lookup output"
+
+
+async def test_comm_lookup_no_hit_is_small_not_found(indexed_corpus, mcp_session):
+    """A no-match query yields a small not_found/ambiguous response with a SQL
+    hint — never a stack trace or a giant dump."""
+    payload = await mcp_session.call_tool_json(
+        "comm_lookup", {"query": "zzzq nonexistent unobtanium xyzzy", "limit": 3})
+    assert isinstance(payload, dict) and not payload.get("error"), payload
+    assert payload["verdict"] in ("not_found", "ambiguous"), payload
+    assert len(json.dumps(payload)) <= _COMM_LOOKUP_BUDGET, payload
+    if payload["verdict"] == "not_found":
+        assert payload["sql_needed"] is True, payload

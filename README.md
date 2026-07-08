@@ -269,6 +269,7 @@ Document Collection                    AI Assistants
 | Tool | Description |
 |------|-------------|
 | `file_search` | Hybrid semantic + keyword search with exact filters plus complex JSON filters (`and`/`or`/`not`, `in`, `contains`, etc.) |
+| `comm_lookup` | One-call **compact** lookup for comm / person / phone / call / voicemail / message questions — returns a small verdict envelope with source ids. Use this first instead of raw comm-store SQL. See [docs/comm-lookup.md](docs/comm-lookup.md) |
 | `file_get_chunk` | Get full text + metadata for one chunk by doc_id and loc |
 | `file_get_doc_chunks` | Get all chunks for a document, sorted by position |
 | `file_list_documents` | Browse all indexed documents with pagination and filters |
