@@ -54,6 +54,34 @@ async def test_file_search_tool_dispatch_maps_return_alias():
     assert mock.call_args.kwargs["content_max_character"] == 123
 
 
+@pytest.mark.anyio
+async def test_file_index_document_dispatches_via_to_thread():
+    """Single-doc indexing must leave the event loop free for /health."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        return {"func": func, "args": args, "kwargs": kwargs}
+
+    with patch(
+        "mcp_server._file_index_document_impl",
+        return_value={"status": "indexed", "doc_id": "documents::00abc"},
+    ) as mock_impl, patch("asyncio.to_thread", side_effect=fake_to_thread) as mock_to_thread:
+        await mcp_server.mcp.call_tool(
+            "file_index_document",
+            {"target": "email-attachments/x@00abc@.pdf", "source_name": "documents", "force": True},
+        )
+
+    assert mock_to_thread.await_count == 1
+    mock_impl.assert_not_called()
+    _, kwargs = mock_to_thread.await_args
+    assert kwargs == {
+        "target": "email-attachments/x@00abc@.pdf",
+        "source_name": "documents",
+        "force": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Slim default + top_k aliases (Hermes TICKET-docorganizer-filesearch-default-slim)
 # ---------------------------------------------------------------------------
