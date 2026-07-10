@@ -1915,11 +1915,93 @@ def test_file_status_ignores_non_indexer_pid_file(tmp_path):
 
 
 def test_health_probe_ok_when_idle_and_no_warnings(tmp_path):
-    """Idle indexer with no recorded FTS failures probes healthy."""
+    """Idle indexer with no recorded FTS failures probes healthy — and always
+    carries index-filesystem telemetry (#0232)."""
     payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
 
     assert status_code == 200
-    assert payload == {"status": "ok", "indexer": "idle"}
+    assert payload["status"] == "ok"
+    assert payload["indexer"] == "idle"
+    assert 0 <= payload["disk_used_percent"] <= 100
+    assert payload["disk_free_bytes"] > 0
+    assert payload["disk_max_percent"] == 90.0
+
+
+def _disk_usage(used_percent: float):
+    """A shutil.disk_usage-shaped triple at the given used percentage."""
+    from collections import namedtuple
+
+    total = 100 * 2**30
+    used = int(total * used_percent / 100)
+    return namedtuple("usage", "total used free")(total, used, total - used)
+
+
+def test_health_probe_disk_high_water_503s(tmp_path):
+    """At/above DISK_USAGE_MAX_PERCENT the probe must 503: disk-full on the
+    index filesystem is an outage class (#0232 grew Lance garbage to 93% of
+    /data) and docker-health is the surface operators watch."""
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(93)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "disk_full"
+    assert payload["disk_used_percent"] == 93.0
+    assert payload["disk_free_bytes"] == _disk_usage(93).free
+
+
+def test_health_probe_disk_threshold_env_override_and_invalid_fallback(tmp_path):
+    """DISK_USAGE_MAX_PERCENT tunes the high-water mark; junk or out-of-range
+    values fall back to the default 90 instead of disabling the check."""
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(75)):
+        with patch.dict(os.environ, {"DISK_USAGE_MAX_PERCENT": "70"}):
+            payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+        assert status_code == 503
+        assert payload["status"] == "disk_full"
+        assert payload["disk_max_percent"] == 70.0
+
+        for bad in ("junk", "0", "-5", "250"):
+            with patch.dict(os.environ, {"DISK_USAGE_MAX_PERCENT": bad}):
+                payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+            assert status_code == 200, f"DISK_USAGE_MAX_PERCENT={bad}"
+            assert payload["disk_max_percent"] == 90.0
+
+
+def test_health_probe_stalled_payload_includes_disk_fields(tmp_path):
+    """Disk telemetry must compose with the frozen-indexer 503, not vanish."""
+    hb = tmp_path / "indexer.heartbeat"
+    hb.write_text("beat")
+    stale = time.time() - 4000
+    os.utime(hb, (stale, stale))
+
+    with patch("mcp_server._resolve_indexer_pid", return_value=(True, 12345)):
+        with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(50)):
+            payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "stalled"
+    assert payload["disk_used_percent"] == 50.0
+
+
+def test_health_probe_fts_failure_composes_with_disk_fields(tmp_path):
+    """FTS failure detail and disk telemetry appear together; when the disk is
+    also over the high-water mark, disk-full wins the status (more urgent)."""
+    import json
+
+    (tmp_path / "index_metadata.json").write_text(json.dumps({
+        "warning_counts": {"fts_rebuild_failed": 1},
+    }))
+
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(50)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+    assert status_code == 503
+    assert payload["status"] == "degraded"
+    assert payload["disk_used_percent"] == 50.0
+
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(95)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+    assert status_code == 503
+    assert payload["status"] == "disk_full"
+    assert payload["fts_rebuild_failed"] == 1
 
 
 def test_health_probe_degraded_when_fts_rebuild_failed(tmp_path):
