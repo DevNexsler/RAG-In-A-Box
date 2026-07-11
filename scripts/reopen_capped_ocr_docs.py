@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
-"""One-time maintenance: re-open OCR-timeout-capped docs in the degraded ledger.
+"""Manual maintenance: re-open OCR/vision-capped docs in the degraded ledger.
+
+MOSTLY ABSORBED INTO THE FLOW (#0251)
+-------------------------------------
+The failure class this script was written for is now fixed at the root:
+
+- Provider-down failures (connection refused, timeout, 5xx) are classified
+  transient and no longer charge the degraded-ledger attempts cap
+  (extractors.Degradation + flow_index_vault._merge_degraded_ledger).
+- The one-time reopen of v1-capped OCR/vision docs runs automatically as the
+  ledger's v1 -> v2 migration (flow_index_vault._migrate_degraded_ledger).
+
+The remaining manual use case is a PERMANENT-class misconfiguration that was
+fixed later by config — e.g. a wrong model name (404 on every describe) or a
+bad endpoint URL. Those failures are doc-independent but not transient, so
+they legitimately consume attempts under v2; once the config is corrected,
+run this script to reset ``attempts`` for capped docs whose failures are ALL
+OCR/vision-class so the next run re-queues them.
 
 Background
 ----------
@@ -8,17 +25,9 @@ land in ``degraded_docs.json`` and are re-queued on later runs until they either
 succeed or reach ``_DEGRADED_MAX_ATTEMPTS`` (5), after which they are abandoned
 as "persistent" and never retried again (flow_index_vault._include_degraded_docs).
 
-A batch of scan-only PDFs hit that cap purely because the deepseek OCR per-page
-timeout (120s) had almost no headroom over the measured ~94s baseline for a
-full-page scan — so every page timed out every run. Those docs are fully
-OCR-able; the timeout was the bug. After raising ocr.timeout (120 -> 300 in
-config.yaml), they should succeed — but they stay stranded because they are
-already past the cap.
-
 This script resets ``attempts`` to 0 for capped docs whose failures are ALL
-OCR-timeout-class, so the next indexing run re-queues and re-OCRs them under the
-new timeout. Docs capped for other reasons (e.g. enrichment_failed) are left
-untouched, since the timeout change does not address them.
+OCR/vision-class. Docs capped for other reasons (e.g. enrichment_failed) are
+left untouched.
 
 Usage
 -----

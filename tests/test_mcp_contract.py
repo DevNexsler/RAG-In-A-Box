@@ -1453,6 +1453,67 @@ def test_recent_provider_failures_marks_transient_dns_recovered_after_success(tm
     assert result["by_key"]["openrouter_embeddings"]["severity"] == "ok"
 
 
+def test_recent_provider_failures_classifies_ocr_vision_logs(tmp_path):
+    """Ticket #0251: OCR/vision provider outages must be visible to the
+    provider-failure probe — 21 connection-refused describes previously
+    scored total_count=0 because only openrouter/deepinfra lines matched."""
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 10, 19, 0, 0, tzinfo=timezone.utc).timestamp()
+    (tmp_path / "indexer.log").write_text(
+        "\n".join(
+            [
+                "2026-07-10 18:44:35,921 WARNING extractors: OCR describe failed for "
+                "/data/documents/quo-attachments/Jermaine-125S13-finishing/photo1.jpg: "
+                "[Errno 111] Connection refused",
+                "2026-07-10 18:45:00,100 WARNING providers.ocr.ollama_vision: "
+                "Vision describe still empty after 3 retries for /data/documents/x.png",
+                "2026-07-10 18:46:12,004 WARNING extractors: OCR failed for page 3: "
+                "ollama describe exceeded wall deadline 300s",
+            ]
+        )
+    )
+
+    result = mcp_server._recent_provider_failures(tmp_path, now=now)
+
+    assert result["status"] == "degraded"
+    assert result["total_count"] == 3
+    assert result["by_key"]["ocr_vision_describe"]["count"] == 2
+    assert result["by_key"]["ocr_vision_describe"]["operation"] == "describe"
+    # sample tracks the most recent failure line for the key
+    assert "Vision describe still empty" in result["by_key"]["ocr_vision_describe"]["sample"]
+    assert result["by_key"]["ocr_vision_page"]["count"] == 1
+
+
+def test_recent_provider_failures_ocr_vision_recovery_clears_status(tmp_path):
+    """A vision describe / page-OCR success (2xx to the provider endpoints)
+    after failures marks the OCR keys recovered, so status returns to ok."""
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 10, 20, 0, 0, tzinfo=timezone.utc).timestamp()
+    (tmp_path / "indexer.log").write_text(
+        "\n".join(
+            [
+                "2026-07-10 18:44:35,921 WARNING extractors: OCR describe failed for "
+                "/data/documents/a.jpg: [Errno 111] Connection refused",
+                "2026-07-10 18:46:12,004 WARNING extractors: OCR failed for page 3: "
+                "[Errno 111] Connection refused",
+                "2026-07-10 19:30:00,000 INFO httpx: HTTP Request: POST "
+                'http://192.168.68.70:11434/api/chat "HTTP/1.1 200 OK"',
+                "2026-07-10 19:31:00,000 INFO httpx: HTTP Request: POST "
+                'http://192.168.68.70:8790/extract "HTTP/1.1 200 OK"',
+            ]
+        )
+    )
+
+    result = mcp_server._recent_provider_failures(tmp_path, now=now)
+
+    assert result["status"] == "ok"
+    assert result["recovered_count"] == 2
+    assert result["by_key"]["ocr_vision_describe"]["recovered"] is True
+    assert result["by_key"]["ocr_vision_page"]["recovered"] is True
+
+
 def test_file_status_surfaces_recent_provider_failures_from_logs(tmp_path):
     """file_status should summarize recent provider failures without live provider probes."""
     import json

@@ -605,6 +605,28 @@ class TestFailedEnrichment:
         r2 = failed_enrichment("RuntimeError: connection refused")
         assert r1["_enrichment_failed"] != r2["_enrichment_failed"]
 
+    def test_carries_transient_classification(self):
+        # Provider-level failures are marked transient so the degraded ledger
+        # doesn't charge its attempts cap for an LLM-provider outage (#0251).
+        assert failed_enrichment("boom", transient=True)["_enrichment_transient"] is True
+        assert failed_enrichment("boom")["_enrichment_transient"] is False
+
+    def test_enrich_document_classifies_provider_down_as_transient(self):
+        import httpx
+
+        gen = MagicMock()
+        gen.generate.side_effect = httpx.ConnectError("[Errno 111] Connection refused")
+        result = enrich_document("Some text", "doc.md", "md", gen)
+        assert result["_enrichment_failed"]
+        assert result["_enrichment_transient"] is True
+
+    def test_enrich_document_classifies_bad_json_as_doc_specific(self):
+        gen = MagicMock()
+        gen.generate.return_value = "This is not valid JSON at all!"
+        result = enrich_document("Some text", "doc.md", "md", gen)
+        assert "json_parse_error" in result["_enrichment_failed"]
+        assert result["_enrichment_transient"] is False
+
 
 # -----------------------------------------------------------------------
 # Live integration tests — real OpenRouter enrichment
