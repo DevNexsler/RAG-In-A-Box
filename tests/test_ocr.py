@@ -21,6 +21,7 @@ try:
 except ImportError:
     pass
 
+from extractors import begin_degradation_capture, collect_degradations
 from providers.ocr.deepseek_ocr2_local import DeepSeekOCR2Local
 
 
@@ -311,6 +312,41 @@ class TestOllamaVisionBudget:
                 result = OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
         assert result == "a real description"
         assert state["calls"] == 2
+
+    def test_describe_connect_error_enters_cooldown_and_notes_degradation(
+        self, tmp_path, caplog
+    ):
+        import logging
+        from providers.ocr.ollama_vision import OllamaVisionOCR
+
+        state = {"calls": 0}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def stream(self, method, url, json=None):
+                state["calls"] += 1
+                raise httpx.ConnectError("Connection refused")
+
+        begin_degradation_capture()
+        with patch("providers.ocr.ollama_vision.httpx.Client", _Client):
+            with caplog.at_level(logging.WARNING, logger="providers.ocr.ollama_vision"):
+                provider = OllamaVisionOCR(base_url="http://ollama:11434")
+                assert provider.describe(self._img(tmp_path)) == ""
+                assert provider.describe(self._img(tmp_path)) == ""
+        assert state["calls"] == 1
+        assert collect_degradations() == [
+            "ocr_describe_failed",
+            "ocr_describe_failed",
+        ]
+        assert any("suppressing new describe calls" in r.message for r in caplog.records)
 
 
 # -----------------------------------------------------------------------

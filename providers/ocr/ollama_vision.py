@@ -89,6 +89,9 @@ _DESCRIBE_NUM_PREDICT = int(os.environ.get("OLLAMA_DESCRIBE_NUM_PREDICT", "5120"
 # backoff before falling back to a metadata-only stub.
 _DESCRIBE_EMPTY_RETRIES = 2
 _DESCRIBE_RETRY_BACKOFF = 2.0
+_UNAVAILABLE_COOLDOWN = float(
+    os.environ.get("OLLAMA_VISION_UNAVAILABLE_COOLDOWN", "300")
+)
 
 # --- Hang guards ---
 # Root cause of indexer freezes: every describe funnels through the single-permit
@@ -145,7 +148,35 @@ class OllamaVisionOCR(OCRProvider):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self._unavailable_until = 0.0
+        self._availability_lock = threading.Lock()
         logger.info("OllamaVisionOCR: %s model=%s", self.base_url, self.model)
+
+    def _note_describe_degradation(self) -> None:
+        # Avoid a module-level import cycle: extractors imports OCR providers.
+        try:
+            from extractors import note_degradation
+        except Exception:
+            return
+        note_degradation("ocr_describe_failed")
+
+    def _describe_cooldown_remaining(self) -> float:
+        with self._availability_lock:
+            remaining = self._unavailable_until - time.monotonic()
+        return max(0.0, remaining)
+
+    def _mark_describe_unavailable(self, file_path: Path, exc: Exception) -> None:
+        cooldown = max(0.0, _UNAVAILABLE_COOLDOWN)
+        until = time.monotonic() + cooldown
+        with self._availability_lock:
+            self._unavailable_until = until
+        logger.warning(
+            "Vision describe backend unavailable for %s; suppressing new "
+            "describe calls for %.0fs: %s",
+            file_path,
+            cooldown,
+            exc,
+        )
 
     def _call(self, file_path: Path, prompt: str, num_predict: int) -> str:
         image_bytes = _downscale(file_path.read_bytes())
@@ -236,7 +267,21 @@ class OllamaVisionOCR(OCRProvider):
         file_path = Path(file_path)
         if not file_path.exists():
             return ""
-        text = self._call(file_path, _DESCRIBE_PROMPT, _DESCRIBE_NUM_PREDICT)
+        remaining = self._describe_cooldown_remaining()
+        if remaining > 0:
+            self._note_describe_degradation()
+            logger.info(
+                "Vision describe skipped for %s; backend cooldown %.0fs remaining",
+                file_path,
+                remaining,
+            )
+            return ""
+        try:
+            text = self._call(file_path, _DESCRIBE_PROMPT, _DESCRIBE_NUM_PREDICT)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            self._mark_describe_unavailable(file_path, exc)
+            self._note_describe_degradation()
+            return ""
         # Empty is almost always transient (timeout/contention under load), not
         # a deterministic refusal — retry before falling back to a metadata stub.
         attempt = 0
