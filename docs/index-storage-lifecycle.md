@@ -20,17 +20,28 @@ Consequence: **something must delete old versions**, or they accumulate
 forever. Three mechanisms below manage that, plus a fourth (an independent
 copy) for the "the directory itself is gone" case.
 
-## 1. Compaction + FTS merge (every indexing run)
+## 1. Index merge (every run) + data compaction (once per day)
 
-`ensure_fts_index()` runs at the end of each indexing flow. If the FTS index
-exists it calls `table.optimize()`, which compacts new/​small fragments and
-merges freshly-written rows into the native BM25 inverted index. Keyword search
-is correct even before this runs; the merge is a performance step.
+`ensure_fts_index()` runs at the end of each indexing flow. Every run merges
+freshly-written rows into the native BM25 inverted index
+(`optimize.optimize_indices()` — no data rewrite). Keyword search is correct
+even before this runs; the merge is a performance step.
+
+Full data compaction (`table.optimize()`, which rewrites small fragments into
+larger ones) runs at most **once per calendar day**. Compacting every ~15-min
+run was the #0232 outage mechanism: each rewrite supersedes every data file,
+and any retained restore-point tag pins the superseded set — per-run
+compaction × daily tags held hundreds of full-table rewrites on disk (350+ GB
+for a ~5 GB table). The cadence is tracked by a plain-text marker next to the
+dataset (`chunks.lance.last-compaction`, atomic replace): it survives restarts
+without pinning any Lance version, and a failed compaction leaves it unwritten
+so the next run retries.
 
 If the incremental merge hits a transient Lance commit conflict (another writer
 raced it) it raises, and the flow falls back to a **full FTS rebuild**
 (`create_fts_index`, which only reads the small `text` column). That fallback
-is why keyword search never silently goes stale.
+is why keyword search never silently goes stale. Compaction failures are
+non-fatal (logged, retried next run).
 
 ## 2. Version pruning — keeps disk bounded (#0112)
 
@@ -38,8 +49,11 @@ is why keyword search never silently goes stale.
 alone, the index regrew **5.0 GB → 8.6 GB in ~11 h** of normal traffic (only
 ~68 new docs — the rest was dead version churn).
 
-`_optimize_and_prune` now prunes every run via the dataset-level
-`cleanup_old_versions(older_than=<retention>, error_if_tagged_old_versions=False)`:
+`_optimize_and_prune` prunes twice per run via the dataset-level
+`cleanup_old_versions(older_than=<retention>, error_if_tagged_old_versions=False)` —
+once *before* maintenance (frees headroom before any rewrite) and once *after*
+restore-point expiry (so versions unpinned by an expiring tag are reclaimed in
+the same run, not the next one). Each pass logs reclaimed bytes/files:
 
 - **Retention window** `LANCE_VERSION_RETENTION_MINUTES` (default **30**):
   versions younger than this are kept so a slow reader / long indexing scan is
@@ -67,11 +81,13 @@ after compaction, `_manage_restore_points` **tags** the current version
 `daily-<YYYY-MM-DD>` (Lance tags). Tagged versions are immune to the prune, so
 each daily tag is an in-place, point-in-time snapshot.
 
-- Retention `LANCE_DAILY_RESTORE_POINTS` (default **30** days). Daily tags older
-  than the window are deleted so their versions become reclaimable. Tags that
-  aren't `daily-*` are never touched.
-- **Cheap**: tags share immutable data files, so 30 days costs only each day's
-  delta (append-heavy message corpus = small), not 30 full copies.
+- Retention `LANCE_DAILY_RESTORE_POINTS` (default **7**) counts retained
+  points *exactly*: today plus N-1 prior days. Older `daily-*` tags are deleted
+  so their versions become reclaimable; `0` disables the feature **and removes
+  previously created daily tags**. Tags that aren't `daily-*` are never touched.
+- **Not free**: tags share immutable data files, but with once-daily compaction
+  each retained tag can pin up to one full rewrite of the table for its day —
+  which is why the default window is 7, not 30 (#0232).
 - **Scope**: protects against *logical* disaster — a bad indexing run, a botched
   migration, a corruption event like the #0108 `_node_content` bloat. It does
   **not** survive loss/corruption of the `chunks.lance` directory itself; that's
@@ -128,9 +144,16 @@ docker compose start doc-organizer
 ## Health signals
 
 - `GET /health` — `fts_rebuild_failed` non-zero ⇒ keyword search degrading.
+  Every payload also carries `disk_used_percent` / `disk_free_bytes` /
+  `disk_max_percent` for the index filesystem; at/above
+  `DISK_USAGE_MAX_PERCENT` (default 90) the probe returns **503** with
+  `status: disk_full` (#0232).
 - `indexer.log` — `FTS index optimized (incremental merge)` = healthy;
+  `Lance version prune (…): reclaimed N bytes` = the prune is doing real work;
   `Incremental FTS update failed … falling back to full rebuild` = the merge
-  conflicted/failed that run (self-healed, but investigate if persistent).
+  conflicted/failed that run (self-healed, but investigate if persistent);
+  `Daily Lance compaction failed` = non-fatal, retried next run (investigate
+  if persistent).
 - Disk: `du -sh /data/index/chunks.lance`. Live footprint is ~1 GB per ~40 K
   chunks; a bounded plateau above that is retained versions + daily tags.
 
@@ -139,6 +162,7 @@ docker compose start doc-organizer
 | Var | Default | Effect |
 |---|---|---|
 | `LANCE_VERSION_RETENTION_MINUTES` | 30 | Prune versions older than this each run (#2). 0 = prune all superseded. |
-| `LANCE_DAILY_RESTORE_POINTS` | 30 | Days of `daily-*` restore-point tags to keep (#3). 0 = disable tagging. |
+| `LANCE_DAILY_RESTORE_POINTS` | 7 | Exactly this many `daily-*` restore-point tags kept (#3). 0 = disable tagging and drop existing daily tags. |
+| `DISK_USAGE_MAX_PERCENT` | 90 | `/health` 503s (`disk_full`) when the index filesystem is at/above this used-percent. |
 
-Both are wired in `docker-compose.yml`.
+All three are wired in `docker-compose.yml`.

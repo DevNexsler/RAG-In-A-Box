@@ -10,7 +10,8 @@ Developer-facing details about the search pipeline, storage schema, taxonomy sys
 | `OPENROUTER_API_KEY` | Default cloud config — embeddings (Qwen3-Embedding-8B) + enrichment (GPT-4.1 Mini) |
 | `DEEPINFRA_API_KEY`  | Default cloud config — reranker (Qwen3-Reranker-8B via DeepInfra) |
 | `LANCE_VERSION_RETENTION_MINUTES` | Optional (default 30) — prune index versions older than this each run. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
-| `LANCE_DAILY_RESTORE_POINTS` | Optional (default 30) — days of daily version-tag restore points to keep. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
+| `LANCE_DAILY_RESTORE_POINTS` | Optional (default 7) — exactly this many daily version-tag restore points kept. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
+| `DISK_USAGE_MAX_PERCENT` | Optional (default 90) — `/health` returns 503 when the index filesystem is at/above this used-percent. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
 
 Store these in a `.env` file in the project root. The MCP server and indexer load it automatically.
 

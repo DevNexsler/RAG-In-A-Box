@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,7 @@ _MAX_LIMIT = 200
 _DEFAULT_CONTENT_MAX_CHARACTER = 10_000
 _VALID_SEARCH_RETURN_MODES = {"slim", "compact", "full"}
 _VALID_SEARCH_SORTS = {"relevance", "recent"}
+_DEFAULT_DISK_USAGE_MAX_PERCENT = 90.0
 _DEFAULT_SEARCH_TOP_K = 8
 # sort="recent" pool: relevance ranking scopes the candidates, recency orders
 # them — the pool must be wider than top_k or the newest messages can be
@@ -219,17 +221,57 @@ def _fts_rebuild_failed_count(index_root: Path) -> int:
         return 0
 
 
+def _disk_usage_max_percent() -> float:
+    """High-water mark for index-filesystem usage (env-tunable via
+    DISK_USAGE_MAX_PERCENT). Junk or out-of-range values fall back to the
+    default instead of silently disabling the check."""
+    raw = os.environ.get("DISK_USAGE_MAX_PERCENT")
+    if raw is None:
+        return _DEFAULT_DISK_USAGE_MAX_PERCENT
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_DISK_USAGE_MAX_PERCENT
+    if not 0 < val <= 100:
+        return _DEFAULT_DISK_USAGE_MAX_PERCENT
+    return val
+
+
+def _index_disk_usage(index_root: Path) -> dict:
+    """Disk telemetry for the filesystem backing the index, carried on every
+    /health payload so operators see pressure trending, not just the 503.
+
+    Lance MVCC garbage once grew the index to 93% of /data (#0232);
+    disk-full there is a host-wide outage class. Empty dict when the
+    filesystem can't be statted (telemetry must never break the probe)."""
+    try:
+        usage = shutil.disk_usage(index_root)
+        used_percent = round(usage.used / usage.total * 100, 1)
+    except (OSError, ZeroDivisionError):
+        return {}
+    return {
+        "disk_used_percent": used_percent,
+        "disk_free_bytes": usage.free,
+        "disk_max_percent": _disk_usage_max_percent(),
+    }
+
+
 def _health_probe(config: dict) -> tuple[dict, int]:
     """Payload and HTTP status for the unauthenticated /health probe.
 
     503 is reserved for states that need operator attention: an indexer that
     is running but frozen (stale heartbeat — a freeze logs nothing, so this
-    probe is the only thing that can catch it), and an FTS index whose last
-    rebuild failed (keyword search silently going stale, #0106).
+    probe is the only thing that can catch it), an FTS index whose last
+    rebuild failed (keyword search silently going stale, #0106), and an index
+    filesystem at/above its high-water mark (#0232). Disk telemetry rides on
+    every payload; when several conditions hold at once, the most urgent one
+    (disk) names the status but the others keep their fields.
     """
     index_root = Path(config["index_root"])
+    disk = _index_disk_usage(index_root)
     running, pid = _resolve_indexer_pid(index_root / "indexer.pid")
     payload: dict = {"status": "ok", "indexer": "running" if running else "idle"}
+    payload.update(disk)
     if running:
         hb = index_root / "indexer.heartbeat"
         pidf = index_root / "indexer.pid"
@@ -247,18 +289,27 @@ def _health_probe(config: dict) -> tuple[dict, int]:
                     "heartbeat_age_s": round(age) if age is not None else None,
                     "max_age_s": max_age,
                     "detail": "indexer running but not progressing (frozen?)",
+                    **disk,
                 },
                 503,
             )
         payload["indexer_pid"] = pid
         payload["heartbeat_age_s"] = round(age)
+    status_code = 200
     fts_failed = _fts_rebuild_failed_count(index_root)
     if fts_failed:
         payload["status"] = "degraded"
         payload["fts_rebuild_failed"] = fts_failed
         payload["detail"] = "FTS index rebuild failing — keyword search is going stale"
-        return payload, 503
-    return payload, 200
+        status_code = 503
+    if disk and disk["disk_used_percent"] >= disk["disk_max_percent"]:
+        payload["status"] = "disk_full"
+        payload["detail"] = (
+            f"index filesystem at {disk['disk_used_percent']}% "
+            f"(threshold {disk['disk_max_percent']}%) — reclaim space"
+        )
+        status_code = 503
+    return payload, status_code
 
 
 def _hit_to_dict(h: SearchHit, include_text: bool = False) -> dict:
