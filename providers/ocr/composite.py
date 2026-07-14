@@ -1,9 +1,13 @@
 """Composite OCR provider — delegates extract() and describe() to separate providers."""
 
+import logging
 from pathlib import Path
 from typing import Optional
 
+from core.resilience import is_transient
 from providers.ocr.base import OCRProvider
+
+logger = logging.getLogger(__name__)
 
 
 class CompositeOCRProvider(OCRProvider):
@@ -21,4 +25,15 @@ class CompositeOCRProvider(OCRProvider):
         return self._extract.extract(file_path, page)
 
     def describe(self, file_path: str | Path) -> str:
-        return self._describe.describe(file_path)
+        try:
+            return self._describe.describe(file_path)
+        except Exception as exc:
+            if self._extract is self._describe or not is_transient(exc):
+                raise
+            logger.warning(
+                "Dedicated OCR describe backend failed transiently for %s; "
+                "falling back to extract backend describe: %s",
+                file_path,
+                exc,
+            )
+            return self._extract.describe(file_path)

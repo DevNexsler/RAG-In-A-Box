@@ -227,6 +227,54 @@ class TestDeepSeekOCR2Unit:
         assert captured["url"] == "http://ollama:11434/api/chat"
         assert captured["payload"]["model"] == "qwen3-vl:8b"
 
+    def test_split_provider_describe_falls_back_to_extract_backend_on_transient_error(self, tmp_path):
+        """If the dedicated image-describe backend is transiently down, reuse the
+        extract backend's describe path instead of degrading the image to metadata only."""
+        from providers.ocr import build_ocr_provider
+        from providers.ocr.composite import CompositeOCRProvider
+
+        from PIL import Image as _Img
+        img = tmp_path / "photo.png"
+        _Img.new("RGB", (8, 8), "white").save(str(img))
+        config = {
+            "ocr": {
+                "enabled": True,
+                "provider": "deepseek_ocr2",
+                "base_url": "http://deepseek:8790",
+                "timeout": 60.0,
+                "describe": {
+                    "provider": "ollama_vision",
+                    "base_url": "http://ollama:11434",
+                    "model": "qwen3-vl:8b",
+                    "timeout": 90.0,
+                },
+            }
+        }
+
+        provider = build_ocr_provider(config)
+
+        # build_ocr_provider now ALWAYS wraps in FallbackOCRProvider; the composite
+        # (with #62's local sibling-failover) is the wrapper's primary. This asserts
+        # #62's failover works correctly INSIDE the fallback wrapper: an outage on the
+        # dedicated describe backend is recovered locally via the extract backend before
+        # the (dark / unconfigured) cloud fallback would ever see an empty.
+        from providers.ocr.fallback import FallbackOCRProvider
+
+        assert isinstance(provider, FallbackOCRProvider)
+        composite = provider._primary
+        assert isinstance(composite, CompositeOCRProvider)
+        with patch.object(
+            composite._describe, "describe", side_effect=httpx.ConnectError("vision down")
+        ) as describe_call:
+            with patch.object(
+                composite._extract, "describe", return_value="deepseek backup description"
+            ) as backup_call:
+                assert provider.describe(img) == "deepseek backup description"
+
+        # FallbackOCRProvider stringifies the path before delegating to the primary.
+        describe_call.assert_called_once_with(str(img))
+        backup_call.assert_called_once_with(str(img))
+
 
 class TestOllamaVisionBudget:
     """qwen3-vl's hidden reasoning trace starved the old 800-token cap, leaving

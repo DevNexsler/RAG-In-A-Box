@@ -46,6 +46,7 @@ sources:
           WHERE body IS NOT NULL AND body <> ''
         id_template: "{source}/{source_message_id}"
         text_column: _text
+        text_normalizer: zoho_cliq_mentions
         mtime_column: updated_at
         metadata_columns: [source, source_message_id, channel_name, sender, sent_at, direction]
 
