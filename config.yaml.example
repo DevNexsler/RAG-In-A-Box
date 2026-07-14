@@ -70,6 +70,28 @@ ocr:
   #   provider: "ollama_vision"           # uses Ollama vision model for photos/screenshots
   #   model: "qwen3-vl:8b"
   #   base_url: "http://localhost:11434"
+  #
+  # Optional per-method fallback disambiguation (transient-vs-blank). When the
+  # primary returns EMPTY (reachable but no text), an independent LiteLLM model is
+  # consulted: it recovers the content, or (both empty) confirms a genuine blank.
+  # A primary OUTAGE (unreachable) is NOT charged to the fallback — it just retries.
+  # Auth: the LiteLLM client uses LITELLM_API_KEY / LITELLM_MASTER_KEY from the env
+  # (config.yaml is NOT env-expanded, so put the key in the environment, not here).
+  # describe:
+  #   provider: "ollama_vision"
+  #   ...
+  #   fallback:
+  #     provider: "litellm"
+  #     endpoint: "http://YOUR_LITELLM_PROXY:4000/v1"   # OpenAI-compatible /v1
+  #     model: "vision"                    # image-describe model on the proxy
+  # extract:                               # add this block to fall back OCR too
+  #   provider: "deepseek_ocr2"            # (repeat the extract primary's config)
+  #   base_url: "http://localhost:8790"
+  #   fallback:
+  #     provider: "litellm"
+  #     endpoint: "http://YOUR_LITELLM_PROXY:4000/v1"
+  #     model: "ocr"                       # note: an empty OCR page indexes as
+  #                                        # clean (no re-OCR), unlike describe
 
 media:
   enabled: true
@@ -82,6 +104,15 @@ media:
   max_file_size_mb: 50
   timeout: 300
   # base_url: "https://openrouter.ai/api/v1"  # override for staging/self-hosted gateways
+  #
+  # Optional video-analyze fallback (same transient-vs-blank rule as OCR above).
+  # Audio already falls back across fallback_audio_models, so it needs no LiteLLM
+  # endpoint; add one under `audio:` only if you want a distinct model there.
+  # video:
+  #   fallback:
+  #     provider: "litellm"
+  #     endpoint: "http://YOUR_LITELLM_PROXY:4000/v1"
+  #     model: "video"
 
 embeddings:
   provider: "openrouter"                  # Qwen3-Embedding-8B via OpenRouter
