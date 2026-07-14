@@ -222,6 +222,44 @@ class TestDeepSeekOCR2Unit:
         assert captured["url"] == "http://ollama:11434/api/chat"
         assert captured["payload"]["model"] == "qwen3-vl:8b"
 
+    def test_split_provider_describe_falls_back_to_extract_backend_on_transient_error(self, tmp_path):
+        """If the dedicated image-describe backend is transiently down, reuse the
+        extract backend's describe path instead of degrading the image to metadata only."""
+        from providers.ocr import build_ocr_provider
+        from providers.ocr.composite import CompositeOCRProvider
+
+        from PIL import Image as _Img
+        img = tmp_path / "photo.png"
+        _Img.new("RGB", (8, 8), "white").save(str(img))
+        config = {
+            "ocr": {
+                "enabled": True,
+                "provider": "deepseek_ocr2",
+                "base_url": "http://deepseek:8790",
+                "timeout": 60.0,
+                "describe": {
+                    "provider": "ollama_vision",
+                    "base_url": "http://ollama:11434",
+                    "model": "qwen3-vl:8b",
+                    "timeout": 90.0,
+                },
+            }
+        }
+
+        provider = build_ocr_provider(config)
+
+        assert isinstance(provider, CompositeOCRProvider)
+        with patch.object(
+            provider._describe, "describe", side_effect=httpx.ConnectError("vision down")
+        ) as describe_call:
+            with patch.object(
+                provider._extract, "describe", return_value="deepseek backup description"
+            ) as backup_call:
+                assert provider.describe(img) == "deepseek backup description"
+
+        describe_call.assert_called_once_with(img)
+        backup_call.assert_called_once_with(img)
+
 
 class TestOllamaVisionBudget:
     """qwen3-vl's hidden reasoning trace starved the old 800-token cap, leaving
