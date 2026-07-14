@@ -46,3 +46,25 @@ def test_extract_passthrough_when_primary_has_text():
     w = FallbackOCRProvider(_Stub(lambda p: "", lambda p, pg=None: "text"),
                             extract_fallback=_fb("fb"))
     assert w.extract("/x.pdf", page=1) == "text"
+
+
+from providers.ocr import build_ocr_provider
+
+
+def test_factory_always_wraps_even_without_fallback():
+    prov = build_ocr_provider({"ocr": {"enabled": True, "provider": "ollama_vision"}})
+    assert isinstance(prov, FallbackOCRProvider)  # dark: wrapped, fallback None
+
+
+def test_factory_builds_describe_fallback_from_config():
+    prov = build_ocr_provider({"ocr": {"enabled": True, "provider": "ollama_vision",
+        "describe": {"fallback": {"provider": "litellm",
+                                  "endpoint": "http://lite/v1", "model": "m"}}}})
+    assert isinstance(prov, FallbackOCRProvider)
+    assert prov._describe_fb is not None
+
+
+def test_factory_missing_fallback_model_raises():
+    with pytest.raises(Exception):
+        build_ocr_provider({"ocr": {"enabled": True, "provider": "ollama_vision",
+            "describe": {"fallback": {"provider": "litellm", "endpoint": "http://lite/v1"}}}})

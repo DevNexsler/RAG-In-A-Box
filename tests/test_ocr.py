@@ -158,9 +158,11 @@ class TestDeepSeekOCR2Unit:
             }
         }
         provider = build_ocr_provider(config)
-        assert isinstance(provider, DeepSeekOCR2Local)
-        assert provider.base_url == "http://localhost:8790"
-        assert provider.timeout == 60.0
+        from providers.ocr.fallback import FallbackOCRProvider
+        assert isinstance(provider, FallbackOCRProvider)
+        assert isinstance(provider._primary, DeepSeekOCR2Local)
+        assert provider._primary.base_url == "http://localhost:8790"
+        assert provider._primary.timeout == 60.0
 
     def test_build_ocr_provider_routes_images_to_ollama_describe(self, tmp_path):
         """Split OCR config keeps PDF OCR on DeepSeek and routes images to Ollama VL."""
@@ -187,13 +189,15 @@ class TestDeepSeekOCR2Unit:
 
         provider = build_ocr_provider(config)
 
-        assert isinstance(provider, CompositeOCRProvider)
+        from providers.ocr.fallback import FallbackOCRProvider
+        assert isinstance(provider, FallbackOCRProvider)
+        assert isinstance(provider._primary, CompositeOCRProvider)
         with patch("providers.ocr.deepseek_ocr2_local.httpx.post") as deepseek_post:
             deepseek_resp = MagicMock()
             deepseek_resp.json.return_value = {"text": "pdf page text"}
             deepseek_resp.raise_for_status = MagicMock()
             deepseek_post.return_value = deepseek_resp
-            assert provider.extract(img) == "pdf page text"
+            assert provider._primary.extract(img) == "pdf page text"
 
         # ollama_vision streams via httpx.Client().stream() (not httpx.post) —
         # capture the stream call to assert routing + payload.
@@ -217,7 +221,7 @@ class TestDeepSeekOCR2Unit:
                 return _OllamaResp()
 
         with patch("providers.ocr.ollama_vision.httpx.Client", _OllamaClient):
-            assert provider.describe(img) == "image description"
+            assert provider._primary.describe(img) == "image description"
 
         assert deepseek_post.call_args.args[0] == "http://deepseek:8790/extract"
         assert captured["url"] == "http://ollama:11434/api/chat"
