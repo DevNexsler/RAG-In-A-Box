@@ -6,6 +6,9 @@ __all__ = ["MediaProvider", "build_media_provider", "DEFAULT_VIDEO_MODEL"]
 
 DEFAULT_VIDEO_MODEL = "qwen/qwen3.5-397b-a17b"
 
+_VIDEO_PROMPT = "Describe this video's visual content in detail for document search."
+_AUDIO_PROMPT = "Transcribe this audio faithfully for document search."
+
 
 def _dedupe_models(models: list[str]) -> list[str]:
     seen: set[str] = set()
@@ -53,7 +56,7 @@ def build_media_provider(config: dict) -> MediaProvider | None:
 
     from providers.media.openrouter_media import OpenRouterMediaProvider
 
-    return OpenRouterMediaProvider(
+    primary = OpenRouterMediaProvider(
         api_key=media_cfg.get("api_key"),
         base_url=media_cfg.get("base_url", "https://openrouter.ai/api/v1"),
         audio_models=_dedupe_models(list(audio_models)),
@@ -61,3 +64,13 @@ def build_media_provider(config: dict) -> MediaProvider | None:
         timeout=media_cfg.get("timeout", 300.0),
         max_file_size_mb=media_cfg.get("max_file_size_mb", 50.0),
     )
+
+    from providers.media.fallback import MediaFallbackProvider
+    from providers.fallback import build_litellm_fallback
+    from providers.fallback.litellm_fallback import audio_encoder, video_encoder
+
+    video_fb = build_litellm_fallback(media_cfg.get("video", {}).get("fallback"),
+                                      _VIDEO_PROMPT, video_encoder)
+    audio_fb = build_litellm_fallback(media_cfg.get("audio", {}).get("fallback"),
+                                      _AUDIO_PROMPT, audio_encoder)
+    return MediaFallbackProvider(primary, video_fallback=video_fb, audio_fallback=audio_fb)

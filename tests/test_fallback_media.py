@@ -71,3 +71,29 @@ def test_video_encoder_shape(tmp_path):
     assert parts[0] == {"type": "text", "text": "analyze"}
     assert parts[1]["type"] == "video_url"
     assert parts[1]["video_url"]["url"].startswith("data:video/mp4;base64,")
+
+
+from providers.media import build_media_provider
+from providers.media.fallback import MediaFallbackProvider
+
+
+def test_media_factory_always_wraps_when_enabled():
+    prov = build_media_provider({"media": {"enabled": True, "provider": "openrouter", "api_key": "k"}})
+    assert isinstance(prov, MediaFallbackProvider)
+
+
+def test_media_factory_builds_video_fallback():
+    prov = build_media_provider({"media": {"enabled": True, "provider": "openrouter", "api_key": "k",
+        "video": {"fallback": {"provider": "litellm", "endpoint": "http://lite/v1", "model": "m"}}}})
+    assert isinstance(prov, MediaFallbackProvider)
+    assert prov._video_fb is not None
+
+
+def test_media_factory_missing_model_raises():
+    with pytest.raises(Exception):
+        build_media_provider({"media": {"enabled": True, "provider": "openrouter", "api_key": "k",
+            "audio": {"fallback": {"provider": "litellm", "endpoint": "http://lite/v1"}}}})
+
+
+def test_media_factory_disabled_returns_none():
+    assert build_media_provider({"media": {"enabled": False}}) is None

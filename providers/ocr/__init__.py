@@ -51,16 +51,9 @@ _EXTRACT_PROMPT = "Transcribe all text in this image verbatim."
 
 
 def _build_fallback_run(cfg: dict | None, prompt: str):
-    if not cfg:
-        return None
-    if cfg.get("provider") != "litellm":
-        raise ValueError(f"Unknown fallback provider: {cfg.get('provider')}")
-    if not cfg.get("model"):
-        raise ValueError("fallback.model is required (no implicit default)")
-    from providers.fallback.litellm_fallback import LiteLLMFallback, image_encoder
-    client = LiteLLMFallback(cfg["endpoint"], cfg["model"], prompt, image_encoder,
-                             api_key=cfg.get("api_key"))
-    return client.run
+    from providers.fallback import build_litellm_fallback
+    from providers.fallback.litellm_fallback import image_encoder
+    return build_litellm_fallback(cfg, prompt, image_encoder)
 
 
 def _compose_primary(extract_prov: OCRProvider | None,

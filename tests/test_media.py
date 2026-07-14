@@ -33,12 +33,13 @@ def test_build_media_provider_uses_whisper_then_fallbacks(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     provider = build_media_provider({"media": {"enabled": True}})
 
-    assert provider.audio_models == [
+    primary = provider._primary
+    assert primary.audio_models == [
         "openai/whisper-1",
         "mistralai/voxtral-small-24b-2507",
         "google/gemini-2.5-flash-lite",
     ]
-    assert provider.video_model == "qwen/qwen3.5-397b-a17b"
+    assert primary.video_model == "qwen/qwen3.5-397b-a17b"
 
 
 @pytest.mark.parametrize(
