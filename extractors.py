@@ -557,11 +557,8 @@ def extract_audio(
         transcript = media_provider.transcribe_audio(file_path)
     except Exception as e:
         logger.warning("Audio extraction failed for %s: %s", file_path, e)
-        note_degradation("audio_extract_failed")
+        note_degradation("audio_extract_failed", transient=is_transient(e))
         transcript = ""
-    else:
-        if not transcript.strip():
-            note_degradation("audio_transcript_empty")
     return ExtractionResult.from_text(transcript, frontmatter=fm)
 
 
@@ -577,17 +574,10 @@ def extract_video(
         notes = media_provider.analyze_video(file_path)
     except Exception as e:
         logger.warning("Video extraction failed for %s: %s", file_path, e)
-        # Video failures don't recover on retry (oversized > limit, unsupported
-        # codec, unreadable) — the file won't change itself. Mark as a skip so
-        # it isn't re-extracted every run; a genuinely new/re-encoded file gets
-        # a fresh change_hash and is re-evaluated.
-        note_skip("video_extract_failed")
+        # transient (outage) -> retries; permanent (oversized/codec, non-transient)
+        # -> caps at the degraded-ledger max then stops.
+        note_degradation("video_extract_failed", transient=is_transient(e))
         notes = ""
-    else:
-        if not notes.strip():
-            # Provider responded but produced nothing — transient (LLM empty
-            # output), unlike the exception path above which is permanent.
-            note_degradation("video_analysis_empty")
     return ExtractionResult.from_text(notes, frontmatter=fm)
 
 

@@ -404,19 +404,21 @@ def test_extract_image_good_describe_notes_nothing():
 
 
 class _FakeMedia:
-    def __init__(self, transcript="", notes="", boom=False):
+    def __init__(self, transcript="", notes="", boom=False, exc=None):
         self._transcript = transcript
         self._notes = notes
-        self._boom = boom
+        # `exc` lets a test pick the exception type (transient vs permanent);
+        # `boom=True` keeps the legacy transient ConnectionError default.
+        self._exc = exc or (ConnectionError("media host down") if boom else None)
 
     def transcribe_audio(self, file_path):
-        if self._boom:
-            raise ConnectionError("media host down")
+        if self._exc is not None:
+            raise self._exc
         return self._transcript
 
     def analyze_video(self, file_path):
-        if self._boom:
-            raise ConnectionError("media host down")
+        if self._exc is not None:
+            raise self._exc
         return self._notes
 
 
@@ -425,15 +427,19 @@ def test_extract_audio_provider_failure_notes_degradation():
 
     begin_degradation_capture()
     extract_audio("/fake/voicemail.mp3", media_provider=_FakeMedia(boom=True))
-    assert "audio_extract_failed" in collect_degradations()
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["audio_extract_failed"]
+    assert degs[0].transient is True  # ConnectionError is transient
 
 
-def test_extract_audio_empty_transcript_notes_degradation():
+def test_extract_audio_empty_transcript_notes_nothing():
+    # The media provider is always wrapped: it returns "" ONLY for a
+    # fallback-confirmed blank. extract_audio must treat that as clean.
     from extractors import begin_degradation_capture, collect_degradations, extract_audio
 
     begin_degradation_capture()
-    extract_audio("/fake/voicemail.mp3", media_provider=_FakeMedia(transcript=" "))
-    assert "audio_transcript_empty" in collect_degradations()
+    extract_audio("/fake/voicemail.mp3", media_provider=_FakeMedia(transcript=""))
+    assert collect_degradations() == []
 
 
 def test_extract_audio_good_transcript_notes_nothing():
@@ -444,12 +450,45 @@ def test_extract_audio_good_transcript_notes_nothing():
     assert collect_degradations() == []
 
 
-def test_extract_video_empty_analysis_notes_degradation():
+def test_extract_video_provider_failure_transient_notes_degradation():
+    # A vision/video-provider OUTAGE is transient — a degradation (retries with
+    # attempts unburned), NOT a permanent skip (was the bug).
+    from extractors import (
+        begin_degradation_capture,
+        collect_degradations,
+        collect_skips,
+        extract_video,
+    )
+
+    begin_degradation_capture()
+    extract_video("/fake/clip.mp4", media_provider=_FakeMedia(boom=True))
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["video_extract_failed"]
+    assert degs[0].transient is True  # ConnectionError is transient
+    assert collect_skips() == []  # no longer a skip
+
+
+def test_extract_video_provider_failure_permanent_notes_degradation():
+    # A genuinely permanent failure (oversized/codec) is non-transient — it
+    # rides the degraded ledger and caps after the max attempts.
+    from extractors import begin_degradation_capture, collect_degradations, extract_video
+
+    begin_degradation_capture()
+    extract_video(
+        "/fake/clip.mp4", media_provider=_FakeMedia(exc=ValueError("oversized"))
+    )
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["video_extract_failed"]
+    assert degs[0].transient is False  # ValueError is not transient
+
+
+def test_extract_video_empty_analysis_notes_nothing():
+    # Confirmed-blank analysis (wrapper returns "") is clean — no note.
     from extractors import begin_degradation_capture, collect_degradations, extract_video
 
     begin_degradation_capture()
     extract_video("/fake/clip.mp4", media_provider=_FakeMedia(notes=""))
-    assert "video_analysis_empty" in collect_degradations()
+    assert collect_degradations() == []
 
 
 # --- Dispatcher ---
