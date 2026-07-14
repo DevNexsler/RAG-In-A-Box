@@ -42,9 +42,16 @@ services:
       # Prune Lance versions older than this each indexing run (#0112); keeps
       # the index from re-accumulating dead versions. Default 30m if unset.
       - LANCE_VERSION_RETENTION_MINUTES=${LANCE_VERSION_RETENTION_MINUTES:-30}
-      # Keep this many daily version tags as logical restore points (#0113);
-      # each is an in-place rollback target protected from the prune. 0 = off.
-      - LANCE_DAILY_RESTORE_POINTS=${LANCE_DAILY_RESTORE_POINTS:-30}
+      # Keep exactly this many daily version tags as logical restore points
+      # (#0113); each is an in-place rollback target protected from the prune.
+      # With daily compaction every retained tag pins one full rewrite of the
+      # table on disk, so the window stays small (#0232). 0 = off (and removes
+      # previously created daily tags).
+      - LANCE_DAILY_RESTORE_POINTS=${LANCE_DAILY_RESTORE_POINTS:-7}
+      # /health returns 503 when the index filesystem is at/above this
+      # used-percent (#0232), so docker-health surfaces disk pressure
+      # before ENOSPC takes the host down.
+      - DISK_USAGE_MAX_PERCENT=${DISK_USAGE_MAX_PERCENT:-90}
 
 networks:
   rag-net:

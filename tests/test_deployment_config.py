@@ -30,6 +30,19 @@ def test_docker_compose_raises_doc_organizer_nofile_limit():
     assert nofile["hard"] >= nofile["soft"]
 
 
+def test_docker_compose_bounds_lance_retention_and_monitors_disk():
+    """Compose must bound Lance MVCC garbage (#0232): a short version-prune
+    window, a small daily restore-point count (every retained tag pins that
+    day's data files against reclaim), and a disk high-water threshold so
+    /health surfaces pressure before ENOSPC."""
+    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+    env = compose["services"]["doc-organizer"]["environment"]
+
+    assert "LANCE_VERSION_RETENTION_MINUTES=${LANCE_VERSION_RETENTION_MINUTES:-30}" in env
+    assert "LANCE_DAILY_RESTORE_POINTS=${LANCE_DAILY_RESTORE_POINTS:-7}" in env
+    assert "DISK_USAGE_MAX_PERCENT=${DISK_USAGE_MAX_PERCENT:-90}" in env
+
+
 def test_dockerfile_declares_health_check_on_health_endpoint():
     """The image must ship a HEALTHCHECK so the container's health is visible
     (docker ps / .State.Health) instead of relying only on an external probe

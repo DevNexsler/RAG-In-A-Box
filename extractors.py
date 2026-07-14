@@ -19,8 +19,9 @@ import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
+from core.resilience import is_transient
 from providers.media.base import MediaProvider
 from providers.ocr.base import OCRProvider
 
@@ -34,19 +35,32 @@ logger = logging.getLogger(__name__)
 _degradations = threading.local()
 
 
+class Degradation(NamedTuple):
+    """One degradation noted while processing a document.
+
+    `transient` marks provider-level failures (connection refused, timeout,
+    5xx — see core.resilience.is_transient): the provider is down, nothing is
+    wrong with the doc, so the degraded ledger must not charge its attempts
+    cap. Under the old flat-string capture a >~75min provider outage burned
+    every affected doc to the cap and abandoned it forever (#0251)."""
+
+    reason: str
+    transient: bool = False
+
+
 def begin_degradation_capture() -> None:
     _degradations.items = []
     _degradations.skips = []
 
 
-def collect_degradations() -> list[str]:
+def collect_degradations() -> list[Degradation]:
     return list(getattr(_degradations, "items", []))
 
 
-def note_degradation(reason: str) -> None:
+def note_degradation(reason: str, transient: bool = False) -> None:
     items = getattr(_degradations, "items", None)
     if items is not None:
-        items.append(reason)
+        items.append(Degradation(reason, transient))
 
 
 def collect_skips() -> list[str]:
@@ -373,7 +387,7 @@ def _ocr_page(
         text = ocr_provider.extract(tmp_path)
     except Exception as e:
         logger.warning("OCR failed for page %d: %s", page_num, e)
-        note_degradation(f"ocr_page_failed:{page_num}")
+        note_degradation(f"ocr_page_failed:{page_num}", transient=is_transient(e))
         text = ""
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -506,7 +520,7 @@ def extract_image(
         vision_text = ocr_provider.describe(str(file_path))
     except Exception as e:
         logger.warning("OCR describe failed for %s: %s", file_path, e)
-        note_degradation("ocr_describe_failed")
+        note_degradation("ocr_describe_failed", transient=is_transient(e))
         vision_text = ""
     header = _format_image_metadata_header(meta)
     parts = [p for p in [header, vision_text] if p.strip()]
@@ -543,6 +557,7 @@ def extract_audio(
         transcript = media_provider.transcribe_audio(file_path)
     except Exception as e:
         logger.warning("Audio extraction failed for %s: %s", file_path, e)
+        note_degradation("audio_extract_failed", transient=is_transient(e))
         transcript = ""
     return ExtractionResult.from_text(transcript, frontmatter=fm)
 
@@ -559,11 +574,9 @@ def extract_video(
         notes = media_provider.analyze_video(file_path)
     except Exception as e:
         logger.warning("Video extraction failed for %s: %s", file_path, e)
-        # Video failures don't recover on retry (oversized > limit, unsupported
-        # codec, unreadable) — the file won't change itself. Mark as a skip so
-        # it isn't re-extracted every run; a genuinely new/re-encoded file gets
-        # a fresh change_hash and is re-evaluated.
-        note_skip("video_extract_failed")
+        # transient (outage) -> retries; permanent (oversized/codec, non-transient)
+        # -> caps at the degraded-ledger max then stops.
+        note_degradation("video_extract_failed", transient=is_transient(e))
         notes = ""
     return ExtractionResult.from_text(notes, frontmatter=fm)
 

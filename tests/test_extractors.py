@@ -353,6 +353,144 @@ def test_extract_image_no_ocr():
     assert result.full_text == ""
 
 
+def test_extract_image_failed_describe_notes_transient_reason():
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+
+    class BoomOCR(OCRProvider):
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): raise ConnectionError("vision host down")
+
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=BoomOCR())
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["ocr_describe_failed"]
+    assert degs[0].transient is True  # ConnectionError is transient
+
+
+def test_extract_image_confirmed_blank_returns_no_degradation():
+    # The describe provider is always wrapped: it returns "" ONLY for a
+    # fallback-confirmed blank. extract_image must treat that as clean (no
+    # degradation note) so the doc drops from the ledger and is never re-described.
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+
+    class BlankOCR(OCRProvider):
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): return ""
+
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=BlankOCR())
+    assert collect_degradations() == []
+
+
+def test_extract_image_good_describe_notes_nothing():
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+
+    class GoodOCR(OCRProvider):
+        def extract(self, file_path, page=None):
+            return "A receipt for $50"
+
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=GoodOCR())
+    assert collect_degradations() == []
+
+
+# --- Audio/video extraction degradations ---
+# Same rule as images (#0264): a configured provider that fails or produces no
+# content must note a degradation, so the doc rides the degraded-ledger retry
+# lane instead of being silently parked as "no text extracted".
+
+
+class _FakeMedia:
+    def __init__(self, transcript="", notes="", boom=False, exc=None):
+        self._transcript = transcript
+        self._notes = notes
+        # `exc` lets a test pick the exception type (transient vs permanent);
+        # `boom=True` keeps the legacy transient ConnectionError default.
+        self._exc = exc or (ConnectionError("media host down") if boom else None)
+
+    def transcribe_audio(self, file_path):
+        if self._exc is not None:
+            raise self._exc
+        return self._transcript
+
+    def analyze_video(self, file_path):
+        if self._exc is not None:
+            raise self._exc
+        return self._notes
+
+
+def test_extract_audio_provider_failure_notes_degradation():
+    from extractors import begin_degradation_capture, collect_degradations, extract_audio
+
+    begin_degradation_capture()
+    extract_audio("/fake/voicemail.mp3", media_provider=_FakeMedia(boom=True))
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["audio_extract_failed"]
+    assert degs[0].transient is True  # ConnectionError is transient
+
+
+def test_extract_audio_empty_transcript_notes_nothing():
+    # The media provider is always wrapped: it returns "" ONLY for a
+    # fallback-confirmed blank. extract_audio must treat that as clean.
+    from extractors import begin_degradation_capture, collect_degradations, extract_audio
+
+    begin_degradation_capture()
+    extract_audio("/fake/voicemail.mp3", media_provider=_FakeMedia(transcript=""))
+    assert collect_degradations() == []
+
+
+def test_extract_audio_good_transcript_notes_nothing():
+    from extractors import begin_degradation_capture, collect_degradations, extract_audio
+
+    begin_degradation_capture()
+    extract_audio("/fake/voicemail.mp3", media_provider=_FakeMedia(transcript="hello"))
+    assert collect_degradations() == []
+
+
+def test_extract_video_provider_failure_transient_notes_degradation():
+    # A vision/video-provider OUTAGE is transient — a degradation (retries with
+    # attempts unburned), NOT a permanent skip (was the bug).
+    from extractors import (
+        begin_degradation_capture,
+        collect_degradations,
+        collect_skips,
+        extract_video,
+    )
+
+    begin_degradation_capture()
+    extract_video("/fake/clip.mp4", media_provider=_FakeMedia(boom=True))
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["video_extract_failed"]
+    assert degs[0].transient is True  # ConnectionError is transient
+    assert collect_skips() == []  # no longer a skip
+
+
+def test_extract_video_provider_failure_permanent_notes_degradation():
+    # A genuinely permanent failure (oversized/codec) is non-transient — it
+    # rides the degraded ledger and caps after the max attempts.
+    from extractors import begin_degradation_capture, collect_degradations, extract_video
+
+    begin_degradation_capture()
+    extract_video(
+        "/fake/clip.mp4", media_provider=_FakeMedia(exc=ValueError("oversized"))
+    )
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["video_extract_failed"]
+    assert degs[0].transient is False  # ValueError is not transient
+
+
+def test_extract_video_empty_analysis_notes_nothing():
+    # Confirmed-blank analysis (wrapper returns "") is clean — no note.
+    from extractors import begin_degradation_capture, collect_degradations, extract_video
+
+    begin_degradation_capture()
+    extract_video("/fake/clip.mp4", media_provider=_FakeMedia(notes=""))
+    assert collect_degradations() == []
+
+
 # --- Dispatcher ---
 
 
@@ -662,3 +800,59 @@ def test_extract_markitdown_conversion_error():
         result = extract_markitdown("/fake/doc.docx")
 
     assert result.full_text == ""
+
+
+def test_fallback_chain_recovers_content_through_extract_image():
+    """Primary describe reachable-but-empty + a fallback that returns text ->
+    extract_image indexes the RECOVERED text and notes NO degradation (clean)."""
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    class EmptyPrimary(OCRProvider):
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): return ""      # reachable but empty
+
+    wrapped = FallbackOCRProvider(EmptyPrimary(),
+                                  describe_fallback=lambda p: "a recovered description")
+    begin_degradation_capture()
+    result = extract_image("/fake/path.png", ocr_provider=wrapped)
+    assert "a recovered description" in result.full_text   # recovered content indexed
+    assert collect_degradations() == []                    # clean, no degradation
+
+
+def test_fallback_chain_confirmed_blank_is_clean_through_extract_image():
+    """Primary empty + fallback ALSO empty -> confirmed blank -> extract_image
+    indexes only the metadata stub and notes NO degradation (doc drops from ledger)."""
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    class EmptyPrimary(OCRProvider):
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): return ""
+
+    wrapped = FallbackOCRProvider(EmptyPrimary(),
+                                  describe_fallback=lambda p: "")   # fallback agrees: blank
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=wrapped)
+    assert collect_degradations() == []                    # confirmed blank == clean
+
+
+def test_fallback_chain_dark_mode_outage_degrades_transient_through_extract_image():
+    """No fallback configured + primary empty -> wrapper raises transient ->
+    extract_image notes ocr_describe_failed as TRANSIENT (retries, never capped)."""
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    class EmptyPrimary(OCRProvider):
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): return ""
+
+    wrapped = FallbackOCRProvider(EmptyPrimary(), describe_fallback=None)  # dark
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=wrapped)
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["ocr_describe_failed"]
+    assert degs[0].transient is True                       # transient -> #60 never caps

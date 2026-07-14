@@ -21,6 +21,7 @@ try:
 except ImportError:
     pass
 
+from extractors import begin_degradation_capture, collect_degradations
 from providers.ocr.deepseek_ocr2_local import DeepSeekOCR2Local
 
 
@@ -157,9 +158,11 @@ class TestDeepSeekOCR2Unit:
             }
         }
         provider = build_ocr_provider(config)
-        assert isinstance(provider, DeepSeekOCR2Local)
-        assert provider.base_url == "http://localhost:8790"
-        assert provider.timeout == 60.0
+        from providers.ocr.fallback import FallbackOCRProvider
+        assert isinstance(provider, FallbackOCRProvider)
+        assert isinstance(provider._primary, DeepSeekOCR2Local)
+        assert provider._primary.base_url == "http://localhost:8790"
+        assert provider._primary.timeout == 60.0
 
     def test_build_ocr_provider_routes_images_to_ollama_describe(self, tmp_path):
         """Split OCR config keeps PDF OCR on DeepSeek and routes images to Ollama VL."""
@@ -186,13 +189,15 @@ class TestDeepSeekOCR2Unit:
 
         provider = build_ocr_provider(config)
 
-        assert isinstance(provider, CompositeOCRProvider)
+        from providers.ocr.fallback import FallbackOCRProvider
+        assert isinstance(provider, FallbackOCRProvider)
+        assert isinstance(provider._primary, CompositeOCRProvider)
         with patch("providers.ocr.deepseek_ocr2_local.httpx.post") as deepseek_post:
             deepseek_resp = MagicMock()
             deepseek_resp.json.return_value = {"text": "pdf page text"}
             deepseek_resp.raise_for_status = MagicMock()
             deepseek_post.return_value = deepseek_resp
-            assert provider.extract(img) == "pdf page text"
+            assert provider._primary.extract(img) == "pdf page text"
 
         # ollama_vision streams via httpx.Client().stream() (not httpx.post) —
         # capture the stream call to assert routing + payload.
@@ -216,7 +221,7 @@ class TestDeepSeekOCR2Unit:
                 return _OllamaResp()
 
         with patch("providers.ocr.ollama_vision.httpx.Client", _OllamaClient):
-            assert provider.describe(img) == "image description"
+            assert provider._primary.describe(img) == "image description"
 
         assert deepseek_post.call_args.args[0] == "http://deepseek:8790/extract"
         assert captured["url"] == "http://ollama:11434/api/chat"
@@ -311,6 +316,30 @@ class TestOllamaVisionBudget:
                 result = OllamaVisionOCR(base_url="http://ollama:11434").describe(self._img(tmp_path))
         assert result == "a real description"
         assert state["calls"] == 2
+
+    def test_describe_connect_error_raises_transient_and_enters_cooldown(self, tmp_path):
+        from core.resilience import TransientError, is_transient
+        from providers.ocr.ollama_vision import OllamaVisionOCR
+
+        state = {"calls": 0}
+
+        class _Client:
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def stream(self, method, url, json=None):
+                state["calls"] += 1
+                raise httpx.ConnectError("Connection refused")
+
+        with patch("providers.ocr.ollama_vision.httpx.Client", _Client):
+            provider = OllamaVisionOCR(base_url="http://ollama:11434")
+            with pytest.raises(Exception) as first:
+                provider.describe(self._img(tmp_path))
+            assert is_transient(first.value)          # outage is transient
+            # second call is short-circuited by cooldown -> raises WITHOUT hitting client
+            with pytest.raises(TransientError):
+                provider.describe(self._img(tmp_path))
+        assert state["calls"] == 1                     # cooldown suppressed the 2nd real call
 
 
 # -----------------------------------------------------------------------

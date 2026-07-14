@@ -65,8 +65,9 @@ _LLAMA_MANAGED_METADATA_KEYS = frozenset({
 
 
 _DEFAULT_LANCE_VERSION_RETENTION_MINUTES = 30.0
-_DEFAULT_DAILY_RESTORE_POINT_DAYS = 30
+_DEFAULT_DAILY_RESTORE_POINT_DAYS = 7
 _DAILY_TAG_PREFIX = "daily-"
+_COMPACTION_MARKER_SUFFIX = ".last-compaction"
 
 
 def _lance_version_retention_minutes() -> float:
@@ -86,12 +87,15 @@ def _lance_version_retention_minutes() -> float:
 
 
 def _daily_restore_point_days() -> int:
-    """How many days of daily version tags to keep as logical restore points
-    (env-tunable via LANCE_DAILY_RESTORE_POINTS). 0 disables the feature.
+    """How many daily version tags to keep as logical restore points — exactly
+    N points: today plus N-1 prior days (env-tunable via
+    LANCE_DAILY_RESTORE_POINTS). 0 disables the feature and removes any
+    previously created daily tags.
 
     Each daily tag pins that day's superseded data files against the version
-    prune, so `git reset`-style rollback to a past day stays possible. Cheap
-    on an append-heavy corpus (unchanged data files are shared across tags)."""
+    prune, so `git reset`-style rollback to a past day stays possible. That
+    pinning is also why the window must stay small: with daily compaction,
+    every retained tag holds one full rewrite of the table on disk (#0232)."""
     raw = os.environ.get("LANCE_DAILY_RESTORE_POINTS")
     if raw is None:
         return _DEFAULT_DAILY_RESTORE_POINT_DAYS
@@ -116,15 +120,6 @@ def _parse_daily_tag_date(name: str):
         return date.fromisoformat(name[len(_DAILY_TAG_PREFIX):])
     except ValueError:
         return None
-
-
-def _is_retryable_commit_conflict(exc: BaseException) -> bool:
-    """True for Lance's transient 'Retryable commit conflict' raised when a
-    prune races a concurrent write — safe to retry."""
-    text = str(exc).lower()
-    return "retryable commit conflict" in text or (
-        "conflict" in text and "retry" in text
-    )
 
 
 def _is_retryable_commit_conflict(exc: BaseException) -> bool:
@@ -953,74 +948,174 @@ class LanceDBStore:
         logger.info("FTS index optimized (incremental merge)")
 
     def _optimize_and_prune(self, table) -> None:
-        """Compact + merge the index, refresh daily restore-point tags, then
-        prune superseded Lance versions older than the retention window.
+        """Per-run Lance maintenance: prune dead versions, merge index deltas,
+        compact data files at most once per calendar day, refresh restore
+        points.
 
-        optimize() compacts data files but leaves every superseded version on
-        disk; without a prune those dead versions accumulate unbounded (they
-        grew the index 5 GB -> 8.6 GB in ~11 h of routine indexing). We reclaim
-        them each run while keeping a retention window so any in-flight reader
-        on a recent version is unaffected.
+        Full compaction (table.optimize()) rewrites every fragment, and each
+        retained daily restore-point tag pins the superseded fragments until
+        that tag expires — running it every ~15-minute indexing cycle held a
+        full rewrite of the table per cycle per tag on disk and grew a ~5 GB
+        table to 350+ GB of dead files (#0232). Compaction is therefore
+        bounded to once per calendar day, tracked by a plain-text marker
+        outside the dataset (atomic replace; survives restarts without
+        pinning any Lance version). Every other run only merges newly written
+        rows into the search indices (optimize_indices — no data rewrite).
 
-        Ordering matters: compact -> tag today's version -> prune. Tagging
-        before the prune protects today's version (and every retained daily
-        tag) from cleanup. The prune therefore runs via the dataset-level
-        cleanup_old_versions with error_if_tagged_old_versions=False so it
-        skips tagged restore points instead of erroring on them (plain
-        table.optimize(cleanup_older_than=...) cannot skip tags and would raise
-        every run once a daily tag exists).
+        Ordering matters: prune -> compact/merge -> tag today -> expire tags
+        -> prune. The first prune frees headroom before any rewrite; the
+        second reclaims versions unpinned by tag expiry in the same run.
+        The prunes run via dataset-level cleanup_old_versions with
+        error_if_tagged_old_versions=False so tagged restore points are
+        skipped, not errors (and delete_unverified stays False — Lance's
+        in-flight-write protection is only overridden in stopped-service
+        repair, never routinely).
 
-        Tag management and pruning are housekeeping: their failure is logged
-        but never propagated, so an indexing run always completes (stale
-        versions/tags reconcile on the next pass).
+        Compaction, tagging, and pruning are housekeeping: failures are
+        logged, never raised, so an indexing run always completes (a failed
+        compaction leaves the marker unwritten and retries next run). Only
+        the index-delta merge propagates, letting the flow fall back to a
+        full FTS rebuild.
         """
-        from datetime import date, timedelta
+        from datetime import date
 
         from core.resilience import call_with_retry
 
-        # 1. Compaction + FTS index merge (the part that makes search current).
-        table.optimize()
+        today = date.today()
+        self._prune_versions("pre-maintenance")
 
-        # 2. Daily restore points (protected from the prune below).
-        self._manage_restore_points(table, date.today())
+        if self._compaction_due(today):
+            try:
+                def _compact():
+                    # The per-run index merge commits at the dataset level, so
+                    # a cached handle can be behind the latest version — its
+                    # optimize would abort on a Retryable commit conflict.
+                    table.checkout_latest()
+                    table.optimize()  # compacts data files + merges index deltas
 
-        # 3. Prune superseded, untagged versions older than the retention band.
+                call_with_retry(
+                    _compact,
+                    attempts=3,
+                    backoff=(2.0, 5.0),
+                    label="lance daily compaction",
+                    classify=_is_retryable_commit_conflict,
+                )
+                self._record_compaction(today)
+            except Exception as exc:
+                logger.warning(
+                    "Daily Lance compaction failed (%s); retrying next run", exc
+                )
+                self._merge_index_deltas()
+        else:
+            self._merge_index_deltas()
+
+        self._manage_restore_points(table, today)
+        self._prune_versions("post-expiry")
+
+    def _dataset_path(self) -> str:
+        return str(Path(self.index_root) / f"{self.table_name}.lance")
+
+    def _compaction_marker_path(self) -> Path:
+        # Lives NEXT TO the .lance directory, not inside it — Lance owns that
+        # tree and cleanup may remove files it does not recognize.
+        return Path(self.index_root) / (
+            f"{self.table_name}.lance{_COMPACTION_MARKER_SUFFIX}"
+        )
+
+    def _compaction_due(self, today) -> bool:
+        from datetime import date
+
+        try:
+            recorded = self._compaction_marker_path().read_text().strip()
+            return date.fromisoformat(recorded) < today
+        except (OSError, ValueError):
+            # Missing or unreadable marker: compact now and rewrite it.
+            return True
+
+    def _record_compaction(self, today) -> None:
+        """Write-then-rename so a crash mid-write cannot corrupt the marker."""
+        marker = self._compaction_marker_path()
+        tmp = marker.with_name(marker.name + ".tmp")
+        try:
+            tmp.write_text(today.isoformat())
+            os.replace(tmp, marker)
+        except OSError as exc:
+            logger.warning("Could not record compaction date: %s", exc)
+
+    def _merge_index_deltas(self) -> None:
+        """Merge newly written rows into the existing indices without
+        rewriting data files. Raises on failure so the flow can fall back to
+        a full FTS rebuild."""
+        import lance
+
+        lance.dataset(self._dataset_path()).optimize.optimize_indices()
+
+    def _prune_versions(self, label: str) -> None:
+        """Reclaim superseded, untagged Lance versions older than the
+        retention band, logging reclaimed bytes/files so shrinkage (or its
+        absence) is observable. Best-effort: failure is logged, never raised
+        (dead versions reclaim on a later pass)."""
+        from datetime import timedelta
+
+        from core.resilience import call_with_retry
+
         retention = timedelta(minutes=_lance_version_retention_minutes())
-        dataset_path = str(Path(self.index_root) / f"{self.table_name}.lance")
         try:
             import lance
 
             def _prune():
-                lance.dataset(dataset_path).cleanup_old_versions(
+                return lance.dataset(self._dataset_path()).cleanup_old_versions(
                     older_than=retention,
                     error_if_tagged_old_versions=False,
                 )
 
-            call_with_retry(
+            stats = call_with_retry(
                 _prune,
                 attempts=3,
                 backoff=(2.0, 5.0),
-                label="lance version prune",
+                label=f"lance version prune ({label})",
                 classify=_is_retryable_commit_conflict,
             )
+            if stats is not None and stats.old_versions:
+                logger.info(
+                    "Lance version prune (%s): reclaimed %d bytes "
+                    "(%d versions, %d data files)",
+                    label,
+                    stats.bytes_removed,
+                    stats.old_versions,
+                    stats.data_files_removed,
+                )
         except Exception as exc:
             logger.warning(
-                "Version prune failed (%s); dead versions reclaim next run", exc
+                "Version prune (%s) failed (%s); dead versions reclaim next run",
+                label,
+                exc,
             )
 
     def _manage_restore_points(self, table, today) -> None:
-        """Keep a rolling window of daily version tags as logical restore points.
+        """Keep exactly N daily version tags (today plus N-1 prior days) as
+        logical restore points.
 
         Points today's `daily-<date>` tag at the current (just-compacted)
-        version and drops daily tags older than the retention window so their
-        versions become reclaimable. Best-effort: any failure is logged, never
-        raised (a missed tag is reconciled next run)."""
+        version and drops daily tags beyond the window so their versions
+        become reclaimable. N = 0 disables the feature and removes previously
+        created daily tags; tags that are not ours (no daily- date encoding)
+        are never touched. Best-effort: any failure is logged, never raised
+        (a missed tag is reconciled next run)."""
         days = _daily_restore_point_days()
-        if days <= 0:
-            return
         try:
+            # Tag the true latest version, not a stale cached one — a tag on
+            # an old version pins its superseded data files (#0232).
+            table.checkout_latest()
             tags = table.tags
             existing = set(tags.list())
+
+            if days <= 0:
+                for tag_name in existing:
+                    if _parse_daily_tag_date(tag_name) is not None:
+                        tags.delete(tag_name)
+                return
+
             name = _daily_tag_name(today)
             version = table.version
             if name in existing:
@@ -1030,7 +1125,7 @@ class LanceDBStore:
 
             from datetime import timedelta
 
-            cutoff = today - timedelta(days=days)
+            cutoff = today - timedelta(days=days - 1)
             for tag_name in existing:
                 tag_date = _parse_daily_tag_date(tag_name)
                 if tag_date is not None and tag_date < cutoff:

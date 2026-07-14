@@ -1189,13 +1189,13 @@ def test_daily_restore_point_days_env_parsing():
 
     with patch.dict("os.environ", {}, clear=False):
         ls.os.environ.pop("LANCE_DAILY_RESTORE_POINTS", None)
-        assert ls._daily_restore_point_days() == 30
+        assert ls._daily_restore_point_days() == 7
     with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "14"}):
         assert ls._daily_restore_point_days() == 14
     with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "0"}):
         assert ls._daily_restore_point_days() == 0
     with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "junk"}):
-        assert ls._daily_restore_point_days() == 30
+        assert ls._daily_restore_point_days() == 7
 
 
 def test_parse_daily_tag_date():
@@ -1235,6 +1235,182 @@ def test_fts_finds_rows_added_after_index_creation():
         store.ensure_fts_index()  # merges the unindexed tail; still searchable after
         hits = store.keyword_search("quasar astronomy", top_k=10)
         assert len(hits) == 1
+
+
+# ---------------------------------------------------------------------------
+# Daily compaction cadence (#0232) — full data compaction runs at most once
+# per calendar day; every run still merges new rows into the search indices.
+# Per-run compaction × retained restore-point tags pinned every superseded
+# fragment set, growing a ~5 GB table to 350+ GB of dead files.
+# ---------------------------------------------------------------------------
+
+
+def _compaction_marker(tmpdir: str) -> Path:
+    return Path(tmpdir) / "test_chunks.lance.last-compaction"
+
+
+def _fts_unindexed_rows(tmpdir: str) -> int:
+    """Unindexed-row count via a fresh handle (immune to stale-version caching)."""
+    table = LanceDBStore(tmpdir, "test_chunks")._vs.table
+    name = next(
+        idx.name for idx in table.list_indices()
+        if str(getattr(idx, "index_type", "")).upper() == "FTS"
+    )
+    return table.index_stats(name).num_unindexed_rows
+
+
+def test_first_maintenance_run_compacts_and_records_marker():
+    """The first ensure_fts_index of the day runs the full table.optimize()
+    (data compaction) and records the date in a durable marker outside the
+    dataset directory."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
+        store.create_fts_index()
+        table = store._vs.table
+        with patch.object(table, "optimize", wraps=table.optimize) as spy:
+            store.ensure_fts_index()
+
+        assert spy.call_count == 1
+        marker = _compaction_marker(tmpdir)
+        assert marker.exists()
+        assert marker.read_text().strip() == date.today().isoformat()
+
+
+def test_maintenance_compacts_at_most_once_per_day():
+    """A second run on the same day must not rewrite data files (per-run
+    compaction × retained restore tags is what grew the index to 350 GB) —
+    but it must still merge newly written rows into the existing FTS index."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
+        store.create_fts_index()
+        store.ensure_fts_index()  # first run today: compacts + writes marker
+
+        store.upsert_nodes([_make_node_with_meta("b.md", "c:0", "quasar telescope", vec, source_type="md")])
+        table = store._vs.table
+        with patch.object(table, "optimize", wraps=table.optimize) as spy:
+            store.ensure_fts_index()  # same calendar day: no data rewrite
+
+        assert spy.call_count == 0                  # data compaction skipped
+        assert _fts_unindexed_rows(tmpdir) == 0     # index deltas still merged
+        assert len(store.keyword_search("quasar", top_k=5)) == 1
+
+
+def test_maintenance_compacts_again_when_marker_is_stale():
+    """A marker from a previous day (or a fresh restart with an old marker)
+    makes compaction due again — the marker is the only cadence state."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
+        store.create_fts_index()
+        store.ensure_fts_index()
+        _compaction_marker(tmpdir).write_text("2020-01-01")
+
+        table = store._vs.table
+        with patch.object(table, "optimize", wraps=table.optimize) as spy:
+            store.ensure_fts_index()
+
+        assert spy.call_count == 1
+
+
+def test_compaction_failure_is_non_fatal_and_retried_next_run():
+    """A failed daily compaction must not fail the indexing run and must not
+    record the marker, so the next run retries it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
+        store.create_fts_index()
+
+        with patch.object(store._vs.table, "optimize", side_effect=RuntimeError("disk hiccup")):
+            store.ensure_fts_index()  # must not raise
+
+        assert not _compaction_marker(tmpdir).exists()
+        assert len(store.keyword_search("banana", top_k=5)) == 1  # search unharmed
+
+        store.ensure_fts_index()  # next run retries the compaction
+        assert _compaction_marker(tmpdir).exists()
+
+
+def test_restore_points_keep_exactly_configured_count():
+    """LANCE_DAILY_RESTORE_POINTS counts retained points — today plus N-1
+    prior days — not an N-day grace window on top of today. Every retained
+    tag pins that day's data files, so the window must be exact."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
+        table = store._vs.table
+        v = table.version
+        for day in ("2026-06-18", "2026-06-19", "2026-06-20", "2026-06-24"):
+            table.tags.create(f"daily-{day}", v)
+
+        with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "7"}):
+            store._manage_restore_points(table, date(2026, 6, 25))
+
+        daily = {t for t in table.tags.list() if t.startswith("daily-")}
+        # cutoff = 06-25 - 6 days = 06-19: the 06-18 point is the 8th -> expired
+        assert daily == {
+            "daily-2026-06-19",
+            "daily-2026-06-20",
+            "daily-2026-06-24",
+            "daily-2026-06-25",
+        }
+
+
+def test_restore_points_zero_removes_existing_managed_tags():
+    """Turning restore points off must also drop previously created daily tags
+    (each pins data files against reclaim) while never touching tags created
+    by an operator."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
+        table = store._vs.table
+        v = table.version
+        table.tags.create("daily-2026-06-20", v)
+        table.tags.create("manual-keepsake", v)
+
+        with patch.dict("os.environ", {"LANCE_DAILY_RESTORE_POINTS": "0"}):
+            store._manage_restore_points(table, date(2026, 6, 25))
+
+        tags = set(table.tags.list())
+        assert "daily-2026-06-20" not in tags
+        assert "manual-keepsake" in tags
+
+
+def test_tag_expiry_reclaims_pinned_versions_same_run():
+    """A version pinned only by an expiring daily tag is reclaimed by the same
+    maintenance pass that expires the tag — the post-expiry prune must not
+    wait for the next indexing run (regression guard for the pass ordering)."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
+        store.create_fts_index()
+        table = store._vs.table
+        pinned_version = table.version
+        table.tags.create("daily-2020-01-01", pinned_version)  # long expired
+
+        store.upsert_nodes([_make_node_with_meta("b.md", "c:0", "cherry", vec, source_type="md")])
+        env = {"LANCE_VERSION_RETENTION_MINUTES": "0", "LANCE_DAILY_RESTORE_POINTS": "7"}
+        with patch.dict("os.environ", env):
+            store.ensure_fts_index()
+
+        versions = {v["version"] for v in lance.dataset(_lance_path(tmpdir)).versions()}
+        assert pinned_version not in versions
 
 
 def test_keyword_search_recovers_from_stale_store_handle():

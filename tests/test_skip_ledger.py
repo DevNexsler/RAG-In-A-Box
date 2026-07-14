@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import flow_index_vault as fiv
 from extractors import (
+    Degradation,
     begin_degradation_capture,
     collect_degradations,
     collect_skips,
@@ -236,4 +237,4 @@ def test_degraded_no_text_doc_stays_in_degraded_lane(monkeypatch):
     begin_degradation_capture()
     fiv.process_doc_task.fn(_no_text_doc(doc_id))
     assert collect_skips() == []
-    assert collect_degradations() == ["ocr_timeout"]
+    assert collect_degradations() == [Degradation("ocr_timeout")]

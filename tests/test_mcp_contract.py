@@ -54,6 +54,34 @@ async def test_file_search_tool_dispatch_maps_return_alias():
     assert mock.call_args.kwargs["content_max_character"] == 123
 
 
+@pytest.mark.anyio
+async def test_file_index_document_dispatches_via_to_thread():
+    """Single-doc indexing must leave the event loop free for /health."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        return {"func": func, "args": args, "kwargs": kwargs}
+
+    with patch(
+        "mcp_server._file_index_document_impl",
+        return_value={"status": "indexed", "doc_id": "documents::00abc"},
+    ) as mock_impl, patch("asyncio.to_thread", side_effect=fake_to_thread) as mock_to_thread:
+        await mcp_server.mcp.call_tool(
+            "file_index_document",
+            {"target": "email-attachments/x@00abc@.pdf", "source_name": "documents", "force": True},
+        )
+
+    assert mock_to_thread.await_count == 1
+    mock_impl.assert_not_called()
+    _, kwargs = mock_to_thread.await_args
+    assert kwargs == {
+        "target": "email-attachments/x@00abc@.pdf",
+        "source_name": "documents",
+        "force": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Slim default + top_k aliases (Hermes TICKET-docorganizer-filesearch-default-slim)
 # ---------------------------------------------------------------------------
@@ -1453,6 +1481,67 @@ def test_recent_provider_failures_marks_transient_dns_recovered_after_success(tm
     assert result["by_key"]["openrouter_embeddings"]["severity"] == "ok"
 
 
+def test_recent_provider_failures_classifies_ocr_vision_logs(tmp_path):
+    """Ticket #0251: OCR/vision provider outages must be visible to the
+    provider-failure probe — 21 connection-refused describes previously
+    scored total_count=0 because only openrouter/deepinfra lines matched."""
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 10, 19, 0, 0, tzinfo=timezone.utc).timestamp()
+    (tmp_path / "indexer.log").write_text(
+        "\n".join(
+            [
+                "2026-07-10 18:44:35,921 WARNING extractors: OCR describe failed for "
+                "/data/documents/quo-attachments/Jermaine-125S13-finishing/photo1.jpg: "
+                "[Errno 111] Connection refused",
+                "2026-07-10 18:45:00,100 WARNING providers.ocr.ollama_vision: "
+                "Vision describe still empty after 3 retries for /data/documents/x.png",
+                "2026-07-10 18:46:12,004 WARNING extractors: OCR failed for page 3: "
+                "ollama describe exceeded wall deadline 300s",
+            ]
+        )
+    )
+
+    result = mcp_server._recent_provider_failures(tmp_path, now=now)
+
+    assert result["status"] == "degraded"
+    assert result["total_count"] == 3
+    assert result["by_key"]["ocr_vision_describe"]["count"] == 2
+    assert result["by_key"]["ocr_vision_describe"]["operation"] == "describe"
+    # sample tracks the most recent failure line for the key
+    assert "Vision describe still empty" in result["by_key"]["ocr_vision_describe"]["sample"]
+    assert result["by_key"]["ocr_vision_page"]["count"] == 1
+
+
+def test_recent_provider_failures_ocr_vision_recovery_clears_status(tmp_path):
+    """A vision describe / page-OCR success (2xx to the provider endpoints)
+    after failures marks the OCR keys recovered, so status returns to ok."""
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 10, 20, 0, 0, tzinfo=timezone.utc).timestamp()
+    (tmp_path / "indexer.log").write_text(
+        "\n".join(
+            [
+                "2026-07-10 18:44:35,921 WARNING extractors: OCR describe failed for "
+                "/data/documents/a.jpg: [Errno 111] Connection refused",
+                "2026-07-10 18:46:12,004 WARNING extractors: OCR failed for page 3: "
+                "[Errno 111] Connection refused",
+                "2026-07-10 19:30:00,000 INFO httpx: HTTP Request: POST "
+                'http://192.168.68.70:11434/api/chat "HTTP/1.1 200 OK"',
+                "2026-07-10 19:31:00,000 INFO httpx: HTTP Request: POST "
+                'http://192.168.68.70:8790/extract "HTTP/1.1 200 OK"',
+            ]
+        )
+    )
+
+    result = mcp_server._recent_provider_failures(tmp_path, now=now)
+
+    assert result["status"] == "ok"
+    assert result["recovered_count"] == 2
+    assert result["by_key"]["ocr_vision_describe"]["recovered"] is True
+    assert result["by_key"]["ocr_vision_page"]["recovered"] is True
+
+
 def test_file_status_surfaces_recent_provider_failures_from_logs(tmp_path):
     """file_status should summarize recent provider failures without live provider probes."""
     import json
@@ -1915,11 +2004,93 @@ def test_file_status_ignores_non_indexer_pid_file(tmp_path):
 
 
 def test_health_probe_ok_when_idle_and_no_warnings(tmp_path):
-    """Idle indexer with no recorded FTS failures probes healthy."""
+    """Idle indexer with no recorded FTS failures probes healthy — and always
+    carries index-filesystem telemetry (#0232)."""
     payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
 
     assert status_code == 200
-    assert payload == {"status": "ok", "indexer": "idle"}
+    assert payload["status"] == "ok"
+    assert payload["indexer"] == "idle"
+    assert 0 <= payload["disk_used_percent"] <= 100
+    assert payload["disk_free_bytes"] > 0
+    assert payload["disk_max_percent"] == 90.0
+
+
+def _disk_usage(used_percent: float):
+    """A shutil.disk_usage-shaped triple at the given used percentage."""
+    from collections import namedtuple
+
+    total = 100 * 2**30
+    used = int(total * used_percent / 100)
+    return namedtuple("usage", "total used free")(total, used, total - used)
+
+
+def test_health_probe_disk_high_water_503s(tmp_path):
+    """At/above DISK_USAGE_MAX_PERCENT the probe must 503: disk-full on the
+    index filesystem is an outage class (#0232 grew Lance garbage to 93% of
+    /data) and docker-health is the surface operators watch."""
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(93)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "disk_full"
+    assert payload["disk_used_percent"] == 93.0
+    assert payload["disk_free_bytes"] == _disk_usage(93).free
+
+
+def test_health_probe_disk_threshold_env_override_and_invalid_fallback(tmp_path):
+    """DISK_USAGE_MAX_PERCENT tunes the high-water mark; junk or out-of-range
+    values fall back to the default 90 instead of disabling the check."""
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(75)):
+        with patch.dict(os.environ, {"DISK_USAGE_MAX_PERCENT": "70"}):
+            payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+        assert status_code == 503
+        assert payload["status"] == "disk_full"
+        assert payload["disk_max_percent"] == 70.0
+
+        for bad in ("junk", "0", "-5", "250"):
+            with patch.dict(os.environ, {"DISK_USAGE_MAX_PERCENT": bad}):
+                payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+            assert status_code == 200, f"DISK_USAGE_MAX_PERCENT={bad}"
+            assert payload["disk_max_percent"] == 90.0
+
+
+def test_health_probe_stalled_payload_includes_disk_fields(tmp_path):
+    """Disk telemetry must compose with the frozen-indexer 503, not vanish."""
+    hb = tmp_path / "indexer.heartbeat"
+    hb.write_text("beat")
+    stale = time.time() - 4000
+    os.utime(hb, (stale, stale))
+
+    with patch("mcp_server._resolve_indexer_pid", return_value=(True, 12345)):
+        with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(50)):
+            payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "stalled"
+    assert payload["disk_used_percent"] == 50.0
+
+
+def test_health_probe_fts_failure_composes_with_disk_fields(tmp_path):
+    """FTS failure detail and disk telemetry appear together; when the disk is
+    also over the high-water mark, disk-full wins the status (more urgent)."""
+    import json
+
+    (tmp_path / "index_metadata.json").write_text(json.dumps({
+        "warning_counts": {"fts_rebuild_failed": 1},
+    }))
+
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(50)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+    assert status_code == 503
+    assert payload["status"] == "degraded"
+    assert payload["disk_used_percent"] == 50.0
+
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(95)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+    assert status_code == 503
+    assert payload["status"] == "disk_full"
+    assert payload["fts_rebuild_failed"] == 1
 
 
 def test_health_probe_degraded_when_fts_rebuild_failed(tmp_path):

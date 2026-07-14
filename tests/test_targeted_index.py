@@ -246,6 +246,155 @@ def test_mcp_file_index_document_impl_surfaces_flow_exception():
     assert result["code"] == "index_failed"
 
 
+# --------------------------------------------------------------------------
+# Single-doc ledger bookkeeping (#0264)
+#
+# The targeted path (REST per-attachment, MCP file_index_document) runs the
+# same process_doc_task as the full flow, but historically never began a
+# degradation capture nor merged outcomes into the ledgers — every
+# note_degradation()/note_skip() from extraction was silently dropped. During
+# the 2026-07 vision outage that indexed 28 image attachments as metadata-only
+# stubs with NO degraded-ledger entry: no retry, no backfill, permanent
+# content loss that looked like a successful index.
+# --------------------------------------------------------------------------
+
+
+class _EmptyDescribeOCR:
+    """Outage-shaped provider: describe() exhausts retries and returns ''."""
+
+    def extract(self, file_path, page=None):
+        return ""
+
+    def describe(self, file_path):
+        return ""
+
+
+def _make_png(tmp_path, rel):
+    from PIL import Image
+
+    root = tmp_path / "docs"
+    f = root / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (600, 800), "white").save(f)
+    return root, f
+
+
+def _run_single_doc(tmp_path, root, f, ocr_provider):
+    cfg = _fs_config(root, tmp_path / "index")
+    store = MagicMock()
+    store.list_doc_mtimes.return_value = {}
+    store.list_doc_change_hashes.return_value = {}
+    embed = MagicMock()
+    embed.embed_texts.side_effect = lambda texts: [[0.1, 0.2, 0.3] for _ in texts]
+
+    with patch("flow_index_vault.load_config", return_value=cfg), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=store), \
+         patch("flow_index_vault.build_embed_provider", return_value=embed), \
+         patch("flow_index_vault.build_ocr_provider", return_value=ocr_provider), \
+         patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("flow_index_vault.dispatch_event", create=True, return_value=[]):
+        result = fiv.index_document_flow(target=str(f), source_name="documents")
+    return result, store
+
+
+def _ledger(tmp_path, name):
+    import json
+
+    path = tmp_path / "index" / name
+    if not path.exists():
+        return {"docs": {}}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_index_document_flow_stub_indexed_image_lands_in_degraded_ledger(tmp_path):
+    """An image whose describe() came back empty during an outage still indexes
+    (metadata-only stub is better than nothing) but MUST land in degraded_docs.json
+    so the retry machinery re-describes it after provider recovery.
+
+    Post-fallback architecture: production ALWAYS wraps the describe provider
+    (build_ocr_provider), so this test injects the wrapped shape. With no reachable
+    fallback (dark), the wrapper raises transient for the unconfirmed empty — the
+    stub lands as a *transient* ocr_describe_failed: retried every run and, per
+    #0251, never burning the attempt cap."""
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    root, f = _make_png(tmp_path, "quo-attachments/photo@00img@.png")
+
+    # Match production: the describe provider is always wrapped. No fallback endpoint
+    # (dark) => an unconfirmed empty is a transient degradation, not a silent clean stub.
+    wrapped = FallbackOCRProvider(_EmptyDescribeOCR(), describe_fallback=None)
+    result, store = _run_single_doc(tmp_path, root, f, wrapped)
+
+    assert result["status"] == "indexed"
+    store.upsert_nodes.assert_called_once()  # the stub WAS indexed…
+    entry = _ledger(tmp_path, "degraded_docs.json")["docs"].get("documents::00img")
+    assert entry is not None, (
+        "stub-indexed doc has no degraded-ledger entry — nothing will retry it"
+    )
+    assert "ocr_describe_failed" in entry["reasons"]
+    assert entry.get("attempts", 0) == 0  # transient outage must not burn the cap (#0251)
+
+
+def test_index_document_flow_describe_failure_lands_in_degraded_ledger(tmp_path):
+    """Outage shape #2: describe() raising (host down) must also be persisted
+    by the targeted path, not just noted into a dropped thread-local."""
+
+    class BoomOCR:
+        def extract(self, file_path, page=None):
+            return ""
+
+        def describe(self, file_path):
+            raise ConnectionError("vision host down")
+
+    root, f = _make_png(tmp_path, "quo-attachments/photo@00imh@.png")
+
+    result, _ = _run_single_doc(tmp_path, root, f, BoomOCR())
+
+    assert result["status"] == "indexed"
+    entry = _ledger(tmp_path, "degraded_docs.json")["docs"].get("documents::00imh")
+    assert entry is not None
+    assert "ocr_describe_failed" in entry["reasons"]
+
+
+def test_index_document_flow_clean_run_clears_ledger_entries(tmp_path):
+    """Self-heal parity with the full flow: a clean targeted re-index drops the
+    doc from both ledgers."""
+    import json
+
+    root, f = _make_png(tmp_path, "quo-attachments/photo@00imi@.png")
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True)
+    (index_root / "degraded_docs.json").write_text(json.dumps(
+        {"docs": {"documents::00imi": {"reasons": ["ocr_describe_empty"], "attempts": 1}}}
+    ))
+
+    class GoodOCR:
+        def extract(self, file_path, page=None):
+            return ""
+
+        def describe(self, file_path):
+            return "A photo of a leaking kitchen faucet, water pooling under the sink."
+
+    result, _ = _run_single_doc(tmp_path, root, f, GoodOCR())
+
+    assert result["status"] == "indexed"
+    assert "documents::00imi" not in _ledger(tmp_path, "degraded_docs.json")["docs"]
+
+
+def test_index_document_flow_skip_outcome_lands_in_skip_ledger(tmp_path):
+    """Permanent skip decisions (corrupt source) on the targeted path must land
+    in the skip ledger, same as the full flow."""
+    root, f = _make_attachment(
+        tmp_path, "email-attachments/broken@00bad@.pdf", data=b"not a real pdf"
+    )
+
+    result, _ = _run_single_doc(tmp_path, root, f, None)
+
+    entry = _ledger(tmp_path, "skip_docs.json")["docs"].get("documents::00bad")
+    assert entry is not None
+    assert "pdf_unreadable" in entry["reasons"]
+
+
 def test_index_document_flow_missing_file_returns_error(tmp_path):
     root, _ = _make_attachment(tmp_path, "email-attachments/real.pdf")
     cfg = _fs_config(root, tmp_path / "index")
@@ -259,3 +408,27 @@ def test_index_document_flow_missing_file_returns_error(tmp_path):
     assert result["status"] == "error"
     assert result["reason"] == "not_found"
     proc.fn.assert_not_called()
+
+
+def test_index_document_flow_confirmed_blank_clears_ledger_entry(tmp_path):
+    """A fallback-CONFIRMED blank (primary empty + fallback ALSO empty) is clean:
+    it indexes the metadata stub and DROPS any prior degraded-ledger entry (parity
+    with a recovered/clean run via the clean_now path), so a genuinely blank image
+    stops being retried instead of churning forever."""
+    import json
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    root, f = _make_png(tmp_path, "quo-attachments/photo@00imk@.png")
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True)
+    (index_root / "degraded_docs.json").write_text(json.dumps(
+        {"docs": {"documents::00imk": {"reasons": ["ocr_describe_failed"], "attempts": 0}}}
+    ))
+
+    # primary empty + fallback returns "" -> two independent models agree: blank.
+    wrapped = FallbackOCRProvider(_EmptyDescribeOCR(), describe_fallback=lambda p: "")
+    result, store = _run_single_doc(tmp_path, root, f, wrapped)
+
+    assert result["status"] == "indexed"
+    store.upsert_nodes.assert_called_once()  # stub still indexed
+    assert "documents::00imk" not in _ledger(tmp_path, "degraded_docs.json")["docs"]

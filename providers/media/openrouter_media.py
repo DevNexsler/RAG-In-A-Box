@@ -10,6 +10,8 @@ from pathlib import Path
 
 import httpx
 
+from core.resilience import TransientError
+
 logger = logging.getLogger(__name__)
 
 _AUDIO_TRANSCRIBE_PROMPT = (
@@ -118,7 +120,7 @@ class OpenRouterMediaProvider:
                 last_exc = exc
                 logger.warning("OpenRouter audio model failed (%s): %s", model, exc)
 
-        raise RuntimeError("All OpenRouter audio models failed") from last_exc
+        raise TransientError("All OpenRouter audio models failed") from last_exc
 
     def analyze_video(self, file_path: str | Path) -> str:
         """Analyze a local video file using a base64 data URL."""
