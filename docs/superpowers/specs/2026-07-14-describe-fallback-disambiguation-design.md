@@ -48,10 +48,10 @@ transient-flag heuristic that the fallback would discard, the fallback design *i
 
 1. **Purpose = recover + classify.** A successful fallback describe is indexed as the
    doc's real content (not a throwaway probe) *and* marks the primary failure transient.
-2. **Provider = per-modality LiteLLM endpoints** (image, OCR-extract, video), configured
-   with placeholder URLs (`${LITELLM_IMAGE_URL}`, `${LITELLM_OCR_URL}`,
-   `${LITELLM_VIDEO_URL}`) the operator wires later. Built via the existing
-   `build_ocr_provider` factory.
+2. **Provider = per-modality LiteLLM endpoints.** In scope for this spec: image
+   (`${LITELLM_IMAGE_URL}`) and OCR-extract (`${LITELLM_OCR_URL}`), built via the existing
+   `build_ocr_provider` factory. Video (`${LITELLM_VIDEO_URL}`) is documented as intent but
+   wired in the media follow-on (see "Media path"). Operator supplies the URLs later.
 3. **Trigger = reachable-but-empty ONLY.** If the primary is unreachable
    (connect-refused / in cooldown), skip the fallback entirely → mark transient → retry
    later. A whole-host outage (#0263) costs **$0** in fallback calls.
