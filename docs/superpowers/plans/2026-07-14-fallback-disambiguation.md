@@ -614,7 +614,7 @@ Then in `build_ocr_provider`, after computing `extract_prov`/`describe_prov` (an
                                      or ocr_cfg.get("extract", {}).get("fallback"),
                                      _EXTRACT_PROMPT)
 
-    primary = _compose_primary(extract_prov, describe_prov, default)
+    primary = _compose_primary(extract_prov, describe_prov)
     if primary is None:
         return None
     return FallbackOCRProvider(primary,
@@ -623,7 +623,7 @@ Then in `build_ocr_provider`, after computing `extract_prov`/`describe_prov` (an
 ```
 
 Refactor the existing compose logic (providers/ocr/__init__.py:49-81) into a small
-`_compose_primary(extract_prov, describe_prov, default)` helper that returns the bare primary
+`_compose_primary(extract_prov, describe_prov)` helper that returns the bare primary
 `OCRProvider`, preserving today's exact cases:
 - `extract_prov is None and describe_prov is None` → return `None` (caller returns unwrapped `None`; nothing to wrap).
 - `extract_prov is describe_prov` → return that single provider.
