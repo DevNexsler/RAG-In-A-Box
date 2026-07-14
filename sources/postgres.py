@@ -16,6 +16,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from sources.base import SourceRecord
+from sources.text_normalization import build_text_normalizer
 from extractors import ExtractionResult
 
 
@@ -51,6 +52,8 @@ class TableSpec:
     Reserved keys (do not include):
         _text  — overwritten internally with the cached text column value
     """
+    text_normalizer: str | None = None
+    """Optional named normalizer applied before hashing and extraction."""
 
 
 # Satisfies the Source protocol from sources.base structurally — no explicit
@@ -94,6 +97,7 @@ class PostgresSource:
     def scan(self) -> Iterator[SourceRecord]:
         conn = self._get_conn()
         for spec in self._tables:
+            text_normalizer = build_text_normalizer(spec.text_normalizer, conn)
             # Server-side cursor for streaming; named cursors stream in
             # batches of itersize rather than fetching everything.
             with conn.cursor(name=f"scan_{self.name}_{spec.source_type}") as cur:
@@ -102,6 +106,13 @@ class PostgresSource:
                 for row in cur:
                     doc_id = spec.id_template.format(**row)
                     text = row.get(spec.text_column) or ""
+                    change_hash_salt = ""
+                    if text_normalizer is not None:
+                        normalized = text_normalizer.normalize(text, row)
+                        if not normalized.should_index:
+                            continue
+                        text = normalized.text
+                        change_hash_salt = normalized.change_hash_salt
                     mtime_val = row[spec.mtime_column]
                     mtime = mtime_val.timestamp() if mtime_val else 0.0
                     metadata = {c: row[c] for c in spec.metadata_columns if c in row}
@@ -110,8 +121,11 @@ class PostgresSource:
                     # already in hand, so hashing is free. The indexer compares
                     # this instead of mtime, so an upstream job bumping
                     # updated_at without changing the body never re-indexes.
+                    hash_input = text
+                    if change_hash_salt:
+                        hash_input = f"{change_hash_salt}\0{text}"
                     change_hash = hashlib.blake2b(
-                        text.encode("utf-8"), digest_size=16
+                        hash_input.encode("utf-8"), digest_size=16
                     ).hexdigest()
                     yield SourceRecord(
                         doc_id=doc_id,

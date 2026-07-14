@@ -15,6 +15,18 @@ CREATE TABLE messages (
     updated_at        timestamptz NOT NULL
 );
 
+CREATE TABLE participants (
+    source          text NOT NULL,
+    participant_key text NOT NULL,
+    display_name    text,
+    PRIMARY KEY (source, participant_key)
+);
+
+INSERT INTO participants (source, participant_key, display_name)
+VALUES
+    ('zoho_cliq', '720844989', 'Dan Park'),
+    ('zoho_cliq', '918334727', 'Nigel Pine');
+
 -- 5 deterministic fixture rows: fixed timestamps, distinct senders/directions,
 -- distinctive searchable words in each body.
 INSERT INTO messages
