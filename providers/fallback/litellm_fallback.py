@@ -28,8 +28,25 @@ def image_encoder(path: Path, prompt: str) -> list:
          "image_url": {"url": f"data:image/{suffix};base64,{b64}"}},
     ]
 
-# audio_encoder / video_encoder are added in Task 8's follow-up step (input_audio /
-# frame content); the client shape below is identical for all three.
+def audio_encoder(path: Path, prompt: str) -> list:
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    fmt = path.suffix.lstrip(".") or "mp3"
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}},
+    ]
+
+
+def video_encoder(path: Path, prompt: str) -> list:
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    fmt = path.suffix.lstrip(".") or "mp4"
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "video_url",
+         "video_url": {"url": f"data:video/{fmt};base64,{b64}"}},
+    ]
+
+# The client shape below is identical for all three modalities.
 
 
 class LiteLLMFallback:
