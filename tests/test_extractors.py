@@ -353,6 +353,113 @@ def test_extract_image_no_ocr():
     assert result.full_text == ""
 
 
+def test_extract_image_empty_describe_notes_degradation():
+    """describe() can exhaust its empty-retries and return "" WITHOUT raising
+    (starved provider, reasoning-eaten budget). That is the same content loss
+    as a failed describe — it must note a degradation so the metadata-only
+    stub lands in the degraded ledger and is retried, instead of indexing as
+    clean and never being re-described (#0264)."""
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+
+    class EmptyOCR(OCRProvider):
+        def extract(self, file_path, page=None):
+            return ""
+
+        def describe(self, file_path):
+            return "  \n"  # whitespace-only counts as empty
+
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=EmptyOCR())
+    assert "ocr_describe_empty" in collect_degradations()
+
+
+def test_extract_image_failed_describe_notes_single_reason():
+    """The exception path keeps its existing reason and does not also note
+    ocr_describe_empty for the same loss."""
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+
+    class BoomOCR(OCRProvider):
+        def extract(self, file_path, page=None):
+            return ""
+
+        def describe(self, file_path):
+            raise ConnectionError("vision host down")
+
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=BoomOCR())
+    assert collect_degradations() == ["ocr_describe_failed"]
+
+
+def test_extract_image_good_describe_notes_nothing():
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+
+    class GoodOCR(OCRProvider):
+        def extract(self, file_path, page=None):
+            return "A receipt for $50"
+
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=GoodOCR())
+    assert collect_degradations() == []
+
+
+# --- Audio/video extraction degradations ---
+# Same rule as images (#0264): a configured provider that fails or produces no
+# content must note a degradation, so the doc rides the degraded-ledger retry
+# lane instead of being silently parked as "no text extracted".
+
+
+class _FakeMedia:
+    def __init__(self, transcript="", notes="", boom=False):
+        self._transcript = transcript
+        self._notes = notes
+        self._boom = boom
+
+    def transcribe_audio(self, file_path):
+        if self._boom:
+            raise ConnectionError("media host down")
+        return self._transcript
+
+    def analyze_video(self, file_path):
+        if self._boom:
+            raise ConnectionError("media host down")
+        return self._notes
+
+
+def test_extract_audio_provider_failure_notes_degradation():
+    from extractors import begin_degradation_capture, collect_degradations, extract_audio
+
+    begin_degradation_capture()
+    extract_audio("/fake/voicemail.mp3", media_provider=_FakeMedia(boom=True))
+    assert "audio_extract_failed" in collect_degradations()
+
+
+def test_extract_audio_empty_transcript_notes_degradation():
+    from extractors import begin_degradation_capture, collect_degradations, extract_audio
+
+    begin_degradation_capture()
+    extract_audio("/fake/voicemail.mp3", media_provider=_FakeMedia(transcript=" "))
+    assert "audio_transcript_empty" in collect_degradations()
+
+
+def test_extract_audio_good_transcript_notes_nothing():
+    from extractors import begin_degradation_capture, collect_degradations, extract_audio
+
+    begin_degradation_capture()
+    extract_audio("/fake/voicemail.mp3", media_provider=_FakeMedia(transcript="hello"))
+    assert collect_degradations() == []
+
+
+def test_extract_video_empty_analysis_notes_degradation():
+    from extractors import begin_degradation_capture, collect_degradations, extract_video
+
+    begin_degradation_capture()
+    extract_video("/fake/clip.mp4", media_provider=_FakeMedia(notes=""))
+    assert "video_analysis_empty" in collect_degradations()
+
+
 # --- Dispatcher ---
 
 

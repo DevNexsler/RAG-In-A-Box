@@ -522,6 +522,14 @@ def extract_image(
         logger.warning("OCR describe failed for %s: %s", file_path, e)
         note_degradation("ocr_describe_failed", transient=is_transient(e))
         vision_text = ""
+    else:
+        if not vision_text.strip():
+            # describe() can exhaust its empty-retries and return "" without
+            # raising (starved provider, reasoning-eaten budget). Same content
+            # loss as a failed describe: without a degradation note the
+            # metadata-only stub indexes as clean and is never re-described.
+            logger.warning("OCR describe returned empty for %s", file_path)
+            note_degradation("ocr_describe_empty")
     header = _format_image_metadata_header(meta)
     parts = [p for p in [header, vision_text] if p.strip()]
     full_text = "\n\n".join(parts)
@@ -557,7 +565,11 @@ def extract_audio(
         transcript = media_provider.transcribe_audio(file_path)
     except Exception as e:
         logger.warning("Audio extraction failed for %s: %s", file_path, e)
+        note_degradation("audio_extract_failed")
         transcript = ""
+    else:
+        if not transcript.strip():
+            note_degradation("audio_transcript_empty")
     return ExtractionResult.from_text(transcript, frontmatter=fm)
 
 
@@ -579,6 +591,11 @@ def extract_video(
         # a fresh change_hash and is re-evaluated.
         note_skip("video_extract_failed")
         notes = ""
+    else:
+        if not notes.strip():
+            # Provider responded but produced nothing — transient (LLM empty
+            # output), unlike the exception path above which is permanent.
+            note_degradation("video_analysis_empty")
     return ExtractionResult.from_text(notes, frontmatter=fm)
 
 

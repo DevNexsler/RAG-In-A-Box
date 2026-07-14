@@ -2416,6 +2416,48 @@ def _update_index_metadata_after_single_doc(index_root: str | Path, store) -> No
     tmp_path.replace(path)  # atomic: readers never see a partial file
 
 
+def _record_single_doc_outcome(index_root: Path, doc: dict) -> None:
+    """Persist one targeted-index run's degradation/skip outcome to the ledgers.
+
+    The full flow accumulates outcomes across all workers and merges once at
+    the end of the run; the targeted path (REST per-attachment, MCP
+    file_index_document) processes exactly one doc, so it merges immediately.
+    Without this, every note_degradation()/note_skip() from extraction was
+    dropped on this path — an image indexed as a metadata-only stub during a
+    vision outage looked clean: no ledger entry, no retry, no backfill (#0264).
+    Classification mirrors _run_one: skips win over degradations; a clean
+    index drops the doc from both ledgers.
+    """
+    reasons = collect_degradations()
+    skips = collect_skips()
+    doc_id = doc["doc_id"]
+    if skips:
+        skip_ledger = _merge_skip_ledger(
+            _load_skip_ledger(index_root),
+            {doc_id: {"reasons": sorted(set(skips)), "change_key": _change_key(doc)}},
+            set(),
+        )
+        _save_skip_ledger(index_root, skip_ledger)
+    elif reasons:
+        degraded = _merge_degraded_ledger(
+            _load_degraded_ledger(index_root), {doc_id: reasons}, set()
+        )
+        _save_degraded_ledger(index_root, degraded)
+    else:
+        # Indexed cleanly — drop any stale entry, rewriting only ledger files
+        # that actually held one (the common clean path stays write-free).
+        degraded = _load_degraded_ledger(index_root)
+        if doc_id in degraded.get("docs", {}):
+            _save_degraded_ledger(
+                index_root, _merge_degraded_ledger(degraded, {}, {doc_id})
+            )
+        skip_ledger = _load_skip_ledger(index_root)
+        if doc_id in skip_ledger.get("docs", {}):
+            _save_skip_ledger(
+                index_root, _merge_skip_ledger(skip_ledger, {}, {doc_id})
+            )
+
+
 def index_document_flow(
     config_path: str = "config.yaml",
     target: str = "",
@@ -2462,7 +2504,9 @@ def index_document_flow(
                 }
 
         _build_single_doc_runtime(config, store, doc_id_store, source_name, record)
+        begin_degradation_capture()
         process_doc_task.fn(record)
+        _record_single_doc_outcome(index_root, record)
         # Signal serving processes to reopen their cached store handle so the
         # doc is searchable immediately. NOTE: the FTS index is deliberately
         # NOT rebuilt here (it is rebuilt once per full sweep), so keyword-
