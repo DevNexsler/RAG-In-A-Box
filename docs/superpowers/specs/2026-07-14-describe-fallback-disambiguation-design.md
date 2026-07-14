@@ -57,43 +57,66 @@ transient-flag heuristic that the fallback would discard, the fallback design *i
    later. A whole-host outage (#0263) costs **$0** in fallback calls.
 4. **Confirmed-blank (both models empty) = accept stub as final / clean.** Index the
    metadata-only stub, drop the doc from the degraded ledger, never re-describe.
+   **"Confirmed" requires a fallback to have actually run and agreed.** An *unconfirmed*
+   empty (no fallback configured, or the fallback was unreachable) is **transient →
+   retry**, never clean — otherwise a single model's silence would silently strand a
+   describable image (the #0264 failure mode).
 5. **Cost guard is structural** — because fallback fires only on reachable-but-empty,
    no counter/budget is required. (A budget backstop was considered and rejected as
    unnecessary given the structural guard.)
+6. **The describe path is ALWAYS wrapped** (degenerate wrapper when no fallback is
+   configured) so the wrapper is the single describe-outcome classifier in every
+   deployment state, including dark mode.
 
 ## Architecture (Approach A: wrapper provider)
 
 A new `FallbackOCRProvider` (`providers/ocr/fallback.py`) implements `OCRProvider`,
-wrapping `{primary, fallback}`. It composes with the existing factory and
-`CompositeOCRProvider`; one instance per modality, each pointed at its LiteLLM endpoint.
+wrapping `{primary, fallback}` where `fallback` may be `None` (degenerate/dark mode).
+It composes with the existing factory and `CompositeOCRProvider`. `build_ocr_provider`
+**always** wraps the describe provider in a `FallbackOCRProvider` (fallback `None` unless
+configured), so the wrapper is the sole describe-outcome classifier in every state.
 
 The wrapper **never imports `extractors`** — it communicates outcome purely via
 return/raise, and the existing `extract_image` `except` block (from #60) performs ledger
-classification. Describe-outcome classification thus lives in exactly one place.
+classification. Describe-outcome classification thus lives in exactly one place. This is
+why `extract_image` can safely drop #61's `ocr_describe_empty` note: an unconfirmed empty
+no longer *reaches* `extract_image` as `""` — the wrapper raises transient for it.
 
 ### Decision flow — `FallbackOCRProvider.describe(path)`
+
+The primary's own short empty-retry loop (`_DESCRIBE_EMPTY_RETRIES`) runs first, inside
+`primary.describe()`, so "reachable-but-empty" already means *persistently* empty — this
+reduces false-blank risk from a one-off starved response.
 
 ```
 text = primary.describe(path)          # RAISES a transient error on unreachable/cooldown
   ├─ raises transient  → re-raise                 → extract_image marks transient, NO fallback ($0 in outage)
   ├─ returns non-empty → return text              → primary content, done
-  └─ returns ""        → reachable-but-empty → fallback.describe(path):
-        ├─ raises transient  → re-raise           → marks transient (both down), retry later
-        ├─ returns non-empty → return fallback_text  → RECOVERED: real content indexed, clean
-        └─ returns ""        → return ""           → CONFIRMED BLANK: accept stub, clean
+  └─ returns "" (persistently) → reachable-but-empty:
+        if fallback is None →  RAISE transient     → unconfirmed empty: retry later (dark mode safe)
+        ft = fallback.describe(path):
+          ├─ raises transient  → re-raise          → marks transient (both down), retry later
+          ├─ returns non-empty → return ft         → RECOVERED: real content indexed, clean
+          └─ returns ""        → return ""         → CONFIRMED BLANK: accept stub, clean
 ```
 
-The same wrapper handles `extract()` for the OCR-extract modality and is reused by the
-video-analysis path (its own endpoint). "Similar answer" comparison is intentionally
-NOT implemented for non-empty primary output — the trigger is empty-or-raise only (YAGNI).
+Key invariant: the wrapper returns `""` **only** on fallback-confirmed blank. Every
+*unconfirmed* empty (dark mode or fallback-down) is a transient **raise**, so it retries
+and is never silently dropped.
+
+The same wrapper handles `extract()` for the OCR-extract modality (same `OCRProvider`
+interface, its own endpoint). Video/audio use a **separate** protocol — see "Media path"
+below. "Similar answer" comparison is intentionally NOT implemented for non-empty primary
+output — the trigger is empty-or-raise only (YAGNI).
 
 ### Outcome → ledger mapping (reuses #60, zero new coupling)
 
 | Outcome | Wrapper action | `extract_image` sees | Ledger result |
 |---|---|---|---|
 | Recovered | returns fallback text | non-empty | clean — real content indexed |
-| Confirmed blank | returns `""` | empty | clean — **drops from ledger, never retried** |
-| Transient (primary or fallback down) | raises transient error | `except` → `note_degradation(..., transient=True)` | attempts stay 0, retries next run |
+| Confirmed blank (fallback ran, agreed) | returns `""` | empty | clean — **drops from ledger, never retried** |
+| Unconfirmed empty (dark mode / fallback down) | raises transient error | `except` → `note_degradation(..., transient=True)` | attempts stay 0, **retries next run** |
+| Primary unreachable | raises transient error | `except` → `note_degradation(..., transient=True)` | attempts stay 0, retries next run |
 
 ## Changes to the five PRs
 
@@ -101,10 +124,13 @@ NOT implemented for non-empty primary output — the trigger is empty-or-raise o
   active cooldown **raise** a transient `ProviderUnavailable` error (classified transient
   by `core.resilience.is_transient`) instead of swallowing to `""`. Restores the signal
   the wrapper and #60 depend on. Net effect: #59 becomes smaller.
-- **#61** — **remove** the `extract_image` `ocr_describe_empty` note (superseded: empty now
-  means confirmed-blank → clean). Keep `_record_single_doc_outcome` (single-doc-path
-  ledgering) and `scripts/backfill_unledgered_stub_docs.py`. Re-evaluate the analogous
-  `audio_transcript_empty` / `video_analysis_empty` notes under the same wrapper rule.
+- **#61** — **remove** the `extract_image` `ocr_describe_empty` note. This is safe **only
+  because** the describe path is always wrapped: an unconfirmed empty is raised as
+  transient by the wrapper (retry) and never reaches `extract_image` as `""`; a `""` that
+  does reach `extract_image` is fallback-confirmed blank → clean. Keep
+  `_record_single_doc_outcome` (single-doc-path ledgering) and
+  `scripts/backfill_unledgered_stub_docs.py`. The analogous `audio_transcript_empty` /
+  `video_analysis_empty` notes move to the media wrapper (see "Media path").
 - **#60** — **unchanged.** Its ledger transient semantics are the foundation.
 - **#57, #58** — orthogonal (health probe / Lance storage); unaffected.
 
@@ -120,15 +146,33 @@ ocr:
       provider: litellm
       endpoint: "${LITELLM_IMAGE_URL}"   # placeholder, operator-supplied
   extract:
-    fallback: { provider: litellm, endpoint: "${LITELLM_OCR_URL}" }
-# video-analysis media provider: fallback endpoint "${LITELLM_VIDEO_URL}"
+    fallback: { provider: litellm, endpoint: "${LITELLM_OCR_URL}", model: "..." }
+media:
+  video:
+    fallback: { provider: litellm, endpoint: "${LITELLM_VIDEO_URL}", model: "..." }
 ```
 
-- Fallback subsection **absent** → `build_ocr_provider` returns the bare primary (no
-  wrapper). Feature ships **dark**; behavior is byte-identical to today until endpoints
-  are wired.
+- Fallback subsection **absent** → the describe provider is still wrapped, but with
+  `fallback=None` (degenerate). Feature ships **dark**: no paid fallback calls, and empties
+  retry as transient. This is **not** byte-identical to today's `main` — it is the intended
+  #0251/#0264 fix (empties no longer cap or silently drop); it *is* identical in that no
+  external/paid provider is contacted until an endpoint is configured.
 - A `litellm` OCR-provider adapter is added to the factory (reusing
-  `providers/llm/litellm_llm.py` patterns) so `endpoint`/model resolve per modality.
+  `providers/llm/litellm_llm.py` patterns). `model` is required in the fallback config (no
+  implicit default) so the operator's per-modality endpoint/model are explicit; a missing
+  `model` is a config error surfaced at startup, not a silent default.
+
+### Media path (video / audio)
+
+`extract_video` / `extract_audio` do **not** use `OCRProvider` / `build_ocr_provider` —
+they go through the separate `MediaProvider` protocol (`analyze_video` / `transcribe_audio`
+in `providers/media/base.py`) built by `build_media_provider`. The OCR wrapper cannot wrap
+them. A **sibling** `MediaFallbackProvider` (`providers/media/fallback.py`) implements the
+identical decision flow on the media interface, wired by `build_media_provider` from a
+`media.video.fallback` (and, if enabled, `media.audio.fallback`) subsection. The video
+LiteLLM endpoint placeholder lives here. This keeps the image/OCR fix and the media fix as
+two focused components sharing one decision rule (extract the rule into a small shared
+helper both wrappers call, to avoid divergence).
 
 ## Error handling
 
@@ -140,12 +184,15 @@ ocr:
 
 ## Testing
 
-- `FallbackOCRProvider` unit tests, all four branches:
+- `FallbackOCRProvider` unit tests, all branches:
   - primary-unreachable → raises transient AND **fallback not called** (cost-guard assertion)
   - primary returns text → passthrough, fallback not called
+  - **dark mode (`fallback=None`) + empty → raises transient** (retry, not clean — #0264 guard)
   - reachable-but-empty + fallback text → returns fallback text (recovered)
   - reachable-but-empty + fallback empty → returns `""` (confirmed blank)
   - reachable-but-empty + fallback unreachable → raises transient
+- `MediaFallbackProvider` unit tests mirroring the same branch matrix on
+  `analyze_video` (and `transcribe_audio` if in scope).
 - Integration:
   - resurrected **`test_provider_outage_never_caps_doc`** passes (outage → transient →
     attempts 0)
@@ -161,8 +208,9 @@ ocr:
 1. Build the wrapper + factory wiring + #59/#61 reconciliation on
    `feat/describe-fallback-disambiguation`.
 2. Rebuild the integration branch from the reconciled PRs; `make gate` green.
-3. Ship **dark** (no fallback endpoints configured) — identical to current behavior, but
-   with the #0251 regression fixed via #59 raising transient.
+3. Ship **dark** (no fallback endpoints configured): no paid provider is contacted, and
+   the #0251/#0264 regression is fixed — unconfirmed empties retry as transient (wrapper
+   raise + #59 raising transient on unreachable) instead of capping or silently dropping.
 4. Operator stands up the LiteLLM per-modality endpoints and sets the placeholder URLs.
 5. Only then does the backfill of confirmed-blank / recoverable stubs become meaningful;
    `backfill_unledgered_stub_docs.py` apply stays deferred until after endpoints + a
@@ -173,5 +221,9 @@ ocr:
 - **Non-goal:** "similar answer" comparison for non-empty primary output (only empty/raise
   triggers fallback).
 - **Non-goal:** budget/rate counter (structural guard suffices).
+- **Scope for this spec:** OCR image-describe + OCR-extract (the `OCRProvider` path) and the
+  sibling media `analyze_video` path. Audio (`transcribe_audio`) fallback is designed for
+  but its endpoint may be wired later — confirm during planning whether it's in the first PR.
 - **To confirm during planning:** exact `ProviderUnavailable` type vs re-raising the
-  underlying `httpx.ConnectError`; whether audio gets a fallback endpoint now or later.
+  underlying `httpx.ConnectError` (must satisfy `is_transient`); the shared decision-rule
+  helper's signature used by both the OCR and media wrappers.
