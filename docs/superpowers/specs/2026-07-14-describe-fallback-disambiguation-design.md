@@ -111,17 +111,23 @@ endpoint.
 - **`MediaFallbackProvider`** (`providers/media/fallback.py`) implements `MediaProvider`; its
   `analyze_video()` and `transcribe_audio()` do the same.
 
+Each adapter holds **two** independent `LiteLLMFallback` clients — one per method with its own
+endpoint (OCR: describe vs extract; media: video vs audio), exactly as the config models it.
 Each adapter is a few lines — the logic lives in the shared core. Both factories
 (`build_ocr_provider`, `build_media_provider`) **always** wrap their enrichment provider
-(fallback `None` unless configured). Wrappers **never import `extractors`**; they communicate
-outcome purely via return/raise.
+(each method's fallback `None` unless configured). Wrappers **never import `extractors`**; they
+communicate outcome purely via return/raise.
 
 ### Provider contract (uniform, required of every primary)
 - **Unreachable** (connect refused / cooldown) → **raise** a transient error.
 - **Reachable but empty** → **return `""`**.
 
-`OllamaVisionOCR` (#59) already needs the change from "swallow to `''`" to "raise transient";
-the OpenRouter media primary needs the same contract on its all-fail path.
+`OllamaVisionOCR` (#59) already needs the change from "swallow to `''`" to "raise transient".
+The OpenRouter media primary needs the same only for **`transcribe_audio`**: its all-fail path
+raises `RuntimeError("All OpenRouter audio models failed")`, and `is_transient(RuntimeError)`
+is **False** — so that site must raise a `TransientError` (or re-raise the chained underlying
+`httpx` error) instead. `analyze_video` and `deepseek_ocr2` already honor the contract
+(raise `httpx.ConnectError` on unreachable, return `""` on empty) and are unchanged.
 
 ## Outcome → ledger mapping (uniform across all callers)
 
@@ -223,7 +229,14 @@ media:
 2. Rebuild the integration branch from the reconciled PRs; `make gate` green.
 3. Ship **dark** (no fallback endpoints set): no paid provider contacted; #0251/#0264
    regression fixed (unconfirmed empties retry as transient everywhere).
-4. Operator stands up the four LiteLLM endpoints and sets the URLs/models.
+   **Operator-visible cost of dark mode:** because no fallback can *confirm* blank, every
+   empty result across all four modalities — including genuine blanks (blank scan pages,
+   silent/short audio, textless images) — is retried every run. This deliberately trades the
+   #0251 *capping* failure for *re-processing* of true-blanks until endpoints are wired. Given
+   the standing "silent re-processing is why indexing never catches up" concern, keep step 4
+   close behind the dark ship; only a configured fallback lets true-blanks settle to clean.
+4. Operator stands up the four LiteLLM endpoints and sets the URLs/models (do this promptly
+   after the dark ship to stop true-blank re-processing).
 5. Only then does the backfill of confirmed-blank / recoverable stubs become meaningful;
    `backfill_unledgered_stub_docs.py` apply stays deferred until endpoints + a healthy primary
    (per #0264 sequencing).
