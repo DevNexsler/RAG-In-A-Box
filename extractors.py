@@ -522,14 +522,6 @@ def extract_image(
         logger.warning("OCR describe failed for %s: %s", file_path, e)
         note_degradation("ocr_describe_failed", transient=is_transient(e))
         vision_text = ""
-    else:
-        if not vision_text.strip():
-            # describe() can exhaust its empty-retries and return "" without
-            # raising (starved provider, reasoning-eaten budget). Same content
-            # loss as a failed describe: without a degradation note the
-            # metadata-only stub indexes as clean and is never re-described.
-            logger.warning("OCR describe returned empty for %s", file_path)
-            note_degradation("ocr_describe_empty")
     header = _format_image_metadata_header(meta)
     parts = [p for p in [header, vision_text] if p.strip()]
     full_text = "\n\n".join(parts)

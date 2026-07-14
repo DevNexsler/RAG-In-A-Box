@@ -353,43 +353,35 @@ def test_extract_image_no_ocr():
     assert result.full_text == ""
 
 
-def test_extract_image_empty_describe_notes_degradation():
-    """describe() can exhaust its empty-retries and return "" WITHOUT raising
-    (starved provider, reasoning-eaten budget). That is the same content loss
-    as a failed describe — it must note a degradation so the metadata-only
-    stub lands in the degraded ledger and is retried, instead of indexing as
-    clean and never being re-described (#0264)."""
-    from extractors import begin_degradation_capture, collect_degradations, extract_image
-    from providers.ocr.base import OCRProvider
-
-    class EmptyOCR(OCRProvider):
-        def extract(self, file_path, page=None):
-            return ""
-
-        def describe(self, file_path):
-            return "  \n"  # whitespace-only counts as empty
-
-    begin_degradation_capture()
-    extract_image("/fake/path.png", ocr_provider=EmptyOCR())
-    assert "ocr_describe_empty" in collect_degradations()
-
-
-def test_extract_image_failed_describe_notes_single_reason():
-    """The exception path keeps its existing reason and does not also note
-    ocr_describe_empty for the same loss."""
+def test_extract_image_failed_describe_notes_transient_reason():
     from extractors import begin_degradation_capture, collect_degradations, extract_image
     from providers.ocr.base import OCRProvider
 
     class BoomOCR(OCRProvider):
-        def extract(self, file_path, page=None):
-            return ""
-
-        def describe(self, file_path):
-            raise ConnectionError("vision host down")
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): raise ConnectionError("vision host down")
 
     begin_degradation_capture()
     extract_image("/fake/path.png", ocr_provider=BoomOCR())
-    assert collect_degradations() == ["ocr_describe_failed"]
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["ocr_describe_failed"]
+    assert degs[0].transient is True  # ConnectionError is transient
+
+
+def test_extract_image_confirmed_blank_returns_no_degradation():
+    # The describe provider is always wrapped: it returns "" ONLY for a
+    # fallback-confirmed blank. extract_image must treat that as clean (no
+    # degradation note) so the doc drops from the ledger and is never re-described.
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+
+    class BlankOCR(OCRProvider):
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): return ""
+
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=BlankOCR())
+    assert collect_degradations() == []
 
 
 def test_extract_image_good_describe_notes_nothing():
