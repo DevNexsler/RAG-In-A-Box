@@ -21,7 +21,7 @@ try:
 except ImportError:
     pass
 
-from extractors import begin_degradation_capture, collect_degradations
+from extractors import begin_degradation_capture, collect_degradations, extract_image
 from providers.ocr.deepseek_ocr2_local import DeepSeekOCR2Local
 
 
@@ -274,6 +274,56 @@ class TestDeepSeekOCR2Unit:
         # FallbackOCRProvider stringifies the path before delegating to the primary.
         describe_call.assert_called_once_with(str(img))
         backup_call.assert_called_once_with(str(img))
+
+    def test_split_provider_cooldown_preserves_ocr_output_without_degradation(self, tmp_path):
+        """A failed dedicated describe call and its cooldown both use extract describe."""
+        from PIL import Image as _Img
+
+        from providers.ocr import build_ocr_provider
+        from providers.ocr.composite import CompositeOCRProvider
+        from providers.ocr.fallback import FallbackOCRProvider
+        from providers.ocr.ollama_vision import OllamaVisionOCR
+
+        img = tmp_path / "photo.png"
+        _Img.new("RGB", (8, 8), "white").save(str(img))
+        provider = build_ocr_provider(
+            {
+                "ocr": {
+                    "enabled": True,
+                    "provider": "deepseek_ocr2",
+                    "base_url": "http://deepseek:8790",
+                    "describe": {
+                        "provider": "ollama_vision",
+                        "base_url": "http://ollama:11434",
+                    },
+                }
+            }
+        )
+
+        assert isinstance(provider, FallbackOCRProvider)
+        composite = provider._primary
+        assert isinstance(composite, CompositeOCRProvider)
+        assert isinstance(composite._describe, OllamaVisionOCR)
+
+        begin_degradation_capture()
+        with patch.object(
+            composite._describe,
+            "_call",
+            side_effect=httpx.ConnectError("vision down"),
+        ) as vision_call:
+            with patch.object(
+                composite._extract,
+                "describe",
+                return_value="deepseek backup description",
+            ) as backup_call:
+                first = extract_image(img, provider)
+                second = extract_image(img, provider)
+
+        assert "deepseek backup description" in first.full_text
+        assert "deepseek backup description" in second.full_text
+        assert collect_degradations() == []
+        vision_call.assert_called_once()
+        assert backup_call.call_count == 2
 
 
 class TestOllamaVisionBudget:
