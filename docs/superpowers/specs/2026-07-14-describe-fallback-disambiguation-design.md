@@ -129,8 +129,9 @@ output — the trigger is empty-or-raise only (YAGNI).
   transient by the wrapper (retry) and never reaches `extract_image` as `""`; a `""` that
   does reach `extract_image` is fallback-confirmed blank → clean. Keep
   `_record_single_doc_outcome` (single-doc-path ledgering) and
-  `scripts/backfill_unledgered_stub_docs.py`. The analogous `audio_transcript_empty` /
-  `video_analysis_empty` notes move to the media wrapper (see "Media path").
+  `scripts/backfill_unledgered_stub_docs.py`. #61's analogous `audio_transcript_empty` /
+  `video_analysis_empty` notes are left **as-is** here and reconciled in the media follow-on
+  (they are not on the image-describe path this spec fixes).
 - **#60** — **unchanged.** Its ledger transient semantics are the foundation.
 - **#57, #58** — orthogonal (health probe / Lance storage); unaffected.
 
@@ -147,9 +148,7 @@ ocr:
       endpoint: "${LITELLM_IMAGE_URL}"   # placeholder, operator-supplied
   extract:
     fallback: { provider: litellm, endpoint: "${LITELLM_OCR_URL}", model: "..." }
-media:
-  video:
-    fallback: { provider: litellm, endpoint: "${LITELLM_VIDEO_URL}", model: "..." }
+# media.video.fallback (endpoint "${LITELLM_VIDEO_URL}") — follow-on spec, see "Media path"
 ```
 
 - Fallback subsection **absent** → the describe provider is still wrapped, but with
@@ -162,17 +161,30 @@ media:
   implicit default) so the operator's per-modality endpoint/model are explicit; a missing
   `model` is a config error surfaced at startup, not a silent default.
 
-### Media path (video / audio)
+### Media path (video / audio) — deferred to a follow-on spec
 
 `extract_video` / `extract_audio` do **not** use `OCRProvider` / `build_ocr_provider` —
 they go through the separate `MediaProvider` protocol (`analyze_video` / `transcribe_audio`
 in `providers/media/base.py`) built by `build_media_provider`. The OCR wrapper cannot wrap
-them. A **sibling** `MediaFallbackProvider` (`providers/media/fallback.py`) implements the
-identical decision flow on the media interface, wired by `build_media_provider` from a
-`media.video.fallback` (and, if enabled, `media.audio.fallback`) subsection. The video
-LiteLLM endpoint placeholder lives here. This keeps the image/OCR fix and the media fix as
-two focused components sharing one decision rule (extract the rule into a small shared
-helper both wrappers call, to avoid divergence).
+them, and — critically — the media *callers* classify degradations differently from
+`extract_image`, so the "reuses #60, zero coupling" property below does **not** transfer:
+
+- `extract_video`'s except calls `note_skip("video_extract_failed")` — a **permanent** skip
+  (never retried), not a transient degradation.
+- `extract_audio`'s except calls `note_degradation(...)` with the default `transient=False`.
+
+A media fallback that raises transient would therefore be mis-ledgered (permanent skip for
+video; non-transient for audio) — the opposite of the intended retry. Making media correct
+requires its own caller-side edits (classify via `is_transient` in `extract_video` /
+`extract_audio`, relocate the empty notes) **plus** a new LiteLLM `MediaProvider` adapter
+(`build_media_provider` currently only accepts `provider: openrouter`).
+
+Because that is a distinct subsystem with its own ledger reconciliation — and the #0251 /
+#0264 regression that blocks the PR cluster is entirely on the image-describe path — the
+media (video/audio) fallback is **deferred to a named follow-on spec**
+(`media-fallback-disambiguation`) that reuses the same decision rule (extracted into a
+shared helper) but specifies the media caller edits explicitly. The `${LITELLM_VIDEO_URL}`
+placeholder is documented here as intent; its wiring lands in that spec.
 
 ## Error handling
 
@@ -191,8 +203,7 @@ helper both wrappers call, to avoid divergence).
   - reachable-but-empty + fallback text → returns fallback text (recovered)
   - reachable-but-empty + fallback empty → returns `""` (confirmed blank)
   - reachable-but-empty + fallback unreachable → raises transient
-- `MediaFallbackProvider` unit tests mirroring the same branch matrix on
-  `analyze_video` (and `transcribe_audio` if in scope).
+- (Media wrapper tests belong to the follow-on media-fallback spec.)
 - Integration:
   - resurrected **`test_provider_outage_never_caps_doc`** passes (outage → transient →
     attempts 0)
@@ -221,9 +232,11 @@ helper both wrappers call, to avoid divergence).
 - **Non-goal:** "similar answer" comparison for non-empty primary output (only empty/raise
   triggers fallback).
 - **Non-goal:** budget/rate counter (structural guard suffices).
-- **Scope for this spec:** OCR image-describe + OCR-extract (the `OCRProvider` path) and the
-  sibling media `analyze_video` path. Audio (`transcribe_audio`) fallback is designed for
-  but its endpoint may be wired later — confirm during planning whether it's in the first PR.
+- **Scope for this spec:** OCR image-describe + OCR-extract (the `OCRProvider` path) only.
+  Video/audio (`MediaProvider` path) are **deferred to the `media-fallback-disambiguation`
+  follow-on** (different protocol + ledger classification + a new media adapter — see
+  "Media path"). This keeps the spec to a single focused plan and fixes the actual
+  regression fastest.
 - **To confirm during planning:** exact `ProviderUnavailable` type vs re-raising the
   underlying `httpx.ConnectError` (must satisfy `is_transient`); the shared decision-rule
-  helper's signature used by both the OCR and media wrappers.
+  helper's signature (so the follow-on media wrapper can reuse it).
