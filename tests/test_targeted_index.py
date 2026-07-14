@@ -307,12 +307,23 @@ def _ledger(tmp_path, name):
 
 
 def test_index_document_flow_stub_indexed_image_lands_in_degraded_ledger(tmp_path):
-    """An image whose describe() came back empty still indexes (metadata-only
-    stub is better than nothing) but MUST land in degraded_docs.json so the
-    retry machinery re-describes it after provider recovery."""
+    """An image whose describe() came back empty during an outage still indexes
+    (metadata-only stub is better than nothing) but MUST land in degraded_docs.json
+    so the retry machinery re-describes it after provider recovery.
+
+    Post-fallback architecture: production ALWAYS wraps the describe provider
+    (build_ocr_provider), so this test injects the wrapped shape. With no reachable
+    fallback (dark), the wrapper raises transient for the unconfirmed empty — the
+    stub lands as a *transient* ocr_describe_failed: retried every run and, per
+    #0251, never burning the attempt cap."""
+    from providers.ocr.fallback import FallbackOCRProvider
+
     root, f = _make_png(tmp_path, "quo-attachments/photo@00img@.png")
 
-    result, store = _run_single_doc(tmp_path, root, f, _EmptyDescribeOCR())
+    # Match production: the describe provider is always wrapped. No fallback endpoint
+    # (dark) => an unconfirmed empty is a transient degradation, not a silent clean stub.
+    wrapped = FallbackOCRProvider(_EmptyDescribeOCR(), describe_fallback=None)
+    result, store = _run_single_doc(tmp_path, root, f, wrapped)
 
     assert result["status"] == "indexed"
     store.upsert_nodes.assert_called_once()  # the stub WAS indexed…
@@ -320,7 +331,8 @@ def test_index_document_flow_stub_indexed_image_lands_in_degraded_ledger(tmp_pat
     assert entry is not None, (
         "stub-indexed doc has no degraded-ledger entry — nothing will retry it"
     )
-    assert "ocr_describe_empty" in entry["reasons"]
+    assert "ocr_describe_failed" in entry["reasons"]
+    assert entry.get("attempts", 0) == 0  # transient outage must not burn the cap (#0251)
 
 
 def test_index_document_flow_describe_failure_lands_in_degraded_ledger(tmp_path):
