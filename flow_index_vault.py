@@ -68,6 +68,7 @@ from core.config import load_config
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
+    Degradation,
     begin_degradation_capture,
     collect_degradations,
     collect_skips,
@@ -677,15 +678,68 @@ def _degraded_ledger_path(index_root: Path) -> Path:
     return Path(index_root) / "degraded_docs.json"
 
 
+# v2: `attempts` only counts doc-specific failures; all-transient runs
+# (provider down) accumulate in the observability-only `transient_attempts`.
+_DEGRADED_LEDGER_VERSION = 2
+
+# Failure-reason prefixes produced by the OCR/vision describe pipeline
+# (ocr_describe_failed, ocr_page_failed:N, ocr_describe_empty_backfill,
+# vision_describe_backfill).
+_OCR_VISION_REASON_PREFIXES = ("ocr_", "vision_")
+
+
+def _ledger_version(ledger: dict) -> int:
+    try:
+        return int(ledger.get("version", 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _migrate_degraded_ledger(ledger: dict) -> tuple[dict, int]:
+    """v1 -> v2: reopen capped entries whose failures are all OCR/vision-shaped.
+
+    Under v1 every degraded run charged `attempts`, so a vision-provider outage
+    (connection refused — not a doc problem) burned docs to the cap in ~75min
+    and abandoned them forever (#0251: 66 of 68 ocr_describe_failed docs).
+    Those v1 attempts are ambiguous, so reset them: the doc re-queues, degrades
+    transiently while the provider is still down (attempts stay 0), and heals
+    on the first run after recovery; a doc that genuinely breaks OCR re-caps
+    under v2's stricter counting. v2 caps are all doc-specific and are NOT
+    reopened. Absorbs scripts/reopen_capped_ocr_docs.py into the flow."""
+    reopened = 0
+    if _ledger_version(ledger) >= _DEGRADED_LEDGER_VERSION:
+        return ledger, reopened
+    docs = ledger.get("docs", {})
+    for entry in docs.values():
+        reasons = entry.get("reasons", [])
+        if (
+            int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
+            and reasons
+            and all(str(r).startswith(_OCR_VISION_REASON_PREFIXES) for r in reasons)
+        ):
+            entry["attempts"] = 0
+            reopened += 1
+    return {"version": _DEGRADED_LEDGER_VERSION, "docs": docs}, reopened
+
+
 def _load_degraded_ledger(index_root: Path) -> dict:
     path = _degraded_ledger_path(index_root)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict) and isinstance(payload.get("docs"), dict):
-            return payload
     except (OSError, json.JSONDecodeError):
-        pass
-    return {"docs": {}}
+        payload = None
+    if not (isinstance(payload, dict) and isinstance(payload.get("docs"), dict)):
+        return {"version": _DEGRADED_LEDGER_VERSION, "docs": {}}
+    if _ledger_version(payload) < _DEGRADED_LEDGER_VERSION:
+        payload, reopened = _migrate_degraded_ledger(payload)
+        _save_degraded_ledger(index_root, payload)  # stamp so this runs once
+        if reopened:
+            logging.getLogger(__name__).info(
+                "Degraded ledger migrated to v%d: reopened %d capped "
+                "OCR/vision docs (v1 attempts were outage-ambiguous)",
+                _DEGRADED_LEDGER_VERSION, reopened,
+            )
+    return payload
 
 
 def _save_degraded_ledger(index_root: Path, ledger: dict) -> None:
@@ -727,21 +781,37 @@ def _include_degraded_docs(
 
 def _merge_degraded_ledger(
     ledger: dict,
-    degraded_now: dict[str, list[str]],
+    degraded_now: dict[str, list],
     clean_now: set[str],
 ) -> dict:
-    """Fold one run's outcomes into the ledger: clean docs drop out,
-    degraded docs accumulate attempts."""
+    """Fold one run's outcomes into the ledger: clean docs drop out, degraded
+    docs accumulate attempts — but only doc-specific failures charge the cap.
+    A run degraded solely by transient (provider-down) failures keeps
+    `attempts` untouched and counts in the observability-only
+    `transient_attempts`, so a provider outage of any length can never
+    abandon a doc (#0251); it retries every run and heals on recovery.
+    Bare-string reasons (legacy callers) count as doc-specific."""
     docs = dict(ledger.get("docs", {}))
     for doc_id in clean_now:
         docs.pop(doc_id, None)
-    for doc_id, reasons in degraded_now.items():
+    for doc_id, noted in degraded_now.items():
+        degradations = [
+            d if isinstance(d, Degradation) else Degradation(str(d)) for d in noted
+        ]
         prev = docs.get(doc_id, {})
-        docs[doc_id] = {
-            "reasons": sorted(set(reasons)),
-            "attempts": int(prev.get("attempts", 0)) + 1,
+        entry = {
+            "reasons": sorted({d.reason for d in degradations}),
+            "attempts": int(prev.get("attempts", 0)),
         }
-    return {"docs": docs}
+        transient_attempts = int(prev.get("transient_attempts", 0))
+        if degradations and all(d.transient for d in degradations):
+            transient_attempts += 1
+        else:
+            entry["attempts"] += 1
+        if transient_attempts:
+            entry["transient_attempts"] = transient_attempts
+        docs[doc_id] = entry
+    return {"version": _DEGRADED_LEDGER_VERSION, "docs": docs}
 
 
 # --- Skip ledger: docs intentionally NOT indexed (duplicate, oversized,
@@ -1137,12 +1207,16 @@ def process_doc_task(doc: dict) -> None:
                 _RUNTIME.setdefault("_warnings", []).append(
                     f"enrichment_failed:{doc_id}:{reason}"
                 )
-                note_degradation("enrichment_failed")
+                note_degradation(
+                    "enrichment_failed",
+                    transient=bool(enrichment.get("_enrichment_transient")),
+                )
             elif not enrichment.get("enr_summary"):
                 logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
             if not enrichment_failed:
                 _queue_taxonomy_usage(enrichment, _RUNTIME.get("taxonomy_usage"))
             enrichment.pop("_enrichment_failed", None)
+            enrichment.pop("_enrichment_transient", None)
             doc_meta.update(enrichment)
         else:
             doc_meta.update(empty_enrichment())

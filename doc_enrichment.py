@@ -22,6 +22,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from core.enrichment_postprocess import repair_enrichment
+from core.resilience import is_transient
 from core.tracing import get_tracer
 
 if TYPE_CHECKING:
@@ -281,14 +282,19 @@ def empty_enrichment() -> dict[str, str]:
     return {f: "" for f in ENRICHMENT_FIELDS}
 
 
-def failed_enrichment(reason: str) -> dict[str, str]:
+def failed_enrichment(reason: str, transient: bool = False) -> dict:
     """Return an enrichment dict that signals failure with a reason.
 
-    The caller should check for ``_enrichment_failed`` and remove it
-    before storing in LanceDB.
+    ``transient`` marks provider-level failures (connection refused, timeout,
+    5xx — see core.resilience.is_transient) so the degraded ledger does not
+    charge its attempts cap for an LLM-provider outage (#0251).
+
+    The caller should check for ``_enrichment_failed`` and remove it (and
+    ``_enrichment_transient``) before storing in LanceDB.
     """
     result = empty_enrichment()
     result["_enrichment_failed"] = reason
+    result["_enrichment_transient"] = transient
     return result
 
 
@@ -719,4 +725,6 @@ def enrich_document(
             logger.error(
                 "LLM enrichment failed for '%s': %s: %s", title, type(exc).__name__, exc,
             )
-            return failed_enrichment(f"{type(exc).__name__}: {exc}")
+            return failed_enrichment(
+                f"{type(exc).__name__}: {exc}", transient=is_transient(exc)
+            )

@@ -784,6 +784,15 @@ def _not_extractable_doc_counts(index_root: Path) -> tuple[dict[str, int], str |
 
 def _provider_failure_kind(line: str) -> tuple[str, str, str] | None:
     lower = line.lower()
+    # OCR/vision extraction failures log without an HTTP status ("Connection
+    # refused", wall-deadline timeouts, empty describes), so match their
+    # specific lines before the generic failure-marker gate — otherwise a
+    # vision-provider outage is invisible to index_health (#0251: 21 refused
+    # describes scored provider_failures.total_count=0).
+    if "ocr describe failed" in lower or "vision describe still empty" in lower:
+        return "ocr_vision_describe", "ocr_vision", "describe"
+    if "ocr failed for page" in lower:
+        return "ocr_vision_page", "ocr_vision", "page_ocr"
     status_code = _http_status_from_log_line(line)
     failure_marker = (
         status_code is not None and status_code >= 400
@@ -830,6 +839,12 @@ def _provider_success_kind(line: str) -> tuple[str, str, str] | None:
             return "openrouter_chat", "openrouter", "chat"
     if "deepinfra" in lower or "reranker" in lower:
         return "deepinfra_reranker", "deepinfra", "reranker"
+    # OCR/vision provider endpoints: ollama chat (describe) and deepseek-ocr2
+    # /describe + /extract — a 2xx marks the outage recovered (#0251).
+    if "/api/chat" in lower or "/describe" in lower:
+        return "ocr_vision_describe", "ocr_vision", "describe"
+    if "/extract" in lower:
+        return "ocr_vision_page", "ocr_vision", "page_ocr"
     return None
 
 
