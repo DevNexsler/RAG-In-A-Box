@@ -117,6 +117,30 @@ def test_openrouter_media_provider_falls_back_between_audio_models(tmp_path: Pat
     ]
 
 
+def test_openrouter_media_provider_all_audio_models_fail_is_transient(tmp_path: Path):
+    from core.resilience import is_transient
+    from providers.media.openrouter_media import OpenRouterMediaProvider
+
+    audio = tmp_path / "voice.wav"
+    audio.write_bytes(b"fake-audio")
+
+    def fake_post(*args, **kwargs):
+        raise httpx.ConnectError("connection refused")
+
+    provider = OpenRouterMediaProvider(
+        api_key="sk-test",
+        audio_models=["openai/whisper-1", "mistralai/voxtral-small-24b-2507"],
+        video_model="google/gemini-2.5-flash-lite",
+        max_file_size_mb=1,
+    )
+
+    with patch("providers.media.openrouter_media.httpx.post", side_effect=fake_post):
+        with pytest.raises(RuntimeError) as excinfo:
+            provider.transcribe_audio(audio)
+
+    assert is_transient(excinfo.value) is True
+
+
 def test_openrouter_media_provider_sends_video_data_url(tmp_path: Path):
     from providers.media.openrouter_media import OpenRouterMediaProvider
 
