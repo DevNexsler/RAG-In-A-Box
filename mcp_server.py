@@ -2,6 +2,7 @@
 
 Single service: both querying and indexing via MCP tools. Same config as indexer."""
 
+import asyncio
 import logging
 import os
 import re
@@ -2379,18 +2380,10 @@ if HAS_MCP and FastMCP is not None:
         import functools
         import inspect
 
-        # Loud registration-time guard: this wrapper is sync-only. An async
-        # tool would return an un-awaited coroutine and close its span at ~0ms.
-        assert not inspect.iscoroutinefunction(fn), (
-            "tool span wrapper is sync-only; add an async branch before "
-            "registering async tools"
-        )
-
         tool_name = tool_name or fn.__name__
         sig = inspect.signature(fn)
 
-        @functools.wraps(fn)  # transparent: FastMCP schema generation sees the
-        def wrapper(*args, **kwargs):  # original signature via __wrapped__
+        def _span_attributes(args, kwargs):
             attributes = {"tool": tool_name}
             try:
                 bound = sig.bind_partial(*args, **kwargs)
@@ -2400,8 +2393,25 @@ if HAS_MCP and FastMCP is not None:
                         attributes[arg_name] = value
             except TypeError:
                 pass  # attribute capture must never break a tool call
+            return attributes
+
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)  # transparent: FastMCP schema generation sees the
+            async def async_wrapper(*args, **kwargs):  # original signature via __wrapped__
+                with _mcp_tracer.start_as_current_span(
+                    f"mcp.tool.{tool_name}",
+                    attributes=_span_attributes(args, kwargs),
+                ):
+                    return await fn(*args, **kwargs)
+
+            return async_wrapper
+
+        @functools.wraps(fn)  # transparent: FastMCP schema generation sees the
+        def wrapper(*args, **kwargs):  # original signature via __wrapped__
             with _mcp_tracer.start_as_current_span(
-                f"mcp.tool.{tool_name}", attributes=attributes
+                f"mcp.tool.{tool_name}",
+                attributes=_span_attributes(args, kwargs),
             ):
                 return fn(*args, **kwargs)
 
@@ -3072,7 +3082,7 @@ if HAS_MCP and FastMCP is not None:
         return _file_index_update_impl(source_name=source_name)
 
     @mcp.tool()
-    def file_index_document(
+    async def file_index_document(
         target: str, source_name: str = "documents", force: bool = False
     ) -> dict:
         """Index a SINGLE document immediately, without a full-source scan.
@@ -3101,8 +3111,11 @@ if HAS_MCP and FastMCP is not None:
             - {"status": "error", "reason": "not_found", ...}
             - {"error": true, "code": ..., "message": ...} on failure.
         """
-        return _file_index_document_impl(
-            target=target, source_name=source_name, force=force
+        return await asyncio.to_thread(
+            _file_index_document_impl,
+            target=target,
+            source_name=source_name,
+            force=force,
         )
 
     def run_server(transport: str = "stdio", host: str = "127.0.0.1", port: int = 7788):
