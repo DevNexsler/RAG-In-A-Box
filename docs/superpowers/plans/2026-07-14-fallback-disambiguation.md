@@ -564,10 +564,21 @@ def test_factory_missing_fallback_model_raises():
             "describe": {"fallback": {"provider": "litellm", "endpoint": "http://lite/v1"}}}})
 ```
 
+**ALSO reconcile the two existing factory tests in `tests/test_ocr.py`** that assert a bare
+provider type (they will break once the factory always-wraps). Update them to inspect the
+wrapper's `_primary`:
+
+- `test_build_ocr_provider_deepseek` (~line 148): change
+  `assert isinstance(provider, DeepSeekOCR2Local)` → `assert isinstance(provider, FallbackOCRProvider)`
+  and read the base/timeout off `provider._primary` (e.g. `assert isinstance(provider._primary, DeepSeekOCR2Local)`, `assert provider._primary.base_url == ...`).
+- `test_build_ocr_provider_routes_images_to_ollama_describe` (~line 165): change
+  `assert isinstance(provider, CompositeOCRProvider)` → `assert isinstance(provider, FallbackOCRProvider)`
+  and `assert isinstance(provider._primary, CompositeOCRProvider)`, then inspect `_primary._describe` / `_primary._extract` as before.
+
 - [ ] **Step 2: Run to verify failure**
 
-Run: `.venv/bin/python -m pytest tests/test_fallback_ocr.py -q -k factory`
-Expected: FAIL (factory returns bare provider / no wrap).
+Run: `.venv/bin/python -m pytest tests/test_fallback_ocr.py -q -k factory` and `.venv/bin/python -m pytest tests/test_ocr.py -q -k build_ocr_provider`
+Expected: FAIL (factory returns bare provider / no wrap; the two updated existing tests also red until Step 3).
 
 - [ ] **Step 3: Implement**
 
@@ -603,15 +614,22 @@ Then in `build_ocr_provider`, after computing `extract_prov`/`describe_prov` (an
                                      or ocr_cfg.get("extract", {}).get("fallback"),
                                      _EXTRACT_PROMPT)
 
-    base = default if (extract_prov is None and describe_prov is None) else None
-    # (keep the existing None/compose logic to pick the underlying primary provider)
-    primary = base or _compose_primary(extract_prov, describe_prov, default)
+    primary = _compose_primary(extract_prov, describe_prov, default)
+    if primary is None:
+        return None
     return FallbackOCRProvider(primary,
                                describe_fallback=describe_fb,
                                extract_fallback=extract_fb)
 ```
 
-Refactor the existing compose logic (the `CompositeOCRProvider` branch and single-provider returns) into a small `_compose_primary(...)` helper that returns the bare primary `OCRProvider`; the factory then wraps it once. Keep `enabled: false` → `None` (unwrapped) unchanged.
+Refactor the existing compose logic (providers/ocr/__init__.py:49-81) into a small
+`_compose_primary(extract_prov, describe_prov, default)` helper that returns the bare primary
+`OCRProvider`, preserving today's exact cases:
+- `extract_prov is None and describe_prov is None` → return `None` (caller returns unwrapped `None`; nothing to wrap).
+- `extract_prov is describe_prov` → return that single provider.
+- otherwise → return `CompositeOCRProvider(extract_provider=extract_prov or describe_prov, describe_provider=describe_prov or extract_prov)`.
+
+The factory then: if `not ocr_cfg.get("enabled")` → `None` (unchanged); elif `_compose_primary(...) is None` → `None`; else → wrap the composed primary once in `FallbackOCRProvider(primary, describe_fallback=..., extract_fallback=...)`. Do NOT wrap the `enabled: false` / all-`none` cases.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -797,7 +815,14 @@ git commit -m "feat(media): always-wrap in MediaFallbackProvider; shared litellm
 - Modify: `extractors.py` (`extract_audio` ~564-573, `extract_video` ~584-599)
 - Modify: `tests/test_extractors.py` (audio/video tests)
 
-- [ ] **Step 1: Update tests** — audio: outage → `note_degradation("audio_extract_failed", transient=True)`, no `audio_transcript_empty` note. video: outage → `note_degradation("video_extract_failed", transient=True)` (NOT a skip); a non-transient error (e.g. `ValueError` oversized) → `transient=False`; no `video_analysis_empty` note.
+- [ ] **Step 1: Update tests** — the existing audio/video tests use bare-string membership
+(`"audio_extract_failed" in collect_degradations()` at test_extractors.py ~436/444/460), which no
+longer matches the `Degradation` NamedTuple. Rewrite them to the same shape Task 7 uses
+(`[d.reason for d in collect_degradations()]` and `d.transient`). Assertions:
+  - audio outage (`ConnectionError`) → `reasons == ["audio_extract_failed"]`, `transient is True`; **no** `audio_transcript_empty` note.
+  - video outage (`ConnectionError`) → `reasons == ["video_extract_failed"]`, `transient is True` (NOT a skip).
+  - video non-transient error (e.g. `ValueError("oversized")`) → `reasons == ["video_extract_failed"]`, `transient is False`.
+  - **no** `video_analysis_empty` note on the empty path.
 
 - [ ] **Step 2: Run to verify failure.**
 
@@ -848,7 +873,13 @@ git commit -m "fix(index): uniform transient classification in extract_video/ext
 - [ ] **Step 1: Confirm the resurrected repro now passes**
 
 Run: `.venv/bin/python -m pytest tests/test_degraded_ledger.py::test_provider_outage_never_caps_doc -q`
-Expected: **PASS** (was the Task 1 RED baseline). If it still uses a raw `OllamaVisionOCR`, ensure the doc flow wraps it via the factory (dark mode) so the unreachable path now raises transient → attempts stay 0.
+Expected: **PASS** (was the Task 1 RED baseline). This test passes a **raw** `OllamaVisionOCR`
+directly to `extract_image` (it does not go through `build_ocr_provider`), so what turns it
+green is **Task 3** — `describe()` now *raises* `httpx.ConnectError` instead of swallowing to
+`""` — combined with `extract_image`'s existing `note_degradation(..., transient=is_transient(e))`.
+No factory wrapping is involved here. (The production doc flow *does* wrap via
+`build_ocr_provider`/`build_media_provider` at flow_index_vault.py:1715/1727/2313/2314, so the
+always-wrap takes effect in prod; it's just not what this particular test exercises.)
 
 - [ ] **Step 2: Add two integration tests**
 
