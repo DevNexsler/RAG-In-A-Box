@@ -800,3 +800,59 @@ def test_extract_markitdown_conversion_error():
         result = extract_markitdown("/fake/doc.docx")
 
     assert result.full_text == ""
+
+
+def test_fallback_chain_recovers_content_through_extract_image():
+    """Primary describe reachable-but-empty + a fallback that returns text ->
+    extract_image indexes the RECOVERED text and notes NO degradation (clean)."""
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    class EmptyPrimary(OCRProvider):
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): return ""      # reachable but empty
+
+    wrapped = FallbackOCRProvider(EmptyPrimary(),
+                                  describe_fallback=lambda p: "a recovered description")
+    begin_degradation_capture()
+    result = extract_image("/fake/path.png", ocr_provider=wrapped)
+    assert "a recovered description" in result.full_text   # recovered content indexed
+    assert collect_degradations() == []                    # clean, no degradation
+
+
+def test_fallback_chain_confirmed_blank_is_clean_through_extract_image():
+    """Primary empty + fallback ALSO empty -> confirmed blank -> extract_image
+    indexes only the metadata stub and notes NO degradation (doc drops from ledger)."""
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    class EmptyPrimary(OCRProvider):
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): return ""
+
+    wrapped = FallbackOCRProvider(EmptyPrimary(),
+                                  describe_fallback=lambda p: "")   # fallback agrees: blank
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=wrapped)
+    assert collect_degradations() == []                    # confirmed blank == clean
+
+
+def test_fallback_chain_dark_mode_outage_degrades_transient_through_extract_image():
+    """No fallback configured + primary empty -> wrapper raises transient ->
+    extract_image notes ocr_describe_failed as TRANSIENT (retries, never capped)."""
+    from extractors import begin_degradation_capture, collect_degradations, extract_image
+    from providers.ocr.base import OCRProvider
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    class EmptyPrimary(OCRProvider):
+        def extract(self, file_path, page=None): return ""
+        def describe(self, file_path): return ""
+
+    wrapped = FallbackOCRProvider(EmptyPrimary(), describe_fallback=None)  # dark
+    begin_degradation_capture()
+    extract_image("/fake/path.png", ocr_provider=wrapped)
+    degs = collect_degradations()
+    assert [d.reason for d in degs] == ["ocr_describe_failed"]
+    assert degs[0].transient is True                       # transient -> #60 never caps
