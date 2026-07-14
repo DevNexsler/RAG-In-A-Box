@@ -68,3 +68,17 @@ def test_factory_missing_fallback_model_raises():
     with pytest.raises(Exception):
         build_ocr_provider({"ocr": {"enabled": True, "provider": "ollama_vision",
             "describe": {"fallback": {"provider": "litellm", "endpoint": "http://lite/v1"}}}})
+
+
+def test_extract_dark_mode_empty_is_clean():
+    # Empty OCR-extract page in dark mode indexes clean (returns ""), does NOT raise.
+    w = FallbackOCRProvider(_Stub(lambda p: "", lambda p, pg=None: ""),
+                            extract_fallback=None)
+    assert w.extract("/x.pdf", page=1) == ""
+
+
+def test_extract_unreachable_still_raises_even_in_dark_mode():
+    def boom(p, pg=None): raise TransientError("ocr host down")
+    w = FallbackOCRProvider(_Stub(lambda p: "", boom), extract_fallback=None)
+    with pytest.raises(TransientError):
+        w.extract("/x.pdf", page=1)

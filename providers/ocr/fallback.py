@@ -33,4 +33,8 @@ class FallbackOCRProvider(OCRProvider):
         return resolve_with_fallback(
             lambda: self._primary.extract(p, page),
             (lambda: self._extract_fb(p)) if self._extract_fb else None,
+            # An empty OCR-extract page is normally just textless (not an outage);
+            # in dark mode it indexes clean rather than re-OCRing every run. An
+            # unreachable extract still raises transient (handled in the primary call).
+            empty_is_clean=True,
         )

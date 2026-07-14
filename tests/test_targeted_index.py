@@ -408,3 +408,27 @@ def test_index_document_flow_missing_file_returns_error(tmp_path):
     assert result["status"] == "error"
     assert result["reason"] == "not_found"
     proc.fn.assert_not_called()
+
+
+def test_index_document_flow_confirmed_blank_clears_ledger_entry(tmp_path):
+    """A fallback-CONFIRMED blank (primary empty + fallback ALSO empty) is clean:
+    it indexes the metadata stub and DROPS any prior degraded-ledger entry (parity
+    with a recovered/clean run via the clean_now path), so a genuinely blank image
+    stops being retried instead of churning forever."""
+    import json
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    root, f = _make_png(tmp_path, "quo-attachments/photo@00imk@.png")
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True)
+    (index_root / "degraded_docs.json").write_text(json.dumps(
+        {"docs": {"documents::00imk": {"reasons": ["ocr_describe_failed"], "attempts": 0}}}
+    ))
+
+    # primary empty + fallback returns "" -> two independent models agree: blank.
+    wrapped = FallbackOCRProvider(_EmptyDescribeOCR(), describe_fallback=lambda p: "")
+    result, store = _run_single_doc(tmp_path, root, f, wrapped)
+
+    assert result["status"] == "indexed"
+    store.upsert_nodes.assert_called_once()  # stub still indexed
+    assert "documents::00imk" not in _ledger(tmp_path, "degraded_docs.json")["docs"]

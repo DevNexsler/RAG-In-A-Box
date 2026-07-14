@@ -9,9 +9,10 @@ come back with an empty describe() and still index "successfully" as a
 metadata-only stub (EXIF header, no visual content) — with NO entry in
 ``degraded_docs.json``. Nothing retries such a doc: the diff sees it as
 unchanged forever, and #0251's reopen only iterates existing ledger entries.
-The code gap is fixed (extract_image notes ``ocr_describe_empty``; the
-targeted path now persists degradation outcomes), but docs stub-indexed before
-the fix stay lost unless swept into the ledger.
+The code gap is fixed (the describe provider is always wrapped: an unconfirmed
+empty raises transient and is ledgered as ``ocr_describe_failed``; the targeted
+path now persists degradation outcomes), but docs stub-indexed before the fix
+stay lost unless swept into the ledger.
 
 This script scans the LanceDB ``chunks`` table for image docs whose entire
 indexed text is metadata-only (context header + enrichment summary + EXIF

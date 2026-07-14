@@ -97,7 +97,7 @@ def build_ocr_provider(config: dict) -> OCRProvider | None:
         describe_prov = _build_single_provider(describe_cfg) if describe_cfg else default
 
     describe_fb = _build_fallback_run(
-        (describe_cfg or {}).get("fallback") or ocr_cfg.get("describe", {}).get("fallback"),
+        (describe_cfg or {}).get("fallback"),
         _DESCRIBE_PROMPT,
     )
     extract_fb = _build_fallback_run(

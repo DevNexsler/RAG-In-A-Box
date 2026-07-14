@@ -14,7 +14,13 @@ from typing import Callable
 
 import httpx
 
-from core.resilience import DEFAULT_ATTEMPTS, DEFAULT_BACKOFF, call_with_retry
+from core.resilience import (
+    DEFAULT_ATTEMPTS,
+    DEFAULT_BACKOFF,
+    TransientError,
+    call_with_retry,
+    is_transient,
+)
 
 Encoder = Callable[[Path, str], list]  # (path, prompt) -> OpenAI content parts
 
@@ -82,5 +88,16 @@ class LiteLLMFallback:
 
         # call_with_retry re-raises the transient exc UNCHANGED on exhaustion, so an
         # unreachable endpoint propagates as a transient error to resolve_with_fallback.
-        return call_with_retry(_once, attempts=self.attempts, backoff=self.backoff,
-                               label=f"litellm-fallback {self.model}")
+        try:
+            return call_with_retry(_once, attempts=self.attempts, backoff=self.backoff,
+                                   label=f"litellm-fallback {self.model}")
+        except Exception as exc:
+            if is_transient(exc):
+                raise
+            # A misconfigured/erroring fallback (401 bad key, 404 wrong model, 4xx,
+            # malformed body) must be treated as UNREACHABLE -> transient, so the doc
+            # retries and self-heals once the config is fixed. It must never cap the
+            # doc (#0251) nor be mistaken for a confirmed blank (#0264).
+            raise TransientError(
+                f"litellm fallback {self.model} failed: {type(exc).__name__}: {exc}"
+            ) from exc
