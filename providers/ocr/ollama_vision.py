@@ -12,6 +12,7 @@ from typing import Optional
 
 import httpx
 
+from core.resilience import TransientError
 from providers.ocr.base import OCRProvider
 
 logger = logging.getLogger(__name__)
@@ -152,14 +153,6 @@ class OllamaVisionOCR(OCRProvider):
         self._availability_lock = threading.Lock()
         logger.info("OllamaVisionOCR: %s model=%s", self.base_url, self.model)
 
-    def _note_describe_degradation(self) -> None:
-        # Avoid a module-level import cycle: extractors imports OCR providers.
-        try:
-            from extractors import note_degradation
-        except Exception:
-            return
-        note_degradation("ocr_describe_failed")
-
     def _describe_cooldown_remaining(self) -> float:
         with self._availability_lock:
             remaining = self._unavailable_until - time.monotonic()
@@ -269,19 +262,18 @@ class OllamaVisionOCR(OCRProvider):
             return ""
         remaining = self._describe_cooldown_remaining()
         if remaining > 0:
-            self._note_describe_degradation()
             logger.info(
                 "Vision describe skipped for %s; backend cooldown %.0fs remaining",
-                file_path,
-                remaining,
+                file_path, remaining,
             )
-            return ""
+            raise TransientError(
+                f"vision describe backend in cooldown, {remaining:.0f}s remaining"
+            )
         try:
             text = self._call(file_path, _DESCRIBE_PROMPT, _DESCRIBE_NUM_PREDICT)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             self._mark_describe_unavailable(file_path, exc)
-            self._note_describe_degradation()
-            return ""
+            raise  # transient (httpx.ConnectError); wrapper/caller classifies + degrades
         # Empty is almost always transient (timeout/contention under load), not
         # a deterministic refusal — retry before falling back to a metadata stub.
         attempt = 0

@@ -313,40 +313,29 @@ class TestOllamaVisionBudget:
         assert result == "a real description"
         assert state["calls"] == 2
 
-    def test_describe_connect_error_enters_cooldown_and_notes_degradation(
-        self, tmp_path, caplog
-    ):
-        import logging
+    def test_describe_connect_error_raises_transient_and_enters_cooldown(self, tmp_path):
+        from core.resilience import TransientError, is_transient
         from providers.ocr.ollama_vision import OllamaVisionOCR
 
         state = {"calls": 0}
 
         class _Client:
-            def __init__(self, *a, **k):
-                pass
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
             def stream(self, method, url, json=None):
                 state["calls"] += 1
                 raise httpx.ConnectError("Connection refused")
 
-        begin_degradation_capture()
         with patch("providers.ocr.ollama_vision.httpx.Client", _Client):
-            with caplog.at_level(logging.WARNING, logger="providers.ocr.ollama_vision"):
-                provider = OllamaVisionOCR(base_url="http://ollama:11434")
-                assert provider.describe(self._img(tmp_path)) == ""
-                assert provider.describe(self._img(tmp_path)) == ""
-        assert state["calls"] == 1
-        assert collect_degradations() == [
-            "ocr_describe_failed",
-            "ocr_describe_failed",
-        ]
-        assert any("suppressing new describe calls" in r.message for r in caplog.records)
+            provider = OllamaVisionOCR(base_url="http://ollama:11434")
+            with pytest.raises(Exception) as first:
+                provider.describe(self._img(tmp_path))
+            assert is_transient(first.value)          # outage is transient
+            # second call is short-circuited by cooldown -> raises WITHOUT hitting client
+            with pytest.raises(TransientError):
+                provider.describe(self._img(tmp_path))
+        assert state["calls"] == 1                     # cooldown suppressed the 2nd real call
 
 
 # -----------------------------------------------------------------------
