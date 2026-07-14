@@ -253,17 +253,27 @@ class TestDeepSeekOCR2Unit:
 
         provider = build_ocr_provider(config)
 
-        assert isinstance(provider, CompositeOCRProvider)
+        # build_ocr_provider now ALWAYS wraps in FallbackOCRProvider; the composite
+        # (with #62's local sibling-failover) is the wrapper's primary. This asserts
+        # #62's failover works correctly INSIDE the fallback wrapper: an outage on the
+        # dedicated describe backend is recovered locally via the extract backend before
+        # the (dark / unconfigured) cloud fallback would ever see an empty.
+        from providers.ocr.fallback import FallbackOCRProvider
+
+        assert isinstance(provider, FallbackOCRProvider)
+        composite = provider._primary
+        assert isinstance(composite, CompositeOCRProvider)
         with patch.object(
-            provider._describe, "describe", side_effect=httpx.ConnectError("vision down")
+            composite._describe, "describe", side_effect=httpx.ConnectError("vision down")
         ) as describe_call:
             with patch.object(
-                provider._extract, "describe", return_value="deepseek backup description"
+                composite._extract, "describe", return_value="deepseek backup description"
             ) as backup_call:
                 assert provider.describe(img) == "deepseek backup description"
 
-        describe_call.assert_called_once_with(img)
-        backup_call.assert_called_once_with(img)
+        # FallbackOCRProvider stringifies the path before delegating to the primary.
+        describe_call.assert_called_once_with(str(img))
+        backup_call.assert_called_once_with(str(img))
 
 
 class TestOllamaVisionBudget:
