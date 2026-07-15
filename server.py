@@ -22,7 +22,11 @@ import os
 
 from core.config import load_config
 from core.tracing import setup_tracing
-from mcp_server import run_server
+from mcp_server import (
+    initialize_index_supervisor,
+    run_server,
+    shutdown_index_supervisors,
+)
 from prefect_server import PrefectServer
 
 
@@ -41,7 +45,11 @@ def main() -> None:
     # One persistent Prefect server for the container's lifetime; index
     # subprocesses inherit PREFECT_API_URL and reuse it (never spawn their own).
     with PrefectServer():
-        run_server(transport="streamable-http", host=host, port=port)
+        initialize_index_supervisor(config)
+        try:
+            run_server(transport="streamable-http", host=host, port=port)
+        finally:
+            shutdown_index_supervisors()
 
 
 if __name__ == "__main__":

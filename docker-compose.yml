@@ -4,6 +4,8 @@ services:
     image: doc-organizer:latest
     container_name: doc-organizer
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
     logging:
       driver: json-file
       options:
@@ -20,7 +22,7 @@ services:
       - doc-organizer-data:/data/index
       - ./config.yaml:/app/config.yaml:ro
       - ./.evals:/app/.evals
-    command: ["sh", "-c", "mkdir -p /data/documents /data/index && python server.py"]
+    command: ["python", "server.py"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

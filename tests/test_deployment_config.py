@@ -59,6 +59,28 @@ def test_compose_disables_prefect_ephemeral_server():
     assert "PREFECT_SERVER_ALLOW_EPHEMERAL_MODE=false" in env
 
 
+def test_compose_uses_init_and_direct_exec_entrypoint():
+    """Container PID 1 must reap children and forward shutdown directly.
+
+    A shell PID 1 cannot reliably reap an index process group's descendants or
+    deliver Docker's stop signal to ``server.py``.  Compose must install the
+    built-in init and start Python directly, without ``sh -c``.
+    """
+    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+    service = compose["services"]["doc-organizer"]
+
+    assert service.get("init") is True
+    assert service.get("command") == ["python", "server.py"]
+    assert service.get("stop_grace_period") == "30s"
+
+
+def test_example_config_keeps_memory_observability_opt_in():
+    """Per-doc sampling must be explicit; default indexing pays no probe cost."""
+    config = yaml.safe_load(Path("config.yaml.example").read_text())
+
+    assert config["memory_observability"]["enabled"] is False
+
+
 def test_dockerfile_declares_health_check_on_health_endpoint():
     """The image must ship a HEALTHCHECK so the container's health is visible
     (docker ps / .State.Health) instead of relying only on an external probe

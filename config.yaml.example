@@ -8,6 +8,12 @@
 vault_root: "/path/to/your/obsidian-vault"
 index_root: "/path/to/index/output"
 
+# Opt-in structured RSS + Arrow allocator checkpoints in indexer.log. Includes
+# phase boundaries and per-document start/finish samples for memory diagnosis.
+# Disabled means no /proc reads, pyarrow import, or measurement logging.
+memory_observability:
+  enabled: false
+
 scan:
   # Supported file types: md, pdf, images (png/jpg/jpeg), audio/video, documents
   # (docx/doc/pptx/rtf/epub/html/htm/csv/txt), and spreadsheets (xlsx/xls).

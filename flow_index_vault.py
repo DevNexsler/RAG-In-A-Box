@@ -40,8 +40,9 @@ import shutil
 import threading
 import time
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 
 from prefect import flow, task
 from prefect.logging import get_run_logger
@@ -88,6 +89,7 @@ from doc_id_store import (
     strip_id_from_filename as _strip_id_from_filename,
 )
 from core.tracing import get_tracer, setup_tracing
+from memory_observer import MemoryObserver
 from hooks.dispatcher import dispatch_event
 from hooks.events import build_document_indexed_event
 from lancedb_store import LanceDBStore, open_store_with_recovery
@@ -1373,6 +1375,51 @@ def process_doc_task(doc: dict) -> None:
                 logger.warning(warning)
 
 
+def _bounded_executor_map(
+    executor: Executor,
+    function: Callable[[Any], Any],
+    items: Iterable[Any],
+    *,
+    max_pending: int,
+) -> Iterator[Any]:
+    """Map with a completion-driven, bounded submission window.
+
+    ``Executor.map`` eagerly submits the entire iterable on supported Python
+    versions. Keeping at most ``max_pending`` futures prevents a large document
+    backlog from being retained a second time inside the executor queue. Results
+    remain input-ordered to preserve the prior contract.
+    """
+    item_iter = iter(items)
+    pending: dict[Any, int] = {}
+    ready: dict[int, Any] = {}
+    next_sequence = 0
+    next_to_yield = 0
+
+    def submit_one() -> bool:
+        nonlocal next_sequence
+        try:
+            item = next(item_iter)
+        except StopIteration:
+            return False
+        pending[executor.submit(function, item)] = next_sequence
+        next_sequence += 1
+        return True
+
+    for _ in range(max(1, max_pending)):
+        if not submit_one():
+            break
+
+    while pending:
+        completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+        for future in completed:
+            sequence = pending.pop(future)
+            ready[sequence] = future.result()
+            submit_one()
+        while next_to_yield in ready:
+            yield ready.pop(next_to_yield)
+            next_to_yield += 1
+
+
 def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
     """Process a batch of docs. Return list of failed doc_ids.
 
@@ -1395,6 +1442,10 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
 
     def _run_one(doc: dict) -> str | None:
         nonlocal active_workers, peak_active_workers
+        observer = _RUNTIME.get("memory_observer")
+        if observer is not None:
+            observer.sample("doc_start", phase="process", doc_id=doc["doc_id"])
+        outcome = "ok"
         # Heartbeat: a worker picking up a doc means the indexer is progressing.
         # When all workers are stuck (a freeze) this stops, and /health flips to 503.
         _write_heartbeat(_RUNTIME.get("index_root"))
@@ -1435,6 +1486,7 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
                         _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
             return None
         except Exception as exc:
+            outcome = "failed"
             logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
             return doc["doc_id"]
         finally:
@@ -1449,6 +1501,13 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
                     threading.current_thread().name,
                     current_active,
                     current_peak,
+                )
+            if observer is not None:
+                observer.sample(
+                    "doc_finish",
+                    phase="process",
+                    doc_id=doc["doc_id"],
+                    outcome=outcome,
                 )
 
     if concurrency <= 1 or len(docs) <= 1:
@@ -1475,9 +1534,15 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
         failed_docs.append(first_bad)
 
     from concurrent.futures import ThreadPoolExecutor
+    from itertools import islice
 
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        for result in ex.map(_run_one, docs[1:]):
+        for result in _bounded_executor_map(
+            ex,
+            _run_one,
+            islice(docs, 1, None),
+            max_pending=concurrency,
+        ):
             if result is not None:
                 failed_docs.append(result)
     if debug_concurrency:
@@ -1687,6 +1752,9 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     import time
     logger = get_run_logger()
     config = load_config(config_path)
+    memory_observer = MemoryObserver.from_config(config, logger)
+    _RUNTIME["memory_observer"] = memory_observer
+    memory_observer.sample("phase_start", phase="initialize")
     # Load-bearing: the full indexing flow runs as a separate subprocess
     # (spawned via `python -c` in _file_index_update_impl, or run_index.py),
     # so it needs its own tracing setup. No-op when tracing is disabled or
@@ -1855,6 +1923,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     _RUNTIME["taxonomy_usage"] = TaxonomyUsageAccumulator() if taxonomy_store is not None else None
     _RUNTIME["config"] = config
     _RUNTIME["sources_by_name"] = {s.name: s for s in all_sources}
+    memory_observer.sample("phase_finish", phase="initialize")
 
     # --- Migration: first run with existing LanceDB data but empty registry ---
     # If the registry is empty but the store has data, the old doc_ids were paths.
@@ -1906,6 +1975,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
 
     # Multi-source scan: iterate over all configured sources, namespace doc_ids.
     # Re-stamps the heartbeat as it goes so a long scan doesn't false-503 /health.
+    memory_observer.sample("phase_start", phase="scan_diff")
     all_records, source_records_by_ns_doc_id = _scan_and_register_sources(
         all_sources, doc_id_store, index_root
     )
@@ -1967,6 +2037,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         logger.info("Excluded %d unchanged skip-ledger docs (no reprocessing)", skipped_count)
     stored_doc_count = len(stored_mtimes)
     changed_doc_count = len(to_add_or_update) + len(to_delete)
+    memory_observer.sample("phase_finish", phase="scan_diff")
 
     active_store = store
     safety_cfg = config.get("safety", {})
@@ -2029,7 +2100,14 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     concurrency = int(enrichment_cfg.get("concurrency", 1) or 1)
     if concurrency > 1:
         logger.info("Processing %d docs with concurrency=%d", len(docs_to_process), concurrency)
+    memory_observer.sample("phase_start", phase="process", doc_count=len(docs_to_process))
     failed_docs = _process_docs(docs_to_process, concurrency=concurrency)
+    memory_observer.sample(
+        "phase_finish",
+        phase="process",
+        doc_count=len(docs_to_process),
+        failed_count=len(failed_docs),
+    )
 
     if failed_docs:
         logger.warning("Failed to process %d docs: %s", len(failed_docs), failed_docs[:20])
@@ -2040,6 +2118,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     # (deletes, FTS rebuild, shadow promote, count reads) is another long,
     # heartbeat-free window. Stamp across its boundaries so a big finalize
     # doesn't false-503 /health as a freeze (#0127).
+    memory_observer.sample("phase_start", phase="finalize")
     _write_heartbeat(index_root)
 
     if docs_to_delete:
@@ -2176,6 +2255,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         failed_docs or None,
         _RUNTIME.get("_warnings") or None,
     )
+    memory_observer.sample("phase_finish", phase="finalize")
     logger.info(f"index_vault_flow finished in {run_seconds:.1f}s")
 
 

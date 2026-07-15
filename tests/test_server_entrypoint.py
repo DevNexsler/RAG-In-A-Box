@@ -46,14 +46,31 @@ def test_main_runs_server_within_prefect_lifecycle(monkeypatch):
     monkeypatch.setattr(server, "load_config", lambda *a, **k: {})
     monkeypatch.setattr(server, "setup_tracing", lambda *a, **k: None)
     monkeypatch.setattr(server, "PrefectServer", FakePrefectServer)
+    monkeypatch.setattr(
+        server,
+        "initialize_index_supervisor",
+        lambda config: order.append("supervisor_init"),
+    )
+    monkeypatch.setattr(
+        server,
+        "shutdown_index_supervisors",
+        lambda: order.append("supervisor_shutdown"),
+    )
     monkeypatch.setattr(server, "run_server", lambda **k: order.append("run_server"))
 
     server.main()
 
-    assert order == ["prefect_enter", "run_server", "prefect_exit"], (
+    assert order == [
+        "prefect_enter",
+        "supervisor_init",
+        "run_server",
+        "supervisor_shutdown",
+        "prefect_exit",
+    ], (
         "run_server must execute strictly within the PrefectServer context so "
-        "the one persistent server is up (and PREFECT_API_URL exported) for the "
-        "whole serving lifetime"
+        "the one persistent server is up for the whole serving lifetime, and "
+        "shutdown must terminate the supervised index process group before "
+        "Prefect exits"
     )
 
 
