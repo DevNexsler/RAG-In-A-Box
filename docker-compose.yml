@@ -6,6 +6,13 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
+    # #0325 production-shaped profiling sizes this envelope for the server,
+    # persistent Prefect process, and an 8-worker full-source index run. Keep
+    # regression failures inside this container instead of exposing the host to
+    # earlyoom; deliberate host-specific sizing remains an explicit override.
+    mem_limit: ${DOC_ORGANIZER_MEMORY_LIMIT:-8g}
+    mem_reservation: ${DOC_ORGANIZER_MEMORY_RESERVATION:-4g}
+    pids_limit: ${DOC_ORGANIZER_PIDS_LIMIT:-512}
     logging:
       driver: json-file
       options:

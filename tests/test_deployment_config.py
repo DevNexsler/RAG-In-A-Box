@@ -74,6 +74,20 @@ def test_compose_uses_init_and_direct_exec_entrypoint():
     assert service.get("stop_grace_period") == "30s"
 
 
+def test_compose_enforces_configurable_resource_envelope():
+    """Indexer regressions must stay inside the Doc Organizer container.
+
+    Defaults are sized from the production-shaped #0325 profile while keeping
+    environment overrides for hosts with a deliberately different capacity.
+    """
+    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+    service = compose["services"]["doc-organizer"]
+
+    assert service["mem_limit"] == "${DOC_ORGANIZER_MEMORY_LIMIT:-8g}"
+    assert service["mem_reservation"] == "${DOC_ORGANIZER_MEMORY_RESERVATION:-4g}"
+    assert service["pids_limit"] == "${DOC_ORGANIZER_PIDS_LIMIT:-512}"
+
+
 def test_example_config_keeps_memory_observability_opt_in():
     """Per-doc sampling must be explicit; default indexing pays no probe cost."""
     config = yaml.safe_load(Path("config.yaml.example").read_text())

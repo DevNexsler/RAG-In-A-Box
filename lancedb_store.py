@@ -7,7 +7,7 @@ import re
 import shutil
 import threading
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +68,7 @@ _LLAMA_MANAGED_METADATA_KEYS = frozenset({
 _DEFAULT_LANCE_VERSION_RETENTION_MINUTES = 30.0
 _DEFAULT_DAILY_RESTORE_POINT_DAYS = 7
 _DAILY_TAG_PREFIX = "daily-"
+_DOCUMENT_WRITE_LOCK_STRIPES = 256
 _COMPACTION_MARKER_SUFFIX = ".last-compaction"
 
 
@@ -213,6 +214,14 @@ class LanceDBStore:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
         self._schema_lock = threading.Lock()
+        # Lance delete+add upserts are not atomic. Duplicate discovery can send
+        # several workers to rewrite one canonical document at once, so stripe
+        # writes by document ID while preserving concurrency across documents.
+        # RLocks allow a canonical metadata rewrite to call upsert_nodes while
+        # already owning the canonical stripe.
+        self._document_write_locks = tuple(
+            threading.RLock() for _ in range(_DOCUMENT_WRITE_LOCK_STRIPES)
+        )
         self._memory_observer = None
         self._vs = self._build_vector_store()
         self._ensure_scalar_index()
@@ -244,6 +253,25 @@ class LanceDBStore:
         except Exception:
             logger.debug("Cannot create memory measurement for %s", subphase, exc_info=True)
             return nullcontext()
+
+    @contextmanager
+    def _serialize_document_writes(self, doc_ids: set[str] | list[str]):
+        """Serialize non-atomic Lance rewrites that target the same document."""
+        stripe_indexes = sorted(
+            {
+                hash(str(doc_id)) % len(self._document_write_locks)
+                for doc_id in doc_ids
+                if doc_id
+            }
+        )
+        locks = [self._document_write_locks[index] for index in stripe_indexes]
+        for lock in locks:
+            lock.acquire()
+        try:
+            yield
+        finally:
+            for lock in reversed(locks):
+                lock.release()
 
     def _build_vector_store(self) -> LanceDBVectorStore:
         return LanceDBVectorStore(
@@ -684,6 +712,12 @@ class LanceDBStore:
     # --- StorageInterface methods ---
 
     def upsert_nodes(self, nodes: list[TextNode]) -> None:
+        """Atomically replace each document relative to peer writer threads."""
+        doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
+        with self._serialize_document_writes(doc_ids):
+            self._upsert_nodes_unlocked(nodes)
+
+    def _upsert_nodes_unlocked(self, nodes: list[TextNode]) -> None:
         """Delete existing nodes for each doc_id, then add new ones."""
         with _tracer.start_as_current_span("store.upsert"):
             if not nodes:
@@ -782,6 +816,17 @@ class LanceDBStore:
         canonical_doc_id: str,
         duplicate_refs: list[dict[str, Any]],
     ) -> None:
+        """Single-flight canonical metadata rewrites by canonical document."""
+        with self._serialize_document_writes([canonical_doc_id]):
+            self._update_canonical_duplicate_metadata_unlocked(
+                canonical_doc_id, duplicate_refs
+            )
+
+    def _update_canonical_duplicate_metadata_unlocked(
+        self,
+        canonical_doc_id: str,
+        duplicate_refs: list[dict[str, Any]],
+    ) -> None:
         """Merge duplicate provenance into canonical chunk metadata and re-upsert it."""
         try:
             table = self._vs.table
@@ -874,6 +919,11 @@ class LanceDBStore:
         self.upsert_nodes(canonical_nodes)
 
     def delete_by_doc_ids(self, doc_ids: list[str]) -> None:
+        """Remove documents without racing a concurrent rewrite of the same IDs."""
+        with self._serialize_document_writes(doc_ids):
+            self._delete_by_doc_ids_unlocked(doc_ids)
+
+    def _delete_by_doc_ids_unlocked(self, doc_ids: list[str]) -> None:
         """Remove all nodes for the given doc_ids."""
         memory_fields: dict[str, Any]
         if len(doc_ids) == 1:
