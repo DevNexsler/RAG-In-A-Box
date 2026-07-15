@@ -260,3 +260,68 @@ class TestLogFile:
                 assert popen_kwargs.get("stdout") is not None
         finally:
             os.environ.pop("PREFECT_API_URL", None)
+
+
+class TestProcessGroupCleanup:
+    """Started Prefect servers must clean up descendant processes too."""
+
+    @patch("prefect_server.signal.signal")
+    @patch("prefect_server.time.sleep")
+    @patch("prefect_server.subprocess.Popen")
+    @patch("prefect_server.httpx.get")
+    def test_popen_starts_new_session(self, mock_get, mock_popen, mock_sleep, mock_signal):
+        calls = {"n": 0}
+
+        def side_effect(url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 1:
+                raise httpx.ConnectError("refused")
+            return _healthy_response()
+
+        mock_get.side_effect = side_effect
+        mock_popen.return_value = _make_mock_popen()
+
+        os.environ.pop("PREFECT_API_URL", None)
+        try:
+            with PrefectServer():
+                popen_kwargs = mock_popen.call_args[1]
+                assert popen_kwargs.get("start_new_session") is True
+        finally:
+            os.environ.pop("PREFECT_API_URL", None)
+
+    @patch("prefect_server.os.killpg")
+    @patch("prefect_server.os.getpgid", return_value=43210)
+    @patch("prefect_server.signal.signal")
+    @patch("prefect_server.time.sleep")
+    @patch("prefect_server.subprocess.Popen")
+    @patch("prefect_server.httpx.get")
+    def test_stop_terminates_process_group(
+        self,
+        mock_get,
+        mock_popen,
+        mock_sleep,
+        mock_signal,
+        mock_getpgid,
+        mock_killpg,
+    ):
+        calls = {"n": 0}
+
+        def side_effect(url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 1:
+                raise httpx.ConnectError("refused")
+            return _healthy_response()
+
+        mock_get.side_effect = side_effect
+        proc = _make_mock_popen()
+        mock_popen.return_value = proc
+
+        os.environ.pop("PREFECT_API_URL", None)
+        try:
+            with PrefectServer():
+                pass
+            mock_getpgid.assert_called_once_with(proc.pid)
+            mock_killpg.assert_called_once_with(43210, signal.SIGTERM)
+            proc.terminate.assert_not_called()
+        finally:
+            os.environ.pop("PREFECT_API_URL", None)

@@ -80,6 +80,7 @@ class PrefectServer:
             ],
             stdout=self._log_fh,
             stderr=self._log_fh,
+            start_new_session=True,
         )
         self._we_started = True
         atexit.register(self._stop)
@@ -118,11 +119,21 @@ class PrefectServer:
             return
         if self._process.poll() is None:
             logger.info("Stopping Prefect server (pid %s)", self._process.pid)
-            self._process.terminate()
+            try:
+                pgid = os.getpgid(self._process.pid)
+            except ProcessLookupError:
+                pgid = None
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                self._process.terminate()
             try:
                 self._process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._process.kill()
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    self._process.kill()
                 self._process.wait(timeout=3)
         self._process = None
         self._we_started = False
