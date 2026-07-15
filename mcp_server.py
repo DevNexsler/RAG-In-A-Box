@@ -2259,6 +2259,12 @@ def _file_index_update_impl(config_path: str = "config.yaml", source_name: str |
         except OSError:
             pass
 
+    # Prefect lifecycle (#0325): this child inherits PREFECT_API_URL from the
+    # server.py entrypoint's persistent PrefectServer, so index_vault_flow
+    # attaches to that one stable server. Do NOT wrap it in its own
+    # PrefectServer or let it auto-start an ephemeral one — a per-run temporary
+    # server orphans when earlyoom kills this subprocess before teardown.
+    # Ephemeral auto-start is disabled in the deployment env for the same reason.
     script = (
         "import os, sys, logging\n"
         "from pathlib import Path\n"

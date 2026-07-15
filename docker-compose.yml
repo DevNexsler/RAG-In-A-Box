@@ -52,6 +52,13 @@ services:
       # used-percent (#0232), so docker-health surfaces disk pressure
       # before ENOSPC takes the host down.
       - DISK_USAGE_MAX_PERCENT=${DISK_USAGE_MAX_PERCENT:-90}
+      # Disable Prefect's ephemeral-server auto-start (#0325). server.py runs
+      # one persistent PrefectServer and exports PREFECT_API_URL, which index
+      # subprocesses inherit; with ephemeral off, a missing PREFECT_API_URL
+      # fails the run loudly instead of silently starting a throwaway temporary
+      # server that orphans when earlyoom kills the indexer (49+ orphans /
+      # ~19 GiB baseline). One intentional server, never a leak.
+      - PREFECT_SERVER_ALLOW_EPHEMERAL_MODE=false
 
 networks:
   rag-net:

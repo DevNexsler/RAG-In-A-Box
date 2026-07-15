@@ -43,6 +43,22 @@ def test_docker_compose_bounds_lance_retention_and_monitors_disk():
     assert "DISK_USAGE_MAX_PERCENT=${DISK_USAGE_MAX_PERCENT:-90}" in env
 
 
+def test_compose_disables_prefect_ephemeral_server():
+    """Production must disable Prefect's ephemeral-server auto-start (#0325).
+
+    The indexer runs as a background subprocess launched by file_index_update.
+    With ephemeral mode enabled and no PREFECT_API_URL, every index flow
+    auto-starts a throwaway Prefect temporary server that orphans when earlyoom
+    kills the indexer before teardown (49+ orphans, ~19 GiB baseline). The
+    entrypoint runs one persistent PrefectServer and exports PREFECT_API_URL, so
+    disabling ephemeral turns a missing URL into a loud failure instead of a
+    silent orphan leak."""
+    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+    env = compose["services"]["doc-organizer"]["environment"]
+
+    assert "PREFECT_SERVER_ALLOW_EPHEMERAL_MODE=false" in env
+
+
 def test_dockerfile_declares_health_check_on_health_endpoint():
     """The image must ship a HEALTHCHECK so the container's health is visible
     (docker ps / .State.Health) instead of relying only on an external probe
