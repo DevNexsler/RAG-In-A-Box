@@ -9,6 +9,15 @@ import os
 import time
 from unittest.mock import patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _stable_process_identity(monkeypatch):
+    """Mocked Popen PIDs have no /proc entry; provide their launch identity."""
+    monkeypatch.setattr(
+        "index_run_supervisor.process_starttime_ticks", lambda pid: pid * 10
+    )
 
 
 def _spawn_zombie_child() -> int:
@@ -55,6 +64,9 @@ def test_index_update_returns_started(tmp_path, monkeypatch):
     class DummyProc:
         pid = 424242
 
+        def poll(self):
+            return None
+
     with patch("subprocess.Popen", return_value=DummyProc()):
         result = mcp_server._file_index_update_impl("config.yaml")
 
@@ -87,6 +99,9 @@ def test_index_update_can_start_source_scoped_run(tmp_path, monkeypatch):
 
     class DummyProc:
         pid = 424245
+
+        def poll(self):
+            return None
 
     popen_args = []
 
@@ -155,6 +170,9 @@ def test_index_update_clears_stale_pid_file(tmp_path, monkeypatch):
     class DummyProc:
         pid = 424243
 
+        def poll(self):
+            return None
+
     with patch("subprocess.Popen", return_value=DummyProc()):
         result = mcp_server._file_index_update_impl("config.yaml")
 
@@ -179,6 +197,9 @@ def test_index_update_clears_zombie_pid_file(tmp_path, monkeypatch):
     class DummyProc:
         pid = 424242
 
+        def poll(self):
+            return None
+
     try:
         with patch("subprocess.Popen", return_value=DummyProc()):
             result = mcp_server._file_index_update_impl("config_test.yaml")
@@ -187,7 +208,9 @@ def test_index_update_clears_zombie_pid_file(tmp_path, monkeypatch):
             f"Expected zombie PID file to be cleared, got {result!r}"
         )
         assert result.get("pid") == 424242
-        assert not pid_file.exists(), "Zombie PID file should be removed before restart"
+        assert pid_file.read_text() == "424242", (
+            "Zombie PID must be replaced with the newly supervised indexer PID"
+        )
     finally:
         try:
             os.waitpid(zombie_pid, os.WNOHANG)
@@ -246,6 +269,9 @@ def test_index_update_ignores_non_indexer_pid_file(tmp_path, monkeypatch):
     class DummyProc:
         pid = 424244
 
+        def poll(self):
+            return None
+
     try:
         with patch("subprocess.Popen", return_value=DummyProc()):
             result = mcp_server._file_index_update_impl("config.yaml")
@@ -254,7 +280,9 @@ def test_index_update_ignores_non_indexer_pid_file(tmp_path, monkeypatch):
             f"Expected foreign PID to be ignored, got {result!r}"
         )
         assert result.get("pid") == 424244
-        assert not pid_file.exists(), "Foreign PID file should be removed before restart"
+        assert pid_file.read_text() == "424244", (
+            "Foreign PID must be replaced with the newly supervised indexer PID"
+        )
     finally:
         other_proc.terminate()
         other_proc.wait()

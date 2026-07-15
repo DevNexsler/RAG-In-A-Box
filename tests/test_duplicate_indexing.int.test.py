@@ -1,4 +1,6 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -132,6 +134,97 @@ def test_update_canonical_duplicate_metadata_does_not_nest_node_content(tmp_path
     # Dup provenance lists grow linearly (a few hundred bytes per merge), so
     # allow slack — but geometric doubling per merge must fail.
     assert sizes[-1] < baseline + 10_000, f"unbounded _node_content growth: {sizes}"
+
+
+def test_update_canonical_duplicate_metadata_compacts_duplicate_chunk_ids(tmp_path):
+    """Legacy physical duplication must self-heal without losing real chunks."""
+    store = LanceDBStore(tmp_path, "test_chunks")
+    canonical_doc_id = "documents::00001"
+    vector = [0.1] * 768
+    unique_nodes = [
+        _make_node(canonical_doc_id, "c:0", "alpha", vector),
+        _make_node(canonical_doc_id, "c:1", "beta", vector),
+    ]
+    store.upsert_nodes(unique_nodes)
+    store._vs.add(
+        [_make_node(canonical_doc_id, "c:0", "alpha", vector) for _ in range(128)]
+    )
+
+    before = (
+        store._vs.table.search(None)
+        .where(f"doc_id = '{canonical_doc_id}'", prefilter=True)
+        .select(["id"])
+        .to_list()
+    )
+    assert len(before) == 130
+
+    store.update_canonical_duplicate_metadata(
+        canonical_doc_id,
+        [{"doc_id": "documents::duplicate", "rel_path": "duplicate.jpg"}],
+    )
+
+    after = (
+        store._vs.table.search(None)
+        .where(f"doc_id = '{canonical_doc_id}'", prefilter=True)
+        .select(["id"])
+        .to_list()
+    )
+    assert sorted(row["id"] for row in after) == [
+        f"{canonical_doc_id}::c:0",
+        f"{canonical_doc_id}::c:1",
+    ]
+
+
+def test_concurrent_canonical_metadata_updates_are_single_flight(tmp_path):
+    """Concurrent duplicate discoveries must not recreate physical rows."""
+    store = LanceDBStore(tmp_path, "test_chunks")
+    canonical_doc_id = "documents::00001"
+    vector = [0.1] * 768
+    store.upsert_nodes(
+        [
+            _make_node(canonical_doc_id, "c:0", "alpha", vector),
+            _make_node(canonical_doc_id, "c:1", "beta", vector),
+        ]
+    )
+
+    workers = 8
+    start = threading.Barrier(workers)
+
+    def update(worker: int) -> None:
+        start.wait(timeout=5)
+        store.update_canonical_duplicate_metadata(
+            canonical_doc_id,
+            [
+                {
+                    "doc_id": f"documents::duplicate-{worker}",
+                    "rel_path": f"duplicate-{worker}.jpg",
+                }
+            ],
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(executor.map(update, range(workers)))
+
+    rows = (
+        store._vs.table.search(None)
+        .where(f"doc_id = '{canonical_doc_id}'", prefilter=True)
+        .select(["id"])
+        .to_list()
+    )
+    assert sorted(row["id"] for row in rows) == [
+        f"{canonical_doc_id}::c:0",
+        f"{canonical_doc_id}::c:1",
+    ]
+    metadata = (
+        store._vs.table.search(None)
+        .where(f"doc_id = '{canonical_doc_id}'", prefilter=True)
+        .select(["metadata"])
+        .limit(1)
+        .to_list()[0]["metadata"]
+    )
+    assert set(json.loads(metadata["dup_locations"])) == {
+        f"duplicate-{worker}.jpg" for worker in range(workers)
+    }
 
 
 def test_upsert_nodes_strips_llama_managed_metadata_keys(tmp_path):

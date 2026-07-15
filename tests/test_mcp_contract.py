@@ -13,6 +13,12 @@ from core.storage import SearchHit
 import mcp_server
 
 
+def test_pid_is_indexer_rejects_unreadable_cmdline(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_pid_cmdline", lambda _pid: None)
+
+    assert mcp_server._pid_is_indexer(4242) is False
+
+
 # ---------------------------------------------------------------------------
 # MCP tool schema contract
 # ---------------------------------------------------------------------------
@@ -808,10 +814,18 @@ def test_index_update_returns_started_status():
     """
     import tempfile
 
+    class CompletedProc:
+        pid = 424260
+
+        def poll(self):
+            return 0
+
     with tempfile.TemporaryDirectory() as tmpdir:
         old_cache = mcp_server._cache
         try:
-            with patch("mcp_server.load_config", return_value={"index_root": tmpdir}):
+            with patch("mcp_server.load_config", return_value={"index_root": tmpdir}), patch(
+                "subprocess.Popen", return_value=CompletedProc()
+            ), patch("index_run_supervisor.process_starttime_ticks", return_value=260):
                 mcp_server._cache = None
                 result = mcp_server._file_index_update_impl(config_path="config.yaml")
 
@@ -820,6 +834,10 @@ def test_index_update_returns_started_status():
             )
             assert "pid" in result
             assert isinstance(result["pid"], int)
+            supervisor = mcp_server._get_index_run_supervisor({"index_root": tmpdir})
+            deadline = time.time() + 2
+            while supervisor.status_summary()["current"] is not None and time.time() < deadline:
+                time.sleep(0.01)
         finally:
             mcp_server._cache = old_cache
 
@@ -828,16 +846,28 @@ def test_index_update_no_failures():
     """Alias kept for historical coverage: same contract as test_index_update_returns_started_status."""
     import tempfile
 
+    class CompletedProc:
+        pid = 424261
+
+        def poll(self):
+            return 0
+
     with tempfile.TemporaryDirectory() as tmpdir:
         old_cache = mcp_server._cache
         try:
-            with patch("mcp_server.load_config", return_value={"index_root": tmpdir}):
+            with patch("mcp_server.load_config", return_value={"index_root": tmpdir}), patch(
+                "subprocess.Popen", return_value=CompletedProc()
+            ), patch("index_run_supervisor.process_starttime_ticks", return_value=261):
                 mcp_server._cache = None
                 result = mcp_server._file_index_update_impl(config_path="config.yaml")
 
             # Non-blocking: always returns "started", never "completed"
             assert result["status"] == "started"
             assert "failed_count" not in result
+            supervisor = mcp_server._get_index_run_supervisor({"index_root": tmpdir})
+            deadline = time.time() + 2
+            while supervisor.status_summary()["current"] is not None and time.time() < deadline:
+                time.sleep(0.01)
         finally:
             mcp_server._cache = old_cache
 
@@ -2157,3 +2187,89 @@ def test_health_probe_running_with_fts_failure_degrades(tmp_path):
     assert status_code == 503
     assert payload["status"] == "degraded"
     assert payload["fts_rebuild_failed"] == 1
+
+
+def test_health_probe_idle_after_killed_indexer_stays_failed(tmp_path):
+    """SIGKILL terminal state must survive PID cleanup and keep health red."""
+    import json
+
+    terminal = {
+        "run_id": "killed-run",
+        "status": "signaled",
+        "pid": 12345,
+        "source_name": None,
+        "started_at": "2026-07-15T12:00:00+00:00",
+        "finished_at": "2026-07-15T12:05:00+00:00",
+        "exit_code": None,
+        "termination_signal": 9,
+        "terminal_reason": "process_exit",
+        "peak_rss_bytes": 123456,
+    }
+    (tmp_path / "index_run_state.json").write_text(json.dumps({
+        "version": 1,
+        "current": None,
+        "last_attempt": terminal,
+        "last_success": None,
+    }))
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "index_failed"
+    assert payload["indexer"] == "idle"
+    assert payload["index_run"]["unresolved_failure"] is True
+    assert payload["index_run"]["latest_terminal"]["termination_signal"] == 9
+
+
+def test_file_status_exposes_last_attempt_success_and_terminal_freshness(tmp_path):
+    import json
+
+    terminal = {
+        "run_id": "failed-after-success",
+        "status": "failed",
+        "pid": 12345,
+        "source_name": "documents",
+        "started_at": "2026-07-15T12:00:00+00:00",
+        "finished_at": "2026-07-15T12:05:00+00:00",
+        "exit_code": 1,
+        "termination_signal": None,
+        "terminal_reason": "process_exit",
+        "peak_rss_bytes": 123456,
+    }
+    success = {
+        **terminal,
+        "run_id": "older-success",
+        "status": "succeeded",
+        "finished_at": "2026-07-14T12:05:00+00:00",
+        "exit_code": 0,
+        "terminal_reason": "clean_exit",
+    }
+    (tmp_path / "index_run_state.json").write_text(json.dumps({
+        "version": 1,
+        "current": None,
+        "last_attempt": terminal,
+        "last_success": success,
+    }))
+
+    store = MagicMock()
+    store.list_doc_ids.return_value = ["a.md"]
+    store.count_chunks.return_value = 1
+    store._metadata_subfields.return_value = {"doc_id"}
+    store.fts_available.return_value = True
+    config = {
+        "index_root": str(tmp_path),
+        "embeddings": {"provider": "openrouter"},
+        "search": {"reranker": {"enabled": False}},
+    }
+    old_cache = mcp_server._cache
+    try:
+        mcp_server._cache = (store, MagicMock(), config)
+        with patch("mcp_server._get_deep_health", return_value={}):
+            result = mcp_server._file_status_impl()
+    finally:
+        mcp_server._cache = old_cache
+
+    assert result["index_run"]["last_attempt"]["run_id"] == "failed-after-success"
+    assert result["index_run"]["last_success"]["run_id"] == "older-success"
+    assert result["index_run"]["latest_terminal"]["status"] == "failed"
+    assert result["index_run"]["unresolved_failure"] is True

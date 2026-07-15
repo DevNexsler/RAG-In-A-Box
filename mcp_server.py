@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_sa
 from core.storage import SearchHit
 from core.tracing import get_tracer
 from lancedb_store import LanceDBStore, open_store_with_recovery
+from index_run_supervisor import IndexRunSupervisor
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
 import sor_query as sorq
@@ -41,6 +43,7 @@ _DEFAULT_CONTENT_MAX_CHARACTER = 10_000
 _VALID_SEARCH_RETURN_MODES = {"slim", "compact", "full"}
 _VALID_SEARCH_SORTS = {"relevance", "recent"}
 _DEFAULT_DISK_USAGE_MAX_PERCENT = 90.0
+_ACTIVE_INDEX_RUN_STATUSES = {"starting", "running", "terminating"}
 _DEFAULT_SEARCH_TOP_K = 8
 # sort="recent" pool: relevance ranking scopes the candidates, recency orders
 # them — the pool must be wider than top_k or the newest messages can be
@@ -149,8 +152,7 @@ def _pid_is_indexer(pid: int) -> bool:
     """Return True when pid appears to be the background indexer subprocess."""
     cmdline = _pid_cmdline(pid)
     if not cmdline:
-        # If cmdline is unavailable, keep legacy liveness behavior.
-        return True
+        return False
     return "index_vault_flow" in cmdline or "flow_index_vault" in cmdline
 
 
@@ -261,16 +263,27 @@ def _health_probe(config: dict) -> tuple[dict, int]:
 
     503 is reserved for states that need operator attention: an indexer that
     is running but frozen (stale heartbeat — a freeze logs nothing, so this
-    probe is the only thing that can catch it), an FTS index whose last
-    rebuild failed (keyword search silently going stale, #0106), and an index
-    filesystem at/above its high-water mark (#0232). Disk telemetry rides on
-    every payload; when several conditions hold at once, the most urgent one
-    (disk) names the status but the others keep their fields.
+    probe is the only thing that can catch it), a latest terminal index failure
+    with no newer success, an FTS index whose last rebuild failed (keyword
+    search silently going stale, #0106), and an index filesystem at/above its
+    high-water mark (#0232). Disk telemetry rides on every payload; when
+    several conditions hold at once, the most urgent one (disk) names the
+    status but the others keep their fields.
     """
     index_root = Path(config["index_root"])
     disk = _index_disk_usage(index_root)
-    running, pid = _resolve_indexer_pid(index_root / "indexer.pid")
-    payload: dict = {"status": "ok", "indexer": "running" if running else "idle"}
+    index_run = _get_index_run_supervisor(config).status_summary()
+    current_run = index_run.get("current")
+    if isinstance(current_run, dict):
+        running = current_run.get("status") in _ACTIVE_INDEX_RUN_STATUSES
+        pid = current_run.get("pid") if running else None
+    else:
+        running, pid = _resolve_indexer_pid(index_root / "indexer.pid")
+    payload: dict = {
+        "status": "ok",
+        "indexer": "running" if running else "idle",
+        "index_run": index_run,
+    }
     payload.update(disk)
     if running:
         hb = index_root / "indexer.heartbeat"
@@ -296,6 +309,14 @@ def _health_probe(config: dict) -> tuple[dict, int]:
         payload["indexer_pid"] = pid
         payload["heartbeat_age_s"] = round(age)
     status_code = 200
+    if not running and index_run["unresolved_failure"]:
+        terminal = index_run["latest_terminal"]
+        payload["status"] = "index_failed"
+        payload["detail"] = (
+            f"latest index attempt ended {terminal['status']}; "
+            "last successful index is older or absent"
+        )
+        status_code = 503
     fts_failed = _fts_rebuild_failed_count(index_root)
     if fts_failed:
         payload["status"] = "degraded"
@@ -501,6 +522,52 @@ _cache_identity: int | None = None
 _DEEP_HEALTH_CACHE_TTL_SECONDS = 600
 _DEEP_HEALTH_SNAPSHOT = "index_health.json"
 _deep_health_cache: dict | None = None
+_index_supervisors: dict[str, IndexRunSupervisor] = {}
+_index_supervisors_lock = threading.Lock()
+
+
+def _index_monitor_interval(config: dict) -> float:
+    raw = os.environ.get(
+        "INDEXER_MONITOR_INTERVAL_SECONDS",
+        config.get("indexing", {}).get("monitor_interval_seconds", 5),
+    )
+    try:
+        return max(0.1, float(raw))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _get_index_run_supervisor(config: dict) -> IndexRunSupervisor:
+    """Return one process-local supervisor per canonical index root."""
+    index_root = Path(config["index_root"]).resolve()
+    key = str(index_root)
+    with _index_supervisors_lock:
+        supervisor = _index_supervisors.get(key)
+        if supervisor is None:
+            supervisor = IndexRunSupervisor(
+                index_root,
+                process_matches=_pid_is_indexer,
+                monitor_interval=_index_monitor_interval(config),
+            )
+            _index_supervisors[key] = supervisor
+        return supervisor
+
+
+def initialize_index_supervisor(config: dict) -> None:
+    """Reconcile a crash-left active run before serving requests."""
+    _get_index_run_supervisor(config).reconcile()
+
+
+def shutdown_index_supervisors() -> None:
+    """Stop every supervised index process group during server shutdown."""
+    with _index_supervisors_lock:
+        supervisors = list(_index_supervisors.values())
+        _index_supervisors.clear()
+    for supervisor in supervisors:
+        try:
+            supervisor.shutdown()
+        except Exception:  # shutdown must continue across independent roots
+            logger.exception("Failed to shut down index supervisor at %s", supervisor.index_root)
 
 
 def _index_metadata_signature(config: dict) -> tuple[int, int] | None:
@@ -2039,8 +2106,13 @@ def _file_status_impl() -> dict:
 
     # Check if an indexer subprocess is currently running
     index_root = Path(config["index_root"])
-    pid_file = index_root / "indexer.pid"
-    indexer_running, indexer_pid = _resolve_indexer_pid(pid_file)
+    index_run = _get_index_run_supervisor(config).status_summary()
+    current_run = index_run.get("current")
+    if isinstance(current_run, dict):
+        indexer_running = current_run.get("status") in _ACTIVE_INDEX_RUN_STATUSES
+        indexer_pid = current_run.get("pid") if indexer_running else None
+    else:
+        indexer_running, indexer_pid = _resolve_indexer_pid(index_root / "indexer.pid")
     deep_health = _get_deep_health(
         store=store,
         config=config,
@@ -2065,6 +2137,7 @@ def _file_status_impl() -> dict:
         "embeddings_provider": config.get("embeddings", {}).get("provider"),
         "metadata_fields": sorted(store._metadata_subfields()),
         "indexer_running": indexer_running,
+        "index_run": index_run,
         "health": {
             "fts_available": fts_ok,
             "reranker_enabled": reranker_enabled,
@@ -2220,7 +2293,6 @@ def _file_index_update_impl(config_path: str = "config.yaml", source_name: str |
     responsive while indexing runs.  The subprocess writes results to
     index_metadata.json when it finishes.  Use file_status to check progress.
     """
-    import subprocess
     import sys
 
     config = load_config(config_path)
@@ -2234,63 +2306,48 @@ def _file_index_update_impl(config_path: str = "config.yaml", source_name: str |
                 f"Use one of: {', '.join(valid_sources) if valid_sources else '(none configured)'}",
             )
     index_root = Path(config["index_root"])
-    pid_file = index_root / "indexer.pid"
+    log_path = index_root / "indexer.log"
 
-    # Check if an indexer is already running
-    indexer_running, old_pid = _resolve_indexer_pid(pid_file)
-    if indexer_running and old_pid is not None:
-        logger.info("file_index_update: indexer already running (pid %d)", old_pid)
+    # Prefect lifecycle (#0325): this child inherits PREFECT_API_URL from the
+    # server.py entrypoint's persistent PrefectServer, so index_vault_flow
+    # attaches to that one stable server. Do NOT wrap it in its own
+    # PrefectServer or let it auto-start an ephemeral one — a per-run temporary
+    # server orphans when earlyoom kills this subprocess before teardown.
+    # Ephemeral auto-start is disabled in the deployment env for the same reason.
+    script = (
+        "import logging\n"
+        "logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')\n"
+        "from flow_index_vault import index_vault_flow\n"
+        f"index_vault_flow({config_path!r}, source_name={source_name!r})\n"
+    )
+
+    launch = _get_index_run_supervisor(config).start(
+        [sys.executable, "-u", "-c", script],
+        log_path=log_path,
+        source_name=source_name,
+    )
+
+    if launch["status"] == "already_running":
+        logger.info("file_index_update: indexer already running (pid %d)", launch["pid"])
         return {
-            "status": "already_running",
-            "pid": old_pid,
-            "source_name": source_name,
+            **launch,
             "message": "An indexer is already running. Use file_status to check progress.",
         }
+    if launch["status"] == "launch_failed":
+        return _error(
+            "index_launch_failed",
+            f"Failed to start indexer: {launch['error']}",
+            "Check index-root permissions and server logs.",
+        )
 
-    # Ensure index_root exists so the subprocess can write its PID file
-    index_root.mkdir(parents=True, exist_ok=True)
-
-    # Rotate previous log (keep one .prev) so each run is diagnosable
-    log_path = index_root / "indexer.log"
-    prev_log_path = index_root / "indexer.log.prev"
-    if log_path.exists():
-        try:
-            log_path.replace(prev_log_path)
-        except OSError:
-            pass
-
-    script = (
-        "import os, sys, logging\n"
-        "from pathlib import Path\n"
-        "logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')\n"
-        f"pid_file = Path({str(pid_file)!r})\n"
-        "pid_file.write_text(str(os.getpid()))\n"
-        "try:\n"
-        "    from flow_index_vault import index_vault_flow\n"
-        f"    index_vault_flow({config_path!r}, source_name={source_name!r})\n"
-        "finally:\n"
-        "    pid_file.unlink(missing_ok=True)\n"
-    )
-
-    log_fh = open(log_path, "a", buffering=1)
-    proc = subprocess.Popen(
-        [sys.executable, "-u", "-c", script],
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,  # Detach so the subprocess survives parent restart
-    )
-    log_fh.close()  # Child inherited the fd; parent doesn't need it
-
-    logger.info("file_index_update: started indexer subprocess (pid %d)", proc.pid)
+    logger.info("file_index_update: started indexer subprocess (pid %d)", launch["pid"])
 
     # Invalidate cache so the next query picks up fresh data after indexing
     global _cache
     _cache = None
 
     return {
-        "status": "started",
-        "pid": proc.pid,
-        "source_name": source_name,
+        **launch,
         "message": "Indexing started in background. Use file_status to check progress.",
     }
 
@@ -3233,9 +3290,9 @@ if HAS_MCP and FastMCP is not None:
 
                 # Unauthenticated liveness/progress probe (for docker-health etc.).
                 # Returns 503 when an indexer is RUNNING but its heartbeat has
-                # gone stale (a silent freeze), or when the last run failed to
-                # rebuild the FTS index (keyword search silently going stale);
-                # 200 when healthy or idle. See _health_probe.
+                # gone stale (a silent freeze), when the latest run terminated
+                # unsuccessfully, or when FTS rebuild failed; 200 only when the
+                # current/last attempt is healthy. See _health_probe.
                 async def _health(request):
                     try:
                         payload, status_code = _health_probe(config)

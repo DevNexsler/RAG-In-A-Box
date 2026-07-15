@@ -7,6 +7,7 @@ index metadata and sidecar.
 """
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -92,6 +93,39 @@ def test_duplicate_content_indexes_once(runtime):
                   store._vs.table.to_lance().to_table(columns=["doc_id"]).to_pylist())
     assert "documents::00001" in doc_ids
     assert "documents::00002" not in doc_ids  # duplicate skipped
+
+
+def test_process_doc_task_emits_memory_subphases(runtime):
+    docs_root, store, registry = runtime
+    doc = _make_doc(docs_root, "notes/one.md", "# One\nBody text", "00001")
+    _register(registry, doc)
+    spans: list[tuple[str, str, dict]] = []
+
+    class Observer:
+        @contextmanager
+        def measure(self, subphase, **fields):
+            spans.append(("start", subphase, fields))
+            try:
+                yield
+            finally:
+                spans.append(("finish", subphase, fields))
+
+    observer = Observer()
+    fiv._RUNTIME["memory_observer"] = observer
+    store.set_memory_observer(observer)
+
+    fiv.process_doc_task.fn(doc)
+
+    started = [subphase for event, subphase, _ in spans if event == "start"]
+    assert started == [
+        "extract",
+        "enrichment",
+        "embed",
+        "storage_schema",
+        "storage_delete",
+        "storage_add",
+    ]
+    assert all(fields.get("doc_id") == doc["doc_id"] for _, _, fields in spans)
 
 
 def test_duplicate_marked_in_registry_with_canonical(runtime):

@@ -4,6 +4,15 @@ services:
     image: doc-organizer:latest
     container_name: doc-organizer
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    # #0325 production-shaped profiling sizes this envelope for the server,
+    # persistent Prefect process, and an 8-worker full-source index run. Keep
+    # regression failures inside this container instead of exposing the host to
+    # earlyoom; deliberate host-specific sizing remains an explicit override.
+    mem_limit: ${DOC_ORGANIZER_MEMORY_LIMIT:-8g}
+    mem_reservation: ${DOC_ORGANIZER_MEMORY_RESERVATION:-4g}
+    pids_limit: ${DOC_ORGANIZER_PIDS_LIMIT:-512}
     logging:
       driver: json-file
       options:
@@ -20,7 +29,7 @@ services:
       - doc-organizer-data:/data/index
       - ./config.yaml:/app/config.yaml:ro
       - ./.evals:/app/.evals
-    command: ["sh", "-c", "mkdir -p /data/documents /data/index && python server.py"]
+    command: ["python", "server.py"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -52,6 +61,13 @@ services:
       # used-percent (#0232), so docker-health surfaces disk pressure
       # before ENOSPC takes the host down.
       - DISK_USAGE_MAX_PERCENT=${DISK_USAGE_MAX_PERCENT:-90}
+      # Disable Prefect's ephemeral-server auto-start (#0325). server.py runs
+      # one persistent PrefectServer and exports PREFECT_API_URL, which index
+      # subprocesses inherit; with ephemeral off, a missing PREFECT_API_URL
+      # fails the run loudly instead of silently starting a throwaway temporary
+      # server that orphans when earlyoom kills the indexer (49+ orphans /
+      # ~19 GiB baseline). One intentional server, never a leak.
+      - PREFECT_SERVER_ALLOW_EPHEMERAL_MODE=false
 
 networks:
   rag-net:

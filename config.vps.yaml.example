@@ -14,6 +14,10 @@
 documents_root: "/data/documents"
 index_root: "/data/index"
 
+# Opt-in phase/per-document RSS + Arrow allocator checkpoints in indexer.log.
+memory_observability:
+  enabled: false
+
 # To use S3-backed LanceDB (multi-instance scaling):
 # index_root: "s3://my-bucket/doc-organizer-index"
 # storage_options:
