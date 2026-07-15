@@ -41,6 +41,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -102,6 +103,14 @@ _tracer = get_tracer("pipeline")
 # Module-level runtime context populated by the flow, read by tasks.
 # Avoids passing unpickleable objects as Prefect task arguments.
 _RUNTIME: dict[str, Any] = {}
+
+
+def _measure_index_memory(subphase: str, doc_id: str):
+    observer = _RUNTIME.get("memory_observer")
+    measure = getattr(observer, "measure", None)
+    if not callable(measure):
+        return nullcontext()
+    return measure(subphase, doc_id=doc_id)
 
 
 # --- Helpers ---
@@ -1083,22 +1092,23 @@ def process_doc_task(doc: dict) -> None:
         source_record = source_records_by_ns_doc_id.get(doc_id)
 
         with _tracer.start_as_current_span("extract", attributes={"source_type": source_type}):
-            if src is not None and source_record is not None:
-                result = src.extract(source_record)
-            else:
-                # Fallback: direct extract_text for records that pre-date the source refactor
-                # (e.g., tasks spawned from a _RUNTIME that doesn't have sources_by_name yet).
-                pdf_cfg = config.get("pdf", {})
-                abs_path = doc.get("abs_path", doc_id)
-                result = extract_text(
-                    file_path=abs_path,
-                    ext=ext,
-                    ocr_provider=ocr_provider,
-                    media_provider=media_provider,
-                    pdf_strategy=pdf_cfg.get("strategy", "text_then_ocr"),
-                    min_text_chars=pdf_cfg.get("min_text_chars_before_ocr", 200),
-                    ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
-                )
+            with _measure_index_memory("extract", doc_id):
+                if src is not None and source_record is not None:
+                    result = src.extract(source_record)
+                else:
+                    # Fallback: direct extract_text for records that pre-date the source refactor
+                    # (e.g., tasks spawned from a _RUNTIME that doesn't have sources_by_name yet).
+                    pdf_cfg = config.get("pdf", {})
+                    abs_path = doc.get("abs_path", doc_id)
+                    result = extract_text(
+                        file_path=abs_path,
+                        ext=ext,
+                        ocr_provider=ocr_provider,
+                        media_provider=media_provider,
+                        pdf_strategy=pdf_cfg.get("strategy", "text_then_ocr"),
+                        min_text_chars=pdf_cfg.get("min_text_chars_before_ocr", 200),
+                        ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
+                    )
 
         source_metadata = (
             getattr(source_record, "metadata", {}) if source_record is not None else {}
@@ -1188,40 +1198,41 @@ def process_doc_task(doc: dict) -> None:
         llm_generator = _RUNTIME.get("llm_generator")
         taxonomy_store = _RUNTIME.get("taxonomy_store")
         enrichment_cfg = _RUNTIME.get("config", {}).get("enrichment", {})
-        if llm_generator:
-            enrichment = enrich_document(
-                text=full_text,
-                title=title,
-                source_type=source_type,
-                generator=llm_generator,
-                max_input_chars=enrichment_cfg.get("max_input_chars", 4000),
-                max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
-                taxonomy_store=taxonomy_store,
-                context_text=context_text,
-                record_taxonomy_usage=False,
-                postprocess_enrichment=bool(enrichment_cfg.get("postprocess_enrichment", False)),
-                postprocess_rules=enrichment_cfg.get("postprocess_rules"),
-            )
-            enrichment_failed = bool(enrichment.get("_enrichment_failed"))
-            if enrichment_failed:
-                reason = enrichment.pop("_enrichment_failed")
-                logger.warning("Enrichment failed for '%s': %s", doc_id, reason)
-                _RUNTIME.setdefault("_warnings", []).append(
-                    f"enrichment_failed:{doc_id}:{reason}"
+        with _measure_index_memory("enrichment", doc_id):
+            if llm_generator:
+                enrichment = enrich_document(
+                    text=full_text,
+                    title=title,
+                    source_type=source_type,
+                    generator=llm_generator,
+                    max_input_chars=enrichment_cfg.get("max_input_chars", 4000),
+                    max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
+                    taxonomy_store=taxonomy_store,
+                    context_text=context_text,
+                    record_taxonomy_usage=False,
+                    postprocess_enrichment=bool(enrichment_cfg.get("postprocess_enrichment", False)),
+                    postprocess_rules=enrichment_cfg.get("postprocess_rules"),
                 )
-                note_degradation(
-                    "enrichment_failed",
-                    transient=bool(enrichment.get("_enrichment_transient")),
-                )
-            elif not enrichment.get("enr_summary"):
-                logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
-            if not enrichment_failed:
-                _queue_taxonomy_usage(enrichment, _RUNTIME.get("taxonomy_usage"))
-            enrichment.pop("_enrichment_failed", None)
-            enrichment.pop("_enrichment_transient", None)
-            doc_meta.update(enrichment)
-        else:
-            doc_meta.update(empty_enrichment())
+                enrichment_failed = bool(enrichment.get("_enrichment_failed"))
+                if enrichment_failed:
+                    reason = enrichment.pop("_enrichment_failed")
+                    logger.warning("Enrichment failed for '%s': %s", doc_id, reason)
+                    _RUNTIME.setdefault("_warnings", []).append(
+                        f"enrichment_failed:{doc_id}:{reason}"
+                    )
+                    note_degradation(
+                        "enrichment_failed",
+                        transient=bool(enrichment.get("_enrichment_transient")),
+                    )
+                elif not enrichment.get("enr_summary"):
+                    logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
+                if not enrichment_failed:
+                    _queue_taxonomy_usage(enrichment, _RUNTIME.get("taxonomy_usage"))
+                enrichment.pop("_enrichment_failed", None)
+                enrichment.pop("_enrichment_transient", None)
+                doc_meta.update(enrichment)
+            else:
+                doc_meta.update(empty_enrichment())
 
         # --- Importance: frontmatter overrides LLM, track source ---
         fm_importance = fm.get("importance")
@@ -1263,7 +1274,8 @@ def process_doc_task(doc: dict) -> None:
                 ctx = _build_chunk_context(doc_meta, page=page_text.page)
                 contextualized = [ctx + c for c in raw_chunks]
                 with _tracer.start_as_current_span("embed", attributes={"chunk_count": len(contextualized)}):
-                    page_vectors = embed_provider.embed_texts(contextualized)
+                    with _measure_index_memory("embed", doc_id):
+                        page_vectors = embed_provider.embed_texts(contextualized)
 
                 for i, (ctx_text, raw_text, vector) in enumerate(
                     zip(contextualized, raw_chunks, page_vectors, strict=True)
@@ -1300,7 +1312,8 @@ def process_doc_task(doc: dict) -> None:
                     all_sections.append(heading_ctx)
 
             with _tracer.start_as_current_span("embed", attributes={"chunk_count": len(all_ctx)}):
-                vectors = embed_provider.embed_texts(all_ctx)
+                with _measure_index_memory("embed", doc_id):
+                    vectors = embed_provider.embed_texts(all_ctx)
 
             for i, (ctx_text, raw_text, sec, vector) in enumerate(
                 zip(all_ctx, all_raw, all_sections, vectors, strict=True)
@@ -1328,7 +1341,8 @@ def process_doc_task(doc: dict) -> None:
             ctx = _build_chunk_context(doc_meta)
             contextualized = [ctx + c for c in raw_chunks]
             with _tracer.start_as_current_span("embed", attributes={"chunk_count": len(contextualized)}):
-                vectors = embed_provider.embed_texts(contextualized)
+                with _measure_index_memory("embed", doc_id):
+                    vectors = embed_provider.embed_texts(contextualized)
 
             for i, (ctx_text, raw_text, vector) in enumerate(
                 zip(contextualized, raw_chunks, vectors, strict=True)
@@ -1768,6 +1782,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     # --- Build components from config (stored in _RUNTIME for tasks) ---
     table_name = config.get("lancedb", {}).get("table", "chunks")
     store = open_store_with_recovery(index_root, table_name, logger_obj=logger, auto_recover=True)
+    store.set_memory_observer(memory_observer)
 
     # Persistent document ID registry
     doc_id_store = DocIDStore(Path(index_root) / "doc_registry.db")
@@ -1968,6 +1983,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
                 except Exception as exc:
                     logger.warning("Failed to drop table during migration: %s", exc)
                 store = LanceDBStore(index_root, table_name)
+                store.set_memory_observer(memory_observer)
                 _RUNTIME["store"] = store
 
     # --- Run pipeline ---
@@ -2092,6 +2108,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
             len(scanned),
         )
         store = LanceDBStore(index_root, shadow_table_name)
+        store.set_memory_observer(memory_observer)
         store.reset_table()
         _RUNTIME["store"] = store
         docs_to_process = scanned
@@ -2202,6 +2219,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         recovered_store = _recover_corrupt_table(index_root, table_name, logger)
         if recovered_store:
             store = recovered_store
+            store.set_memory_observer(memory_observer)
             _RUNTIME["store"] = store
             try:
                 store.create_fts_index()
@@ -2389,6 +2407,8 @@ def _build_single_doc_runtime(
     from sources.filesystem import _communication_sidecar_metadata
 
     chunk_cfg = config.get("chunking", {})
+    memory_observer = MemoryObserver.from_config(config, _get_logger())
+    store.set_memory_observer(memory_observer)
     embed_provider = build_embed_provider(config)
     ocr_provider = build_ocr_provider(config)
     media_provider = build_media_provider(config)
@@ -2436,6 +2456,7 @@ def _build_single_doc_runtime(
     _RUNTIME.update(
         {
             "store": store,
+            "memory_observer": memory_observer,
             "doc_id_store": doc_id_store,
             "embed_provider": embed_provider,
             "splitter": splitter,

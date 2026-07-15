@@ -6,8 +6,9 @@ import json
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 
 def current_rss_bytes() -> int | None:
@@ -52,8 +53,7 @@ class MemoryObserver:
         self._rss_reader = rss_reader
         self._arrow_reader = arrow_reader
         self._lock = threading.Lock()
-        self._last_rss: int | None = None
-        self._last_arrow: int | None = None
+        self._baselines: dict[str, tuple[int | None, int | None]] = {}
 
     @classmethod
     def from_config(cls, config: dict, logger: logging.Logger) -> "MemoryObserver":
@@ -67,18 +67,49 @@ class MemoryObserver:
             with self._lock:
                 rss = self._rss_reader()
                 arrow = self._arrow_reader()
+                baseline_key = self._baseline_key(fields)
+                baseline = self._baselines.get(baseline_key)
                 payload: dict[str, Any] = {"event": event, **fields}
                 if rss is not None:
                     payload["rss_bytes"] = rss
-                    if self._last_rss is not None:
-                        payload["rss_delta_bytes"] = rss - self._last_rss
-                    self._last_rss = rss
+                    if baseline is not None and baseline[0] is not None:
+                        payload["rss_delta_bytes"] = rss - baseline[0]
                 if arrow is not None:
                     payload["arrow_allocated_bytes"] = arrow
-                    if self._last_arrow is not None:
-                        payload["arrow_delta_bytes"] = arrow - self._last_arrow
-                    self._last_arrow = arrow
+                    if baseline is not None and baseline[1] is not None:
+                        payload["arrow_delta_bytes"] = arrow - baseline[1]
+                if event.endswith("_finish"):
+                    self._baselines.pop(baseline_key, None)
+                else:
+                    self._baselines[baseline_key] = (rss, arrow)
                 self._logger.info("index-memory %s", json.dumps(payload, sort_keys=True))
         except Exception:
             # Observability must never interrupt indexing.
             self._logger.debug("index memory checkpoint failed", exc_info=True)
+
+    @contextmanager
+    def measure(self, subphase: str, **fields: Any) -> Iterator[None]:
+        """Measure one named operation without changing its control flow."""
+        self.sample("subphase_start", subphase=subphase, **fields)
+        try:
+            yield
+        except BaseException:
+            self.sample(
+                "subphase_finish", subphase=subphase, outcome="failed", **fields
+            )
+            raise
+        else:
+            self.sample("subphase_finish", subphase=subphase, outcome="ok", **fields)
+
+    @staticmethod
+    def _baseline_key(fields: dict[str, Any]) -> str:
+        doc_id = fields.get("doc_id")
+        phase = fields.get("phase")
+        subphase = fields.get("subphase")
+        if doc_id is not None:
+            return f"doc:{doc_id}:subphase:{subphase or ''}"
+        if subphase is not None:
+            return f"subphase:{subphase}"
+        if phase is not None:
+            return f"phase:{phase}"
+        return "global"

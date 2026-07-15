@@ -57,6 +57,58 @@ def test_enabled_memory_observer_logs_rss_arrow_and_deltas():
     assert payloads[1]["outcome"] == "ok"
 
 
+def test_concurrent_doc_deltas_use_each_docs_own_start_baseline():
+    from memory_observer import MemoryObserver
+
+    logger = RecordingLogger()
+    rss = iter([100, 200, 150, 260])
+    arrow = iter([10, 20, 15, 30])
+    observer = MemoryObserver(
+        enabled=True,
+        logger=logger,
+        rss_reader=lambda: next(rss),
+        arrow_reader=lambda: next(arrow),
+    )
+
+    observer.sample("doc_start", phase="process", doc_id="documents::a")
+    observer.sample("doc_start", phase="process", doc_id="documents::b")
+    observer.sample("doc_finish", phase="process", doc_id="documents::a", outcome="ok")
+    observer.sample("doc_finish", phase="process", doc_id="documents::b", outcome="ok")
+
+    payloads = [json.loads(args[0]) for _, args in logger.messages]
+    assert payloads[2]["rss_delta_bytes"] == 50
+    assert payloads[2]["arrow_delta_bytes"] == 5
+    assert payloads[3]["rss_delta_bytes"] == 60
+    assert payloads[3]["arrow_delta_bytes"] == 10
+
+
+def test_measure_emits_subphase_boundaries_with_one_baseline():
+    from memory_observer import MemoryObserver
+
+    logger = RecordingLogger()
+    rss = iter([100, 175])
+    arrow = iter([10, 30])
+    observer = MemoryObserver(
+        enabled=True,
+        logger=logger,
+        rss_reader=lambda: next(rss),
+        arrow_reader=lambda: next(arrow),
+    )
+
+    with observer.measure("extract", doc_id="documents::abc"):
+        pass
+
+    payloads = [json.loads(args[0]) for _, args in logger.messages]
+    assert [payload["event"] for payload in payloads] == [
+        "subphase_start",
+        "subphase_finish",
+    ]
+    assert {payload["subphase"] for payload in payloads} == {"extract"}
+    assert payloads[1]["rss_delta_bytes"] == 75
+    assert payloads[1]["arrow_delta_bytes"] == 20
+    assert payloads[1]["outcome"] == "ok"
+
+
 def test_bounded_executor_map_consumes_at_most_window_before_completion():
     from flow_index_vault import _bounded_executor_map
 

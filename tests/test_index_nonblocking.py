@@ -9,6 +9,15 @@ import os
 import time
 from unittest.mock import patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _stable_process_identity(monkeypatch):
+    """Mocked Popen PIDs have no /proc entry; provide their launch identity."""
+    monkeypatch.setattr(
+        "index_run_supervisor.process_starttime_ticks", lambda pid: pid * 10
+    )
 
 
 def _spawn_zombie_child() -> int:

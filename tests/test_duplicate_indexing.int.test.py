@@ -134,6 +134,45 @@ def test_update_canonical_duplicate_metadata_does_not_nest_node_content(tmp_path
     assert sizes[-1] < baseline + 10_000, f"unbounded _node_content growth: {sizes}"
 
 
+def test_update_canonical_duplicate_metadata_compacts_duplicate_chunk_ids(tmp_path):
+    """Legacy physical duplication must self-heal without losing real chunks."""
+    store = LanceDBStore(tmp_path, "test_chunks")
+    canonical_doc_id = "documents::00001"
+    vector = [0.1] * 768
+    unique_nodes = [
+        _make_node(canonical_doc_id, "c:0", "alpha", vector),
+        _make_node(canonical_doc_id, "c:1", "beta", vector),
+    ]
+    store.upsert_nodes(unique_nodes)
+    store._vs.add(
+        [_make_node(canonical_doc_id, "c:0", "alpha", vector) for _ in range(128)]
+    )
+
+    before = (
+        store._vs.table.search(None)
+        .where(f"doc_id = '{canonical_doc_id}'", prefilter=True)
+        .select(["id"])
+        .to_list()
+    )
+    assert len(before) == 130
+
+    store.update_canonical_duplicate_metadata(
+        canonical_doc_id,
+        [{"doc_id": "documents::duplicate", "rel_path": "duplicate.jpg"}],
+    )
+
+    after = (
+        store._vs.table.search(None)
+        .where(f"doc_id = '{canonical_doc_id}'", prefilter=True)
+        .select(["id"])
+        .to_list()
+    )
+    assert sorted(row["id"] for row in after) == [
+        f"{canonical_doc_id}::c:0",
+        f"{canonical_doc_id}::c:1",
+    ]
+
+
 def test_upsert_nodes_strips_llama_managed_metadata_keys(tmp_path):
     """Defense in depth: a node whose metadata carries LlamaIndex-managed keys
     from a read-back row (stale _node_content etc.) must not persist them into

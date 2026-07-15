@@ -74,6 +74,58 @@ def process_peak_rss_bytes(pid: int) -> int:
     return max(values.values(), default=0)
 
 
+def _read_proc_stat(pid: int) -> list[str] | None:
+    """Return Linux proc stat fields after the parenthesized command name."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    command_end = raw.rfind(")")
+    if command_end < 0:
+        return None
+    fields = raw[command_end + 1 :].split()
+    return fields or None
+
+
+def process_starttime_ticks(pid: int) -> int | None:
+    """Return immutable Linux process identity from /proc/<pid>/stat field 22."""
+    fields = _read_proc_stat(pid)
+    if fields is None or len(fields) <= 19:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def process_group_is_alive(pgid: int) -> bool:
+    """Return true when a process group contains any non-zombie member."""
+    if pgid <= 0:
+        return False
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return False
+        return True
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            fields = _read_proc_stat(int(entry.name))
+            if fields is None or len(fields) <= 2 or fields[0] == "Z":
+                continue
+            try:
+                member_pgid = int(fields[2])
+            except ValueError:
+                continue
+            if member_pgid == pgid:
+                return True
+    return False
+
+
 class IndexRunSupervisor:
     """Own one index run for one index root."""
 
@@ -86,8 +138,11 @@ class IndexRunSupervisor:
         popen_factory: Callable[..., Any] | None = None,
         rss_reader: Callable[[int], int] = process_peak_rss_bytes,
         killpg: Callable[[int, int], None] = os.killpg,
+        group_alive: Callable[[int], bool] = process_group_is_alive,
+        starttime_reader: Callable[[int], int | None] | None = None,
         monitor_interval: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.index_root = Path(index_root)
@@ -101,9 +156,14 @@ class IndexRunSupervisor:
         self._popen = popen_factory or subprocess.Popen
         self._rss_reader = rss_reader
         self._killpg = killpg
+        self._group_alive = group_alive
+        self._starttime_reader = starttime_reader or process_starttime_ticks
         self._monitor_interval = max(0.001, float(monitor_interval))
+        self._monitor_lease_seconds = max(1.0, self._monitor_interval * 3.0)
         self._clock = clock
+        self._wall_clock = wall_clock
         self._sleep = sleep
+        self._owner_id = uuid.uuid4().hex
         self._thread_lock = threading.RLock()
         self._monitor_lock = threading.Lock()
         self._monitors: dict[str, threading.Thread] = {}
@@ -180,12 +240,50 @@ class IndexRunSupervisor:
                 return
         self.pid_path.unlink(missing_ok=True)
 
-    def _active_is_live(self, current: dict[str, Any]) -> bool:
+    def _active_identity_failure(self, current: dict[str, Any]) -> str | None:
         try:
             pid = int(current.get("pid") or 0)
         except (TypeError, ValueError):
+            return "process_missing_on_reconcile"
+        if pid <= 0 or not self._pid_alive(pid):
+            return "process_missing_on_reconcile"
+        expected_starttime = current.get("process_starttime_ticks")
+        actual_starttime = self._starttime_reader(pid)
+        if actual_starttime is None or expected_starttime is None:
+            return "process_identity_unreadable_on_reconcile"
+        try:
+            expected_starttime = int(expected_starttime)
+        except (TypeError, ValueError):
+            return "process_identity_unreadable_on_reconcile"
+        if actual_starttime != expected_starttime:
+            return "process_identity_changed_on_reconcile"
+        if not self._process_matches(pid):
+            return "process_command_changed_on_reconcile"
+        return None
+
+    def _lease_is_fresh(self, current: dict[str, Any]) -> bool:
+        try:
+            expires_at = float(current.get("monitor_lease_expires_at") or 0)
+        except (TypeError, ValueError):
             return False
-        return pid > 0 and self._pid_alive(pid) and self._process_matches(pid)
+        return bool(current.get("monitor_owner_id")) and expires_at > self._wall_clock()
+
+    def _owned_by_self(self, current: dict[str, Any]) -> bool:
+        return current.get("monitor_owner_id") == self._owner_id
+
+    def _claim_monitor_locked(
+        self, state: dict[str, Any], current: dict[str, Any]
+    ) -> dict[str, Any]:
+        current = {
+            **current,
+            "monitor_owner_id": self._owner_id,
+            "monitor_lease_expires_at": self._wall_clock()
+            + self._monitor_lease_seconds,
+        }
+        state["current"] = current
+        state["last_attempt"] = current
+        self._write_state_locked(state)
+        return current
 
     def _monitor_is_alive(self, run_id: object) -> bool:
         if not run_id:
@@ -207,30 +305,47 @@ class IndexRunSupervisor:
         )
         return terminal
 
-    def _reconcile_locked(self, state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    def _reconcile_locked(
+        self, state: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
         current = state.get("current")
         if isinstance(current, dict) and current.get("status") in _ACTIVE_STATUSES:
-            if self._active_is_live(current):
+            identity_failure = self._active_identity_failure(current)
+            if identity_failure is None:
                 self._write_pid_locked(int(current["pid"]))
-                return state, current
+                if self._owned_by_self(current):
+                    return state, current, True
+                if self._lease_is_fresh(current):
+                    return state, current, False
+                current = self._claim_monitor_locked(state, current)
+                return state, current, True
             # A child-backed monitor owns the authoritative return code.  Give
             # it the short race between process exit and its next poll instead
             # of degrading a clean/signalled exit to an ambiguous lost state.
-            if self._monitor_is_alive(current.get("run_id")):
-                return state, current
-            terminal = self._terminal_lost(current, "process_missing_on_reconcile")
+            if (
+                self._monitor_is_alive(current.get("run_id"))
+                or self._lease_is_fresh(current)
+            ):
+                return state, current, False
+            terminal = self._terminal_lost(current, identity_failure)
             state["current"] = None
             state["last_attempt"] = terminal
             self._clear_pid_locked(current.get("pid"))
             self._write_state_locked(state)
-            return state, None
+            return state, None, False
 
         # Upgrade the legacy PID-only contract without losing an in-progress run.
         try:
             legacy_pid = int(self.pid_path.read_text().strip())
         except (OSError, ValueError):
             legacy_pid = 0
-        if legacy_pid and self._pid_alive(legacy_pid) and self._process_matches(legacy_pid):
+        legacy_starttime = self._starttime_reader(legacy_pid) if legacy_pid else None
+        if (
+            legacy_pid
+            and legacy_starttime is not None
+            and self._pid_alive(legacy_pid)
+            and self._process_matches(legacy_pid)
+        ):
             try:
                 started_at = datetime.fromtimestamp(
                     self.pid_path.stat().st_mtime, tz=timezone.utc
@@ -242,24 +357,27 @@ class IndexRunSupervisor:
                 "status": "running",
                 "pid": legacy_pid,
                 "pgid": legacy_pid,
+                "process_starttime_ticks": legacy_starttime,
                 "source_name": None,
                 "started_at": started_at,
                 "peak_rss_bytes": self._rss_reader(legacy_pid),
                 "adopted": True,
             }
+            adopted = self._claim_monitor_locked(state, adopted)
             state["current"] = adopted
             state["last_attempt"] = adopted
-            self._write_state_locked(state)
-            return state, adopted
+            return state, adopted, True
         if legacy_pid:
             self._clear_pid_locked(legacy_pid)
-        return state, None
+        return state, None, False
 
     def reconcile(self) -> dict[str, Any]:
         with self._locked():
-            state, active = self._reconcile_locked(self._read_state_locked())
+            state, active, should_monitor = self._reconcile_locked(
+                self._read_state_locked()
+            )
             snapshot = copy.deepcopy(state)
-        if active:
+        if active and should_monitor:
             self._ensure_monitor(active, process=None)
         return snapshot
 
@@ -297,8 +415,12 @@ class IndexRunSupervisor:
         process = None
         attempt: dict[str, Any]
         with self._locked():
-            state, active = self._reconcile_locked(self._read_state_locked())
+            state, active, should_monitor = self._reconcile_locked(
+                self._read_state_locked()
+            )
             if active:
+                if should_monitor:
+                    self._ensure_monitor(active, process=None)
                 return {
                     "status": "already_running",
                     "pid": int(active["pid"]),
@@ -314,6 +436,9 @@ class IndexRunSupervisor:
                 "source_name": source_name,
                 "started_at": _utc_now(),
                 "peak_rss_bytes": 0,
+                "monitor_owner_id": self._owner_id,
+                "monitor_lease_expires_at": self._wall_clock()
+                + self._monitor_lease_seconds,
             }
             state["current"] = attempt
             state["last_attempt"] = attempt
@@ -338,17 +463,24 @@ class IndexRunSupervisor:
                     start_new_session=True,
                 )
                 pid = int(process.pid)
+                process_starttime = self._starttime_reader(pid)
+                if process_starttime is None:
+                    raise OSError(f"cannot read process identity for spawned pid {pid}")
                 attempt = {
                     **attempt,
                     "status": "running",
                     "pid": pid,
                     "pgid": pid,
+                    "process_starttime_ticks": process_starttime,
                 }
                 state["current"] = attempt
                 state["last_attempt"] = attempt
                 self._write_pid_locked(pid)
                 self._write_state_locked(state)
-            except OSError as exc:
+                self._ensure_monitor(attempt, process=process)
+            except Exception as exc:
+                if process is not None:
+                    self._terminate_spawned_process(process)
                 terminal = {
                     **attempt,
                     "status": "launch_failed",
@@ -371,13 +503,25 @@ class IndexRunSupervisor:
                 if log_handle is not None:
                     log_handle.close()
 
-        self._ensure_monitor(attempt, process=process)
         return {
             "status": "started",
             "pid": int(attempt["pid"]),
             "run_id": attempt["run_id"],
             "source_name": source_name,
         }
+
+    def _terminate_spawned_process(self, process: Any) -> None:
+        """Best-effort kill and reap after a post-spawn persistence failure."""
+        try:
+            self._killpg(int(process.pid), signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            wait = getattr(process, "wait", None)
+            if callable(wait):
+                wait(timeout=1.0)
+        except (OSError, subprocess.TimeoutExpired):
+            logger.error("Could not reap failed index launch pid %s", process.pid)
 
     def _ensure_monitor(self, attempt: dict[str, Any], process: Any | None) -> None:
         run_id = str(attempt["run_id"])
@@ -395,16 +539,22 @@ class IndexRunSupervisor:
             thread.start()
 
     def _record_peak(self, run_id: str, rss_bytes: int) -> None:
-        if rss_bytes <= 0:
-            return
         with self._locked():
             state = self._read_state_locked()
             current = state.get("current")
-            if not isinstance(current, dict) or current.get("run_id") != run_id:
+            if (
+                not isinstance(current, dict)
+                or current.get("run_id") != run_id
+                or not self._owned_by_self(current)
+            ):
                 return
-            if rss_bytes <= int(current.get("peak_rss_bytes") or 0):
-                return
-            current = {**current, "peak_rss_bytes": int(rss_bytes)}
+            current = {
+                **current,
+                "monitor_lease_expires_at": self._wall_clock()
+                + self._monitor_lease_seconds,
+            }
+            if rss_bytes > int(current.get("peak_rss_bytes") or 0):
+                current["peak_rss_bytes"] = int(rss_bytes)
             state["current"] = current
             state["last_attempt"] = current
             self._write_state_locked(state)
@@ -413,9 +563,17 @@ class IndexRunSupervisor:
         with self._locked():
             state = self._read_state_locked()
             current = state.get("current")
-            if not isinstance(current, dict) or current.get("run_id") != run_id:
+            if (
+                not isinstance(current, dict)
+                or current.get("run_id") != run_id
+                or not self._owned_by_self(current)
+            ):
                 return
             terminating = current.get("status") == "terminating"
+            if terminating and self._group_alive(
+                int(current.get("pgid") or current.get("pid") or 0)
+            ):
+                return
             if terminating:
                 status = "terminated"
             elif returncode == 0:
@@ -447,7 +605,11 @@ class IndexRunSupervisor:
         with self._locked():
             state = self._read_state_locked()
             current = state.get("current")
-            if not isinstance(current, dict) or current.get("run_id") != run_id:
+            if (
+                not isinstance(current, dict)
+                or current.get("run_id") != run_id
+                or not self._owned_by_self(current)
+            ):
                 return
             terminal = self._terminal_lost(current, reason)
             state["current"] = None
@@ -464,9 +626,16 @@ class IndexRunSupervisor:
                     if returncode is not None:
                         self._finish(run_id, int(returncode))
                         return
-                elif not self._pid_alive(pid) or not self._process_matches(pid):
-                    self._finish_lost(run_id, "process_disappeared_after_adoption")
-                    return
+                else:
+                    with self._locked():
+                        state = self._read_state_locked()
+                        current = state.get("current")
+                        if not isinstance(current, dict) or current.get("run_id") != run_id:
+                            return
+                        identity_failure = self._active_identity_failure(current)
+                    if identity_failure is not None:
+                        self._finish_lost(run_id, identity_failure)
+                        return
                 self._sleep(self._monitor_interval)
         except Exception as exc:  # monitoring must not take down the MCP server
             logger.exception("Index run monitor failed for %s: %s", run_id, exc)
@@ -477,9 +646,12 @@ class IndexRunSupervisor:
     def shutdown(self, grace_seconds: float = 10.0) -> None:
         """Terminate the active index process group before the server exits."""
         with self._locked():
-            state, active = self._reconcile_locked(self._read_state_locked())
+            state, active, _should_monitor = self._reconcile_locked(
+                self._read_state_locked()
+            )
             if not active:
                 return
+            active = self._claim_monitor_locked(state, active)
             current = {
                 **active,
                 "status": "terminating",
@@ -492,8 +664,9 @@ class IndexRunSupervisor:
             pid = int(current["pid"])
             pgid = int(current.get("pgid") or pid)
 
-        if not self._pid_alive(pid) or not self._process_matches(pid):
-            self._finish_lost(run_id, "process_missing_during_shutdown")
+        identity_failure = self._active_identity_failure(current)
+        if identity_failure is not None:
+            self._finish_lost(run_id, identity_failure)
             return
 
         sent_signal = signal.SIGTERM
@@ -504,10 +677,10 @@ class IndexRunSupervisor:
             return
 
         deadline = self._clock() + max(0.0, grace_seconds)
-        while self._pid_alive(pid) and self._clock() < deadline:
+        while self._group_alive(pgid) and self._clock() < deadline:
             self._sleep(min(0.05, max(0.0, deadline - self._clock())))
 
-        if self._pid_alive(pid):
+        if self._group_alive(pgid):
             sent_signal = signal.SIGKILL
             try:
                 self._killpg(pgid, signal.SIGKILL)
@@ -515,8 +688,11 @@ class IndexRunSupervisor:
                 pass
 
         settle_deadline = self._clock() + 1.0
-        while self._pid_alive(pid) and self._clock() < settle_deadline:
+        while self._group_alive(pgid) and self._clock() < settle_deadline:
             self._sleep(0.01)
+        if self._group_alive(pgid):
+            self._finish_lost(run_id, "process_group_survived_shutdown")
+            return
         # The monitor normally records the real return code. If it lost the race
         # with shutdown, preserve the signal outcome directly.
         self._finish(run_id, -int(sent_signal))

@@ -80,3 +80,42 @@ def test_shutdown_terminates_real_process_group_descendants(tmp_path):
     assert not process_is_alive(leader_pid)
     assert not process_is_alive(grandchild_pid)
     assert supervisor.status_summary()["last_attempt"]["status"] == "terminated"
+
+
+def test_shutdown_escalates_when_leader_exits_but_descendant_ignores_term(tmp_path):
+    grandchild_pid_path = tmp_path / "ignoring-grandchild.pid"
+    ready_path = tmp_path / "ignoring-grandchild.ready"
+    grandchild_script = (
+        "import pathlib, signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"pathlib.Path({str(ready_path)!r}).write_text('ready'); "
+        "time.sleep(30)"
+    )
+    leader_script = (
+        "import pathlib, subprocess, sys, time; "
+        f"child = subprocess.Popen([sys.executable, '-c', {grandchild_script!r}]); "
+        f"pathlib.Path({str(grandchild_pid_path)!r}).write_text(str(child.pid)); "
+        "time.sleep(30)"
+    )
+    supervisor = IndexRunSupervisor(
+        tmp_path,
+        process_matches=lambda _pid: True,
+        monitor_interval=0.01,
+    )
+    launch = supervisor.start(
+        [sys.executable, "-c", leader_script],
+        log_path=tmp_path / "indexer.log",
+    )
+    leader_pid = launch["pid"]
+    _wait_for(ready_path.exists)
+    grandchild_pid = int(grandchild_pid_path.read_text())
+
+    try:
+        supervisor.shutdown(grace_seconds=0.1)
+        assert not process_is_alive(leader_pid)
+        assert not process_is_alive(grandchild_pid)
+        assert supervisor.status_summary()["last_attempt"]["status"] == "terminated"
+        assert supervisor.status_summary()["last_attempt"]["termination_signal"] == signal.SIGKILL
+    finally:
+        if process_is_alive(grandchild_pid):
+            os.kill(grandchild_pid, signal.SIGKILL)

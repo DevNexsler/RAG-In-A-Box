@@ -152,8 +152,7 @@ def _pid_is_indexer(pid: int) -> bool:
     """Return True when pid appears to be the background indexer subprocess."""
     cmdline = _pid_cmdline(pid)
     if not cmdline:
-        # If cmdline is unavailable, keep legacy liveness behavior.
-        return True
+        return False
     return "index_vault_flow" in cmdline or "flow_index_vault" in cmdline
 
 

@@ -15,11 +15,13 @@ class FakeProcess:
         self.pid = pid
         self.returncode: int | None = None
         self._done = threading.Event()
+        self.wait_calls = 0
 
     def poll(self):
         return self.returncode
 
     def wait(self, timeout=None):
+        self.wait_calls += 1
         if not self._done.wait(timeout):
             raise subprocess.TimeoutExpired(["indexer"], timeout)
         return self.returncode
@@ -42,11 +44,19 @@ def _wait_for(predicate, timeout: float = 2.0):
 def _supervisor(tmp_path: Path, process: FakeProcess, **kwargs):
     from index_run_supervisor import IndexRunSupervisor
 
+    kwargs.setdefault("monitor_interval", 0.01)
+    kwargs.setdefault(
+        "group_alive",
+        lambda pgid: pgid == process.pid and process.poll() is None,
+    )
+    kwargs.setdefault(
+        "starttime_reader",
+        lambda pid: 1000 if pid == process.pid else None,
+    )
     return IndexRunSupervisor(
         tmp_path,
         process_matches=lambda pid: pid == process.pid,
         pid_alive=lambda pid: pid == process.pid and process.poll() is None,
-        monitor_interval=0.01,
         **kwargs,
     )
 
@@ -267,6 +277,145 @@ def test_launch_failure_is_durable_terminal_attempt(tmp_path):
     assert state["last_attempt"]["status"] == "launch_failed"
     assert state["last_attempt"]["finished_at"]
     assert state["last_success"] is None
+
+
+def test_post_spawn_pid_persistence_failure_kills_and_reaps_group(tmp_path, monkeypatch):
+    process = FakeProcess()
+    signals: list[tuple[int, int]] = []
+
+    def killpg(pgid, sig):
+        signals.append((pgid, sig))
+        process.finish(-sig)
+
+    supervisor = _supervisor(
+        tmp_path,
+        process,
+        popen_factory=lambda *a, **k: process,
+        killpg=killpg,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_write_pid_locked",
+        lambda _pid: (_ for _ in ()).throw(OSError("pid persistence failed")),
+    )
+
+    result = supervisor.start(["python", "indexer"], log_path=tmp_path / "indexer.log")
+    state = supervisor.snapshot()
+
+    assert result["status"] == "launch_failed"
+    assert signals == [(process.pid, signal.SIGKILL)]
+    assert process.wait_calls >= 1
+    assert process.poll() == -signal.SIGKILL
+    assert state["current"] is None
+    assert state["last_attempt"]["status"] == "launch_failed"
+
+
+def test_post_spawn_running_state_failure_kills_and_reaps_group(tmp_path, monkeypatch):
+    process = FakeProcess()
+    signals: list[tuple[int, int]] = []
+
+    def killpg(pgid, sig):
+        signals.append((pgid, sig))
+        process.finish(-sig)
+
+    supervisor = _supervisor(
+        tmp_path,
+        process,
+        popen_factory=lambda *a, **k: process,
+        killpg=killpg,
+    )
+    real_write = supervisor._write_state_locked
+    failed = False
+
+    def fail_running_state(state):
+        nonlocal failed
+        current = state.get("current")
+        if not failed and isinstance(current, dict) and current.get("status") == "running":
+            failed = True
+            raise OSError("running state persistence failed")
+        real_write(state)
+
+    monkeypatch.setattr(supervisor, "_write_state_locked", fail_running_state)
+
+    result = supervisor.start(["python", "indexer"], log_path=tmp_path / "indexer.log")
+    state = supervisor.snapshot()
+
+    assert result["status"] == "launch_failed"
+    assert signals == [(process.pid, signal.SIGKILL)]
+    assert process.wait_calls >= 1
+    assert process.poll() == -signal.SIGKILL
+    assert state["current"] is None
+    assert state["last_attempt"]["status"] == "launch_failed"
+
+
+def test_second_supervisor_cannot_overwrite_owner_success_with_false_lost(tmp_path):
+    process = FakeProcess()
+    owner = _supervisor(
+        tmp_path,
+        process,
+        popen_factory=lambda *a, **k: process,
+        monitor_interval=0.5,
+    )
+    owner.start(["python", "indexer"], log_path=tmp_path / "indexer.log")
+
+    observer = _supervisor(
+        tmp_path,
+        process,
+        popen_factory=lambda *a, **k: process,
+        monitor_interval=0.001,
+    )
+    process.finish(0)
+
+    state = _wait_for(
+        lambda: (
+            snapshot
+            if (snapshot := owner.snapshot()).get("current") is None
+            else None
+        ),
+        timeout=2,
+    )
+    assert state["last_attempt"]["status"] == "succeeded"
+    assert state["last_success"]["run_id"] == state["last_attempt"]["run_id"]
+    assert observer.status_summary()["unresolved_failure"] is False
+
+
+def test_reconcile_rejects_reused_pid_with_different_starttime(tmp_path):
+    active = {
+        "run_id": "old-process",
+        "status": "running",
+        "pid": 4242,
+        "pgid": 4242,
+        "process_starttime_ticks": 111,
+        "source_name": None,
+        "started_at": "2026-07-15T12:00:00+00:00",
+        "peak_rss_bytes": 99,
+    }
+    (tmp_path / "index_run_state.json").write_text(json.dumps({
+        "version": 1,
+        "current": active,
+        "last_attempt": active,
+        "last_success": None,
+    }))
+    (tmp_path / "indexer.pid").write_text("4242")
+    signals: list[tuple[int, int]] = []
+
+    from index_run_supervisor import IndexRunSupervisor
+
+    supervisor = IndexRunSupervisor(
+        tmp_path,
+        pid_alive=lambda _pid: True,
+        process_matches=lambda _pid: True,
+        starttime_reader=lambda _pid: 222,
+        killpg=lambda pgid, sig: signals.append((pgid, sig)),
+        monitor_interval=0.01,
+    )
+    state = supervisor.snapshot()
+    supervisor.shutdown(grace_seconds=0)
+
+    assert state["current"] is None
+    assert state["last_attempt"]["status"] == "lost"
+    assert state["last_attempt"]["terminal_reason"] == "process_identity_changed_on_reconcile"
+    assert signals == []
 
 
 def test_status_summary_marks_latest_terminal_failure_unresolved(tmp_path):

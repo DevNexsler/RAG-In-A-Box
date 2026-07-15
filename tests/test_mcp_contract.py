@@ -13,6 +13,12 @@ from core.storage import SearchHit
 import mcp_server
 
 
+def test_pid_is_indexer_rejects_unreadable_cmdline(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_pid_cmdline", lambda _pid: None)
+
+    assert mcp_server._pid_is_indexer(4242) is False
+
+
 # ---------------------------------------------------------------------------
 # MCP tool schema contract
 # ---------------------------------------------------------------------------
@@ -819,7 +825,7 @@ def test_index_update_returns_started_status():
         try:
             with patch("mcp_server.load_config", return_value={"index_root": tmpdir}), patch(
                 "subprocess.Popen", return_value=CompletedProc()
-            ):
+            ), patch("index_run_supervisor.process_starttime_ticks", return_value=260):
                 mcp_server._cache = None
                 result = mcp_server._file_index_update_impl(config_path="config.yaml")
 
@@ -851,7 +857,7 @@ def test_index_update_no_failures():
         try:
             with patch("mcp_server.load_config", return_value={"index_root": tmpdir}), patch(
                 "subprocess.Popen", return_value=CompletedProc()
-            ):
+            ), patch("index_run_supervisor.process_starttime_ticks", return_value=261):
                 mcp_server._cache = None
                 result = mcp_server._file_index_update_impl(config_path="config.yaml")
 

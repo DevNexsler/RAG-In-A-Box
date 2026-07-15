@@ -7,6 +7,7 @@ import re
 import shutil
 import threading
 from collections import Counter
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -212,6 +213,7 @@ class LanceDBStore:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
         self._schema_lock = threading.Lock()
+        self._memory_observer = None
         self._vs = self._build_vector_store()
         self._ensure_scalar_index()
         try:
@@ -227,6 +229,21 @@ class LanceDBStore:
             self._vs = self._build_vector_store()
             self._ensure_scalar_index()
             self._probe_table_read()
+
+    def set_memory_observer(self, observer: Any | None) -> None:
+        """Attach optional index memory instrumentation to storage writes."""
+        self._memory_observer = observer
+
+    def _measure_memory(self, subphase: str, **fields: Any):
+        observer = self._memory_observer
+        measure = getattr(observer, "measure", None)
+        if not callable(measure):
+            return nullcontext()
+        try:
+            return measure(subphase, **fields)
+        except Exception:
+            logger.debug("Cannot create memory measurement for %s", subphase, exc_info=True)
+            return nullcontext()
 
     def _build_vector_store(self) -> LanceDBVectorStore:
         return LanceDBVectorStore(
@@ -680,35 +697,44 @@ class LanceDBStore:
                 if n.metadata and not _LLAMA_MANAGED_METADATA_KEYS.isdisjoint(n.metadata):
                     n.metadata = _strip_llama_managed_keys(n.metadata)
 
-            # Detect new metadata fields and evolve schema if needed
-            existing_subfields = self._metadata_subfields()
-            if existing_subfields:  # table already has data
-                incoming_keys: set[str] = set()
-                for n in nodes:
-                    if n.metadata:
-                        incoming_keys.update(n.metadata.keys())
-                if incoming_keys:
-                    # Threaded indexing shares one store instance; re-check missing
-                    # fields under a lock so temp-table schema evolution is serialized.
-                    with self._schema_lock:
-                        existing_subfields = self._metadata_subfields()
-                        new_fields = incoming_keys - existing_subfields
-                        if new_fields:
-                            self._evolve_metadata_schema(new_fields)
-
             # Collect distinct doc_ids from this batch
             doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
+            memory_fields: dict[str, Any]
+            if len(doc_ids) == 1:
+                memory_fields = {"doc_id": next(iter(doc_ids))}
+            else:
+                memory_fields = {"doc_ids": sorted(doc_ids)}
+
+            # Detect new metadata fields and evolve schema if needed
+            with self._measure_memory("storage_schema", **memory_fields):
+                existing_subfields = self._metadata_subfields()
+                if existing_subfields:  # table already has data
+                    incoming_keys: set[str] = set()
+                    for n in nodes:
+                        if n.metadata:
+                            incoming_keys.update(n.metadata.keys())
+                    if incoming_keys:
+                        # Threaded indexing shares one store instance; re-check missing
+                        # fields under a lock so temp-table schema evolution is serialized.
+                        with self._schema_lock:
+                            existing_subfields = self._metadata_subfields()
+                            new_fields = incoming_keys - existing_subfields
+                            if new_fields:
+                                self._evolve_metadata_schema(new_fields)
+
             # Delete old data for those doc_ids first
-            for doc_id in doc_ids:
-                try:
-                    self._vs.delete(doc_id)
-                except TableNotFoundError:
-                    pass  # Table not created yet on first run
-                except Exception as e:
-                    logger.warning("Failed to delete old data for %s: %s", doc_id, e)
+            with self._measure_memory("storage_delete", **memory_fields):
+                for doc_id in doc_ids:
+                    try:
+                        self._vs.delete(doc_id)
+                    except TableNotFoundError:
+                        pass  # Table not created yet on first run
+                    except Exception as e:
+                        logger.warning("Failed to delete old data for %s: %s", doc_id, e)
             # Add new nodes
             try:
-                self._vs.add(nodes)
+                with self._measure_memory("storage_add", **memory_fields):
+                    self._vs.add(nodes)
             except Exception:
                 logger.critical(
                     "Failed to add %d nodes for doc_ids=%s after old chunks were deleted; "
@@ -716,6 +742,40 @@ class LanceDBStore:
                     len(nodes), sorted(doc_ids),
                 )
                 raise
+
+    def _load_unique_canonical_rows(
+        self, table: Any, canonical_doc_id: str
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Load at most one full row per chunk id, never every physical duplicate."""
+        escaped_doc_id = self._sql_escape(canonical_doc_id)
+        batches = (
+            table.to_lance()
+            .sql(
+                "SELECT DISTINCT id FROM dataset "
+                f"WHERE doc_id = '{escaped_doc_id}' AND id IS NOT NULL"
+            )
+            .build()
+            .to_batch_records()
+        )
+        unique_chunk_ids = (
+            pa.Table.from_batches(batches)["id"].to_pylist() if batches else []
+        )
+        rows: list[dict[str, Any]] = []
+        for chunk_id in sorted(str(value) for value in unique_chunk_ids if value):
+            escaped_chunk_id = self._sql_escape(chunk_id)
+            row = (
+                table.search(None)
+                .where(
+                    f"doc_id = '{escaped_doc_id}' AND id = '{escaped_chunk_id}'",
+                    prefilter=True,
+                )
+                .select(["id", "doc_id", "text", "vector", "metadata"])
+                .limit(1)
+                .to_list()
+            )
+            if row:
+                rows.append(row[0])
+        return rows, table.count_rows(f"doc_id = '{escaped_doc_id}'")
 
     def update_canonical_duplicate_metadata(
         self,
@@ -730,15 +790,20 @@ class LanceDBStore:
                 f"Canonical doc {canonical_doc_id} missing in LanceDB; refusing duplicate metadata update"
             ) from exc
 
-        rows = (
-            table.search(None)
-            .where(f"doc_id = '{self._sql_escape(canonical_doc_id)}'", prefilter=True)
-            .select(["id", "doc_id", "text", "vector", "metadata"])
-            .to_list()
-        )
+        with self._measure_memory("storage_canonical_read", doc_id=canonical_doc_id):
+            rows, physical_rows = self._load_unique_canonical_rows(
+                table, canonical_doc_id
+            )
         if not rows:
             raise LookupError(
                 f"Canonical doc {canonical_doc_id} missing in LanceDB; refusing duplicate metadata update"
+            )
+        if physical_rows > len(rows):
+            logger.warning(
+                "Compacting duplicate canonical rows for %s: %d physical rows, %d unique chunk ids",
+                canonical_doc_id,
+                physical_rows,
+                len(rows),
             )
 
         first_meta = rows[0].get("metadata") if isinstance(rows[0].get("metadata"), dict) else {}
@@ -810,13 +875,19 @@ class LanceDBStore:
 
     def delete_by_doc_ids(self, doc_ids: list[str]) -> None:
         """Remove all nodes for the given doc_ids."""
-        for doc_id in doc_ids:
-            try:
-                self._vs.delete(doc_id)
-            except TableNotFoundError:
-                pass  # Table not created yet — nothing to delete
-            except Exception as e:
-                logger.warning("Failed to delete doc %s: %s", doc_id, e)
+        memory_fields: dict[str, Any]
+        if len(doc_ids) == 1:
+            memory_fields = {"doc_id": doc_ids[0]}
+        else:
+            memory_fields = {"doc_ids": list(doc_ids)}
+        with self._measure_memory("storage_delete", **memory_fields):
+            for doc_id in doc_ids:
+                try:
+                    self._vs.delete(doc_id)
+                except TableNotFoundError:
+                    pass  # Table not created yet — nothing to delete
+                except Exception as e:
+                    logger.warning("Failed to delete doc %s: %s", doc_id, e)
 
     def list_doc_ids(self) -> list[str]:
         """Return all distinct doc_ids in the store.
