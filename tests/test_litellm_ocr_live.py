@@ -1,5 +1,6 @@
 """Real LiteLLM OCR and image-description routing checks."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -26,13 +27,17 @@ def _load_large_font() -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
             continue
     try:
         return ImageFont.load_default(size=112)
-    except TypeError:
-        return ImageFont.load_default()
+    except TypeError as exc:
+        raise RuntimeError(
+            "Pillow cannot provide a readable 112-pixel fallback font"
+        ) from exc
 
 
-@pytest.fixture
-def litellm_live_image(tmp_path: Path) -> Path:
-    image_path = tmp_path / "litellm-live-ocr.png"
+@pytest.fixture(scope="module")
+def litellm_live_image(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    image_path = (
+        tmp_path_factory.mktemp("litellm-live-ocr") / "litellm-live-ocr.png"
+    )
     image = Image.new("RGB", _IMAGE_SIZE, "white")
     draw = ImageDraw.Draw(image)
     font = _load_large_font()
@@ -56,10 +61,12 @@ def litellm_live_image(tmp_path: Path) -> Path:
     return image_path
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def litellm_live_provider() -> LiteLLMOCR:
     provider = build_ocr_provider(load_config())
     assert isinstance(provider, LiteLLMOCR)
+    assert provider.extract_model == "ocr"
+    assert provider.describe_model == "vision"
     return provider
 
 
@@ -81,7 +88,7 @@ def test_litellm_vision_alias_describes_generated_image(
 ) -> None:
     description = litellm_live_provider.describe(litellm_live_image).lower()
 
-    assert "red" in description
-    assert "blue" in description
-    assert any(shape in description for shape in ("circle", "round"))
-    assert any(shape in description for shape in ("square", "box"))
+    assert re.search(r"\bred\b", description)
+    assert re.search(r"\bblue\b", description)
+    assert re.search(r"\b(?:circle|round)\b", description)
+    assert re.search(r"\b(?:square|box)\b", description)
