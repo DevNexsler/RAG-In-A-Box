@@ -13,7 +13,7 @@ A full `make gate` pass means, end to end and in this order:
 | 2 | `unit` | ~1000 fast tests, no network, no external services | free |
 | 3 | `integration` | subsystems against local resources (tmp dirs, in-process apps) | free |
 | 4 | `staging-e2e` | the real container image, driven from outside over real MCP/REST, against simulated providers — every MCP tool exercised AND traced (see [Traceability](#traceability)) | free |
-| 5 | `live` | real providers, real money: OpenRouter, DeepInfra, Mac Mini OCR, comm-store Postgres | $$ |
+| 5 | `live` | real providers: OpenRouter, DeepInfra, LiteLLM `ocr`/`vision`, comm-store Postgres | $$ |
 
 The ordering is a **spend gate by design**: each tier only runs if every
 tier before it passed (`scripts/gate.py` fails fast). Fakes rule out code
@@ -35,17 +35,18 @@ been executed to completion against real providers; keep it that way.
 |---|---|
 | `make gate` | all five tiers, fail-fast, artifacts per run |
 | `make gate-fast` | tiers 1–3 only (static, unit, integration) — the dev loop |
-| `make gate-real` | full gate **+** an opt-in real-API e2e pass (media + enrichment live; SPENDS MONEY, needs a real key) |
+| `make gate-real` | full gate **+** an opt-in real-API e2e pass (media + enrichment live; additional spend, needs a real key) |
 | `make test-unit` | `pytest -m unit -q` directly |
 | `make test-integration` | `pytest -m integration -q` directly |
 | `make test-e2e` | gate `--only staging-e2e` (brings the compose stack up/down) |
 | `make test-e2e-real` | gate `--only e2e-real` — just the real-API e2e stage (SPENDS MONEY) |
 | `make test-live` | gate `--only live` (preflight still enforced) |
 
-The two real-API targets (`gate-real`, `test-e2e-real`) are the only ones that
-spend money, and only when explicitly invoked with a real `OPENROUTER_API_KEY`;
-a plain `make gate` never does. See "Live tier" and "Cross-repo test target"
-below for the deterministic-then-real workflow.
+`make gate` includes the real-provider `live` tier and can spend money. It does
+not run the optional `e2e-real` stage. `make gate-real` adds that stage after a
+full gate; `make test-e2e-real` runs only that stage. Both optional real-e2e
+commands require a real `OPENROUTER_API_KEY`. See "Live tier" and "Cross-repo
+test target" below for the deterministic-then-real workflow.
 
 ### Tier selection: auto-derived markers
 
@@ -156,19 +157,29 @@ immediately instead of flapping.
 
 ## Live tier
 
-`pytest -m live` (~150 tests) runs in-process against the real world:
-OpenRouter, DeepInfra, the Mac Mini OCR service (192.168.68.70:8790),
-and the comm-store Postgres (localhost:5433). `scripts/live_preflight.py`
-runs all five checks (no early exit — one run reports every problem)
-and **only exit code 0 releases the spend**:
+`pytest -m live` runs in-process against the real world: OpenRouter, DeepInfra,
+the configured LiteLLM proxy, and the comm-store Postgres (localhost:5433).
+LiteLLM is the OCR routing authority: alias `ocr` handles extraction, alias
+`vision` handles image description, and the proxy owns local/cloud fallback
+routing. The first-class OCR factory does not read a LiteLLM credential from
+YAML; it reads `LITELLM_API_KEY` first, then `LITELLM_MASTER_KEY`, from the
+environment.
+
+`scripts/live_preflight.py` runs all five checks (no early exit — one run
+reports every problem) and **only exit code 0 releases the spend**:
 
 | Check | What it verifies | When it fails |
 |---|---|---|
 | `api_keys` | `OPENROUTER_API_KEY` and `DEEPINFRA_API_KEY` non-empty | set them in `.env` (dotenv is loaded) |
 | `config_test` | `config_test.yaml` present in CWD | it's gitignored so fresh worktrees don't have it — copy from the main checkout (the failure message prints the path) |
-| `mac_ocr` | `ocr.base_url` (from the main checkout's `config.yaml`) answers HTTP | Mac Mini asleep/rebooting or wrong URL; any HTTP status counts as reachable |
-| `prod_indexer_idle` | prod container heartbeat (`/data/index/indexer.heartbeat`) older than 120 s | **"prod indexer active — rerun when quiet"**: the prod indexer is mid-run and would contend with the live tier for the shared Mac Mini. Wait for it to finish and re-run; the preflight itself is the poll (it prints the heartbeat age). |
+| `litellm_ocr` | reads the first existing config candidate (CWD/worktree `config.yaml` before the main checkout), authenticates a non-generating `GET {ocr.endpoint}/models`, and confirms both configured aliases | config/endpoint/model alias/credential missing, endpoint unreachable, authentication rejected, malformed response, or either alias absent; credentials belong only in `LITELLM_API_KEY` or `LITELLM_MASTER_KEY` |
+| `prod_indexer_idle` | prod container heartbeat (`/data/index/indexer.heartbeat`) older than 120 s | **"prod indexer active — rerun when quiet"**: the prod indexer is mid-run and would contend with the live tier for shared LiteLLM/local inference hardware. Wait for it to finish and re-run; the preflight itself is the poll (it prints the heartbeat age). |
 | `comm_postgres` | `COMM_DATA_STORE_DSN` answers `SELECT 1` | DSN unset or Postgres down |
+
+The LiteLLM probe is fail-closed: missing configuration, network/auth errors,
+invalid JSON/schema, and missing aliases all fail preflight without generating
+model output. Failure messages identify the endpoint/check but never print the
+credential.
 
 **Worktree setup**: linked worktrees need their own copies of three
 gitignored files from the main checkout — `config_test.yaml`, `.env`,
@@ -178,10 +189,21 @@ paths are absolute, so a straight copy is correct — without it the live
 tier fails ~35 tests on `FileNotFoundError: config.yaml`). The `.env`
 copy must keep the host-side DSN rewrite
 (`COMM_DATA_STORE_DSN=postgresql://...@localhost:5433/...`), since live
-tests run on the host, not in a container.
+tests run on the host, not in a container. CWD precedence means a worktree's
+copied `config.yaml` is the exact provider configuration preflight validates.
+OCR stays disabled in `config_test.yaml`; the dedicated LiteLLM live test owns
+all real OCR/vision generation.
 
-Live failures come in two flavors: infrastructure flakes (Mac busy,
-provider rate limits — retry once, document) and genuine failures
+`tests/test_litellm_ocr_live.py` creates one large image containing the OCR
+sentinel `RAGBOX LIVE OCR 7319`, a red circle, and a blue square. It contains
+two non-skipping generation smoke invocations: one through alias `ocr` to
+recover the normalized sentinel, and one through alias `vision` to identify
+both colors and shapes. Provider retries and the preflight `/models` probe can
+add HTTP requests, so these are not a total request count. Missing
+infrastructure fails preflight or the tests; the file has no skip fallback.
+
+Live failures come in two flavors: infrastructure flakes (LiteLLM or a local
+backend busy, provider rate limits — retry once, document) and genuine failures
 (stop, investigate, never weaken the test to pass).
 
 ## Adding a new MCP tool

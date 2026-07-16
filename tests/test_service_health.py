@@ -7,43 +7,17 @@ Run with:  pytest tests/test_service_health.py -v
 """
 
 import os
-import struct
-import zlib
 
 import pytest
 import httpx
+
+from scripts.live_preflight import check_litellm_ocr
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
-
-
-# --- Helpers ---
-
-def _probe_url(url: str, timeout: float = 3.0) -> bool:
-    """Return True if URL responds (any non-5xx status)."""
-    try:
-        resp = httpx.get(url, timeout=timeout)
-        return resp.status_code < 500
-    except Exception:
-        return False
-
-
-def _minimal_png() -> bytes:
-    """Generate a valid 1x1 white PNG for endpoint testing."""
-    sig = b"\x89PNG\r\n\x1a\n"
-    ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
-    ihdr_crc = zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF
-    ihdr = struct.pack(">I", 13) + b"IHDR" + ihdr_data + struct.pack(">I", ihdr_crc)
-    raw = b"\x00\xff\xff\xff"
-    compressed = zlib.compress(raw)
-    idat_crc = zlib.crc32(b"IDAT" + compressed) & 0xFFFFFFFF
-    idat = struct.pack(">I", len(compressed)) + b"IDAT" + compressed + struct.pack(">I", idat_crc)
-    iend_crc = zlib.crc32(b"IEND") & 0xFFFFFFFF
-    iend = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", iend_crc)
-    return sig + ihdr + idat + iend
 
 
 # -----------------------------------------------------------------------
@@ -125,71 +99,16 @@ class TestDeepInfraRerankerHealth:
 
 
 # -----------------------------------------------------------------------
-# DeepSeek-OCR2 (configured via ocr.base_url)
+# LiteLLM OCR/vision routing authority
 # -----------------------------------------------------------------------
 
-def _resolve_ocr_base_url() -> str:
-    """Resolve DeepSeek-OCR2 URL: OCR_BASE_URL env, config_test.yaml,
-    config.yaml, then http://localhost:8790 fallback."""
-    env_url = os.environ.get("OCR_BASE_URL")
-    if env_url:
-        return env_url.rstrip("/")
-    from pathlib import Path
-    repo_root = Path(__file__).parent.parent
-    for cfg_name in ("config_test.yaml", "config.yaml"):
-        cfg_path = repo_root / cfg_name
-        if not cfg_path.exists():
-            continue
-        try:
-            import yaml
-            with open(cfg_path) as f:
-                raw = yaml.safe_load(f) or {}
-            url = (raw.get("ocr") or {}).get("base_url")
-            if url:
-                return url.rstrip("/")
-        except Exception:
-            continue
-    return "http://localhost:8790"
-
-
-_OCR_BASE_URL = _resolve_ocr_base_url()
-_deepseek_ocr2_available = _probe_url(f"{_OCR_BASE_URL}/health")
-
-
-def _deepseek_ocr2_extract_available() -> bool:
-    if not _deepseek_ocr2_available:
-        return False
-    try:
-        resp = httpx.post(
-            f"{_OCR_BASE_URL}/extract",
-            files={"file": ("test.png", _minimal_png(), "image/png")},
-            timeout=10.0,
-        )
-        return resp.status_code < 500
-    except Exception:
-        return False
-
-
 @pytest.mark.live
-@pytest.mark.skipif(not _deepseek_ocr2_available, reason=f"DeepSeek-OCR2 not reachable at {_OCR_BASE_URL}")
-class TestDeepSeekOCR2Health:
-    """Verify DeepSeek-OCR2 service is responding at its configured base_url."""
+class TestLiteLLMOCRHealth:
+    """Verify configured LiteLLM OCR and vision aliases are available."""
 
-    def test_health_endpoint(self):
-        """GET /health returns 200."""
-        resp = httpx.get(f"{_OCR_BASE_URL}/health", timeout=5.0)
-        assert resp.status_code == 200
-
-    def test_extract_endpoint_accepts_post(self):
-        """POST /extract with minimal PNG returns non-5xx."""
-        if not _deepseek_ocr2_extract_available():
-            pytest.skip(f"DeepSeek-OCR2 /extract not ready at {_OCR_BASE_URL}")
-        resp = httpx.post(
-            f"{_OCR_BASE_URL}/extract",
-            files={"file": ("test.png", _minimal_png(), "image/png")},
-            timeout=30.0,
-        )
-        assert resp.status_code < 500, f"DeepSeek-OCR2 /extract: {resp.status_code}"
+    def test_preflight_accepts_configured_aliases(self):
+        ok, reason = check_litellm_ocr()
+        assert ok, reason
 
 
 # -----------------------------------------------------------------------
