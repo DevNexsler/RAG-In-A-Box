@@ -3,6 +3,7 @@
 Single service: both querying and indexing via MCP tools. Same config as indexer."""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -13,11 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.config import load_config
+from core.artifacts import is_communication_sidecar
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
 from core.tracing import get_tracer
 from lancedb_store import LanceDBStore, open_store_with_recovery
-from index_run_supervisor import IndexRunSupervisor
+from index_run_supervisor import IndexRunSupervisor, index_log_paths
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
 import sor_query as sorq
@@ -50,7 +52,6 @@ _DEFAULT_SEARCH_TOP_K = 8
 # hidden below the relevance cutoff (#0110: outbounds invisible at top_k=8).
 _RECENT_SORT_POOL = 50
 _PROVIDER_FAILURE_LOOKBACK_SECONDS = 24 * 60 * 60
-_PROVIDER_FAILURE_LOG_NAMES = ("indexer.log", "indexer.log.prev")
 _PROVIDER_FAILURE_MAX_BYTES = 128 * 1024 * 1024
 _COMPACT_EXCLUDED_METADATA_KEYS = {
     "_node_content",
@@ -642,44 +643,130 @@ def _registry_source_stats(index_root: Path) -> tuple[dict[str, dict], str | Non
     if not registry_path.exists():
         return {}, None
 
-    from doc_id_store import DocIDStore
+    from doc_id_store import DocIDStore, strip_id_from_filename
 
     registry = DocIDStore(registry_path)
     try:
         with registry._lock:
             cur = registry._conn.execute(
-                "SELECT COALESCE(NULLIF(source_name, ''), 'documents'), doc_id, "
+                "SELECT COALESCE(NULLIF(source_name, ''), 'documents'), doc_id, rel_path, "
+                "size_bytes, content_hash, hash_algo, dedupe_status, "
                 "COALESCE(last_seen_at, first_seen_at, created) FROM doc_registry"
             )
             rows = cur.fetchall()
 
         stats: dict[str, dict] = {}
-        for source_name, doc_id, seen_at in rows:
+        for (
+            source_name,
+            doc_id,
+            rel_path,
+            size_bytes,
+            content_hash,
+            hash_algo,
+            dedupe_status,
+            seen_at,
+        ) in rows:
             source = str(source_name or "documents")
             entry = stats.setdefault(
                 source,
                 {
-                    "doc_ids": set(),
+                    "docs": {},
                     "raw_doc_count": 0,
                     "latest_seen_at": None,
                 },
             )
             entry["raw_doc_count"] += 1
-            entry["doc_ids"].add(_canonical_registry_doc_id(source, str(doc_id)))
+            canonical_id = _canonical_registry_doc_id(source, str(doc_id))
+            doc = entry["docs"].setdefault(
+                canonical_id,
+                {
+                    "rel_paths": set(),
+                    "identities": [],
+                    "dedupe_statuses": set(),
+                },
+            )
+            doc["rel_paths"].add(str(rel_path))
+            if size_bytes is not None and content_hash is not None and hash_algo:
+                identity = (int(size_bytes), bytes(content_hash), str(hash_algo))
+                if identity not in doc["identities"]:
+                    doc["identities"].append(identity)
+            doc["dedupe_statuses"].add(str(dedupe_status or "canonical"))
             if seen_at is not None:
                 seen = float(seen_at)
                 latest = entry["latest_seen_at"]
                 entry["latest_seen_at"] = seen if latest is None else max(latest, seen)
 
-        return {
-            source: {
-                "doc_count": len(entry["doc_ids"]),
+        result: dict[str, dict] = {}
+        for source, entry in stats.items():
+            docs = entry["docs"]
+            parent = {doc_id: doc_id for doc_id in docs}
+
+            def find(doc_id: str) -> str:
+                while parent[doc_id] != doc_id:
+                    parent[doc_id] = parent[parent[doc_id]]
+                    doc_id = parent[doc_id]
+                return doc_id
+
+            def union(left: str, right: str) -> None:
+                left_root, right_root = find(left), find(right)
+                if left_root != right_root:
+                    parent[right_root] = left_root
+
+            token_owner: dict[tuple, str] = {}
+            natural_path_docs: dict[str, set[str]] = {}
+            hash_docs: dict[tuple, set[str]] = {}
+            for canonical_id, doc in docs.items():
+                tokens: list[tuple] = []
+                for identity in doc["identities"]:
+                    token = ("hash", *identity)
+                    tokens.append(token)
+                    hash_docs.setdefault(token, set()).add(canonical_id)
+                for rel_path in doc["rel_paths"]:
+                    path = Path(rel_path)
+                    natural_path = str(
+                        path.with_name(strip_id_from_filename(path.name))
+                    ).replace("\\", "/")
+                    token = ("path", natural_path)
+                    tokens.append(token)
+                    natural_path_docs.setdefault(natural_path, set()).add(canonical_id)
+                if not tokens:
+                    tokens.append(("doc", canonical_id))
+                for token in tokens:
+                    owner = token_owner.setdefault(token, canonical_id)
+                    union(canonical_id, owner)
+
+            groups: dict[str, dict] = {}
+            for canonical_id, doc in docs.items():
+                group = groups.setdefault(
+                    find(canonical_id),
+                    {"doc_ids": set(), "rel_paths": set()},
+                )
+                group["doc_ids"].add(canonical_id)
+                group["rel_paths"].update(doc["rel_paths"])
+            doc_count = len(entry["docs"])
+            dedupe_duplicates = sum(
+                "duplicate" in doc["dedupe_statuses"]
+                for doc in entry["docs"].values()
+            )
+            content_hash_duplicates = sum(
+                max(0, len(doc_ids) - 1) for doc_ids in hash_docs.values()
+            )
+            natural_path_aliases = sum(
+                max(0, len(doc_ids) - 1)
+                for doc_ids in natural_path_docs.values()
+            )
+            result[source] = {
+                "doc_count": doc_count,
                 "raw_doc_count": entry["raw_doc_count"],
-                "duplicate_doc_count": entry["raw_doc_count"] - len(entry["doc_ids"]),
+                "id_alias_count": entry["raw_doc_count"] - doc_count,
+                "dedupe_duplicate_doc_count": dedupe_duplicates,
+                "content_hash_duplicate_doc_count": content_hash_duplicates,
+                "natural_path_alias_doc_count": natural_path_aliases,
+                "content_group_count": len(groups),
                 "latest_seen_at": entry["latest_seen_at"],
+                "_groups": list(groups.values()),
             }
-            for source, entry in stats.items()
-        }, None
+        return result, None
     except Exception as exc:
         return {}, str(exc)
     finally:
@@ -832,20 +919,105 @@ def _read_recent_log_text(path: Path) -> str:
         return f.read().decode("utf-8", errors="replace")
 
 
-def _not_extractable_doc_counts(index_root: Path) -> tuple[dict[str, int], str | None]:
-    """Count docs that were processed but intentionally produced no chunks."""
-    doc_ids_by_source: dict[str, set[str]] = {}
+def _not_extractable_doc_ids(index_root: Path) -> tuple[set[str], str | None]:
+    """Return legacy no-text outcomes recovered from retained logs."""
+    doc_ids: set[str] = set()
     try:
-        for log_name in _PROVIDER_FAILURE_LOG_NAMES:
-            path = index_root / log_name
-            if not path.exists():
-                continue
-            for match in _NO_TEXT_RE.finditer(_read_recent_log_text(path)):
-                doc_id = match.group(1)
-                source_name = _source_name_from_doc_id(doc_id)
-                doc_ids_by_source.setdefault(source_name, set()).add(doc_id)
+        for path in index_log_paths(index_root):
+            doc_ids.update(match.group(1) for match in _NO_TEXT_RE.finditer(_read_recent_log_text(path)))
     except Exception as exc:
-        return {}, str(exc)
+        return set(), str(exc)
+    return doc_ids, None
+
+
+def _ledger_doc_ids(path: Path) -> tuple[set[str], str | None]:
+    if not path.exists():
+        return set(), None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        docs = payload.get("docs", {}) if isinstance(payload, dict) else {}
+        if not isinstance(docs, dict):
+            raise ValueError("ledger docs must be an object")
+        return {str(doc_id) for doc_id in docs}, None
+    except (OSError, ValueError, TypeError) as exc:
+        return set(), str(exc)
+
+
+def _filesystem_source_roots(config: dict) -> dict[str, Path]:
+    roots: dict[str, Path] = {}
+    for source in config.get("sources") or []:
+        if not isinstance(source, dict) or source.get("type") != "filesystem":
+            continue
+        name = str(source.get("name") or "documents")
+        root = source.get("root")
+        if root:
+            roots[name] = Path(str(root))
+    legacy_root = config.get("documents_root") or config.get("vault_root")
+    if legacy_root and "documents" not in roots:
+        roots["documents"] = Path(str(legacy_root))
+    return roots
+
+
+def _registry_coverage(
+    *,
+    index_root: Path,
+    config: dict,
+    registry_stats: dict[str, dict],
+    indexed_doc_ids: set[str],
+) -> tuple[dict[str, dict[str, int]], str | None]:
+    """Classify content groups as indexed, intentionally skipped, retrying, or missing."""
+    skip_ids, skip_error = _ledger_doc_ids(index_root / "skip_docs.json")
+    degraded_ids, degraded_error = _ledger_doc_ids(index_root / "degraded_docs.json")
+    no_text_ids, log_error = _not_extractable_doc_ids(index_root)
+    roots = _filesystem_source_roots(config)
+    errors = [error for error in (skip_error, degraded_error, log_error) if error]
+
+    coverage: dict[str, dict[str, int]] = {}
+    for source_name, stats in registry_stats.items():
+        counts = {
+            "covered_group_count": 0,
+            "indexed_group_count": 0,
+            "not_extractable_group_count": 0,
+            "retry_pending_group_count": 0,
+            "missing_group_count": 0,
+        }
+        root = roots.get(source_name)
+        for group in stats.get("_groups", []):
+            group_ids = set(group.get("doc_ids", set()))
+            indexed = bool(group_ids & indexed_doc_ids)
+            intentionally_skipped = bool(group_ids & (skip_ids | no_text_ids))
+            retry_pending = bool(group_ids & degraded_ids)
+            sidecar = False
+            if root is not None:
+                sidecar = any(
+                    rel_path.lower().endswith(".json")
+                    and is_communication_sidecar(root / rel_path)
+                    for rel_path in group.get("rel_paths", set())
+                )
+            if indexed:
+                counts["covered_group_count"] += 1
+                counts["indexed_group_count"] += 1
+            elif intentionally_skipped or sidecar:
+                counts["covered_group_count"] += 1
+                counts["not_extractable_group_count"] += 1
+            elif retry_pending:
+                counts["covered_group_count"] += 1
+                counts["retry_pending_group_count"] += 1
+            else:
+                counts["missing_group_count"] += 1
+        coverage[source_name] = counts
+    return coverage, "; ".join(errors) or None
+
+
+def _not_extractable_doc_counts(index_root: Path) -> tuple[dict[str, int], str | None]:
+    """Backward-compatible source counts for legacy no-text log outcomes."""
+    doc_ids_by_source: dict[str, set[str]] = {}
+    doc_ids, error = _not_extractable_doc_ids(index_root)
+    if error:
+        return {}, error
+    for doc_id in doc_ids:
+        source_name = _source_name_from_doc_id(doc_id)
+        doc_ids_by_source.setdefault(source_name, set()).add(doc_id)
     return {source: len(doc_ids) for source, doc_ids in doc_ids_by_source.items()}, None
 
 
@@ -937,8 +1109,7 @@ def _recent_provider_failures(
     last_seen_at: float | None = None
     rank = {"ok": 0, "degraded": 1, "critical": 2}
 
-    for log_name in _PROVIDER_FAILURE_LOG_NAMES:
-        path = index_root / log_name
+    for path in index_log_paths(index_root):
         try:
             stat = path.stat()
         except OSError:
@@ -1038,14 +1209,19 @@ def _compute_deep_health(
     registry_stats, registry_error = _registry_source_stats(index_root)
     index_counts = _count_doc_ids_by_source(doc_ids)
     index_freshness, index_freshness_error = _index_source_freshness(store)
-    not_extractable_counts, not_extractable_error = _not_extractable_doc_counts(index_root)
+    coverage, coverage_error = _registry_coverage(
+        index_root=index_root,
+        config=config,
+        registry_stats=registry_stats,
+        indexed_doc_ids={str(doc_id) for doc_id in doc_ids},
+    )
     provider_failures = _recent_provider_failures(index_root)
     source_names = sorted(
         set(configured_sources)
         | set(registry_stats)
         | set(index_counts)
         | set(index_freshness)
-        | set(not_extractable_counts)
+        | set(coverage)
     )
 
     sources: dict[str, dict] = {}
@@ -1056,22 +1232,35 @@ def _compute_deep_health(
         registry_latest_seen_at = registry_source_stats.get("latest_seen_at")
         index_doc_count = index_counts.get(source_name, 0)
         index_latest_mtime = index_freshness.get(source_name)
-        missing_before_no_text = max(0, registry_doc_count - index_doc_count)
-        not_extractable_doc_count = min(
-            int(not_extractable_counts.get(source_name, 0) or 0),
-            missing_before_no_text,
+        source_coverage = coverage.get(source_name, {})
+        registry_content_group_count = int(
+            registry_source_stats.get("content_group_count") or registry_doc_count
         )
-        unindexed_registry_doc_count = max(
-            0, registry_doc_count - index_doc_count - not_extractable_doc_count
+        not_extractable_doc_count = int(
+            source_coverage.get("not_extractable_group_count") or 0
+        )
+        retry_pending_doc_count = int(
+            source_coverage.get("retry_pending_group_count") or 0
+        )
+        index_content_group_count = int(
+            source_coverage.get("indexed_group_count")
+            if registry_content_group_count > 0
+            else index_doc_count
+        )
+        unindexed_registry_doc_count = int(
+            source_coverage.get("missing_group_count") or 0
         )
         status, reason = _source_health_status(
             configured=source_name in configured_sources,
-            registry_doc_count=registry_doc_count,
-            index_doc_count=index_doc_count,
+            registry_doc_count=registry_content_group_count,
+            index_doc_count=index_content_group_count,
             indexer_running=indexer_running,
             last_run_at=last_run_at,
-            not_extractable_doc_count=not_extractable_doc_count,
+            not_extractable_doc_count=not_extractable_doc_count + retry_pending_doc_count,
         )
+        if retry_pending_doc_count > 0 and status == "ok":
+            status = "indexing" if indexer_running else "degraded"
+            reason = "retry_pending"
         source_statuses.append(status)
         sources[source_name] = {
             "status": status,
@@ -1079,9 +1268,16 @@ def _compute_deep_health(
             "configured": source_name in configured_sources,
             "registry_doc_count": registry_doc_count,
             "registry_raw_doc_count": int(registry_source_stats.get("raw_doc_count") or registry_doc_count),
-            "registry_duplicate_doc_count": int(registry_source_stats.get("duplicate_doc_count") or 0),
+            "registry_content_group_count": registry_content_group_count,
+            "registry_duplicate_doc_count": int(registry_source_stats.get("dedupe_duplicate_doc_count") or 0),
+            "registry_dedupe_duplicate_doc_count": int(registry_source_stats.get("dedupe_duplicate_doc_count") or 0),
+            "registry_content_hash_duplicate_doc_count": int(registry_source_stats.get("content_hash_duplicate_doc_count") or 0),
+            "registry_natural_path_alias_doc_count": int(registry_source_stats.get("natural_path_alias_doc_count") or 0),
+            "registry_id_alias_count": int(registry_source_stats.get("id_alias_count") or 0),
             "index_doc_count": index_doc_count,
+            "index_content_group_count": index_content_group_count,
             "not_extractable_doc_count": not_extractable_doc_count,
+            "retry_pending_doc_count": retry_pending_doc_count,
             "unindexed_registry_doc_count": unindexed_registry_doc_count,
             "registry_latest_seen_at": _iso_or_none(registry_latest_seen_at),
             "index_latest_mtime": index_latest_mtime,
@@ -1109,8 +1305,10 @@ def _compute_deep_health(
             "fts_available": fts_available,
             "index_freshness_available": index_freshness_error is None,
             "index_freshness_error": index_freshness_error,
-            "not_extractable_log_available": not_extractable_error is None,
-            "not_extractable_log_error": not_extractable_error,
+            "registry_coverage_available": coverage_error is None,
+            "registry_coverage_error": coverage_error,
+            "not_extractable_log_available": coverage_error is None,
+            "not_extractable_log_error": coverage_error,
             "provider_status": provider_failures["status"],
             "provider_failures": provider_failures,
         },

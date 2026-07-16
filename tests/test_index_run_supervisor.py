@@ -61,6 +61,84 @@ def _supervisor(tmp_path: Path, process: FakeProcess, **kwargs):
     )
 
 
+def test_log_window_preserves_multiple_completed_runs_in_collector_file(tmp_path):
+    from index_run_supervisor import IndexRunSupervisor, index_log_paths
+
+    supervisor = IndexRunSupervisor(
+        tmp_path,
+        pid_alive=lambda _pid: False,
+        process_matches=lambda _pid: False,
+    )
+    log_path = tmp_path / "indexer.log"
+    log_path.write_text("first completed run\n")
+    supervisor._prepare_log_for_run(log_path)
+    with log_path.open("a") as handle:
+        handle.write("second completed run\n")
+    supervisor._prepare_log_for_run(log_path)
+
+    assert index_log_paths(tmp_path) == [log_path]
+    assert log_path.read_text() == "first completed run\nsecond completed run\n"
+
+
+def test_log_window_is_size_bounded_and_keeps_complete_recent_lines(tmp_path):
+    from index_run_supervisor import IndexRunSupervisor
+
+    supervisor = IndexRunSupervisor(
+        tmp_path,
+        pid_alive=lambda _pid: False,
+        process_matches=lambda _pid: False,
+        log_max_bytes=24,
+        log_retain_bytes=12,
+    )
+    current = tmp_path / "indexer.log"
+    current.write_text("old-one\nold-two\nnew-one\nnew-two\n")
+
+    supervisor._prepare_log_for_run(current)
+
+    assert current.read_text() == "new-two\n"
+    assert current.stat().st_size <= 12
+
+
+def test_start_appends_to_collector_log_without_per_run_rotation(tmp_path):
+    process = FakeProcess()
+    current = tmp_path / "indexer.log"
+    current.write_text("prior run remains visible\n")
+    supervisor = _supervisor(
+        tmp_path,
+        process,
+        popen_factory=lambda *_args, **_kwargs: process,
+    )
+
+    result = supervisor.start(["python", "indexer"], log_path=current)
+
+    assert result["status"] == "started"
+    assert current.read_text() == "prior run remains visible\n"
+    assert not list(tmp_path.glob("indexer.log.run-*.archive"))
+    process.finish(0)
+    _wait_for(lambda: supervisor.snapshot().get("current") is None)
+
+
+def test_log_discovery_tolerates_archive_removed_during_scan(tmp_path, monkeypatch):
+    from index_run_supervisor import index_log_paths
+
+    archive = tmp_path / "indexer.log.run-race.archive"
+    archive.write_text("completed\n")
+    original_stat = Path.stat
+    removed = False
+
+    def remove_after_first_stat(path, *args, **kwargs):
+        nonlocal removed
+        result = original_stat(path, *args, **kwargs)
+        if path == archive and not removed:
+            removed = True
+            archive.unlink()
+        return result
+
+    monkeypatch.setattr(Path, "stat", remove_after_first_stat)
+
+    assert index_log_paths(tmp_path) == [archive]
+
+
 def test_atomic_single_flight_launches_only_one_process(tmp_path):
     """Concurrent MCP calls must perform one check-and-launch transaction."""
     process = FakeProcess()

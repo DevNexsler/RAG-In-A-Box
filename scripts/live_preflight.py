@@ -81,9 +81,19 @@ def check_mac_ocr() -> tuple[bool, str]:
             break
     if config is None:
         return False, "no config.yaml found (main checkout or CWD)"
-    base_url = (config.get("ocr") or {}).get("base_url")
+    ocr = config.get("ocr") or {}
+    describe = ocr.get("describe") if isinstance(ocr.get("describe"), dict) else {}
+    extract = ocr.get("extract") if isinstance(ocr.get("extract"), dict) else {}
+    base_url = (
+        ocr.get("base_url")
+        or ocr.get("endpoint")
+        or describe.get("base_url")
+        or describe.get("endpoint")
+        or extract.get("base_url")
+        or extract.get("endpoint")
+    )
     if not base_url:
-        return False, f"ocr.base_url missing in {used}"
+        return False, f"ocr endpoint (base_url/endpoint) missing in {used}"
     try:
         # Reachability only: any HTTP response (404 included) means the Mac
         # Mini OCR service host is up.

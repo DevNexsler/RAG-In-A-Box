@@ -1380,10 +1380,187 @@ def test_registry_source_stats_dedupes_legacy_and_namespaced_document_ids(tmp_pa
     assert error is None
     assert stats["documents"]["doc_count"] == 1
     assert stats["documents"]["raw_doc_count"] == 2
-    assert stats["documents"]["duplicate_doc_count"] == 1
+    assert stats["documents"]["id_alias_count"] == 1
+    assert stats["documents"]["dedupe_duplicate_doc_count"] == 0
+    assert stats["documents"]["content_hash_duplicate_doc_count"] == 0
     assert stats["sor"]["doc_count"] == 1
     assert stats["sor"]["raw_doc_count"] == 1
-    assert stats["sor"]["duplicate_doc_count"] == 0
+    assert stats["sor"]["id_alias_count"] == 0
+
+
+def test_registry_source_stats_groups_reassigned_ids_by_natural_path(tmp_path):
+    """Repeated ID injection must not turn one physical source path into gaps."""
+    from doc_id_store import DocIDStore
+
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("old-id", "docs/lease@00001@.pdf", source_name="documents")
+    registry.register("new-id", "docs/lease@00002@.pdf", source_name="documents")
+    registry.close()
+
+    stats, error = mcp_server._registry_source_stats(tmp_path)
+
+    assert error is None
+    assert stats["documents"]["doc_count"] == 2
+    assert stats["documents"]["content_group_count"] == 1
+    assert stats["documents"]["natural_path_alias_doc_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("include_missing", "expected_status", "expected_missing"),
+    [(False, "ok", 0), (True, "degraded", 1)],
+)
+def test_deep_health_uses_hash_group_and_ledger_coverage(
+    tmp_path, include_missing, expected_status, expected_missing
+):
+    """Only uncovered indexable content groups should count as index gaps."""
+    import blake3
+    import json
+    from doc_id_store import DocIDStore
+
+    docs_root = tmp_path / "documents"
+    docs_root.mkdir()
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("indexed", "indexed.md", source_name="documents")
+    registry.register("hash-a", "hash-a.pdf", source_name="documents")
+    registry.register("hash-b", "hash-b.pdf", source_name="documents")
+    registry.register("skipped", "skipped.txt", source_name="documents")
+    registry.register("sidecar", "sidecar.json", source_name="documents")
+    if include_missing:
+        registry.register("missing", "missing.md", source_name="documents")
+
+    digest = blake3.blake3(b"same source bytes").digest()
+    registry.claim_canonical_by_exact_hash(
+        "hash-a", 17, digest, hash_algo="blake3"
+    )
+    registry.claim_canonical_by_exact_hash(
+        "hash-b", 17, digest, hash_algo="blake3"
+    )
+    registry.close()
+    (tmp_path / "skip_docs.json").write_text(
+        json.dumps(
+            {
+                "docs": {
+                    "documents::skipped": {
+                        "reasons": ["no_text_extracted"],
+                        "change_key": "h1",
+                    }
+                }
+            }
+        )
+    )
+    (docs_root / "sidecar.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "message": {"source_message_id": "msg-1"},
+                "media": {"storage_path": "attachment.pdf"},
+            }
+        )
+    )
+
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [
+                {"type": "filesystem", "name": "documents", "root": str(docs_root)}
+            ],
+        },
+        # Both members of one hash group are present physically; they still
+        # cover one source-content group and must not mask a separate wedge.
+        doc_ids=[
+            "documents::indexed",
+            "documents::hash-a",
+            "documents::hash-b",
+        ],
+        chunk_count=2,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-07-15T00:00:00+00:00",
+    )
+    documents = result["sources"]["documents"]
+
+    assert documents["status"] == expected_status
+    assert documents["unindexed_registry_doc_count"] == expected_missing
+    assert documents["registry_content_group_count"] == 4 + int(include_missing)
+    assert documents["index_doc_count"] == 3
+    assert documents["index_content_group_count"] == 2
+    assert documents["not_extractable_doc_count"] == 2
+    assert documents["registry_duplicate_doc_count"] == 1
+    assert documents["registry_dedupe_duplicate_doc_count"] == 1
+    assert documents["registry_content_hash_duplicate_doc_count"] == 1
+    assert documents["registry_id_alias_count"] == 0
+
+
+def test_deep_health_keeps_index_only_source_healthy_without_registry(tmp_path):
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [{"type": "postgres", "name": "external"}],
+        },
+        doc_ids=["external::record/1"],
+        chunk_count=1,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-07-15T00:00:00+00:00",
+    )
+
+    assert result["sources"]["external"]["status"] == "ok"
+    assert result["sources"]["external"]["index_content_group_count"] == 1
+
+
+def test_deep_health_reports_retry_pending_source_as_degraded(tmp_path):
+    import json
+    from doc_id_store import DocIDStore
+
+    docs_root = tmp_path / "documents"
+    docs_root.mkdir()
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("retrying", "retrying.jpg.vl.json", source_name="documents")
+    registry.close()
+    (tmp_path / "degraded_docs.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "docs": {
+                    "documents::retrying": {
+                        "reasons": ["vision_sidecar_failed"],
+                        "attempts": 0,
+                    }
+                },
+            }
+        )
+    )
+
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [
+                {"type": "filesystem", "name": "documents", "root": str(docs_root)}
+            ],
+        },
+        doc_ids=[],
+        chunk_count=0,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-07-15T00:00:00+00:00",
+    )
+    documents = result["sources"]["documents"]
+
+    assert documents["status"] == "degraded"
+    assert documents["reason"] == "retry_pending"
+    assert documents["retry_pending_doc_count"] == 1
+    assert documents["unindexed_registry_doc_count"] == 0
+    assert result["overall"] == "degraded"
 
 
 def test_file_status_deep_health_treats_no_text_docs_as_processed(tmp_path):
@@ -1476,6 +1653,28 @@ def test_recent_provider_failures_classifies_openrouter_403_logs(tmp_path):
     assert result["by_key"]["openrouter_embeddings"]["last_seen_at"] == "2026-05-29T17:41:31+00:00"
     assert "Key limit exceeded" in result["by_key"]["openrouter_embeddings"]["sample"]
     assert result["by_key"]["openrouter_chat"]["operation"] == "chat"
+
+
+def test_health_reads_retained_index_run_archives(tmp_path):
+    """24h health and no-text evidence must span more than two runs."""
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    archive = tmp_path / "indexer.log.run-20260715T110000Z-old.archive"
+    archive.write_text(
+        "2026-07-15 11:00:00,000 ERROR providers.embed.openrouter_embed: "
+        "OpenRouter embedding API error: 403 limit exceeded\n"
+        "2026-07-15 11:00:01,000 WARNING prefect.task_runs: "
+        "No text extracted: documents::archived-no-text\n"
+    )
+    os.utime(archive, (now - 3600, now - 3600))
+
+    failures = mcp_server._recent_provider_failures(tmp_path, now=now)
+    no_text, error = mcp_server._not_extractable_doc_counts(tmp_path)
+
+    assert failures["by_key"]["openrouter_embeddings"]["count"] == 1
+    assert error is None
+    assert no_text == {"documents": 1}
 
 
 def test_recent_provider_failures_marks_transient_dns_recovered_after_success(tmp_path):

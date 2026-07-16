@@ -924,12 +924,13 @@ class LanceDBStore:
             self._delete_by_doc_ids_unlocked(doc_ids)
 
     def _delete_by_doc_ids_unlocked(self, doc_ids: list[str]) -> None:
-        """Remove all nodes for the given doc_ids."""
+        """Remove all nodes; report failure after attempting every document."""
         memory_fields: dict[str, Any]
         if len(doc_ids) == 1:
             memory_fields = {"doc_id": doc_ids[0]}
         else:
             memory_fields = {"doc_ids": list(doc_ids)}
+        first_error: Exception | None = None
         with self._measure_memory("storage_delete", **memory_fields):
             for doc_id in doc_ids:
                 try:
@@ -938,6 +939,10 @@ class LanceDBStore:
                     pass  # Table not created yet — nothing to delete
                 except Exception as e:
                     logger.warning("Failed to delete doc %s: %s", doc_id, e)
+                    if first_error is None:
+                        first_error = e
+        if first_error is not None:
+            raise first_error
 
     def list_doc_ids(self) -> list[str]:
         """Return all distinct doc_ids in the store.
@@ -953,6 +958,15 @@ class LanceDBStore:
             return pa.Table.from_batches(batches)["doc_id"].to_pylist()
 
         return self._run_read_with_recovery(_op, [])
+
+    def contains_doc_id(self, doc_id: str) -> bool:
+        """Return whether at least one physical row exists for ``doc_id``."""
+        escaped_doc_id = self._sql_escape(doc_id)
+
+        def _op():
+            return self._vs.table.count_rows(f"doc_id = '{escaped_doc_id}'") > 0
+
+        return self._run_read_with_recovery(_op, False)
 
     def list_doc_mtimes(self) -> dict[str, float]:
         """Return {doc_id: mtime} for all docs in the store.

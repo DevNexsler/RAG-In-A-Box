@@ -102,6 +102,25 @@ def test_mac_ocr_reachable(tmp_path, monkeypatch):
     assert calls["url"] == "http://mac:8790"
 
 
+def test_mac_ocr_accepts_legacy_endpoint_key(tmp_path, monkeypatch):
+    cfg = _write_config(
+        tmp_path / "config.yaml",
+        'ocr:\n  endpoint: "http://mac:4000/v1"\n',
+    )
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    calls = {}
+
+    def fake_get(url, timeout=None, **kw):
+        calls["url"] = url
+        return SimpleNamespace(status_code=404)
+
+    monkeypatch.setattr(lp.httpx, "get", fake_get)
+    ok, _ = lp.check_mac_ocr()
+
+    assert ok
+    assert calls["url"] == "http://mac:4000/v1"
+
+
 def test_mac_ocr_unreachable(tmp_path, monkeypatch):
     cfg = _write_config(tmp_path / "config.yaml",
                         'ocr:\n  base_url: "http://mac:8790"\n')
