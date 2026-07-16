@@ -62,6 +62,29 @@ def test_extract_routes_to_ocr_alias(monkeypatch, tmp_path):
     assert captured["headers"]["Authorization"] == "Bearer unit-key"
 
 
+def test_extract_uses_jpeg_mime_for_jpg(monkeypatch, tmp_path):
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"image")
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return _response(url, "text")
+
+    monkeypatch.setattr(
+        "providers.fallback.litellm_fallback.httpx.post", fake_post
+    )
+    provider = LiteLLMOCR(
+        "http://lite/v1", "ocr", "vision", api_key="unit-key"
+    )
+
+    assert provider.extract(image) == "text"
+    content = captured["json"]["messages"][0]["content"]
+    assert content[1]["image_url"]["url"] == (
+        "data:image/jpeg;base64,aW1hZ2U="
+    )
+
+
 def test_describe_routes_to_vision_alias(monkeypatch, tmp_path):
     image = tmp_path / "photo.png"
     image.write_bytes(b"image")

@@ -14,6 +14,14 @@ _EXTRACT_PROMPT = "Transcribe all text in this image verbatim."
 _DESCRIBE_PROMPT = "Describe this image in detail for document search."
 
 
+def _image_encoder(path: Path, prompt: str) -> list:
+    content = image_encoder(path, prompt)
+    if path.suffix.lower() in {".jpg", ".jpeg"}:
+        encoded = content[1]["image_url"]["url"].split(",", 1)[1]
+        content[1]["image_url"]["url"] = f"data:image/jpeg;base64,{encoded}"
+    return content
+
+
 class LiteLLMOCR(OCRProvider):
     def __init__(
         self,
@@ -32,7 +40,7 @@ class LiteLLMOCR(OCRProvider):
             self.endpoint,
             extract_model,
             _EXTRACT_PROMPT,
-            image_encoder,
+            _image_encoder,
             api_key=api_key,
             timeout=timeout,
         )
@@ -40,7 +48,7 @@ class LiteLLMOCR(OCRProvider):
             self.endpoint,
             describe_model,
             _DESCRIBE_PROMPT,
-            image_encoder,
+            _image_encoder,
             api_key=api_key,
             timeout=timeout,
         )
