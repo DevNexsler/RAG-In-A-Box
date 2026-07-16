@@ -21,6 +21,14 @@ def test_docker_compose_uses_env_vars_for_database_dsns():
             assert "${" in item, f"{item.split('=', 1)[0]} must come from environment"
 
 
+def test_docker_compose_forwards_litellm_credentials_to_doc_organizer():
+    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+    env = compose["services"]["doc-organizer"]["environment"]
+
+    assert "LITELLM_API_KEY=${LITELLM_API_KEY}" in env
+    assert "LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}" in env
+
+
 def test_docker_compose_raises_doc_organizer_nofile_limit():
     """Indexer concurrency needs a higher FD limit than Docker's default 1024."""
     compose = yaml.safe_load(Path("docker-compose.yml").read_text())

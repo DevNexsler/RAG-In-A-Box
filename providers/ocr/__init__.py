@@ -1,10 +1,19 @@
 """OCR providers: extract text from images or PDF pages.
 
-Supports separate providers for extract (PDF pages) vs describe (images):
+First-class LiteLLM routing:
 
     ocr:
       enabled: true
-      provider: "deepseek_ocr2"          # default for both extract and describe
+      provider: "litellm"
+      endpoint: "http://YOUR_LITELLM_PROXY:4000/v1"
+      extract_model: "ocr"
+      describe_model: "vision"
+
+Legacy direct-provider split form:
+
+    ocr:
+      enabled: true
+      provider: "deepseek_ocr2"
       base_url: "http://localhost:8790"
       describe:                           # override just the describe provider
         provider: "ollama_vision"

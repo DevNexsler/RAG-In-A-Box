@@ -1,8 +1,9 @@
-# Obsidian Vault Semantic Index — config (cloud providers)
+# Obsidian Vault Semantic Index — config
 # Copy to config.yaml and set vault_root / index_root for your environment.
-# API keys: use env vars (e.g. GEMINI_API_KEY), not this file.
+# API keys: use env vars, not this file.
+# OCR requires a reachable LiteLLM proxy and either LITELLM_API_KEY or
+# LITELLM_MASTER_KEY.
 #
-# This config uses cloud APIs only — no local servers required.
 # For local/self-hosted providers, see config.local.yaml.example.
 
 vault_root: "/path/to/your/obsidian-vault"
