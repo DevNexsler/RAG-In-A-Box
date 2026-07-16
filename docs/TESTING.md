@@ -161,8 +161,9 @@ immediately instead of flapping.
 the configured LiteLLM proxy, and the comm-store Postgres (localhost:5433).
 LiteLLM is the OCR routing authority: alias `ocr` handles extraction, alias
 `vision` handles image description, and the proxy owns local/cloud fallback
-routing. The application never stores a LiteLLM credential in YAML. It reads
-`LITELLM_API_KEY` first, then `LITELLM_MASTER_KEY`, from the environment.
+routing. The first-class OCR factory does not read a LiteLLM credential from
+YAML; it reads `LITELLM_API_KEY` first, then `LITELLM_MASTER_KEY`, from the
+environment.
 
 `scripts/live_preflight.py` runs all five checks (no early exit — one run
 reports every problem) and **only exit code 0 releases the spend**:
@@ -190,13 +191,16 @@ copy must keep the host-side DSN rewrite
 (`COMM_DATA_STORE_DSN=postgresql://...@localhost:5433/...`), since live
 tests run on the host, not in a container. CWD precedence means a worktree's
 copied `config.yaml` is the exact provider configuration preflight validates.
+OCR stays disabled in `config_test.yaml`; the dedicated LiteLLM live test owns
+all real OCR/vision generation.
 
 `tests/test_litellm_ocr_live.py` creates one large image containing the OCR
 sentinel `RAGBOX LIVE OCR 7319`, a red circle, and a blue square. It contains
-exactly two non-skipping live tests and makes exactly two real LiteLLM calls:
-one through alias `ocr` to recover the normalized sentinel, and one through
-alias `vision` to identify both colors and shapes. Missing infrastructure fails
-preflight or the tests; the file has no skip fallback.
+two non-skipping generation smoke invocations: one through alias `ocr` to
+recover the normalized sentinel, and one through alias `vision` to identify
+both colors and shapes. Provider retries and the preflight `/models` probe can
+add HTTP requests, so these are not a total request count. Missing
+infrastructure fails preflight or the tests; the file has no skip fallback.
 
 Live failures come in two flavors: infrastructure flakes (LiteLLM or a local
 backend busy, provider rate limits — retry once, document) and genuine failures

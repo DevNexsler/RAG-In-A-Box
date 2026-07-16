@@ -6,7 +6,9 @@ Developer-facing details about the search pipeline, storage schema, taxonomy sys
 
 | Variable             | When needed                                              |
 |----------------------|----------------------------------------------------------|
-| `GEMINI_API_KEY`     | Default cloud config — OCR via Gemini Vision (not needed if using local DeepSeek OCR2) |
+| `LITELLM_API_KEY`    | Preferred bearer credential for first-class LiteLLM OCR/vision routing |
+| `LITELLM_MASTER_KEY` | LiteLLM credential fallback when `LITELLM_API_KEY` is unset |
+| `GEMINI_API_KEY`     | Legacy direct Gemini OCR adapter only |
 | `OPENROUTER_API_KEY` | Default cloud config — embeddings (Qwen3-Embedding-8B) + enrichment (GPT-4.1 Mini) |
 | `DEEPINFRA_API_KEY`  | Default cloud config — reranker (Qwen3-Reranker-8B via DeepInfra) |
 | `LANCE_VERSION_RETENTION_MINUTES` | Optional (default 30) — prune index versions older than this each run. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
@@ -26,8 +28,8 @@ Store these in a `.env` file in the project root. The MCP server and indexer loa
 | Embeddings        | Qwen3-Embedding-8B via OpenRouter (batch_size: 64, concurrency: 2) |
 | Vector store      | LanceDB (`LanceDBStore` — direct search with native pre-filters) |
 | Full-text search  | LanceDB + tantivy (BM25)                                     |
-| OCR (PDF pages)   | Gemini Vision (cloud, default) or DeepSeek OCR2 (local) — text extraction from scanned PDFs/images |
-| Image description | Gemini Vision `describe()` — text + detailed visual description (when Gemini OCR enabled) |
+| OCR (PDF pages)   | LiteLLM alias `ocr`; proxy owns local/cloud selection and fallback. Legacy direct Gemini/DeepSeek adapters remain available. |
+| Image description | LiteLLM alias `vision`; proxy owns local/cloud selection and fallback. Legacy direct Gemini/Ollama adapters remain available. |
 | Image metadata    | Pillow EXIF extraction (camera, date, GPS, dimensions)        |
 | PDF metadata      | PyMuPDF (title, author, dates, page count)                    |
 | Reranking         | Qwen3-Reranker-8B via DeepInfra (cloud, always-on, batch scoring, 30s timeout) |

@@ -154,7 +154,8 @@ def check_prod_indexer_idle() -> tuple[bool, str]:
                       "indexer heartbeat; assuming idle")
     if proc.returncode != 0:
         # Container not running, or heartbeat file absent: nothing is
-        # contending for the Mac. Surface stderr so operators can tell
+        # contending for shared LiteLLM/local inference hardware. Surface
+        # stderr so operators can tell
         # container-not-running vs daemon-unreachable vs file-absent apart.
         detail = proc.stderr.strip()[:120]
         return True, ("prod container not running or no heartbeat file"
