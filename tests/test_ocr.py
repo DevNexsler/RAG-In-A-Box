@@ -21,7 +21,6 @@ try:
 except ImportError:
     pass
 
-from extractors import begin_degradation_capture, collect_degradations
 from providers.ocr.deepseek_ocr2_local import DeepSeekOCR2Local
 
 
