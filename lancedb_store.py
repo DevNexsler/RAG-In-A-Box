@@ -954,6 +954,15 @@ class LanceDBStore:
 
         return self._run_read_with_recovery(_op, [])
 
+    def contains_doc_id(self, doc_id: str) -> bool:
+        """Return whether at least one physical row exists for ``doc_id``."""
+        escaped_doc_id = self._sql_escape(doc_id)
+
+        def _op():
+            return self._vs.table.count_rows(f"doc_id = '{escaped_doc_id}'") > 0
+
+        return self._run_read_with_recovery(_op, False)
+
     def list_doc_mtimes(self) -> dict[str, float]:
         """Return {doc_id: mtime} for all docs in the store.
 

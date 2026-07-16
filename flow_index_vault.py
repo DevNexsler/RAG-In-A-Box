@@ -67,6 +67,7 @@ from communication_context import (
     repair_sidecar_context,
 )
 from core.config import load_config
+from core.artifacts import is_communication_sidecar
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
@@ -371,16 +372,7 @@ def _is_communication_sidecar(path: Path) -> bool:
     window, because the 'context' block of nearby messages can push the marker
     keys arbitrarily far into the file.
     """
-    try:
-        if path.stat().st_size > 2_000_000:
-            return False  # sidecars are small; a huge json is real data
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(payload, dict) or "media" not in payload:
-        return False
-    markers = ("schema_version", "message", "counterparty", "channel")
-    return any(k in payload for k in markers)
+    return is_communication_sidecar(path)
 
 
 # --- Tasks (one responsibility each) ---
@@ -982,6 +974,101 @@ def _annotate_canonical_sidecar(
 # indexer heartbeat (_write_heartbeat) + the /health 503.
 @task(retries=1)
 def process_doc_task(doc: dict) -> None:
+    """Serialize equal-content decisions until their canonical is indexed."""
+    registry = _RUNTIME.get("doc_id_store")
+    config = _RUNTIME.get("config", {})
+    abs_path = str(doc.get("abs_path", ""))
+    if (
+        registry is not None
+        and config.get("dedupe", {}).get("enabled")
+        and doc.get("source_name", "documents") == "documents"
+        and abs_path
+        and os.path.isfile(abs_path)
+    ):
+        try:
+            import blake3 as _blake3
+
+            raw_bytes = Path(abs_path).read_bytes()
+            digest = _blake3.blake3(raw_bytes).digest()
+        except OSError:
+            _process_doc_task(doc)
+            return
+        with registry.content_hash_lock(digest):
+            _process_doc_task(doc, raw_bytes=raw_bytes, digest=digest)
+        return
+    _process_doc_task(doc)
+
+
+_TRANSIENT_PROVIDER_ISSUE_KINDS = frozenset({
+    "offline", "timeout", "unavailable", "network", "rate_limited", "overloaded",
+})
+
+
+def _provider_error_artifact(raw_bytes: bytes, ext: str) -> tuple[str, bool] | None:
+    """Classify structured provider failure JSON that is not document content."""
+    if ext.lower() != "json":
+        return None
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    issue = payload.get("issue")
+    if not (
+        isinstance(payload.get("server"), str)
+        and isinstance(payload.get("tool"), str)
+        and payload.get("error")
+        and isinstance(issue, dict)
+    ):
+        return None
+
+    tool = payload["tool"].lower()
+    reason = (
+        "vision_sidecar_failed"
+        if "vision" in tool or tool.startswith("vl_")
+        else "ocr_sidecar_failed"
+        if "ocr" in tool
+        else "provider_sidecar_failed"
+    )
+    kind = str(issue.get("kind") or "").strip().lower()
+    error_text = f"{payload.get('error', '')} {issue.get('rawMessage', '')}".lower()
+    transient = kind in _TRANSIENT_PROVIDER_ISSUE_KINDS or any(
+        marker in error_text
+        for marker in ("timed out", "timeout", "offline", "connection refused", "unavailable")
+    )
+    return reason, transient
+
+
+def _reset_invalid_dedupe_cohort(
+    registry: DocIDStore,
+    store: LanceDBStore,
+    bare_id: str,
+    source_name: str,
+    logger,
+) -> list[str]:
+    affected = registry.reset_exact_hash_cohort(bare_id)
+    if affected:
+        namespaced_ids = [f"{source_name}::{doc_id}" for doc_id in affected]
+        store.delete_by_doc_ids(namespaced_ids)
+        ledger_lock = _RUNTIME.get("degraded_lock")
+        if ledger_lock is not None:
+            with ledger_lock:
+                _RUNTIME.setdefault("skip_clean", set()).update(namespaced_ids)
+        logger.warning(
+            "Reopened invalid exact-content cohort for %s (%d members)",
+            bare_id,
+            len(affected),
+        )
+    return affected
+
+
+def _process_doc_task(
+    doc: dict,
+    *,
+    raw_bytes: bytes | None = None,
+    digest: bytes | None = None,
+) -> None:
     """Extract text, chunk with LlamaIndex, embed, upsert into store.
 
     Reads store / embed_provider / splitter / ocr_provider / config from _RUNTIME.
@@ -1017,6 +1104,36 @@ def process_doc_task(doc: dict) -> None:
         source_name = doc.get("source_name", "documents")
         logger.info(f"Processing: {rel_path} (id={doc_id})")
 
+        registry = _RUNTIME.get("doc_id_store")
+        abs_path_str = str(doc.get("abs_path", ""))
+        if source_name == "documents" and abs_path_str and ext.lower() == "json":
+            try:
+                if raw_bytes is None:
+                    raw_bytes = Path(abs_path_str).read_bytes()
+                provider_error = _provider_error_artifact(raw_bytes, ext)
+            except OSError:
+                provider_error = None
+            if provider_error is not None:
+                bare_id = doc_id.split("::", 1)[1] if "::" in doc_id else doc_id
+                if registry is not None:
+                    try:
+                        _reset_invalid_dedupe_cohort(
+                            registry, store, bare_id, source_name, logger
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Provider error artifact cohort cleanup failed for %s: %s",
+                            doc_id,
+                            exc,
+                        )
+                reason, transient = provider_error
+                note_degradation(reason, transient=transient)
+                logger.warning(
+                    "Provider error artifact is retry-pending, not content: %s",
+                    doc_id,
+                )
+                return
+
         # --- Exact-content dedupe gate (filesystem docs only) ---
         # Same bytes arriving via different paths (e.g. one document attached to
         # several emails) index once: first-seen path wins the canonical election,
@@ -1025,8 +1142,6 @@ def process_doc_task(doc: dict) -> None:
         # sidecar duplicate_deliveries note). Files stay on disk untouched —
         # deposit dirs are externally owned and re-deposit anything missing.
         dedupe_cfg = config.get("dedupe", {})
-        registry = _RUNTIME.get("doc_id_store")
-        abs_path_str = str(doc.get("abs_path", ""))
         if (
             dedupe_cfg.get("enabled")
             and registry is not None
@@ -1038,16 +1153,43 @@ def process_doc_task(doc: dict) -> None:
             try:
                 import blake3 as _blake3
 
-                raw_bytes = Path(abs_path_str).read_bytes()
-                digest = _blake3.blake3(raw_bytes).digest()
+                if raw_bytes is None:
+                    raw_bytes = Path(abs_path_str).read_bytes()
+                if digest is None:
+                    digest = _blake3.blake3(raw_bytes).digest()
                 bare_id = doc_id.split("::", 1)[1] if "::" in doc_id else doc_id
-                winner = registry.claim_canonical_by_exact_hash(
-                    bare_id,
-                    len(raw_bytes),
-                    digest,
-                    hash_algo="blake3",
-                    duplicate_reason="exact content match at index time",
+                winner = registry.find_canonical_by_exact_hash(
+                    len(raw_bytes), digest, "blake3"
                 )
+                if winner is not None and winner.get("doc_id") != bare_id:
+                    canonical_ns = f"{source_name}::{winner['doc_id']}"
+                    if store.contains_doc_id(canonical_ns):
+                        registry.update_dedupe_identity(
+                            bare_id,
+                            size_bytes=len(raw_bytes),
+                            content_hash=digest,
+                            hash_algo="blake3",
+                            dedupe_status="duplicate",
+                            canonical_doc_id=winner["doc_id"],
+                            duplicate_reason="exact content match at index time",
+                        )
+                    else:
+                        logger.warning(
+                            "Dedupe canonical %s is absent from LanceDB; reopening cohort",
+                            canonical_ns,
+                        )
+                        _reset_invalid_dedupe_cohort(
+                            registry, store, bare_id, source_name, logger
+                        )
+                        winner = None
+                if winner is None:
+                    winner = registry.claim_canonical_by_exact_hash(
+                        bare_id,
+                        len(raw_bytes),
+                        digest,
+                        hash_algo="blake3",
+                        duplicate_reason="exact content match at index time",
+                    )
             except Exception as exc:
                 logger.warning("Dedupe gate failed for %s (indexing normally): %s", doc_id, exc)
             if winner is not None and winner.get("doc_id") != bare_id:
@@ -1492,8 +1634,10 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
                             "reasons": sorted(set(skips)),
                             "change_key": _change_key(doc),
                         }
+                        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
                     elif reasons:
                         _RUNTIME.setdefault("degraded_now", {})[doc_id] = reasons
+                        _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
                     else:
                         # Indexed cleanly — drop from both ledgers.
                         _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)

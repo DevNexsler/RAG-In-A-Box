@@ -270,6 +270,55 @@ class TestFTSRebuildDeferred:
             _teardown_runtime()
 
 
+class TestOutcomeLaneTransitions:
+    def _prepare_ledgers(self):
+        _RUNTIME.update({
+            "degraded_lock": threading.Lock(),
+            "degraded_now": {},
+            "degraded_clean": set(),
+            "skip_now": {},
+            "skip_clean": set(),
+        })
+
+    def test_degraded_result_clears_old_skip_lane(self, index_dir):
+        from extractors import note_degradation
+        from flow_index_vault import _process_docs
+
+        _setup_runtime(index_dir)
+        self._prepare_ledgers()
+        doc = _fake_record("provider-error", "provider error artifact")
+        try:
+            with patch(
+                "flow_index_vault.process_doc_task",
+                side_effect=lambda _doc: note_degradation(
+                    "vision_sidecar_failed", transient=True
+                ),
+            ):
+                assert _process_docs([doc]) == []
+            assert _RUNTIME["skip_clean"] == {doc["doc_id"]}
+            assert doc["doc_id"] in _RUNTIME["degraded_now"]
+        finally:
+            _teardown_runtime()
+
+    def test_skip_result_clears_old_degraded_lane(self, index_dir):
+        from extractors import note_skip
+        from flow_index_vault import _process_docs
+
+        _setup_runtime(index_dir)
+        self._prepare_ledgers()
+        doc = _fake_record("duplicate", "duplicate bytes")
+        try:
+            with patch(
+                "flow_index_vault.process_doc_task",
+                side_effect=lambda _doc: note_skip("duplicate_of:canonical"),
+            ):
+                assert _process_docs([doc]) == []
+            assert _RUNTIME["degraded_clean"] == {doc["doc_id"]}
+            assert doc["doc_id"] in _RUNTIME["skip_now"]
+        finally:
+            _teardown_runtime()
+
+
 class TestConcurrencyDebugLogging:
     def test_debug_logging_reports_peak_active_workers(
         self,

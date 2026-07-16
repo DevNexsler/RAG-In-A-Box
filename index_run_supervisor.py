@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -29,6 +30,25 @@ logger = logging.getLogger(__name__)
 
 _STATE_VERSION = 1
 _ACTIVE_STATUSES = {"starting", "running", "terminating"}
+_DEFAULT_LOG_MAX_BYTES = 128 * 1024 * 1024
+_DEFAULT_LOG_RETAIN_BYTES = 96 * 1024 * 1024
+
+
+def index_log_paths(index_root: str | Path, log_name: str = "indexer.log") -> list[Path]:
+    """Return current, legacy previous, and retained per-run logs."""
+    root = Path(index_root)
+    base = root / log_name
+    candidates = [base, base.with_suffix(base.suffix + ".prev")]
+    candidates.extend(root.glob(f"{log_name}.run-*.archive"))
+    existing: list[tuple[float, str, Path]] = []
+    for path in set(candidates):
+        try:
+            metadata = path.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            existing.append((metadata.st_mtime, path.name, path))
+    return [path for _mtime, _name, path in sorted(existing)]
 
 
 def _utc_now() -> str:
@@ -144,6 +164,8 @@ class IndexRunSupervisor:
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        log_max_bytes: int = _DEFAULT_LOG_MAX_BYTES,
+        log_retain_bytes: int = _DEFAULT_LOG_RETAIN_BYTES,
     ) -> None:
         self.index_root = Path(index_root)
         self.state_path = self.index_root / "index_run_state.json"
@@ -163,6 +185,11 @@ class IndexRunSupervisor:
         self._clock = clock
         self._wall_clock = wall_clock
         self._sleep = sleep
+        self._log_max_bytes = max(1, int(log_max_bytes))
+        self._log_retain_bytes = min(
+            self._log_max_bytes,
+            max(1, int(log_retain_bytes)),
+        )
         self._owner_id = uuid.uuid4().hex
         self._thread_lock = threading.RLock()
         self._monitor_lock = threading.Lock()
@@ -239,6 +266,37 @@ class IndexRunSupervisor:
             if existing not in {None, expected_pid}:
                 return
         self.pid_path.unlink(missing_ok=True)
+
+    def _prepare_log_for_run(self, path: Path) -> None:
+        """Keep one collector-visible rolling log, compacting its oldest bytes."""
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            logger.warning("Cannot inspect index log %s: %s", path, exc)
+            return
+        if size <= self._log_max_bytes:
+            return
+
+        offset = max(0, size - self._log_retain_bytes)
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.compact")
+        try:
+            with path.open("rb") as source:
+                source.seek(offset)
+                retained = source.read(self._log_retain_bytes)
+            if offset:
+                _partial, separator, retained = retained.partition(b"\n")
+                if not separator:
+                    retained = b""
+            with temp_path.open("wb") as target:
+                target.write(retained)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temp_path, path)
+        except OSError as exc:
+            temp_path.unlink(missing_ok=True)
+            logger.warning("Cannot compact index log %s: %s", path, exc)
 
     def _active_identity_failure(self, current: dict[str, Any]) -> str | None:
         try:
@@ -446,12 +504,7 @@ class IndexRunSupervisor:
 
             path = Path(log_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            previous = path.with_suffix(path.suffix + ".prev")
-            if path.exists():
-                try:
-                    os.replace(path, previous)
-                except OSError:
-                    pass
+            self._prepare_log_for_run(path)
 
             log_handle = None
             try:
