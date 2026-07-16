@@ -2,13 +2,13 @@
 
 Uses the provider stack defined in config_test.yaml — currently OpenRouter
 (embeddings + enrichment) and DeepInfra (reranker). OCR is disabled in this
-suite; tests/test_litellm_ocr_live.py owns the real LiteLLM OCR/vision smoke.
+suite, so the image fixture contributes metadata but no OCR/vision text;
+tests/test_litellm_ocr_live.py owns the real LiteLLM OCR/vision smoke.
 
 Run with:  pytest tests/test_integration.py -v -s
 
 The test flow:
-  1. Index text-bearing test_vault fixtures (3 MD + 1 PDF) with real embeddings;
-     the image fixture remains unindexed because OCR is disabled
+  1. Index the test_vault fixtures (3 MD + 1 PDF + 1 image) with real embeddings
   2. Run semantic search queries and verify results make sense
   3. Test MCP tool handler implementations
   4. Verify get_chunk returns correct text
@@ -614,7 +614,7 @@ class TestReranker:
                 f"Non-recipe doc {h.doc_id} got unexpectedly high score: {h.score:.4f}"
 
     def test_reranker_meeting_notes_query(self, indexed_store):
-        """For 'meeting notes project kickoff', meeting_notes.png should rank high."""
+        """A meeting-notes query should rank note2 or a meeting-related doc high."""
         from search_hybrid import hybrid_search
 
         query = "meeting notes project kickoff attendees"
