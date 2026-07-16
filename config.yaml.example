@@ -61,37 +61,12 @@ pdf:
 
 ocr:
   enabled: true
-  provider: "gemini"                      # default for both PDF pages and images
-  model: "gemini-2.0-flash"
-  timeout: 120
-  concurrency: 2
-  # Optional: override just the image description provider
-  # describe:
-  #   provider: "ollama_vision"           # uses Ollama vision model for photos/screenshots
-  #   model: "qwen3-vl:8b"
-  #   base_url: "http://localhost:11434"
-  #
-  # Optional per-method fallback disambiguation (transient-vs-blank). When the
-  # primary returns EMPTY (reachable but no text), an independent LiteLLM model is
-  # consulted: it recovers the content, or (both empty) confirms a genuine blank.
-  # A primary OUTAGE (unreachable) is NOT charged to the fallback — it just retries.
-  # Auth: the LiteLLM client uses LITELLM_API_KEY / LITELLM_MASTER_KEY from the env
-  # (config.yaml is NOT env-expanded, so put the key in the environment, not here).
-  # describe:
-  #   provider: "ollama_vision"
-  #   ...
-  #   fallback:
-  #     provider: "litellm"
-  #     endpoint: "http://YOUR_LITELLM_PROXY:4000/v1"   # OpenAI-compatible /v1
-  #     model: "vision"                    # image-describe model on the proxy
-  # extract:                               # add this block to fall back OCR too
-  #   provider: "deepseek_ocr2"            # (repeat the extract primary's config)
-  #   base_url: "http://localhost:8790"
-  #   fallback:
-  #     provider: "litellm"
-  #     endpoint: "http://YOUR_LITELLM_PROXY:4000/v1"
-  #     model: "ocr"                       # note: an empty OCR page indexes as
-  #                                        # clean (no re-OCR), unlike describe
+  provider: "litellm"
+  endpoint: "http://YOUR_LITELLM_PROXY:4000/v1"
+  extract_model: "ocr"
+  describe_model: "vision"
+  timeout: 300
+  concurrency: 1
 
 media:
   enabled: true
