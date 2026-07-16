@@ -24,6 +24,8 @@ boundary instead of duplicating routing policy in the application.
 - Route standalone-image description through LiteLLM model alias `vision`.
 - Remove direct Mac Mini OCR and Ollama endpoints from active runtime configuration.
 - Let LiteLLM own local/cloud selection, retries, and fallback ordering.
+- Update live-tier preflight, health checks, and operator docs to validate LiteLLM instead
+  of the retired direct Mac Mini endpoints.
 - Preserve existing OCR provider contracts: text on success, empty string for confirmed
   blank content, transient exception when the orchestration endpoint fails.
 - Keep credentials in environment variables, never `config.yaml`.
@@ -104,8 +106,10 @@ The direct `192.168.68.70` endpoints, split `extract`/`describe` primary blocks,
 application-level LiteLLM fallback blocks are removed from active OCR configuration.
 `config.yaml.example` documents the new first-class form.
 
-Authentication follows existing LiteLLM behavior: explicit provider key if ever supplied,
-otherwise `LITELLM_API_KEY`, then `LITELLM_MASTER_KEY`. No secret is added to tracked YAML.
+Authentication follows existing LiteLLM behavior: `LITELLM_API_KEY`, then
+`LITELLM_MASTER_KEY`. `LiteLLMOCR` may accept an explicit key for direct construction in
+unit tests, but `build_ocr_provider` must not read an `api_key` field from YAML. No secret is
+added to tracked configuration.
 
 ## Result and Error Semantics
 
@@ -128,6 +132,28 @@ which local or cloud backend was selected.
 The application `/health` endpoint remains a process/indexer probe; provider validation uses
 LiteLLM health/model metadata plus the approved live end-to-end test.
 
+## Live Gate Migration
+
+The current live tier assumes `ocr.base_url` points directly at DeepSeek-OCR2. Moving routing
+to LiteLLM requires updating that gate in the same change:
+
+- `scripts/live_preflight.py` replaces `check_mac_ocr` with a non-generating LiteLLM check.
+  It loads `ocr.endpoint`, `ocr.extract_model`, and `ocr.describe_model`, calls the
+  OpenAI-compatible model-list endpoint with the environment-provided LiteLLM key, and
+  requires both aliases to be present. Missing config, credentials, reachability, or aliases
+  fails preflight before generation spend.
+- Preflight unit tests cover valid aliases plus missing endpoint, key, model, unreachable
+  proxy, and missing-alias failures.
+- Direct Mac Mini live health assertions in `tests/test_service_health.py` and
+  `tests/test_ocr.py` are retired or migrated. Legacy DeepSeek/Ollama unit coverage remains;
+  production live coverage moves to LiteLLM.
+- `docs/TESTING.md` describes LiteLLM OCR/vision in the live tier, the new preflight check,
+  required key environment, and the committed live test.
+
+The production-indexer-idle check remains. Even though application routing moves behind
+LiteLLM, its local routes may still use shared hardware; avoiding concurrent live-test and
+production indexing load remains useful.
+
 ## Testing
 
 Follow TDD for adapter and factory behavior.
@@ -141,27 +167,35 @@ Unit tests cover:
 - transport and proxy errors retain transient retry semantics.
 - factory builds `LiteLLMOCR` from top-level configuration and rejects missing model aliases.
 - first-class LiteLLM configuration is not wrapped in application-level OCR fallback.
+- live preflight validates endpoint, credentials, and both aliases without generation.
+
+A committed `tests/test_litellm_ocr_live.py` test builds the provider through
+`build_ocr_provider` using real configuration, then calls `extract()` and `describe()` once
+each. Its generated fixture contains a unique printed token plus simple visual content. The
+OCR assertion checks the unique token; the vision assertion checks stable visual concepts
+rather than exact prose. The filename places it in the `live` tier automatically.
 
 Repository verification:
 
 1. Run focused OCR/LiteLLM unit tests during red-green development.
 2. Run `make gate-fast` after implementation.
 3. Confirm LiteLLM liveness and alias metadata without generation spend.
-4. Run a live end-to-end test through the new provider and real LiteLLM endpoint for both
-   aliases. A generated fixture contains a unique printed token plus simple visual content;
-   the test asserts `ocr` extracts the token and `vision` describes the expected visual
-   concepts. This rollout has explicit operator approval for any real-provider spend caused
-   by LiteLLM local/cloud routing.
-5. Rebuild/restart `doc-organizer`, then check container health and `/health`.
+4. Run full `make gate` before release. Its preflight-gated live tier executes the committed
+   end-to-end test through the real LiteLLM endpoint for both aliases. This rollout has
+   explicit operator approval for any provider spend caused by LiteLLM local/cloud routing.
+5. Review the gate report and require all five tiers to pass; skips do not satisfy the two
+   LiteLLM live assertions.
+6. Rebuild/restart `doc-organizer`, then check container health and `/health`.
 
 ## Rollout
 
 1. Add provider and tests.
-2. Update active and example configuration.
-3. Run GitNexus change detection and repository gates.
-4. Rebuild/restart `doc-organizer` so its image includes the adapter and it reloads mounted
+2. Update active/example configuration, live preflight, live health tests, and testing docs.
+3. Run GitNexus change detection, `make gate-fast`, then full `make gate`.
+4. Require the gate report to show all five tiers passing, including both live LiteLLM calls.
+5. Rebuild/restart `doc-organizer` so its image includes the adapter and it reloads mounted
    configuration.
-5. Verify application health and inspect startup logs for endpoint and aliases.
+6. Verify application health and inspect startup logs for endpoint and aliases.
 
 Rollback restores the previous OCR configuration and prior application image, then restarts
 `doc-organizer`. LiteLLM proxy state is unchanged by either rollout or rollback.
@@ -171,7 +205,9 @@ Rollback restores the previous OCR configuration and prior application image, th
 - Runtime config contains no direct Mac Mini OCR or Qwen-VL endpoint.
 - OCR factory selects first-class LiteLLM provider using aliases `ocr` and `vision`.
 - Application performs no secondary OCR routing outside LiteLLM for this configuration.
-- Focused tests and `make gate-fast` pass.
+- Live preflight reads LiteLLM configuration and confirms both aliases without generation.
+- Legacy direct-Mac live checks and `docs/TESTING.md` match the new routing boundary.
+- Focused tests, `make gate-fast`, and full `make gate` pass.
 - Live end-to-end requests through the configured LiteLLM endpoint pass for both `ocr` and
   `vision` aliases.
 - Rebuilt `doc-organizer` reports healthy after restart.
