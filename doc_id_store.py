@@ -14,6 +14,7 @@ changes are traceable and recoverable.
 import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 # Base-62 charset: digits, lowercase, uppercase
@@ -645,6 +646,18 @@ class DocIDStore:
         becomes an identity-free canonical candidate so the next successful
         processing pass can elect an indexed canonical from real content.
         """
+        with self.reset_exact_hash_cohort_transaction(doc_id) as affected:
+            return affected
+
+    @contextmanager
+    def reset_exact_hash_cohort_transaction(self, doc_id: str):
+        """Yield cohort IDs, then reset that exact identity on clean exit.
+
+        The write transaction stays open while the caller removes external
+        index rows. An external-delete failure rolls back registry state; other
+        writers cannot move the document into a different cohort between the
+        read and the identity reset.
+        """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -662,8 +675,9 @@ class DocIDStore:
                     or identity[1] is None
                     or identity[2] is None
                 ):
+                    yield []
                     self._conn.commit()
-                    return []
+                    return
                 rows = self._conn.execute(
                     """
                     SELECT doc_id
@@ -674,7 +688,8 @@ class DocIDStore:
                     identity,
                 ).fetchall()
                 affected = [row[0] for row in rows]
-                self._conn.execute(
+                yield affected
+                cursor = self._conn.execute(
                     """
                     UPDATE doc_registry
                     SET size_bytes = NULL,
@@ -690,9 +705,12 @@ class DocIDStore:
                     """,
                     (time.time(), *identity),
                 )
+                if cursor.rowcount != len(affected):
+                    raise RuntimeError(
+                        "exact-hash cohort changed during identity reset"
+                    )
                 self._conn.commit()
-                return affected
-            except Exception:
+            except BaseException:
                 self._conn.rollback()
                 raise
 

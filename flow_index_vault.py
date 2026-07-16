@@ -1002,6 +1002,25 @@ def process_doc_task(doc: dict) -> None:
 _TRANSIENT_PROVIDER_ISSUE_KINDS = frozenset({
     "offline", "timeout", "unavailable", "network", "rate_limited", "overloaded",
 })
+_PROVIDER_CONTENT_FIELDS = frozenset({
+    "content", "document", "documents", "items", "records", "result", "text",
+})
+
+
+def _has_substantive_provider_content(payload: dict) -> bool:
+    for field in _PROVIDER_CONTENT_FIELDS:
+        value = payload.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif isinstance(value, (list, dict)):
+            if value:
+                return True
+        else:
+            return True
+    return False
 
 
 def _provider_error_artifact(raw_bytes: bytes, ext: str) -> tuple[str, bool] | None:
@@ -1014,14 +1033,17 @@ def _provider_error_artifact(raw_bytes: bytes, ext: str) -> tuple[str, bool] | N
         return None
     if not isinstance(payload, dict):
         return None
-    issue = payload.get("issue")
     if not (
         isinstance(payload.get("server"), str)
         and isinstance(payload.get("tool"), str)
         and payload.get("error")
-        and isinstance(issue, dict)
     ):
         return None
+    if _has_substantive_provider_content(payload):
+        return None
+
+    issue = payload.get("issue")
+    issue_details = issue if isinstance(issue, dict) else {}
 
     tool = payload["tool"].lower()
     reason = (
@@ -1031,8 +1053,10 @@ def _provider_error_artifact(raw_bytes: bytes, ext: str) -> tuple[str, bool] | N
         if "ocr" in tool
         else "provider_sidecar_failed"
     )
-    kind = str(issue.get("kind") or "").strip().lower()
-    error_text = f"{payload.get('error', '')} {issue.get('rawMessage', '')}".lower()
+    kind = str(issue_details.get("kind") or "").strip().lower()
+    error_text = (
+        f"{payload.get('error', '')} {issue_details.get('rawMessage', '')}".lower()
+    )
     transient = kind in _TRANSIENT_PROVIDER_ISSUE_KINDS or any(
         marker in error_text
         for marker in ("timed out", "timeout", "offline", "connection refused", "unavailable")
@@ -1047,10 +1071,11 @@ def _reset_invalid_dedupe_cohort(
     source_name: str,
     logger,
 ) -> list[str]:
-    affected = registry.reset_exact_hash_cohort(bare_id)
+    with registry.reset_exact_hash_cohort_transaction(bare_id) as affected:
+        if affected:
+            namespaced_ids = [f"{source_name}::{doc_id}" for doc_id in affected]
+            store.delete_by_doc_ids(namespaced_ids)
     if affected:
-        namespaced_ids = [f"{source_name}::{doc_id}" for doc_id in affected]
-        store.delete_by_doc_ids(namespaced_ids)
         ledger_lock = _RUNTIME.get("degraded_lock")
         if ledger_lock is not None:
             with ledger_lock:

@@ -1258,6 +1258,9 @@ def _compute_deep_health(
             last_run_at=last_run_at,
             not_extractable_doc_count=not_extractable_doc_count + retry_pending_doc_count,
         )
+        if retry_pending_doc_count > 0 and status == "ok":
+            status = "indexing" if indexer_running else "degraded"
+            reason = "retry_pending"
         source_statuses.append(status)
         sources[source_name] = {
             "status": status,
