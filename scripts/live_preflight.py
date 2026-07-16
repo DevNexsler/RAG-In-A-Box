@@ -97,25 +97,29 @@ def check_litellm_ocr() -> tuple[bool, str]:
     if any(not isinstance(ocr[field], str) for field in required):
         return False, f"ocr config fields must be strings in {used}"
 
-    api_key = os.environ.get("LITELLM_API_KEY")
+    api_key = (os.environ.get("LITELLM_API_KEY")
+               or os.environ.get("LITELLM_MASTER_KEY"))
     if not api_key:
-        return False, "LITELLM_API_KEY missing or empty (set in .env)"
+        return False, ("LITELLM_API_KEY or LITELLM_MASTER_KEY missing or empty "
+                       "(set in .env)")
 
     endpoint = ocr["endpoint"].rstrip("/")
-    models_url = (f"{endpoint}/models" if endpoint.endswith("/v1")
-                  else f"{endpoint}/v1/models")
+    models_url = f"{endpoint}/models"
     try:
         response = httpx.get(
             models_url,
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=PROBE_TIMEOUT_S,
         )
+        response.raise_for_status()
+    except httpx.InvalidURL:
+        return False, f"LiteLLM endpoint invalid at {models_url}"
+    except httpx.HTTPStatusError as exc:
+        return False, (f"LiteLLM model list returned HTTP "
+                       f"{exc.response.status_code} at {models_url}")
     except httpx.HTTPError as exc:
         return False, (f"LiteLLM unreachable at {models_url}: "
                        f"{type(exc).__name__}")
-    if not response.is_success:
-        return False, (f"LiteLLM model list returned HTTP "
-                       f"{response.status_code} at {models_url}")
     try:
         payload = response.json()
     except ValueError:

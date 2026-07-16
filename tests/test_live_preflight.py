@@ -111,7 +111,7 @@ def test_config_candidates_prefer_cwd_before_main(monkeypatch):
 @pytest.mark.parametrize(
     ("endpoint", "expected_url"),
     [
-        ("http://litellm:4000", "http://litellm:4000/v1/models"),
+        ("http://litellm:4000", "http://litellm:4000/models"),
         ("http://litellm:4000/v1", "http://litellm:4000/v1/models"),
         ("http://litellm:4000/v1/", "http://litellm:4000/v1/models"),
     ],
@@ -121,6 +121,7 @@ def test_litellm_ocr_validates_both_aliases_with_auth(
     cfg = _write_litellm_config(tmp_path / "config.yaml", endpoint=endpoint)
     monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
     monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "fallback-secret-key")
     calls = {}
 
     def fake_get(url, *, headers, timeout):
@@ -138,6 +139,29 @@ def test_litellm_ocr_validates_both_aliases_with_auth(
     assert calls["timeout"] == lp.PROBE_TIMEOUT_S
     assert "ocr" in reason and "vision" in reason
     assert "test-secret-key" not in reason
+    assert "fallback-secret-key" not in reason
+
+
+def test_litellm_ocr_accepts_master_key_when_api_key_missing(
+        tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-secret-key")
+    calls = {}
+
+    def fake_get(url, *, headers, timeout):
+        calls["authorization"] = headers["Authorization"]
+        return _http_response(
+            payload={"data": [{"id": "ocr"}, {"id": "vision"}]},
+        )
+
+    monkeypatch.setattr(lp.httpx, "get", fake_get)
+    ok, reason = lp.check_litellm_ocr()
+
+    assert ok
+    assert calls["authorization"] == "Bearer master-secret-key"
+    assert "master-secret-key" not in reason
 
 
 def test_litellm_ocr_requires_provider_litellm(tmp_path, monkeypatch):
@@ -166,6 +190,7 @@ def test_litellm_ocr_requires_env_key_and_ignores_yaml_key(tmp_path, monkeypatch
     )
     monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
     monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
     monkeypatch.setattr(
         lp.httpx,
         "get",
@@ -176,6 +201,7 @@ def test_litellm_ocr_requires_env_key_and_ignores_yaml_key(tmp_path, monkeypatch
 
     assert not ok
     assert "LITELLM_API_KEY" in reason
+    assert "LITELLM_MASTER_KEY" in reason
     assert "must-not-be-used-or-printed" not in reason
 
 
@@ -201,6 +227,37 @@ def test_litellm_ocr_reports_unreachable_endpoint(tmp_path, monkeypatch):
     assert not ok
     assert "unreachable" in reason.lower()
     assert "test-secret-key" not in reason
+
+
+def test_litellm_ocr_invalid_url_preserves_tuple_contract(tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml", endpoint=":not-a-url")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+
+    def invalid(*args, **kwargs):
+        raise lp.httpx.InvalidURL("invalid URL")
+
+    monkeypatch.setattr(lp.httpx, "get", invalid)
+    result = lp.check_litellm_ocr()
+
+    assert isinstance(result, tuple) and len(result) == 2
+    ok, reason = result
+    assert not ok
+    assert "invalid" in reason.lower()
+    assert "test-secret-key" not in reason
+
+
+def test_litellm_ocr_does_not_swallow_unexpected_error(tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("unexpected defect")
+
+    monkeypatch.setattr(lp.httpx, "get", crash)
+    with pytest.raises(RuntimeError, match="unexpected defect"):
+        lp.check_litellm_ocr()
 
 
 def test_litellm_ocr_reports_unauthorized_without_key_leak(tmp_path, monkeypatch):
