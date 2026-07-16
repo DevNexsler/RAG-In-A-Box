@@ -76,14 +76,31 @@ def build_ocr_provider(config: dict) -> OCRProvider | None:
 
     Supports split config: separate providers for extract (PDF pages)
     and describe (images). Falls back to a single provider when no
-    extract/describe subsections are present. When OCR is enabled, the
-    composed primary is always wrapped in a FallbackOCRProvider so that a
-    reachable-but-empty describe/extract can recover via an optional
-    per-method LiteLLM fallback (built from the `.fallback` subsection).
+    extract/describe subsections are present. A top-level LiteLLM provider
+    is returned directly because LiteLLM owns routing and fallback. Legacy
+    primaries are wrapped in a FallbackOCRProvider so a reachable-but-empty
+    result can recover via the optional per-method `.fallback` subsection.
     """
     ocr_cfg = config.get("ocr", {})
     if not ocr_cfg.get("enabled", False):
         return None
+
+    if ocr_cfg.get("provider") == "litellm":
+        required = ("endpoint", "extract_model", "describe_model")
+        missing = [key for key in required if not ocr_cfg.get(key)]
+        if missing:
+            raise ValueError(
+                "ocr litellm provider missing required config: "
+                + ", ".join(missing)
+            )
+
+        from providers.ocr.litellm_ocr import LiteLLMOCR
+        return LiteLLMOCR(
+            endpoint=ocr_cfg["endpoint"],
+            extract_model=ocr_cfg["extract_model"],
+            describe_model=ocr_cfg["describe_model"],
+            timeout=ocr_cfg.get("timeout", 300.0),
+        )
 
     default = _build_single_provider(ocr_cfg)
 

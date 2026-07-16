@@ -4,6 +4,8 @@ import httpx
 import pytest
 
 from core.resilience import is_transient
+from providers.ocr import build_ocr_provider
+from providers.ocr.fallback import FallbackOCRProvider
 from providers.ocr.litellm_ocr import LiteLLMOCR
 
 
@@ -180,3 +182,44 @@ def test_startup_log_names_endpoint_and_aliases_but_not_key(caplog):
     assert "ocr" in messages
     assert "vision" in messages
     assert "must-not-appear" not in messages
+
+
+def test_factory_builds_litellm_provider_directly(monkeypatch):
+    monkeypatch.setenv("LITELLM_API_KEY", "environment-key")
+    config = {
+        "ocr": {
+            "enabled": True,
+            "provider": "litellm",
+            "endpoint": "http://lite/v1",
+            "extract_model": "ocr",
+            "describe_model": "vision",
+            "timeout": 41,
+            "api_key": "yaml-key-must-be-ignored",
+        }
+    }
+
+    provider = build_ocr_provider(config)
+
+    assert type(provider) is LiteLLMOCR
+    assert not isinstance(provider, FallbackOCRProvider)
+    assert provider.endpoint == "http://lite/v1"
+    assert provider.extract_model == "ocr"
+    assert provider.describe_model == "vision"
+    assert provider.timeout == 41
+    assert provider._extract_client.api_key == "environment-key"
+    assert provider._describe_client.api_key == "environment-key"
+
+
+@pytest.mark.parametrize("missing", ["endpoint", "extract_model", "describe_model"])
+def test_factory_requires_litellm_field(missing):
+    ocr_config = {
+        "enabled": True,
+        "provider": "litellm",
+        "endpoint": "http://lite/v1",
+        "extract_model": "ocr",
+        "describe_model": "vision",
+    }
+    del ocr_config[missing]
+
+    with pytest.raises(ValueError, match=missing):
+        build_ocr_provider({"ocr": ocr_config})
