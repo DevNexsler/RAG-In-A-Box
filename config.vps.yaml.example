@@ -10,6 +10,8 @@
 #   INDEX_ROOT      — override index_root
 #   PORT            — override mcp.port
 #   API_KEY         — Bearer token for HTTP auth (unset = no auth)
+#   LITELLM_API_KEY — LiteLLM proxy bearer token (preferred)
+#   LITELLM_MASTER_KEY — LiteLLM proxy master key (fallback)
 
 documents_root: "/data/documents"
 index_root: "/data/index"
@@ -69,10 +71,12 @@ pdf:
 
 ocr:
   enabled: true
-  provider: "gemini"
-  model: "gemini-2.0-flash"
-  timeout: 120
-  concurrency: 2
+  provider: "litellm"
+  endpoint: "http://YOUR_LITELLM_PROXY:4000/v1"
+  extract_model: "ocr"
+  describe_model: "vision"
+  timeout: 300
+  concurrency: 1
 
 media:
   enabled: true

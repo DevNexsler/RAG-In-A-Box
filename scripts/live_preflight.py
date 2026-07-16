@@ -8,8 +8,8 @@ every problem at once, printing one line per check:
     ok <name>: <reason>   /   FAIL <name>: <reason>
 
 Checks: OpenRouter/DeepInfra API keys, config_test.yaml present in CWD,
-Mac Mini OCR endpoint reachable, prod indexer idle (don't contend for the
-Mac), comm-store Postgres reachable.
+LiteLLM OCR/vision aliases available, prod indexer idle, comm-store Postgres
+reachable.
 """
 import os
 import subprocess
@@ -24,7 +24,7 @@ import yaml
 PROBE_TIMEOUT_S = 5
 # An indexing run touches the heartbeat continuously; if it is fresher than
 # this, the prod indexer is actively writing and would contend with the live
-# tier for the shared Mac Mini (OCR/vision) — so we refuse to start.
+# tier for shared OCR/vision providers — so we refuse to start.
 HEARTBEAT_ACTIVE_THRESHOLD_S = 120
 PROD_CONTAINER = "doc-organizer"
 HEARTBEAT_PATH = "/data/index/indexer.heartbeat"
@@ -40,8 +40,8 @@ def main_checkout_root() -> Path:
 
 
 def config_candidates() -> list[Path]:
-    """Real config.yaml: prefer the main checkout's, fall back to CWD's."""
-    return [main_checkout_root() / "config.yaml", Path("config.yaml")]
+    """Real config.yaml: prefer CWD's, fall back to the main checkout's."""
+    return [Path("config.yaml"), main_checkout_root() / "config.yaml"]
 
 
 def _load_env() -> None:
@@ -71,7 +71,7 @@ def check_config_test() -> tuple[bool, str]:
     return True, "config_test.yaml present"
 
 
-def check_mac_ocr() -> tuple[bool, str]:
+def check_litellm_ocr() -> tuple[bool, str]:
     config = None
     used = None
     for candidate in config_candidates():
@@ -80,27 +80,65 @@ def check_mac_ocr() -> tuple[bool, str]:
             used = candidate
             break
     if config is None:
-        return False, "no config.yaml found (main checkout or CWD)"
+        return False, "no config.yaml found (CWD or main checkout)"
+    if not isinstance(config, dict):
+        return False, f"config root in {used} must be a mapping"
+
     ocr = config.get("ocr") or {}
-    describe = ocr.get("describe") if isinstance(ocr.get("describe"), dict) else {}
-    extract = ocr.get("extract") if isinstance(ocr.get("extract"), dict) else {}
-    base_url = (
-        ocr.get("base_url")
-        or ocr.get("endpoint")
-        or describe.get("base_url")
-        or describe.get("endpoint")
-        or extract.get("base_url")
-        or extract.get("endpoint")
-    )
-    if not base_url:
-        return False, f"ocr endpoint (base_url/endpoint) missing in {used}"
+    if not isinstance(ocr, dict):
+        return False, f"ocr config in {used} must be a mapping"
+    if ocr.get("provider") != "litellm":
+        return False, f"ocr.provider must be litellm in {used}"
+
+    required = ("endpoint", "extract_model", "describe_model")
+    missing = [field for field in required if not ocr.get(field)]
+    if missing:
+        return False, f"ocr config missing in {used}: {', '.join(missing)}"
+    if any(not isinstance(ocr[field], str) for field in required):
+        return False, f"ocr config fields must be strings in {used}"
+
+    api_key = (os.environ.get("LITELLM_API_KEY")
+               or os.environ.get("LITELLM_MASTER_KEY"))
+    if not api_key:
+        return False, ("LITELLM_API_KEY or LITELLM_MASTER_KEY missing or empty "
+                       "(set in .env)")
+
+    endpoint = ocr["endpoint"].rstrip("/")
+    models_url = f"{endpoint}/models"
     try:
-        # Reachability only: any HTTP response (404 included) means the Mac
-        # Mini OCR service host is up.
-        httpx.get(base_url, timeout=PROBE_TIMEOUT_S)
+        response = httpx.get(
+            models_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=PROBE_TIMEOUT_S,
+        )
+        response.raise_for_status()
+    except httpx.InvalidURL:
+        return False, f"LiteLLM endpoint invalid at {models_url}"
+    except httpx.HTTPStatusError as exc:
+        return False, (f"LiteLLM model list returned HTTP "
+                       f"{exc.response.status_code} at {models_url}")
     except httpx.HTTPError as exc:
-        return False, f"Mac OCR unreachable at {base_url}: {exc}"
-    return True, f"Mac OCR reachable at {base_url}"
+        return False, (f"LiteLLM unreachable at {models_url}: "
+                       f"{type(exc).__name__}")
+    try:
+        payload = response.json()
+    except ValueError:
+        return False, "LiteLLM model list returned invalid JSON"
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return False, "LiteLLM model list returned invalid schema"
+    model_rows = payload["data"]
+    if any(not isinstance(row, dict) or not isinstance(row.get("id"), str)
+           for row in model_rows):
+        return False, "LiteLLM model list returned invalid schema"
+
+    model_ids = {row["id"] for row in model_rows}
+    aliases = [ocr["extract_model"], ocr["describe_model"]]
+    missing_aliases = [alias for alias in aliases if alias not in model_ids]
+    if missing_aliases:
+        return False, ("LiteLLM model list missing configured alias(es): "
+                       + ", ".join(missing_aliases))
+    return True, "LiteLLM aliases available: " + ", ".join(aliases)
 
 
 def check_prod_indexer_idle() -> tuple[bool, str]:
@@ -116,7 +154,8 @@ def check_prod_indexer_idle() -> tuple[bool, str]:
                       "indexer heartbeat; assuming idle")
     if proc.returncode != 0:
         # Container not running, or heartbeat file absent: nothing is
-        # contending for the Mac. Surface stderr so operators can tell
+        # contending for shared LiteLLM/local inference hardware. Surface
+        # stderr so operators can tell
         # container-not-running vs daemon-unreachable vs file-absent apart.
         detail = proc.stderr.strip()[:120]
         return True, ("prod container not running or no heartbeat file"
@@ -148,7 +187,7 @@ def check_comm_postgres() -> tuple[bool, str]:
 CHECKS = [
     ("api_keys", check_api_keys),
     ("config_test", check_config_test),
-    ("mac_ocr", check_mac_ocr),
+    ("litellm_ocr", check_litellm_ocr),
     ("prod_indexer_idle", check_prod_indexer_idle),
     ("comm_postgres", check_comm_postgres),
 ]

@@ -18,6 +18,6 @@ markers = [
     "unit: fast, no network, no external services",
     "integration: subsystems with local resources only (tmp dirs, in-process apps)",
     "e2e: drives the staging container from outside (compose stack must be up)",
-    "live: real providers, real money (API keys, Mac Mini OCR, comm-store Postgres)",
+    "live: real providers, real money (API keys, LiteLLM OCR/vision, comm-store Postgres)",
 ]
 addopts = "--import-mode=importlib"

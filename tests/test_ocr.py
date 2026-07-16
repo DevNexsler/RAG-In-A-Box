@@ -1,15 +1,10 @@
-"""Tests for DeepSeek-OCR2 OCR provider (local mlx-vlm service).
+"""Unit tests for legacy direct DeepSeek-OCR2 and Ollama OCR providers.
 
-Unit tests mock HTTP calls (always run).
-Live tests hit the real service at the URL resolved from, in order:
-OCR_BASE_URL env var, ocr.base_url in config_test.yaml / config.yaml, or
-http://localhost:8790. They are skipped if unreachable.
+HTTP calls are mocked; live OCR and vision coverage uses LiteLLM routing tests.
 
 Run with:  pytest tests/test_ocr.py -v
 """
 
-import os
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -438,122 +433,6 @@ class TestOllamaVisionBudget:
             with pytest.raises(TransientError):
                 provider.describe(self._img(tmp_path))
         assert state["calls"] == 1                     # cooldown suppressed the 2nd real call
-
-
-# -----------------------------------------------------------------------
-# Live integration tests (require DeepSeek-OCR2 reachable at its configured
-# base_url). Resolution order:
-#   1. OCR_BASE_URL env var
-#   2. ocr.base_url from config_test.yaml (or config.yaml as fallback)
-#   3. http://localhost:8790
-# -----------------------------------------------------------------------
-
-def _resolve_ocr_base_url() -> str:
-    env_url = os.environ.get("OCR_BASE_URL")
-    if env_url:
-        return env_url.rstrip("/")
-    repo_root = Path(__file__).parent.parent
-    for cfg_name in ("config_test.yaml", "config.yaml"):
-        cfg_path = repo_root / cfg_name
-        if not cfg_path.exists():
-            continue
-        try:
-            import yaml
-            with open(cfg_path) as f:
-                raw = yaml.safe_load(f) or {}
-            url = (raw.get("ocr") or {}).get("base_url")
-            if url:
-                return url.rstrip("/")
-        except Exception:
-            continue
-    return "http://localhost:8790"
-
-
-_OCR_BASE_URL = _resolve_ocr_base_url()
-
-
-def _deepseek_ocr2_running() -> bool:
-    try:
-        resp = httpx.get(f"{_OCR_BASE_URL}/health", timeout=3.0)
-        return resp.status_code < 500
-    except Exception:
-        return False
-
-
-def _minimal_png() -> bytes:
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        b"\x00\x00\x00\rIHDR"
-        b"\x00\x00\x00\x01\x00\x00\x00\x01"
-        b"\x08\x02\x00\x00\x00\x90wS\xde"
-        b"\x00\x00\x00\x0cIDAT\x08\xd7c\xf8\xff\xff?\x00\x05\xfe\x02\xfeA\xe2%\xb5"
-        b"\x00\x00\x00\x00IEND\xaeB`\x82"
-    )
-
-
-def _deepseek_ocr2_model_ready() -> bool:
-    if not _deepseek_ocr2_running():
-        return False
-    for endpoint in ("/extract", "/describe"):
-        try:
-            resp = httpx.post(
-                f"{_OCR_BASE_URL}{endpoint}",
-                files={"file": ("test.png", _minimal_png(), "image/png")},
-                timeout=10.0,
-            )
-        except Exception:
-            return False
-        if resp.status_code >= 500:
-            return False
-    return True
-
-
-_TEST_IMAGE = Path(__file__).parent.parent / "test_vault" / "meeting_notes@00004@.png"
-
-
-@pytest.mark.live
-@pytest.mark.skipif(
-    not _deepseek_ocr2_model_ready(),
-    reason=f"DeepSeek-OCR2 model endpoints not ready at {_OCR_BASE_URL}",
-)
-class TestDeepSeekOCR2Live:
-    """Live integration tests against real DeepSeek-OCR2 service."""
-
-    @pytest.fixture(scope="class")
-    def provider(self):
-        return DeepSeekOCR2Local(base_url=_OCR_BASE_URL, timeout=120.0)
-
-    def test_extract_returns_nonempty_text(self, provider):
-        """Real OCR should return non-empty text for a real image."""
-        assert _TEST_IMAGE.exists(), f"Test image not found: {_TEST_IMAGE}"
-        text = provider.extract(_TEST_IMAGE)
-        assert len(text) > 10, f"Expected substantial OCR text, got {len(text)} chars"
-
-    def test_describe_returns_nonempty_text(self, provider):
-        """Real describe should return non-empty text for a real image."""
-        assert _TEST_IMAGE.exists(), f"Test image not found: {_TEST_IMAGE}"
-        text = provider.describe(_TEST_IMAGE)
-        assert len(text) > 10, f"Expected substantial describe text, got {len(text)} chars"
-
-    def test_extract_pdf_page_via_ocr(self, provider, tmp_path):
-        """Extract text from a PDF page rendered to PNG (simulates pipeline)."""
-        import fitz
-
-        pdf_path = tmp_path / "test.pdf"
-        doc = fitz.open()
-        page = doc.new_page()
-        page.insert_text((72, 100), "Invoice #12345: Total $500.00", fontsize=14)
-        doc.save(str(pdf_path))
-        doc.close()
-
-        doc = fitz.open(str(pdf_path))
-        pix = doc[0].get_pixmap(dpi=200)
-        png_path = tmp_path / "page0.png"
-        pix.save(str(png_path))
-        doc.close()
-
-        text = provider.extract(png_path)
-        assert "12345" in text or "500" in text, f"Expected invoice content, got: {text[:200]}"
 
 
 def test_ollama_request_prepends_no_reasoning_system_message(monkeypatch):

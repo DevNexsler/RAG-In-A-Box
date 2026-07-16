@@ -78,76 +78,252 @@ def test_config_test_missing_hints_copy(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# check_mac_ocr
+# check_litellm_ocr
 # ---------------------------------------------------------------------------
 
-def _write_config(path, body):
-    path.write_text(body)
+def _write_litellm_config(path, **overrides):
+    ocr = {
+        "provider": "litellm",
+        "endpoint": "http://litellm:4000/v1",
+        "extract_model": "ocr",
+        "describe_model": "vision",
+    }
+    ocr.update(overrides)
+    path.write_text(lp.yaml.safe_dump({"ocr": ocr}))
     return path
 
 
-def test_mac_ocr_reachable(tmp_path, monkeypatch):
-    cfg = _write_config(tmp_path / "config.yaml",
-                        'ocr:\n  base_url: "http://mac:8790"\n')
+def _http_response(status_code=200, payload=None, content=None):
+    kwargs = {"request": lp.httpx.Request("GET", "http://litellm/v1/models")}
+    if content is not None:
+        kwargs["content"] = content
+    else:
+        kwargs["json"] = payload
+    return lp.httpx.Response(status_code, **kwargs)
+
+
+def test_config_candidates_prefer_cwd_before_main(monkeypatch):
+    monkeypatch.setattr(lp, "main_checkout_root", lambda: Path("/main"))
+    assert lp.config_candidates() == [Path("config.yaml"),
+                                      Path("/main/config.yaml")]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected_url"),
+    [
+        ("http://litellm:4000", "http://litellm:4000/models"),
+        ("http://litellm:4000/v1", "http://litellm:4000/v1/models"),
+        ("http://litellm:4000/v1/", "http://litellm:4000/v1/models"),
+    ],
+)
+def test_litellm_ocr_validates_both_aliases_with_auth(
+        tmp_path, monkeypatch, endpoint, expected_url):
+    cfg = _write_litellm_config(tmp_path / "config.yaml", endpoint=endpoint)
     monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "fallback-secret-key")
     calls = {}
 
-    def fake_get(url, timeout=None, **kw):
-        calls["url"] = url
-        return SimpleNamespace(status_code=404)  # any response = reachable
+    def fake_get(url, *, headers, timeout):
+        calls.update(url=url, headers=headers, timeout=timeout)
+        return _http_response(
+            payload={"data": [{"id": "ocr"}, {"id": "vision"}]},
+        )
 
     monkeypatch.setattr(lp.httpx, "get", fake_get)
-    ok, reason = lp.check_mac_ocr()
+    ok, reason = lp.check_litellm_ocr()
+
     assert ok
-    assert calls["url"] == "http://mac:8790"
+    assert calls["url"] == expected_url
+    assert calls["headers"]["Authorization"] == "Bearer test-secret-key"
+    assert calls["timeout"] == lp.PROBE_TIMEOUT_S
+    assert "ocr" in reason and "vision" in reason
+    assert "test-secret-key" not in reason
+    assert "fallback-secret-key" not in reason
 
 
-def test_mac_ocr_accepts_legacy_endpoint_key(tmp_path, monkeypatch):
-    cfg = _write_config(
+def test_litellm_ocr_accepts_master_key_when_api_key_missing(
+        tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "master-secret-key")
+    calls = {}
+
+    def fake_get(url, *, headers, timeout):
+        calls["authorization"] = headers["Authorization"]
+        return _http_response(
+            payload={"data": [{"id": "ocr"}, {"id": "vision"}]},
+        )
+
+    monkeypatch.setattr(lp.httpx, "get", fake_get)
+    ok, reason = lp.check_litellm_ocr()
+
+    assert ok
+    assert calls["authorization"] == "Bearer master-secret-key"
+    assert "master-secret-key" not in reason
+
+
+def test_litellm_ocr_requires_provider_litellm(tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml", provider="deepseek_ocr2")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+    ok, reason = lp.check_litellm_ocr()
+    assert not ok
+    assert "provider" in reason and "litellm" in reason
+
+
+@pytest.mark.parametrize("field", ["endpoint", "extract_model", "describe_model"])
+def test_litellm_ocr_reports_missing_config_field(tmp_path, monkeypatch, field):
+    cfg = _write_litellm_config(tmp_path / "config.yaml", **{field: ""})
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+    ok, reason = lp.check_litellm_ocr()
+    assert not ok
+    assert field in reason
+
+
+def test_litellm_ocr_requires_env_key_and_ignores_yaml_key(tmp_path, monkeypatch):
+    cfg = _write_litellm_config(
         tmp_path / "config.yaml",
-        'ocr:\n  endpoint: "http://mac:4000/v1"\n',
+        api_key="must-not-be-used-or-printed",
     )
     monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
-    calls = {}
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+    monkeypatch.setattr(
+        lp.httpx,
+        "get",
+        lambda *args, **kwargs: pytest.fail("request must not run without env key"),
+    )
 
-    def fake_get(url, timeout=None, **kw):
-        calls["url"] = url
-        return SimpleNamespace(status_code=404)
+    ok, reason = lp.check_litellm_ocr()
 
-    monkeypatch.setattr(lp.httpx, "get", fake_get)
-    ok, _ = lp.check_mac_ocr()
-
-    assert ok
-    assert calls["url"] == "http://mac:4000/v1"
+    assert not ok
+    assert "LITELLM_API_KEY" in reason
+    assert "LITELLM_MASTER_KEY" in reason
+    assert "must-not-be-used-or-printed" not in reason
 
 
-def test_mac_ocr_unreachable(tmp_path, monkeypatch):
-    cfg = _write_config(tmp_path / "config.yaml",
-                        'ocr:\n  base_url: "http://mac:8790"\n')
+def test_litellm_ocr_reports_missing_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(lp, "config_candidates",
+                        lambda: [tmp_path / "missing.yaml"])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+    ok, reason = lp.check_litellm_ocr()
+    assert not ok
+    assert "config.yaml" in reason
+
+
+def test_litellm_ocr_reports_unreachable_endpoint(tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml")
     monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
 
-    def fake_get(url, timeout=None, **kw):
+    def refuse(*args, **kwargs):
         raise lp.httpx.ConnectError("refused")
 
-    monkeypatch.setattr(lp.httpx, "get", fake_get)
-    ok, reason = lp.check_mac_ocr()
+    monkeypatch.setattr(lp.httpx, "get", refuse)
+    ok, reason = lp.check_litellm_ocr()
     assert not ok
-    assert "mac:8790" in reason
+    assert "unreachable" in reason.lower()
+    assert "test-secret-key" not in reason
 
 
-def test_mac_ocr_no_base_url_in_config(tmp_path, monkeypatch):
-    cfg = _write_config(tmp_path / "config.yaml", "ocr:\n  enabled: true\n")
+def test_litellm_ocr_invalid_url_preserves_tuple_contract(tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml", endpoint=":not-a-url")
     monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
-    ok, reason = lp.check_mac_ocr()
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+
+    def invalid(*args, **kwargs):
+        raise lp.httpx.InvalidURL("invalid URL")
+
+    monkeypatch.setattr(lp.httpx, "get", invalid)
+    result = lp.check_litellm_ocr()
+
+    assert isinstance(result, tuple) and len(result) == 2
+    ok, reason = result
     assert not ok
-    assert "base_url" in reason
+    assert "invalid" in reason.lower()
+    assert "test-secret-key" not in reason
 
 
-def test_mac_ocr_no_config_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(lp, "config_candidates",
-                        lambda: [tmp_path / "nope.yaml"])
-    ok, reason = lp.check_mac_ocr()
+def test_litellm_ocr_does_not_swallow_unexpected_error(tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("unexpected defect")
+
+    monkeypatch.setattr(lp.httpx, "get", crash)
+    with pytest.raises(RuntimeError, match="unexpected defect"):
+        lp.check_litellm_ocr()
+
+
+def test_litellm_ocr_reports_unauthorized_without_key_leak(tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+    monkeypatch.setattr(
+        lp.httpx,
+        "get",
+        lambda *args, **kwargs: _http_response(401, {"detail": "unauthorized"}),
+    )
+    ok, reason = lp.check_litellm_ocr()
     assert not ok
+    assert "401" in reason
+    assert "test-secret-key" not in reason
+
+
+def test_litellm_ocr_reports_malformed_json(tmp_path, monkeypatch):
+    cfg = _write_litellm_config(tmp_path / "config.yaml")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+    monkeypatch.setattr(
+        lp.httpx,
+        "get",
+        lambda *args, **kwargs: _http_response(200, content=b"not-json"),
+    )
+    ok, reason = lp.check_litellm_ocr()
+    assert not ok
+    assert "invalid" in reason.lower() or "malformed" in reason.lower()
+
+
+@pytest.mark.parametrize("payload", [{}, {"data": "not-a-list"},
+                                      {"data": [{"name": "ocr"}]}])
+def test_litellm_ocr_reports_malformed_model_schema(tmp_path, monkeypatch, payload):
+    cfg = _write_litellm_config(tmp_path / "config.yaml")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+    monkeypatch.setattr(
+        lp.httpx,
+        "get",
+        lambda *args, **kwargs: _http_response(payload=payload),
+    )
+    ok, reason = lp.check_litellm_ocr()
+    assert not ok
+    assert "schema" in reason.lower()
+
+
+@pytest.mark.parametrize(
+    ("models", "missing"),
+    [(["vision"], "ocr"), (["ocr"], "vision")],
+)
+def test_litellm_ocr_reports_each_missing_alias(
+        tmp_path, monkeypatch, models, missing):
+    cfg = _write_litellm_config(tmp_path / "config.yaml")
+    monkeypatch.setattr(lp, "config_candidates", lambda: [cfg])
+    monkeypatch.setenv("LITELLM_API_KEY", "test-secret-key")
+    monkeypatch.setattr(
+        lp.httpx,
+        "get",
+        lambda *args, **kwargs: _http_response(
+            payload={"data": [{"id": model} for model in models]},
+        ),
+    )
+    ok, reason = lp.check_litellm_ocr()
+    assert not ok
+    assert missing in reason
 
 
 # ---------------------------------------------------------------------------
@@ -318,5 +494,6 @@ def test_main_check_exception_is_a_failure(monkeypatch, capsys):
 
 def test_real_checks_are_registered():
     names = [name for name, _ in lp.CHECKS]
-    assert names == ["api_keys", "config_test", "mac_ocr",
+    assert names == ["api_keys", "config_test", "litellm_ocr",
                      "prod_indexer_idle", "comm_postgres"]
+    assert "mac_ocr" not in names

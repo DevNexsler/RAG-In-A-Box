@@ -2,7 +2,8 @@
 
 Drop your documents into a folder, run the indexer, and get a production-grade RAG pipeline with an **MCP server** — any MCP-compatible AI assistant (Claude Code, OpenClaw, Claude Desktop, Cursor, etc.) can search your documents with a single config entry.
 
-No infrastructure to manage. No GPU required. Works with **cloud APIs** out of the box or **fully self-hosted**.
+The app needs no GPU. LiteLLM routes OCR/vision to **cloud APIs**, **local
+models**, or fallback chains.
 
 ## Use cases
 
@@ -36,7 +37,7 @@ No infrastructure to manage. No GPU required. Works with **cloud APIs** out of t
 |---|---|
 | Embeddings | Qwen3-Embedding-8B via OpenRouter |
 | LLM enrichment | GPT-4.1 Mini via OpenRouter |
-| OCR | Gemini Vision (cloud) or DeepSeek OCR2 (local) |
+| OCR + image description | LiteLLM aliases `ocr` + `vision`; proxy owns local/cloud fallback. Gemini, DeepSeek OCR2, and Ollama remain legacy direct adapters. |
 | Reranker | Qwen3-Reranker-8B via DeepInfra |
 | Vector + FTS | LanceDB + tantivy (BM25) |
 | Orchestration | Prefect 3.x |
@@ -56,24 +57,29 @@ pip install -r requirements.txt
 
 ### 2. Configure
 
-Copy the example config and edit two paths:
+Copy the production example config and edit two paths plus the LiteLLM endpoint:
 
 ```bash
-cp config.yaml.example config.yaml   # cloud providers (default)
+cp config.yaml.example config.yaml
 ```
 
 Open `config.yaml` and set:
 - `documents_root` — path to your document collection
 - `index_root` — where the index will be stored
+- `ocr.endpoint` — OpenAI-compatible LiteLLM `/v1` endpoint exposing aliases
+  `ocr` and `vision`
 
-> **Self-hosting?** Use `cp config.local.yaml.example config.yaml` instead. This config uses Ollama, DeepSeek OCR2, and llama-server — see [Local mode](#local-mode-optional) below.
+> **Self-hosting?** Prefer routing LiteLLM's `ocr` and `vision` aliases to local
+> models. The legacy direct-provider profile remains available via
+> `cp config.local.yaml.example config.yaml`; see [Local mode](#local-mode-optional).
 
 ### 3. Add API keys
 
 Create a `.env` file in the project root:
 
 ```bash
-GEMINI_API_KEY=...               # OCR — get one at https://aistudio.google.com/apikey
+LITELLM_API_KEY=...              # OCR/vision proxy (preferred)
+# LITELLM_MASTER_KEY=...         # alternative when LITELLM_API_KEY is unset
 OPENROUTER_API_KEY=sk-or-...     # embeddings + enrichment — https://openrouter.ai/keys
 DEEPINFRA_API_KEY=...            # reranker — https://deepinfra.com/dash/api_keys
 ```
@@ -151,12 +157,14 @@ python mcp_server.py --http
 
 #### VPS / Docker deployment
 
-Run as a standalone HTTP server on any VPS or container platform. All ML inference uses cloud APIs — no GPU needed.
+Run as a standalone HTTP server on any VPS or container platform. ML inference
+uses configured APIs and the LiteLLM proxy, so the app container needs no GPU.
 
 ```bash
 # Docker
 docker build -t doc-organizer .
 docker run -v /path/to/data:/data -p 7788:7788 \
+  -e LITELLM_API_KEY=... \
   -e OPENROUTER_API_KEY=... \
   -e DEEPINFRA_API_KEY=... \
   -e API_KEY=your-secret-token \
@@ -166,7 +174,7 @@ docker run -v /path/to/data:/data -p 7788:7788 \
 API_KEY=your-secret-token python server.py
 ```
 
-**Environment variable overrides** (for container/VPS use):
+**Environment variables** (for container/VPS use):
 
 | Variable | Description |
 |----------|-------------|
@@ -174,6 +182,8 @@ API_KEY=your-secret-token python server.py
 | `INDEX_ROOT` | Override index path (default: from config.yaml) |
 | `PORT` | Server port (default: 7788) |
 | `API_KEY` | Bearer token for HTTP auth. No auth when unset. |
+| `LITELLM_API_KEY` | Preferred LiteLLM OCR/vision bearer credential |
+| `LITELLM_MASTER_KEY` | LiteLLM credential fallback when `LITELLM_API_KEY` is unset |
 
 When `API_KEY` is set, all HTTP requests must include `Authorization: Bearer <API_KEY>`. See `config.vps.yaml.example` for VPS-specific config.
 
@@ -215,7 +225,9 @@ curl "http://localhost:7788/api/documents/?directory=2-Area&limit=50" \
 
 ### Local mode (optional)
 
-To run everything on your own hardware instead of cloud APIs:
+Preferred local OCR deployment keeps the primary config and routes LiteLLM's
+`ocr` and `vision` aliases to local models; LiteLLM can retain cloud fallbacks.
+For the legacy direct-provider self-hosted profile:
 
 1. Copy `config.local.yaml.example` to `config.yaml`
 2. Install and start **Ollama**: `brew install ollama && ollama serve`
@@ -223,7 +235,9 @@ To run everything on your own hardware instead of cloud APIs:
    - `ollama pull qwen3-embedding:4b-q8_0` (embeddings)
 3. Start **DeepSeek OCR2** on port 8790 (for PDF/image OCR)
 
-No cloud API keys needed in local mode (except reranker — DeepInfra is always cloud).
+That profile runs OCR, embeddings, enrichment, and reranking locally. Its
+enabled media provider still uses OpenRouter; set `OPENROUTER_API_KEY` or
+disable `media`.
 
 ## Features
 
@@ -260,7 +274,9 @@ Document Collection                    AI Assistants
 
 **Incremental updates** — Only new and modified files are processed on re-index. Deleted files are cleaned up automatically. Failed documents are tracked and retried.
 
-**Cloud or local** — Every component (OCR, embeddings, enrichment, reranker) has both cloud and local provider options. Default config uses cloud APIs with no servers to run. Switch to fully self-hosted with a single config file swap.
+**Cloud or local** — LiteLLM is the primary OCR/vision routing authority and
+can select local models, cloud models, or fallback chains. Legacy direct OCR
+adapters remain available. Other providers support cloud and local profiles.
 
 **Resilient by default** — Per-document error handling with retries, structured MCP error responses, search diagnostics on every query (`vector_search_active`, `reranker_applied`, `degraded`), SQL injection protection on filter keys, and automatic LanceDB corruption recovery (version rollback + rebuild).
 
@@ -299,8 +315,9 @@ make gate        # all five tiers, incl. a hermetic staging compose stack + live
 
 `make gate-fast` needs no API keys or Docker; `make gate`'s staging-e2e tier
 brings up an isolated, memory-capped compose stack (production image + provider
-simulator + throwaway Postgres) and its live tier is preflight-guarded. Only the
-opt-in `make gate-real` / `make test-e2e-real` spend money.
+simulator + throwaway Postgres) and its live tier is preflight-guarded. The live
+tier uses real providers and can spend money. `make gate-real` adds the optional
+real-provider e2e stage; `make test-e2e-real` runs only that extra stage.
 
 Raw pytest still works if you want to run a subset directly:
 
@@ -315,7 +332,7 @@ python -m pytest -m "unit or integration" -q # all local tiers
 core/                        Config, storage interface, taxonomy helpers
 providers/embed/             Embedding providers (OpenRouter, Ollama, LlamaIndex)
 providers/llm/               LLM providers (OpenRouter, Ollama)
-providers/ocr/               OCR providers (Gemini Vision, DeepSeek OCR2)
+providers/ocr/               OCR/vision (LiteLLM primary; legacy Gemini/DeepSeek/Ollama adapters)
 taxonomy_store.py            Taxonomy LanceDB store (CRUD, vector search, FTS)
 doc_enrichment.py            LLM metadata extraction (with taxonomy integration)
 extractors.py                Text extraction (MD, PDF, images, audio/video)

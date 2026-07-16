@@ -313,7 +313,11 @@ Query
 
 #### AC-PROV-2: OCR Providers
 - Protocol: `extract(image_path) -> str`, `describe(image_path) -> str`
-- Implementations: Gemini Vision, DeepSeek OCR2 (local)
+- First-class implementation: `LiteLLMOCR`, using separate LiteLLM aliases for
+  extraction (`ocr`) and image description (`vision`); LiteLLM owns local/cloud
+  routing and fallback
+- Legacy direct implementations: Gemini Vision, DeepSeek OCR2 (local), and
+  Ollama Vision
 
 #### AC-PROV-3: LLM Providers
 - Protocol: `generate(prompt: str) -> str`

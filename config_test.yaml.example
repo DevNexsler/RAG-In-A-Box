@@ -1,11 +1,11 @@
-# Test config — mirrors the production config stack (OpenRouter / DeepInfra /
-# DeepSeek-OCR2) with test-only vault and index paths. Loaded by
-# tests/test_integration.py.
+# Test config — mirrors the production OpenRouter / DeepInfra stack with
+# test-only vault and index paths. Loaded by tests/test_integration.py.
 #
-# Required env vars for live tests:
+# Required env vars for this integration suite's live tests:
 #   OPENROUTER_API_KEY, DEEPINFRA_API_KEY
-# DeepSeek-OCR2 OCR tests are skipped if the configured ocr.base_url is
-# unreachable.
+# OCR is deliberately disabled here. Dedicated real OCR/vision coverage lives
+# in tests/test_litellm_ocr_live.py; it loads config.yaml and requires either
+# LITELLM_API_KEY or LITELLM_MASTER_KEY in the environment.
 
 vault_root: "./test_vault"
 index_root: "./test_index"
@@ -39,11 +39,7 @@ pdf:
   min_text_chars_before_ocr: 200
 
 ocr:
-  enabled: true
-  provider: "deepseek_ocr2"
-  base_url: "http://localhost:8790"
-  timeout: 120
-  concurrency: 1
+  enabled: false
 
 embeddings:
   provider: "openrouter"
