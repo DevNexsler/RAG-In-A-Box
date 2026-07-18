@@ -10,6 +10,7 @@ from typing import Any, TypedDict
 
 import httpx
 
+from core.resilience import TransientError
 from doc_enrichment import enrichment_response_schema
 from providers.llm.trace_recorder import LLMTraceRecorder
 
@@ -44,6 +45,57 @@ def _is_response_format_rejection(response: httpx.Response) -> bool:
             "schema",
         )
     )
+
+
+def _truncation_signals(
+    response_payload: dict[str, Any],
+    request_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Return OpenAI-compatible truncation evidence without trusting finish_reason."""
+    message: dict[str, Any] = {}
+    choices = response_payload.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        raw_message = choices[0].get("message")
+        if isinstance(raw_message, dict):
+            message = raw_message
+
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    if not reasoning:
+        provider_fields = message.get("provider_specific_fields")
+        if isinstance(provider_fields, dict):
+            reasoning = (
+                provider_fields.get("reasoning_content")
+                or provider_fields.get("reasoning")
+                or ""
+            )
+
+    completion_tokens: int | None = None
+    usage = response_payload.get("usage")
+    if isinstance(usage, dict):
+        try:
+            completion_tokens = int(usage.get("completion_tokens"))
+        except (TypeError, ValueError):
+            completion_tokens = None
+
+    requested_tokens: int | None = None
+    try:
+        requested_tokens = int(request_payload.get("max_tokens"))
+    except (TypeError, ValueError):
+        requested_tokens = None
+
+    content = message.get("content")
+    reasoning_length = len(reasoning) if isinstance(reasoning, str) else 0
+    truncated = (
+        completion_tokens is not None
+        and requested_tokens is not None
+        and requested_tokens > 0
+        and completion_tokens >= requested_tokens
+    ) or ((content is None or content == "" or content == []) and reasoning_length > 0)
+    return {
+        "completion_tokens": completion_tokens,
+        "reasoning_output_length": reasoning_length,
+        "truncated": truncated,
+    }
 
 
 class LiteLLMReplayMetadata(TypedDict):
@@ -104,6 +156,42 @@ class LiteLLMGenerator:
     def generate_with_metadata(
         self, user_prompt: str, max_tokens: int = 512
     ) -> LiteLLMReplayMetadata:
+        initial = self._request_with_metadata(user_prompt, max_tokens=max_tokens)
+        signals = _truncation_signals(
+            initial["response"], initial["request"]["payload"]
+        )
+        if not signals["truncated"]:
+            return initial
+
+        logger.warning(
+            "LiteLLM structured response exhausted its output budget "
+            "(completion_tokens=%s, reasoning_chars=%s); retrying once with "
+            "reasoning disabled.",
+            signals["completion_tokens"],
+            signals["reasoning_output_length"],
+        )
+        recovered = self._request_with_metadata(
+            user_prompt,
+            max_tokens=max_tokens,
+            reasoning_effort="none",
+        )
+        recovery_signals = _truncation_signals(
+            recovered["response"], recovered["request"]["payload"]
+        )
+        if recovery_signals["truncated"]:
+            raise TransientError(
+                "LiteLLM structured response remained truncated after "
+                "reasoning-disabled retry"
+            )
+        return recovered
+
+    def _request_with_metadata(
+        self,
+        user_prompt: str,
+        *,
+        max_tokens: int,
+        reasoning_effort: str | None = None,
+    ) -> LiteLLMReplayMetadata:
         request_timeout = self._build_request_timeout()
         payload = {
             "model": self.model,
@@ -115,6 +203,8 @@ class LiteLLMGenerator:
             "temperature": self.temperature,
             "response_format": self._build_response_format(),
         }
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -152,9 +242,10 @@ class LiteLLMGenerator:
                     success=True,
                     latency_ms=latency_ms,
                 )
-                content = data["choices"][0]["message"]["content"]
+                raw_content = data["choices"][0]["message"].get("content")
+                content = raw_content.strip() if isinstance(raw_content, str) else ""
                 return {
-                    "content": content.strip(),
+                    "content": content,
                     "request": copy.deepcopy(trace_request),
                     "response": copy.deepcopy(data),
                     "latency_ms": latency_ms,
@@ -208,7 +299,7 @@ class LiteLLMGenerator:
                     )
                     time.sleep(backoff)
                     continue
-                logger.error("LiteLLM API error: %d %s", status, exc.response.text[:500])
+                logger.error("LiteLLM API error: HTTP %d", status)
                 self.trace_recorder.record(
                     request=trace_request,
                     success=False,

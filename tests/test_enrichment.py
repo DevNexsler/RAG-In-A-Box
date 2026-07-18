@@ -4,6 +4,7 @@ Unit tests mock the LLM generator.  Integration test uses the real MiniMax M2.5 
 """
 
 import json
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -291,6 +292,35 @@ class TestEnrichDocument:
         for field in ENRICHMENT_FIELDS:
             assert field in result
 
+    def test_salvaged_response_missing_required_fields_is_failed_without_raw_log(
+        self,
+        caplog,
+    ):
+        private_marker = "private-customer-response-marker"
+        gen = self._make_generator(
+            '{"context_entities_people":["'
+            + private_marker
+            + '"],"context_entities_orgs":['
+        )
+        taxonomy = MagicMock()
+        taxonomy.format_for_prompt.return_value = ""
+
+        with caplog.at_level(logging.DEBUG):
+            result = enrich_document(
+                "A real email body with substantive property-management content.",
+                "mail.eml",
+                "email",
+                gen,
+                taxonomy_store=taxonomy,
+            )
+
+        assert result["_enrichment_failed"] == (
+            "structured_output_missing_required_fields: summary, doc_type"
+        )
+        assert result["_enrichment_transient"] is False
+        taxonomy.increment_usage.assert_not_called()
+        assert private_marker not in caplog.text
+
     def test_exception_in_generate_returns_failed(self):
         gen = MagicMock()
         gen.generate.side_effect = RuntimeError("model unavailable")
@@ -300,7 +330,7 @@ class TestEnrichDocument:
 
     def test_text_truncation_short_doc(self):
         """Documents shorter than max_input_chars are passed through entirely."""
-        gen = self._make_generator('{"summary": "short"}')
+        gen = self._make_generator('{"summary": "short", "doc_type": ["note"]}')
         short_text = "hello world"
         enrich_document(short_text, "small.md", "md", gen, max_input_chars=500)
         call_args = gen.generate.call_args[0][0]
@@ -309,7 +339,7 @@ class TestEnrichDocument:
 
     def test_text_truncation_head_tail(self):
         """Long documents use head+tail sampling with [...] separator."""
-        gen = self._make_generator('{"summary": "short"}')
+        gen = self._make_generator('{"summary": "short", "doc_type": ["note"]}')
         head = "HEAD_MARKER " + "a" * 5000
         tail = "b" * 5000 + " TAIL_MARKER"
         long_text = head + "c" * 5000 + tail
@@ -330,7 +360,10 @@ class TestEnrichDocument:
         assert result["enr_doc_type"] == "note"
 
     def test_thinking_tags_in_response(self):
-        response = '<think>Let me analyze...</think>\n{"summary": "Analyzed", "topics": ["AI"]}'
+        response = (
+            '<think>Let me analyze...</think>\n'
+            '{"summary": "Analyzed", "doc_type": ["note"], "topics": ["AI"]}'
+        )
         gen = self._make_generator(response)
         result = enrich_document("Some text", "doc.md", "md", gen)
         assert result["enr_summary"] == "Analyzed"
@@ -339,7 +372,7 @@ class TestEnrichDocument:
 
     def test_taxonomy_block_in_prompt(self):
         """When taxonomy_store is provided, its format_for_prompt output appears in the LLM prompt."""
-        gen = self._make_generator('{"summary": "test"}')
+        gen = self._make_generator('{"summary": "test", "doc_type": ["note"]}')
         mock_taxonomy = MagicMock()
         mock_taxonomy.format_for_prompt.return_value = "## Available Tags\n- work: Work stuff"
         mock_taxonomy.increment_usage = MagicMock()
@@ -353,6 +386,7 @@ class TestEnrichDocument:
         """Concurrent index workers should read taxonomy for prompts without writing usage."""
         gen = self._make_generator(json.dumps({
             "summary": "test",
+            "doc_type": ["note"],
             "suggested_tags": ["work", "urgent"],
             "suggested_folder": "Projects/Renovation",
         }))
@@ -375,7 +409,7 @@ class TestEnrichDocument:
 
     def test_no_taxonomy_no_block(self):
         """Without taxonomy_store, no taxonomy block in prompt."""
-        gen = self._make_generator('{"summary": "test"}')
+        gen = self._make_generator('{"summary": "test", "doc_type": ["note"]}')
         enrich_document("Some text", "doc.md", "md", gen, taxonomy_store=None)
         call_args = gen.generate.call_args[0][0]
         assert "## Available Tags" not in call_args
@@ -436,7 +470,7 @@ class TestEnrichDocument:
         assert "Do not place context-derived facts only in non-context fields" in prompt
 
     def test_context_prompt_prioritizes_context_fields_before_summary(self):
-        gen = self._make_generator('{"summary": "test"}')
+        gen = self._make_generator('{"summary": "test", "doc_type": ["note"]}')
 
         enrich_document(
             "image notes",
@@ -451,7 +485,7 @@ class TestEnrichDocument:
         assert prompt.index('"context_entities_places"') < prompt.index('"summary"')
 
     def test_context_prompt_rejects_placeholders_and_conflict_confidence(self):
-        gen = self._make_generator('{"summary": "test"}')
+        gen = self._make_generator('{"summary": "test", "doc_type": ["note"]}')
 
         enrich_document(
             "image notes",
@@ -573,7 +607,7 @@ class TestEnrichDocument:
         assert result["enr_context_confidence"] == ""
 
     def test_none_context_text_uses_no_context_prompt(self):
-        gen = self._make_generator('{"summary": "test"}')
+        gen = self._make_generator('{"summary": "test", "doc_type": ["note"]}')
 
         result = enrich_document(
             "Some text",
