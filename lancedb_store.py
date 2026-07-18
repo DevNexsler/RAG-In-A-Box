@@ -1144,9 +1144,12 @@ class LanceDBStore:
         self._finish_index_maintenance(table, today)
 
     def _finish_index_maintenance(self, table, today) -> None:
-        """Tag the latest committed index state, then reclaim expired state."""
-        self._manage_restore_points(table, today)
+        """Stage a safe tag, expire/prune, then retag exact latest."""
+        if not self._tag_latest_restore_point(table, today):
+            return
+        self._expire_restore_points(table, today)
         self._prune_versions("post-expiry")
+        self._tag_latest_restore_point(table, today)
 
     def _compact_data_files_if_due(self, today) -> bool:
         """Best-effort daily data compaction with durable success cadence."""
@@ -1265,16 +1268,19 @@ class LanceDBStore:
         """Keep exactly N daily version tags (today plus N-1 prior days) as
         logical restore points.
 
-        Points today's `daily-<date>` tag at the current (just-compacted)
-        version and drops daily tags beyond the window so their versions
-        become reclaimable. N = 0 disables the feature and removes previously
-        created daily tags; tags that are not ours (no daily- date encoding)
-        are never touched. Best-effort: any failure is logged, never raised
-        (a missed tag is reconciled next run)."""
+        Compatibility wrapper for callers outside the indexing finalizer. The
+        finalizer stages today's tag before destructive work, expires old
+        tags, prunes, then retags because cleanup can commit a metadata-only
+        Lance version.
+        """
+        if not self._tag_latest_restore_point(table, today):
+            return
+        self._expire_restore_points(table, today)
+
+    def _expire_restore_points(self, table, today) -> None:
+        """Drop expired daily tags before pruning; never touch manual tags."""
         days = _daily_restore_point_days()
         try:
-            # Tag the true latest version, not a stale cached one — a tag on
-            # an old version pins its superseded data files (#0232).
             table.checkout_latest()
             tags = table.tags
             existing = set(tags.list())
@@ -1285,13 +1291,6 @@ class LanceDBStore:
                         tags.delete(tag_name)
                 return
 
-            name = _daily_tag_name(today)
-            version = table.version
-            if name in existing:
-                tags.update(name, version)
-            else:
-                tags.create(name, version)
-
             from datetime import timedelta
 
             cutoff = today - timedelta(days=days - 1)
@@ -1300,7 +1299,28 @@ class LanceDBStore:
                 if tag_date is not None and tag_date < cutoff:
                     tags.delete(tag_name)
         except Exception as exc:
+            logger.warning("Daily restore-point expiry skipped this run: %s", exc)
+
+    def _tag_latest_restore_point(self, table, today) -> bool:
+        """Pin latest state, returning false when destructive work must stop."""
+        if _daily_restore_point_days() <= 0:
+            return True
+        try:
+            # Tag the true latest version, not a stale cached one — a tag on
+            # an old version pins its superseded data files (#0232).
+            table.checkout_latest()
+            tags = table.tags
+            existing = set(tags.list())
+            name = _daily_tag_name(today)
+            version = table.version
+            if name in existing:
+                tags.update(name, version)
+            else:
+                tags.create(name, version)
+            return True
+        except Exception as exc:
             logger.warning("Daily restore-point tagging skipped this run: %s", exc)
+            return False
 
     def fts_available(self) -> bool:
         """Check if the FTS/tantivy index is operational (health check for file_status)."""

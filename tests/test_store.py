@@ -1397,17 +1397,111 @@ def test_post_index_maintenance_skips_compaction_then_merges_tags_and_prunes():
             ),
             patch.object(
                 store,
-                "_manage_restore_points",
-                side_effect=lambda _table, _day: order.append("restore"),
+                "_expire_restore_points",
+                side_effect=lambda _table, _day: order.append("expire"),
+            ),
+            patch.object(
+                store,
+                "_tag_latest_restore_point",
+                side_effect=lambda _table, _day: (order.append("tag"), True)[1],
             ),
         ):
             store._optimize_and_prune(table, compact_data=False)
 
         assert order == [
             "merge",
-            "restore",
+            "tag",
+            "expire",
             "prune:post-expiry",
+            "tag",
         ]
+
+
+def test_post_prune_restore_point_tracks_exact_latest_version():
+    """Cleanup may commit a new manifest; today's tag must follow that version."""
+    from datetime import date
+
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+        store.create_fts_index()
+
+        def commit_prune_manifest(_label):
+            store.upsert_nodes(
+                [_make_node_with_meta("b.md", "c:0", "quasar", vec, source_type="md")]
+            )
+
+        with patch.object(store, "_prune_versions", side_effect=commit_prune_manifest):
+            store._finish_index_maintenance(store._vs.table, date.today())
+
+        tag = f"daily-{date.today().isoformat()}"
+        assert lance.dataset(_lance_path(tmpdir), version=tag).version == (
+            lance.dataset(_lance_path(tmpdir)).version
+        )
+
+
+def test_staging_tag_failure_aborts_expiry_and_prune():
+    """Never destroy restore state when today's safety tag cannot be staged."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        with (
+            patch.object(store, "_tag_latest_restore_point", return_value=False) as tag,
+            patch.object(store, "_expire_restore_points") as expire,
+            patch.object(store, "_prune_versions") as prune,
+        ):
+            store._finish_index_maintenance(table, date.today())
+
+        tag.assert_called_once_with(table, date.today())
+        expire.assert_not_called()
+        prune.assert_not_called()
+
+
+def test_final_tag_failure_preserves_staged_readable_restore_point():
+    """Never prune without first pinning a snapshot that survives retag failure."""
+    from datetime import date
+
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+        store.create_fts_index()
+        original_tag = store._tag_latest_restore_point
+        tag_calls = 0
+
+        def fail_final_tag(table, today):
+            nonlocal tag_calls
+            tag_calls += 1
+            if tag_calls == 2:
+                return False
+            return original_tag(table, today)
+
+        def commit_prune_manifest(_label):
+            store.upsert_nodes(
+                [_make_node_with_meta("b.md", "c:0", "quasar", vec, source_type="md")]
+            )
+
+        with (
+            patch.object(store, "_tag_latest_restore_point", side_effect=fail_final_tag),
+            patch.object(store, "_prune_versions", side_effect=commit_prune_manifest),
+        ):
+            store._finish_index_maintenance(store._vs.table, date.today())
+
+        tag = f"daily-{date.today().isoformat()}"
+        assert tag_calls == 2
+        assert lance.dataset(_lance_path(tmpdir), version=tag).count_rows() == 1
+        assert lance.dataset(_lance_path(tmpdir)).count_rows() == 2
 
 
 def test_current_marker_skips_compaction_but_merges_indices():
@@ -1419,7 +1513,8 @@ def test_current_marker_skips_compaction_but_merges_indices():
             patch.object(store, "_prune_versions"),
             patch.object(store, "_compact_data_files") as compact,
             patch.object(store, "_merge_index_deltas") as merge,
-            patch.object(store, "_manage_restore_points"),
+            patch.object(store, "_expire_restore_points"),
+            patch.object(store, "_tag_latest_restore_point"),
         ):
             store._optimize_and_prune(table)
 
@@ -1440,7 +1535,8 @@ def test_compaction_failure_leaves_marker_absent_and_still_merges_indices():
                 side_effect=RuntimeError("disk hiccup"),
             ) as compact,
             patch.object(store, "_merge_index_deltas") as merge,
-            patch.object(store, "_manage_restore_points"),
+            patch.object(store, "_expire_restore_points"),
+            patch.object(store, "_tag_latest_restore_point"),
         ):
             store._optimize_and_prune(table)
 
@@ -1462,13 +1558,15 @@ def test_index_merge_failure_after_successful_compaction_keeps_compaction_marker
                 "_merge_index_deltas",
                 side_effect=RuntimeError("index merge failed"),
             ),
-            patch.object(store, "_manage_restore_points") as restore,
+            patch.object(store, "_expire_restore_points") as expire,
+            patch.object(store, "_tag_latest_restore_point") as tag,
         ):
             with pytest.raises(RuntimeError, match="index merge failed"):
                 store._optimize_and_prune(table)
 
         assert _compaction_marker(tmpdir).exists()
-        restore.assert_not_called()
+        expire.assert_not_called()
+        tag.assert_not_called()
 
 
 def test_first_maintenance_run_compacts_and_records_marker():

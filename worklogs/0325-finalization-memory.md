@@ -114,6 +114,17 @@ pytest -q tests/test_store.py::test_data_compaction_prefers_streaming_binary_cop
 FAILED: expected compact_files(compaction_mode='try_binary_copy'); got compact_files()
 ```
 
+Live restore-point RED (from the first successful resource-gated candidate):
+
+```text
+post-merge daily tag version=50470; post-prune latest version=50471
+pytest -q tests/test_store.py::test_post_prune_restore_point_tracks_exact_latest_version
+FAILED: tagged version 2 != post-prune latest version 4
+
+pytest -q tests/test_store.py::test_final_tag_failure_preserves_staged_readable_restore_point
+FAILED: expected staged + final tag calls; got one post-prune call
+```
+
 Finalization fix:
 
 - Existing non-shadow add/update runs attempt due compaction before `_process_docs`.
@@ -123,10 +134,15 @@ Finalization fix:
   pre-compacts an already-populated shared table.
 - Deletion-only runs retain delete then final all-in-one compaction.
 - Mixed add/delete runs compact existing fragments first; later writes/tombstones materialize at the next due daily cycle, like every post-compaction write.
-- Finalization after a pre-attempt always skips data compaction, but still merges index deltas, tags the exact latest post-run version, and post-prunes. The missing-FTS creation path also tags/prunes without adding a data rewrite.
+- Finalization after a pre-attempt always skips data compaction, but still merges index deltas, stages today's safety tag, expires old restore tags, post-prunes, then retags the exact latest manifest. The missing-FTS creation path follows the same sequence without adding a data rewrite.
 - Data compaction uses a fresh Lance dataset handle. Marker writes only follow success. Failure is non-fatal, leaves marker absent, and is not retried over resident processing state in the same run.
 - Compatible fragments use binary-copy compaction; incompatible fragments
   automatically fall back to re-encoding.
+- Restore expiry and latest tagging are separate helpers because Lance cleanup
+  can commit a metadata-only manifest. A staged tag precedes destructive work;
+  expiry then cleanup reclaim old versions; final retag targets exact latest.
+  If staging fails cleanup aborts, and if retagging fails the staged restore
+  remains readable.
 - Index merge failure still propagates to the existing full-FTS rebuild fallback.
 
 Focused verification after implementation:
@@ -136,7 +152,7 @@ ruff check flow_index_vault.py lancedb_store.py taxonomy_store.py tests/test_sca
 All checks passed!
 
 pytest -q tests/test_taxonomy_store.py tests/test_store.py tests/test_scan.py
-199 passed, 226 warnings in 9.96s
+202 passed, 232 warnings in 10.20s
 ```
 
 The warnings were existing LanceDB deprecations and Prefect missing-flow-context logging warnings. A Prefect temporary-server logger emitted a post-pytest closed-stream logging error after the successful result; pytest exit remained 0.

@@ -6,7 +6,8 @@ This is the operational companion to the per-chunk schema in
 [`architecture.md`](architecture.md#lancedb-schema-per-chunk).
 
 Everything here lives in `lancedb_store.py` (`LanceDBStore.ensure_fts_index` →
-`_optimize_and_prune` → `_manage_restore_points`) plus `scripts/backup_index.sh`.
+`_optimize_and_prune` → restore-point expiry/prune/tag) plus
+`scripts/backup_index.sh`.
 
 ## Mental model: LanceDB is copy-on-write
 
@@ -27,8 +28,9 @@ freshly-written rows into the native BM25 inverted index
 (`optimize.optimize_indices()` — no data rewrite). Keyword search is correct
 even before this runs; the merge is a performance step.
 
-Full data compaction (`table.optimize()`, which rewrites small fragments into
-larger ones) runs at most **once per calendar day**. Compacting every ~15-min
+Full data compaction (`compact_files(compaction_mode="try_binary_copy")`, which
+binary-copies compatible fragments and safely re-encodes incompatible ones)
+runs at most **once per calendar day**. Compacting every ~15-min
 run was the #0232 outage mechanism: each rewrite supersedes every data file,
 and any retained restore-point tag pins the superseded set — per-run
 compaction × daily tags held hundreds of full-table rewrites on disk (350+ GB
@@ -76,10 +78,13 @@ store._vs.table.optimize(cleanup_older_than=timedelta(0))   # delete ALL superse
 
 ## 3. Daily restore points — logical rollback (#0113)
 
-Pruning would also delete anything you might want to roll back to. So each run,
-after compaction, `_manage_restore_points` **tags** the current version
-`daily-<YYYY-MM-DD>` (Lance tags). Tagged versions are immune to the prune, so
-each daily tag is an in-place, point-in-time snapshot.
+Pruning would also delete anything you might want to roll back to. Each run
+first stages today's `daily-<YYYY-MM-DD>` Lance tag, then expires old managed
+tags, prunes newly unpinned versions, and retags today at the exact latest
+manifest. The safety tag blocks destructive expiry/pruning if its creation
+fails and remains readable if the final retag fails. Retagging follows pruning
+because cleanup can commit a metadata-only manifest version. Tagged versions
+are immune to later prunes, so each daily tag is an in-place snapshot.
 
 - Retention `LANCE_DAILY_RESTORE_POINTS` (default **7**) counts retained
   points *exactly*: today plus N-1 prior days. Older `daily-*` tags are deleted
