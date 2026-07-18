@@ -22,29 +22,32 @@ def _read_jsonl(path: Path) -> list[dict]:
 def _completion_response(
     content: str,
     *,
-    completion_tokens: int,
+    completion_tokens: int | None,
     reasoning: str = "",
+    finish_reason: str = "stop",
 ) -> httpx.Response:
     request = httpx.Request("POST", "http://litellm.local/v1/chat/completions")
+    payload = {
+        "id": "chatcmpl-litellm",
+        "choices": [
+            {
+                "finish_reason": finish_reason,
+                "message": {
+                    "content": content,
+                    "reasoning_content": reasoning,
+                },
+            }
+        ],
+    }
+    if completion_tokens is not None:
+        payload["usage"] = {
+            "prompt_tokens": 12,
+            "completion_tokens": completion_tokens,
+            "total_tokens": 12 + completion_tokens,
+        }
     return httpx.Response(
         200,
-        json={
-            "id": "chatcmpl-litellm",
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {
-                        "content": content,
-                        "reasoning_content": reasoning,
-                    },
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 12,
-                "completion_tokens": completion_tokens,
-                "total_tokens": 12 + completion_tokens,
-            },
-        },
+        json=payload,
         request=request,
     )
 
@@ -127,6 +130,34 @@ def test_litellm_generator_retries_budget_saturation_without_reasoning():
     assert json.loads(result)["summary"] == "Recovered"
     assert post.call_count == 2
     assert "reasoning_effort" not in post.call_args_list[0].kwargs["json"]
+    assert post.call_args_list[1].kwargs["json"]["reasoning_effort"] == "none"
+
+
+def test_litellm_generator_retries_explicit_length_without_usage():
+    truncated = _completion_response(
+        '{"summary":"Partial","doc_type":["email"],"topics":["lease"],"keywords":[',
+        completion_tokens=None,
+        finish_reason="length",
+    )
+    recovered = _completion_response(
+        '{"summary":"Recovered","doc_type":["email"],'
+        '"topics":["lease"],"keywords":["renewal"]}',
+        completion_tokens=24,
+    )
+
+    with patch(
+        "providers.llm.litellm_llm.httpx.post",
+        side_effect=[truncated, recovered],
+    ) as post:
+        generator = LiteLLMGenerator(
+            model="ollama-deepseek-v4-pro",
+            base_url="http://litellm.local/v1",
+            api_key="secret-key",
+        )
+        result = generator.generate("large email", max_tokens=77)
+
+    assert json.loads(result)["keywords"] == ["renewal"]
+    assert post.call_count == 2
     assert post.call_args_list[1].kwargs["json"]["reasoning_effort"] == "none"
 
 

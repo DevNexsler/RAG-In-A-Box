@@ -51,10 +51,12 @@ def _truncation_signals(
     response_payload: dict[str, Any],
     request_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return OpenAI-compatible truncation evidence without trusting finish_reason."""
+    """Return truncation evidence without trusting a provider's ``stop`` claim."""
     message: dict[str, Any] = {}
+    finish_reason = ""
     choices = response_payload.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        finish_reason = str(choices[0].get("finish_reason") or "").strip().lower()
         raw_message = choices[0].get("message")
         if isinstance(raw_message, dict):
             message = raw_message
@@ -95,10 +97,11 @@ def _truncation_signals(
         and requested_tokens is not None
         and requested_tokens > 0
         and completion_tokens >= requested_tokens
-    ) or empty_content
+    ) or empty_content or finish_reason == "length"
     return {
         "completion_tokens": completion_tokens,
         "empty_content": empty_content,
+        "finish_reason": finish_reason,
         "reasoning_output_length": reasoning_length,
         "truncated": truncated,
     }
@@ -171,11 +174,13 @@ class LiteLLMGenerator:
 
         logger.warning(
             "LiteLLM structured response was truncated or empty "
-            "(completion_tokens=%s, reasoning_chars=%s, empty=%s); retrying "
+            "(completion_tokens=%s, reasoning_chars=%s, empty=%s, "
+            "finish_reason=%s); retrying "
             "once with reasoning disabled.",
             signals["completion_tokens"],
             signals["reasoning_output_length"],
             signals["empty_content"],
+            signals["finish_reason"],
         )
         recovered = self._request_with_metadata(
             user_prompt,
