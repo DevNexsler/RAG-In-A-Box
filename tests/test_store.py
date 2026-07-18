@@ -1338,6 +1338,21 @@ def test_pre_index_maintenance_orders_prune_compact_marker():
         ]
 
 
+def test_data_compaction_prefers_streaming_binary_copy():
+    """Compatible fragments should avoid full vector decode/re-encode pressure."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        dataset = MagicMock()
+
+        with patch("lance.dataset", return_value=dataset) as open_dataset:
+            store._compact_data_files()
+
+        open_dataset.assert_called_once_with(store._dataset_path())
+        dataset.optimize.compact_files.assert_called_once_with(
+            compaction_mode="try_binary_copy"
+        )
+
+
 def test_pre_index_compaction_refreshes_store_for_following_writes():
     """The long-lived LanceDB handle must follow fresh-handle compaction."""
     with tempfile.TemporaryDirectory() as tmpdir:

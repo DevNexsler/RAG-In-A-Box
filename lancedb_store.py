@@ -1173,11 +1173,13 @@ class LanceDBStore:
         return True
 
     def _compact_data_files(self) -> None:
-        """Compact data fragments through a fresh dataset handle only."""
+        """Compact through a fresh handle without decoding compatible vectors."""
         import lance
 
         with self._measure_memory("lance_daily_compaction"):
-            lance.dataset(self._dataset_path()).optimize.compact_files()
+            lance.dataset(self._dataset_path()).optimize.compact_files(
+                compaction_mode="try_binary_copy"
+            )
 
     def _dataset_path(self) -> str:
         return str(Path(self.index_root) / f"{self.table_name}.lance")
