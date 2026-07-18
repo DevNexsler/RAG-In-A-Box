@@ -55,7 +55,7 @@ TIERS = [
         ],
         needs_compose=True,
         compose_env=(("STAGING_CONFIG", "./config.staging.yaml"), ("E2E_REAL", "0")),
-        pytest_env=(("E2E_REAL", "0"),),
+        pytest_env=(("STAGING_CONFIG", "./config.staging.yaml"), ("E2E_REAL", "0")),
     ),
     Tier("live", [sys.executable, "-m", "pytest", "-m", "live", "-q",
                   "--junitxml={run_dir}/live.xml"]),
@@ -75,7 +75,10 @@ E2E_REAL_TIER = Tier(
         ("STAGING_CONFIG", "./config.staging.realmedia.yaml"),
         ("E2E_REAL", "1"),
     ),
-    pytest_env=(("E2E_REAL", "1"),),
+    pytest_env=(
+        ("STAGING_CONFIG", "./config.staging.realmedia.yaml"),
+        ("E2E_REAL", "1"),
+    ),
 )
 
 

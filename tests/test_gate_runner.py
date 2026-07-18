@@ -189,9 +189,50 @@ def test_staging_tiers_fail_closed_against_host_provider_selectors():
         "STAGING_CONFIG": "./config.staging.yaml",
         "E2E_REAL": "0",
     }
-    assert dict(staging.pytest_env) == {"E2E_REAL": "0"}
+    assert dict(staging.pytest_env) == {
+        "STAGING_CONFIG": "./config.staging.yaml",
+        "E2E_REAL": "0",
+    }
     assert dict(gate.E2E_REAL_TIER.compose_env) == {
         "STAGING_CONFIG": "./config.staging.realmedia.yaml",
         "E2E_REAL": "1",
     }
-    assert dict(gate.E2E_REAL_TIER.pytest_env) == {"E2E_REAL": "1"}
+    assert dict(gate.E2E_REAL_TIER.pytest_env) == {
+        "STAGING_CONFIG": "./config.staging.realmedia.yaml",
+        "E2E_REAL": "1",
+    }
+
+
+def test_compose_tiers_propagate_explicit_provider_env(
+    tmp_path,
+    monkeypatch,
+):
+    compose_file = tmp_path / "compose.yml"
+    compose_file.write_text("services: {}\n")
+    monkeypatch.setattr(gate, "COMPOSE_FILE", compose_file)
+    monkeypatch.setenv("STAGING_CONFIG", "./hostile-realmedia.yaml")
+    monkeypatch.setenv("E2E_REAL", "1")
+
+    calls = []
+
+    def capture_run(cmd, **kwargs):
+        calls.append((list(cmd), dict(kwargs.get("env") or {})))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(gate.subprocess, "run", capture_run)
+    staging = next(tier for tier in gate.TIERS if tier.name == "staging-e2e")
+
+    assert gate.run_compose_tier(staging, tmp_path / "staging") is True
+    staging_calls = list(calls)
+    calls.clear()
+    assert gate.run_compose_tier(gate.E2E_REAL_TIER, tmp_path / "real") is True
+
+    for cmd, env in staging_calls:
+        if cmd[:2] == ["docker", "compose"] or "pytest" in cmd:
+            assert env["STAGING_CONFIG"] == "./config.staging.yaml"
+            assert env["E2E_REAL"] == "0"
+
+    for cmd, env in calls:
+        if cmd[:2] == ["docker", "compose"] or "pytest" in cmd:
+            assert env["STAGING_CONFIG"] == "./config.staging.realmedia.yaml"
+            assert env["E2E_REAL"] == "1"
