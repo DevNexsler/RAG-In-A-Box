@@ -157,6 +157,32 @@ def test_litellm_generator_retries_reasoning_only_response_without_reasoning():
     assert post.call_args_list[1].kwargs["json"]["reasoning_effort"] == "none"
 
 
+@pytest.mark.parametrize("empty_content", ["", "   "])
+def test_litellm_generator_retries_structurally_empty_success_without_reasoning(
+    empty_content,
+):
+    empty_success = _completion_response(empty_content, completion_tokens=1)
+    recovered = _completion_response(
+        '{"summary":"Recovered","doc_type":["email"]}',
+        completion_tokens=12,
+    )
+
+    with patch(
+        "providers.llm.litellm_llm.httpx.post",
+        side_effect=[empty_success, recovered],
+    ) as post:
+        generator = LiteLLMGenerator(
+            model="ollama-deepseek-v4-pro",
+            base_url="http://litellm.local/v1",
+            api_key="secret-key",
+        )
+        result = generator.generate("large email", max_tokens=77)
+
+    assert json.loads(result)["summary"] == "Recovered"
+    assert post.call_count == 2
+    assert post.call_args_list[1].kwargs["json"]["reasoning_effort"] == "none"
+
+
 def test_litellm_generator_raises_transient_after_truncation_retry_exhausted(
     caplog,
 ):

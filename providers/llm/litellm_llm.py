@@ -84,15 +84,21 @@ def _truncation_signals(
         requested_tokens = None
 
     content = message.get("content")
+    empty_content = (
+        content is None
+        or content == []
+        or (isinstance(content, str) and not content.strip())
+    )
     reasoning_length = len(reasoning) if isinstance(reasoning, str) else 0
     truncated = (
         completion_tokens is not None
         and requested_tokens is not None
         and requested_tokens > 0
         and completion_tokens >= requested_tokens
-    ) or ((content is None or content == "" or content == []) and reasoning_length > 0)
+    ) or empty_content
     return {
         "completion_tokens": completion_tokens,
+        "empty_content": empty_content,
         "reasoning_output_length": reasoning_length,
         "truncated": truncated,
     }
@@ -164,11 +170,12 @@ class LiteLLMGenerator:
             return initial
 
         logger.warning(
-            "LiteLLM structured response exhausted its output budget "
-            "(completion_tokens=%s, reasoning_chars=%s); retrying once with "
-            "reasoning disabled.",
+            "LiteLLM structured response was truncated or empty "
+            "(completion_tokens=%s, reasoning_chars=%s, empty=%s); retrying "
+            "once with reasoning disabled.",
             signals["completion_tokens"],
             signals["reasoning_output_length"],
+            signals["empty_content"],
         )
         recovered = self._request_with_metadata(
             user_prompt,
@@ -180,8 +187,8 @@ class LiteLLMGenerator:
         )
         if recovery_signals["truncated"]:
             raise TransientError(
-                "LiteLLM structured response remained truncated after "
-                "reasoning-disabled retry"
+                "LiteLLM structured response remained truncated or empty "
+                "after reasoning-disabled retry"
             )
         return recovered
 
