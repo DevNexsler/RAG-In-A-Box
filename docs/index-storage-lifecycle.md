@@ -45,6 +45,11 @@ raced it) it raises, and the flow falls back to a **full FTS rebuild**
 is why keyword search never silently goes stale. Compaction failures are
 non-fatal (logged, retried next run).
 
+The `doc_id` BTree is created only when missing. Opening a store for status or
+search must never replace a valid existing scalar index: replacement is a
+write, creates a new Lance version, and would turn a read path into version and
+disk churn while moving latest past the finalized restore tag.
+
 ## 2. Version pruning — keeps disk bounded (#0112)
 
 `optimize()` compacts but does **not** delete the versions it supersedes. Left

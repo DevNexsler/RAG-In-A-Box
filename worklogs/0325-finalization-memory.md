@@ -123,6 +123,18 @@ FAILED: tagged version 2 != post-prune latest version 4
 
 pytest -q tests/test_store.py::test_final_tag_failure_preserves_staged_readable_restore_point
 FAILED: expected staged + final tag calls; got one post-prune call
+
+The next exact-SHA live run still showed `daily-2026-07-18=50470` and
+`latest=50471`. Decoding transaction 50470 showed a replacement of only
+`doc_id_idx`. The parent MCP status poll had rebuilt its invalidated store
+cache; every `LanceDBStore` construction unconditionally called
+`create_scalar_index(..., replace=True)`, turning that read path into a new
+manifest commit after finalization.
+
+```text
+pytest -q tests/test_store.py::test_reopening_store_does_not_replace_existing_scalar_index
+FAILED: reopened store advanced Lance version 2 -> 3
+```
 ```
 
 Finalization fix:
@@ -143,6 +155,9 @@ Finalization fix:
   expiry then cleanup reclaim old versions; final retag targets exact latest.
   If staging fails cleanup aborts, and if retagging fails the staged restore
   remains readable.
+- Scalar-index initialization first recognizes a valid existing `doc_id`
+  BTree. Routine store construction no longer replaces it or creates a Lance
+  version; missing or wrong-type indices still self-heal through replacement.
 - Index merge failure still propagates to the existing full-FTS rebuild fallback.
 
 Focused verification after implementation:
@@ -152,7 +167,7 @@ ruff check flow_index_vault.py lancedb_store.py taxonomy_store.py tests/test_sca
 All checks passed!
 
 pytest -q tests/test_taxonomy_store.py tests/test_store.py tests/test_scan.py
-202 passed, 232 warnings in 10.20s
+204 passed, 244 warnings in 10.14s
 ```
 
 The warnings were existing LanceDB deprecations and Prefect missing-flow-context logging warnings. A Prefect temporary-server logger emitted a post-pytest closed-stream logging error after the successful result; pytest exit remained 0.

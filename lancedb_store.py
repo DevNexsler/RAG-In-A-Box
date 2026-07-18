@@ -343,9 +343,15 @@ class LanceDBStore:
         self._ensure_scalar_index()
 
     def _ensure_scalar_index(self) -> None:
-        """Create a BTREE scalar index on doc_id for O(log n) filtered lookups."""
+        """Create the doc-id BTree once; never replace it on routine opens."""
         try:
-            self._vs.table.create_scalar_index("doc_id", index_type="BTREE", replace=True)
+            table = self._vs.table
+            for index in table.list_indices():
+                columns = list(getattr(index, "columns", ()) or ())
+                index_type = str(getattr(index, "index_type", "")).upper()
+                if columns == ["doc_id"] and index_type == "BTREE":
+                    return
+            table.create_scalar_index("doc_id", index_type="BTREE", replace=True)
         except TableNotFoundError:
             pass  # Table not created yet on first run
         except Exception as e:

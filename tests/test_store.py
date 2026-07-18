@@ -61,6 +61,42 @@ def test_upsert_replaces():
         assert doc_ids == ["a.md"]
 
 
+def test_reopening_store_does_not_replace_existing_scalar_index():
+    """Read-path construction must not create a new Lance version each time."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("a.md", "c:0", "hello", [0.1] * 768)])
+
+        LanceDBStore(tmpdir, "test_chunks")
+        version_with_index = lance.dataset(_lance_path(tmpdir)).version
+        reopened = LanceDBStore(tmpdir, "test_chunks")
+
+        assert lance.dataset(_lance_path(tmpdir)).version == version_with_index
+        assert any(
+            list(index.columns) == ["doc_id"]
+            and str(index.index_type).upper() == "BTREE"
+            for index in reopened._vs.table.list_indices()
+        )
+
+
+def test_reopening_store_repairs_wrong_doc_id_index_type():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("a.md", "c:0", "hello", [0.1] * 768)])
+        table = LanceDBStore(tmpdir, "test_chunks")._vs.table
+        table.create_scalar_index("doc_id", index_type="BITMAP", replace=True)
+
+        reopened = LanceDBStore(tmpdir, "test_chunks")
+
+        assert any(
+            list(index.columns) == ["doc_id"]
+            and str(index.index_type).upper() == "BTREE"
+            for index in reopened._vs.table.list_indices()
+        )
+
+
 def test_delete_by_doc_ids():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
