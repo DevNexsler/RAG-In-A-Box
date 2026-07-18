@@ -226,9 +226,11 @@ What to add where:
 
 ## Fault injection how-to
 
-The sim supports three faults: `429` (rate-limit response with
+The sim supports four faults: `429` (rate-limit response with
 `Retry-After: 0`), `timeout` (delay, then answer normally), `garbage`
-(HTTP 200, body `not json {`).
+(HTTP 200, body `not json {`), and `reasoning_only` (HTTP 200 with empty
+content plus reasoning metadata, then a normal response after the armed fault
+is consumed).
 
 **Single-shot, header mode** — for direct requests to the sim:
 

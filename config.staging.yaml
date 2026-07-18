@@ -77,9 +77,12 @@ chunking:
 
 enrichment:
   enabled: true
-  provider: "openrouter"
-  model: "openai/gpt-4.1-mini"
+  # Match production's LiteLLM enrichment path while keeping all traffic in
+  # provider-sim. This makes retry/fallback behavior part of hermetic E2E.
+  provider: "litellm"
+  model: "ollama-deepseek-v4-pro"
   base_url: "http://provider-sim:9999/api/v1"
+  api_key: "sim"
   max_input_chars: 20000
   max_output_tokens: 2000
   concurrency: 1
