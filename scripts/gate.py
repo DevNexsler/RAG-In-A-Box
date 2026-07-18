@@ -41,8 +41,22 @@ TIERS = [
                   "--junitxml={run_dir}/unit.xml"]),
     Tier("integration", [sys.executable, "-m", "pytest", "-m", "integration", "-q",
                          "--junitxml={run_dir}/integration.xml"]),
-    Tier("staging-e2e", [sys.executable, "-m", "pytest", "tests/e2e", "-m", "e2e", "-q",
-                         "--junitxml={run_dir}/e2e.xml"], needs_compose=True),
+    Tier(
+        "staging-e2e",
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/e2e",
+            "-m",
+            "e2e",
+            "-q",
+            "--junitxml={run_dir}/e2e.xml",
+        ],
+        needs_compose=True,
+        compose_env=(("STAGING_CONFIG", "./config.staging.yaml"), ("E2E_REAL", "0")),
+        pytest_env=(("STAGING_CONFIG", "./config.staging.yaml"), ("E2E_REAL", "0")),
+    ),
     Tier("live", [sys.executable, "-m", "pytest", "-m", "live", "-q",
                   "--junitxml={run_dir}/live.xml"]),
 ]
@@ -57,8 +71,14 @@ E2E_REAL_TIER = Tier(
     [sys.executable, "-m", "pytest", "tests/e2e", "-m", "e2e", "-q",
      "--junitxml={run_dir}/e2e-real.xml"],
     needs_compose=True,
-    compose_env=(("STAGING_CONFIG", "./config.staging.realmedia.yaml"),),
-    pytest_env=(("E2E_REAL", "1"),),
+    compose_env=(
+        ("STAGING_CONFIG", "./config.staging.realmedia.yaml"),
+        ("E2E_REAL", "1"),
+    ),
+    pytest_env=(
+        ("STAGING_CONFIG", "./config.staging.realmedia.yaml"),
+        ("E2E_REAL", "1"),
+    ),
 )
 
 

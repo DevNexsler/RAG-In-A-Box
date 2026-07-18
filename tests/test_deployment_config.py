@@ -29,6 +29,15 @@ def test_docker_compose_forwards_litellm_credentials_to_doc_organizer():
     assert "LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}" in env
 
 
+def test_staging_enrichment_exercises_production_litellm_path():
+    config = yaml.safe_load(Path("config.staging.yaml").read_text())
+    enrichment = config["enrichment"]
+
+    assert enrichment["provider"] == "litellm"
+    assert enrichment["base_url"] == "http://provider-sim:9999/api/v1"
+    assert enrichment["api_key"] == "sim"
+
+
 def test_docker_compose_raises_doc_organizer_nofile_limit():
     """Indexer concurrency needs a higher FD limit than Docker's default 1024."""
     compose = yaml.safe_load(Path("docker-compose.yml").read_text())

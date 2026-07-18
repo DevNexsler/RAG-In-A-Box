@@ -9,6 +9,8 @@
 
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,12 +22,31 @@ pytest.importorskip("llama_index")
 from llama_index.core.node_parser import SentenceSplitter
 
 from doc_id_store import DocIDStore
-from flow_index_vault import _RUNTIME
+from flow_index_vault import _RUNTIME, _bounded_executor_map
 from lancedb_store import LanceDBStore
 from providers.embed.base import EmbedProvider
 
 
 _test_logger = logging.getLogger("concurrency-test")
+
+
+def test_bounded_executor_map_propagates_context_to_each_submission():
+    flow_marker = ContextVar("flow_marker", default="missing")
+    token = flow_marker.set("parent-flow")
+    try:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(
+                _bounded_executor_map(
+                    executor,
+                    lambda item: (item, flow_marker.get()),
+                    range(8),
+                    max_pending=4,
+                )
+            )
+    finally:
+        flow_marker.reset(token)
+
+    assert results == [(item, "parent-flow") for item in range(8)]
 
 
 class MockEmbedProvider(EmbedProvider):
@@ -175,6 +196,37 @@ class TestErrorIsolation:
             indexed = set(store.list_doc_ids())
             assert "documents::idbad" not in indexed
             assert {"documents::idok1", "documents::idok2", "documents::idok3"} <= indexed
+        finally:
+            _teardown_runtime()
+
+
+class TestEnrichmentDegradation:
+    def test_missing_required_enrichment_is_retry_pending_not_clean(self, index_dir):
+        from flow_index_vault import _process_docs
+
+        class _IncompleteGenerator:
+            def generate(self, user_prompt: str, max_tokens: int = 512) -> str:
+                return (
+                    '{"suggested_tags":["must-not-count"],'
+                    '"context_entities_people":["partial"],'
+                    '"context_entities_orgs":['
+                )
+
+        store, _ = _setup_runtime(index_dir)
+        doc = _fake_record("truncated", "substantive lease renewal email body")
+        _RUNTIME["llm_generator"] = _IncompleteGenerator()
+        _RUNTIME["degraded_lock"] = threading.Lock()
+        try:
+            with patch("flow_index_vault._queue_taxonomy_usage") as queue_usage:
+                failed = _process_docs([doc], concurrency=1)
+
+            assert failed == []
+            assert doc["doc_id"] in store.list_doc_ids()
+            assert doc["doc_id"] in _RUNTIME["degraded_now"]
+            reasons = _RUNTIME["degraded_now"][doc["doc_id"]]
+            assert [reason.reason for reason in reasons] == ["enrichment_failed"]
+            assert doc["doc_id"] not in _RUNTIME.get("degraded_clean", set())
+            queue_usage.assert_not_called()
         finally:
             _teardown_runtime()
 

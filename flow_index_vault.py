@@ -42,6 +42,7 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from contextlib import nullcontext
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -1582,7 +1583,8 @@ def _bounded_executor_map(
             item = next(item_iter)
         except StopIteration:
             return False
-        pending[executor.submit(function, item)] = next_sequence
+        context = copy_context()
+        pending[executor.submit(context.run, function, item)] = next_sequence
         next_sequence += 1
         return True
 

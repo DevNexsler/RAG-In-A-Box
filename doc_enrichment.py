@@ -675,7 +675,11 @@ def enrich_document(
 
         try:
             raw_response = generator.generate(prompt, max_tokens=max_output_tokens)
-            logger.debug("LLM enrichment raw response for '%s': %s", title, raw_response[:200])
+            logger.debug(
+                "LLM enrichment response received for '%s' (%d chars)",
+                title,
+                len(raw_response),
+            )
 
             enrichment = parse_enrichment_response(raw_response)
             enrichment = _repair_context_omissions(enrichment, truncated, context_text)
@@ -688,10 +692,20 @@ def enrich_document(
                 enabled_rules=postprocess_rules,
             )
 
-            if not enrichment.get("enr_summary"):
+            missing_required = [
+                field
+                for field in ("summary", "doc_type")
+                if not enrichment.get(f"enr_{field}")
+            ]
+            if missing_required:
                 logger.warning(
-                    "LLM returned empty summary for '%s'. Raw response: %s",
-                    title, raw_response[:300],
+                    "LLM structured output for '%s' is missing required fields: %s",
+                    title,
+                    ", ".join(missing_required),
+                )
+                return failed_enrichment(
+                    "structured_output_missing_required_fields: "
+                    + ", ".join(missing_required)
                 )
 
             # Increment usage_count for matched taxonomy entries
@@ -717,8 +731,9 @@ def enrich_document(
 
         except json.JSONDecodeError as exc:
             logger.warning(
-                "Failed to parse LLM JSON for '%s': %s. Response: %s",
-                title, exc, raw_response[:300] if "raw_response" in dir() else "N/A",
+                "Failed to parse LLM JSON for '%s': %s",
+                title,
+                exc,
             )
             return failed_enrichment(f"json_parse_error: {exc}")
         except Exception as exc:

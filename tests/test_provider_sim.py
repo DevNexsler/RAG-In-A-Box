@@ -425,6 +425,30 @@ async def test_fault_header_garbage(client):
 
 
 @pytest.mark.anyio
+async def test_fault_armed_reasoning_only_exhausts_then_recovers(client):
+    arm = await client.post(
+        "/admin/fault",
+        json={
+            "route_prefix": "/api/v1/chat/completions",
+            "fault": "reasoning_only",
+            "times": 1,
+        },
+    )
+    assert arm.status_code == 200
+    payload = _chat_payload("substantive document", {"type": "json_object"})
+
+    truncated = await client.post("/api/v1/chat/completions", json=payload)
+    message = truncated.json()["choices"][0]["message"]
+    assert message["content"] == ""
+    assert message["reasoning_content"]
+
+    recovered = await client.post("/api/v1/chat/completions", json=payload)
+    assert json.loads(recovered.json()["choices"][0]["message"]["content"])[
+        "summary"
+    ]
+
+
+@pytest.mark.anyio
 async def test_fault_header_timeout_delays(client):
     start = time.monotonic()
     resp = await client.post(

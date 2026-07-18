@@ -115,3 +115,29 @@ async def test_degraded_enrichment_still_indexes(indexed_corpus, api, mcp_sessio
     chunk = await mcp_session.call_tool_json(
         "file_get_chunk", {"doc_id": hits[0]["doc_id"], "loc": hits[0]["loc"]})
     assert "kaleidoscope" in chunk["text"].lower()
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
+    reason="enrichment is live in real mode; simulator truncation cannot be armed",
+)
+async def test_reasoning_only_enrichment_retries_with_populated_facets(
+    indexed_corpus,
+    api,
+    mcp_session,
+):
+    await _arm_fault("/api/v1/chat/completions", "reasoning_only", times=1)
+
+    content = b"# Renewal\n\nTenant requested a lease renewal for the apartment.\n"
+    result = await _upload_and_index(api, mcp_session, "truncation-note.md", content)
+
+    payload = await mcp_session.call_tool_json(
+        "file_search", {"query": "tenant lease renewal", "top_k": 5}
+    )
+    hits = search_hits(payload, "truncation-note")
+    assert hits, payload["results"]
+    chunk = await mcp_session.call_tool_json(
+        "file_get_chunk", {"doc_id": hits[0]["doc_id"], "loc": hits[0]["loc"]}
+    )
+    assert chunk["enr_summary"]
+    assert chunk["enr_doc_type"]

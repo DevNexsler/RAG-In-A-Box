@@ -1,18 +1,19 @@
 # Staging config — REAL-MEDIA variant (CDS final e2e run).
 #
-# Identical to config.staging.yaml EXCEPT: media + enrichment call the real
-# OpenRouter API instead of provider-sim. Everything else (embeddings, OCR,
-# reranker) stays on the sim — deterministic and free — because they are not
-# the media-enrichment path under test.
+# Identical to config.staging.yaml EXCEPT: media + enrichment intentionally use
+# the OpenRouter provider/model and call the real OpenRouter API instead of
+# provider-sim. Everything else (embeddings, OCR, reranker) stays on the sim —
+# deterministic and free — because it is not the media-enrichment path under
+# test.
 #
 # Use for the FINAL end-to-end pass after the deterministic (all-sim) run is
 # green. Requires a real OPENROUTER_API_KEY in the container env (the CDS
 # override passes it through). This run SPENDS REAL MONEY.
 #
-# KEEP IN SYNC with config.staging.yaml — the only intended differences are the
-# two base_url lines (marked REAL below), the media timeout, and the audio
-# fallback chain. If you change the base config's sources/chunking/search, mirror
-# it here.
+# KEEP IN SYNC with config.staging.yaml. Intended differences: media and
+# enrichment provider/model/base URL/API-key source; media timeout; audio
+# fallback chain. If you change the base config's sources/chunking/search,
+# mirror it here.
 
 index_root: /data/index
 

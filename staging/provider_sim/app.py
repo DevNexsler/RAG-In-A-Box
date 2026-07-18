@@ -148,6 +148,30 @@ def _fault_response(fault: str) -> Response | None:
         return Response(
             content="not json {", status_code=200, media_type="application/json"
         )
+    if fault == "reasoning_only":
+        return JSONResponse(
+            {
+                "id": "sim-reasoning-only",
+                "object": "chat.completion",
+                "model": "sim-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "simulated output-budget exhaustion",
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 1,
+                    "total_tokens": 13,
+                },
+            }
+        )
     return None  # "timeout" delays, then falls through to normal handling
 
 
@@ -355,7 +379,7 @@ async def admin_reset() -> dict:
     return {"ok": True}
 
 
-_KNOWN_FAULTS = {"429", "timeout", "garbage"}
+_KNOWN_FAULTS = {"429", "timeout", "garbage", "reasoning_only"}
 
 
 @app.post("/admin/fault")
