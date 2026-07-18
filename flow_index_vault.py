@@ -2187,6 +2187,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     )
 
     stored_mtimes = store.list_doc_mtimes()
+    active_table_has_docs = bool(stored_mtimes)
     stored_change_hashes = store.list_doc_change_hashes()
     if source_name:
         source_prefix = f"{source_name}::"
@@ -2285,6 +2286,22 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         docs_to_process = scanned
         docs_to_delete = []
 
+    # A daily full-table compaction can consume several GiB on the production
+    # corpus. Run it before document processing creates its own resident state,
+    # but only for an existing active table. Fresh/shadow tables do not exist
+    # yet; deletion-only runs keep delete -> compaction ordering in finalization.
+    pre_index_maintenance_attempted = bool(
+        docs_to_process and active_table_has_docs and not using_shadow_rebuild
+    )
+    if pre_index_maintenance_attempted:
+        memory_observer.sample("phase_start", phase="pre_index_maintenance")
+        _write_heartbeat(index_root)
+        try:
+            store.prepare_indexing_maintenance()
+        finally:
+            _write_heartbeat(index_root)
+            memory_observer.sample("phase_finish", phase="pre_index_maintenance")
+
     concurrency = int(enrichment_cfg.get("concurrency", 1) or 1)
     if concurrency > 1:
         logger.info("Processing %d docs with concurrency=%d", len(docs_to_process), concurrency)
@@ -2340,7 +2357,12 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
                 store.create_fts_index()
             else:
                 try:
-                    store.ensure_fts_index()
+                    final_compact_data = bool(
+                        active_table_has_docs
+                        and not using_shadow_rebuild
+                        and not pre_index_maintenance_attempted
+                    )
+                    store.ensure_fts_index(compact_data=final_compact_data)
                 except Exception as exc:
                     # A corrupt inverted index fails the incremental merge
                     # deterministically, so retrying next run can never succeed

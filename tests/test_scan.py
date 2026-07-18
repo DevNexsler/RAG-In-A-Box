@@ -938,7 +938,16 @@ def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
     fake_store.create_fts_index.assert_called_once_with()
 
 
-def _run_flow_with_fts_store(tmp_path, fake_store, diff_result):
+def _run_flow_with_fts_store(
+    tmp_path,
+    fake_store,
+    diff_result,
+    *,
+    process_side_effect=None,
+    delete_side_effect=None,
+    memory_observer=None,
+    source_name=None,
+):
     """Run index_vault_flow with a mocked store and pipeline.
 
     Returns the write_index_metadata_task mock so callers can assert on the
@@ -985,20 +994,36 @@ def _run_flow_with_fts_store(tmp_path, fake_store, diff_result):
         "logging": {"level": "WARNING"},
     }
 
+    process_patch = (
+        {"side_effect": process_side_effect}
+        if process_side_effect is not None
+        else {"return_value": []}
+    )
+    delete_patch = (
+        {"side_effect": delete_side_effect}
+        if delete_side_effect is not None
+        else {}
+    )
+    observer = memory_observer or MagicMock()
+
     with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
-        with patch("flow_index_vault.load_config", return_value=config):
-            with patch("flow_index_vault.open_store_with_recovery", return_value=fake_store):
-                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
-                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
-                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
-                            with patch("sources.build_source", return_value=_FakeSource()):
-                                with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
-                                    with patch("flow_index_vault.diff_index_task", return_value=diff_result):
-                                        with patch("flow_index_vault._process_docs", return_value=[]):
-                                            with patch("flow_index_vault.delete_docs_task"):
-                                                with patch("flow_index_vault.index_stats_task"):
-                                                    with patch("flow_index_vault.write_index_metadata_task") as meta_mock:
-                                                        index_vault_flow.fn("dummy.yaml")
+        with patch("flow_index_vault.MemoryObserver.from_config", return_value=observer):
+            with patch("flow_index_vault.load_config", return_value=config):
+                with patch("flow_index_vault.open_store_with_recovery", return_value=fake_store):
+                    with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                        with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                            with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                                with patch("sources.build_source", return_value=_FakeSource()):
+                                    with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                        with patch("flow_index_vault.diff_index_task", return_value=diff_result):
+                                            with patch("flow_index_vault._process_docs", **process_patch):
+                                                with patch("flow_index_vault.delete_docs_task", **delete_patch):
+                                                    with patch("flow_index_vault.index_stats_task"):
+                                                        with patch("flow_index_vault.write_index_metadata_task") as meta_mock:
+                                                            index_vault_flow.fn(
+                                                                "dummy.yaml",
+                                                                source_name=source_name,
+                                                            )
     return meta_mock
 
 
@@ -1015,6 +1040,117 @@ def _changed_doc_diff():
         }],
         [],
     )
+
+
+def test_existing_changed_store_compacts_before_processing_and_finalizes_without_retry(
+    tmp_path,
+):
+    events: list[str] = []
+    observer = MagicMock()
+
+    def sample(event, **fields):
+        phase = fields.get("phase")
+        if phase in {"pre_index_maintenance", "process", "finalize"}:
+            events.append(f"{event}:{phase}")
+
+    observer.sample.side_effect = sample
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = ["documents::doc-1", "documents::old"]
+    fake_store.list_doc_mtimes.return_value = {
+        "documents::doc-1": 1.0,
+        "documents::old": 1.0,
+    }
+    fake_store.list_doc_change_hashes.return_value = {}
+    fake_store.count_chunks.return_value = 2
+    fake_store.fts_available.return_value = True
+    fake_store.prepare_indexing_maintenance.side_effect = lambda: events.append(
+        "prepare"
+    )
+    fake_store.ensure_fts_index.side_effect = lambda **_kwargs: events.append("ensure")
+
+    changed, _ = _changed_doc_diff()
+    _run_flow_with_fts_store(
+        tmp_path,
+        fake_store,
+        (changed, ["documents::old"]),
+        process_side_effect=lambda *_args, **_kwargs: events.append("process") or [],
+        delete_side_effect=lambda *_args, **_kwargs: events.append("delete"),
+        memory_observer=observer,
+    )
+
+    assert events.index("phase_start:pre_index_maintenance") < events.index("prepare")
+    assert events.index("prepare") < events.index("phase_finish:pre_index_maintenance")
+    assert events.index("phase_finish:pre_index_maintenance") < events.index(
+        "phase_start:process"
+    )
+    assert events.index("process") < events.index("delete") < events.index("ensure")
+    fake_store.prepare_indexing_maintenance.assert_called_once_with()
+    fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
+
+
+def test_fresh_store_skips_precompaction_and_creates_fts_after_processing(tmp_path):
+    events: list[str] = []
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = []
+    fake_store.list_doc_mtimes.return_value = {}
+    fake_store.list_doc_change_hashes.return_value = {}
+    fake_store.count_chunks.return_value = 0
+    fake_store.fts_available.return_value = False
+
+    _run_flow_with_fts_store(
+        tmp_path,
+        fake_store,
+        _changed_doc_diff(),
+        process_side_effect=lambda *_args, **_kwargs: events.append("process") or [],
+    )
+
+    assert events == ["process"]
+    fake_store.prepare_indexing_maintenance.assert_not_called()
+    fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
+
+
+def test_new_source_in_populated_shared_table_still_compacts_before_processing(
+    tmp_path,
+):
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = ["other::existing"]
+    fake_store.list_doc_mtimes.return_value = {"other::existing": 1.0}
+    fake_store.list_doc_change_hashes.return_value = {}
+    fake_store.count_chunks.return_value = 1
+    fake_store.fts_available.return_value = True
+
+    _run_flow_with_fts_store(
+        tmp_path,
+        fake_store,
+        _changed_doc_diff(),
+        source_name="documents",
+    )
+
+    fake_store.prepare_indexing_maintenance.assert_called_once_with()
+    fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
+
+
+def test_delete_only_run_deletes_before_final_compaction(tmp_path):
+    events: list[str] = []
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = ["documents::old"]
+    fake_store.list_doc_mtimes.return_value = {"documents::old": 1.0}
+    fake_store.list_doc_change_hashes.return_value = {}
+    fake_store.count_chunks.return_value = 1
+    fake_store.fts_available.return_value = True
+    fake_store.ensure_fts_index.side_effect = lambda **_kwargs: events.append("ensure")
+
+    _run_flow_with_fts_store(
+        tmp_path,
+        fake_store,
+        ([], ["documents::old"]),
+        process_side_effect=lambda *_args, **_kwargs: [],
+        delete_side_effect=lambda *_args, **_kwargs: events.append("delete"),
+    )
+
+    assert events == ["delete", "ensure"]
+    fake_store.prepare_indexing_maintenance.assert_not_called()
+    fake_store.ensure_fts_index.assert_called_once_with(compact_data=True)
 
 
 def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
@@ -1037,7 +1173,7 @@ def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
 
     meta_mock = _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
 
-    fake_store.ensure_fts_index.assert_called_once_with()
+    fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
     fake_store.create_fts_index.assert_called_once_with()
     warnings = meta_mock.call_args[0][4] or []
     assert any(w.startswith("fts_incremental_update_failed:") for w in warnings)
@@ -1139,7 +1275,7 @@ def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
                                                     with patch("flow_index_vault.write_index_metadata_task"):
                                                         index_vault_flow.fn("dummy.yaml")
 
-    shadow_store.ensure_fts_index.assert_called_once_with()
+    shadow_store.ensure_fts_index.assert_called_once_with(compact_data=False)
     shadow_store.reset_table.assert_called_once_with()
     active_store.promote_table.assert_called_once_with("chunks__shadow")
     delete_mock.assert_not_called()

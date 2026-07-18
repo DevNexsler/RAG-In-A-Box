@@ -5,7 +5,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1024,6 +1024,49 @@ def test_ensure_fts_index_creates_when_missing():
         assert len(hits) == 1
 
 
+def test_ensure_fts_index_missing_path_tags_exact_latest_without_data_compaction():
+    """Creating missing FTS still finalizes restore metadata, without rewrite."""
+    from datetime import date
+
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+
+        with patch.object(store, "_compact_data_files") as compact:
+            store.ensure_fts_index(compact_data=False)
+
+        tag = f"daily-{date.today().isoformat()}"
+        compact.assert_not_called()
+        assert lance.dataset(_lance_path(tmpdir), version=tag).version == (
+            lance.dataset(_lance_path(tmpdir)).version
+        )
+
+
+def test_ensure_fts_index_missing_path_honors_requested_data_compaction():
+    """Delete-only/all-in-one callers compact before creating missing FTS."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+
+        with patch.object(
+            store, "_compact_data_files", wraps=store._compact_data_files
+        ) as compact:
+            store.ensure_fts_index(compact_data=True)
+
+        compact.assert_called_once_with()
+        assert _compaction_marker(tmpdir).read_text().strip() == date.today().isoformat()
+
+
 def _lance_path(tmpdir: str, table: str = "test_chunks") -> str:
     return str(Path(tmpdir) / f"{table}.lance")
 
@@ -1032,6 +1075,8 @@ def test_ensure_fts_index_creates_todays_daily_restore_point():
     """A routine indexing run tags the current version as today's restore
     point (daily-<date>), pointing at the latest version."""
     from datetime import date
+
+    import lance
 
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
@@ -1045,6 +1090,9 @@ def test_ensure_fts_index_creates_todays_daily_restore_point():
         tags = store._vs.table.tags.list()
         today_tag = f"daily-{date.today().isoformat()}"
         assert today_tag in tags
+        assert lance.dataset(_lance_path(tmpdir), version=today_tag).version == (
+            lance.dataset(_lance_path(tmpdir)).version
+        )
 
 
 def test_daily_restore_point_is_revertible_after_more_writes():
@@ -1149,8 +1197,7 @@ def test_restore_points_disabled_when_days_zero():
 
 
 def test_ensure_fts_index_prune_failure_is_non_fatal():
-    """If version pruning raises, the indexing run still completes (housekeeping
-    must never fail an index update)."""
+    """A dataset-level prune failure is swallowed by the prune boundary."""
     from unittest.mock import patch
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1162,7 +1209,7 @@ def test_ensure_fts_index_prune_failure_is_non_fatal():
         store.create_fts_index()
         with patch("core.resilience.time.sleep", lambda *_: None):
             with patch("lance.dataset", side_effect=RuntimeError("disk gone")):
-                store.ensure_fts_index()  # must not raise
+                store._prune_versions("test")  # must not raise
         # index still works after a prune failure
         assert len(store.keyword_search("banana", top_k=5)) == 1
 
@@ -1259,10 +1306,158 @@ def _fts_unindexed_rows(tmpdir: str) -> int:
     return table.index_stats(name).num_unindexed_rows
 
 
+def test_pre_index_maintenance_orders_prune_compact_marker():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        order: list[str] = []
+
+        with (
+            patch.object(store, "_compaction_due", return_value=True),
+            patch.object(
+                store,
+                "_prune_versions",
+                side_effect=lambda label: order.append(f"prune:{label}"),
+            ),
+            patch.object(
+                store,
+                "_compact_data_files",
+                side_effect=lambda: order.append("compact"),
+            ),
+            patch.object(
+                store,
+                "_record_compaction",
+                side_effect=lambda _day: order.append("marker"),
+            ),
+        ):
+            store.prepare_indexing_maintenance()
+
+        assert order == [
+            "prune:pre-maintenance",
+            "compact",
+            "marker",
+        ]
+
+
+def test_pre_index_compaction_refreshes_store_for_following_writes():
+    """The long-lived LanceDB handle must follow fresh-handle compaction."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+        store.create_fts_index()
+
+        store.prepare_indexing_maintenance()
+        store.upsert_nodes(
+            [_make_node_with_meta("b.md", "c:0", "quasar", vec, source_type="md")]
+        )
+        store.ensure_fts_index(compact_data=False)
+
+        assert set(store.list_doc_ids()) == {"a.md", "b.md"}
+        assert len(store.keyword_search("quasar", top_k=5)) == 1
+
+
+def test_post_index_maintenance_skips_compaction_then_merges_tags_and_prunes():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        order: list[str] = []
+
+        with (
+            patch.object(
+                store,
+                "_prune_versions",
+                side_effect=lambda label: order.append(f"prune:{label}"),
+            ),
+            patch.object(
+                store,
+                "_compact_data_files",
+                side_effect=lambda: order.append("compact"),
+            ),
+            patch.object(
+                store,
+                "_merge_index_deltas",
+                side_effect=lambda: order.append("merge"),
+            ),
+            patch.object(
+                store,
+                "_manage_restore_points",
+                side_effect=lambda _table, _day: order.append("restore"),
+            ),
+        ):
+            store._optimize_and_prune(table, compact_data=False)
+
+        assert order == [
+            "merge",
+            "restore",
+            "prune:post-expiry",
+        ]
+
+
+def test_current_marker_skips_compaction_but_merges_indices():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        with (
+            patch.object(store, "_compaction_due", return_value=False),
+            patch.object(store, "_prune_versions"),
+            patch.object(store, "_compact_data_files") as compact,
+            patch.object(store, "_merge_index_deltas") as merge,
+            patch.object(store, "_manage_restore_points"),
+        ):
+            store._optimize_and_prune(table)
+
+        compact.assert_not_called()
+        merge.assert_called_once_with()
+
+
+def test_compaction_failure_leaves_marker_absent_and_still_merges_indices():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        with (
+            patch.object(store, "_compaction_due", return_value=True),
+            patch.object(store, "_prune_versions"),
+            patch.object(
+                store,
+                "_compact_data_files",
+                side_effect=RuntimeError("disk hiccup"),
+            ) as compact,
+            patch.object(store, "_merge_index_deltas") as merge,
+            patch.object(store, "_manage_restore_points"),
+        ):
+            store._optimize_and_prune(table)
+
+        assert compact.call_count == 1
+        merge.assert_called_once_with()
+        assert not _compaction_marker(tmpdir).exists()
+
+
+def test_index_merge_failure_after_successful_compaction_keeps_compaction_marker():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        with (
+            patch.object(store, "_compaction_due", return_value=True),
+            patch.object(store, "_prune_versions"),
+            patch.object(store, "_compact_data_files"),
+            patch.object(
+                store,
+                "_merge_index_deltas",
+                side_effect=RuntimeError("index merge failed"),
+            ),
+            patch.object(store, "_manage_restore_points") as restore,
+        ):
+            with pytest.raises(RuntimeError, match="index merge failed"):
+                store._optimize_and_prune(table)
+
+        assert _compaction_marker(tmpdir).exists()
+        restore.assert_not_called()
+
+
 def test_first_maintenance_run_compacts_and_records_marker():
-    """The first ensure_fts_index of the day runs the full table.optimize()
-    (data compaction) and records the date in a durable marker outside the
-    dataset directory."""
+    """First daily maintenance compacts data and records durable cadence."""
     from datetime import date
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1270,8 +1465,9 @@ def test_first_maintenance_run_compacts_and_records_marker():
         vec = [0.0] * 768
         store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
         store.create_fts_index()
-        table = store._vs.table
-        with patch.object(table, "optimize", wraps=table.optimize) as spy:
+        with patch.object(
+            store, "_compact_data_files", wraps=store._compact_data_files
+        ) as spy:
             store.ensure_fts_index()
 
         assert spy.call_count == 1
@@ -1292,8 +1488,9 @@ def test_maintenance_compacts_at_most_once_per_day():
         store.ensure_fts_index()  # first run today: compacts + writes marker
 
         store.upsert_nodes([_make_node_with_meta("b.md", "c:0", "quasar telescope", vec, source_type="md")])
-        table = store._vs.table
-        with patch.object(table, "optimize", wraps=table.optimize) as spy:
+        with patch.object(
+            store, "_compact_data_files", wraps=store._compact_data_files
+        ) as spy:
             store.ensure_fts_index()  # same calendar day: no data rewrite
 
         assert spy.call_count == 0                  # data compaction skipped
@@ -1312,8 +1509,9 @@ def test_maintenance_compacts_again_when_marker_is_stale():
         store.ensure_fts_index()
         _compaction_marker(tmpdir).write_text("2020-01-01")
 
-        table = store._vs.table
-        with patch.object(table, "optimize", wraps=table.optimize) as spy:
+        with patch.object(
+            store, "_compact_data_files", wraps=store._compact_data_files
+        ) as spy:
             store.ensure_fts_index()
 
         assert spy.call_count == 1
@@ -1328,7 +1526,9 @@ def test_compaction_failure_is_non_fatal_and_retried_next_run():
         store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
         store.create_fts_index()
 
-        with patch.object(store._vs.table, "optimize", side_effect=RuntimeError("disk hiccup")):
+        with patch.object(
+            store, "_compact_data_files", side_effect=RuntimeError("disk hiccup")
+        ):
             store.ensure_fts_index()  # must not raise
 
         assert not _compaction_marker(tmpdir).exists()

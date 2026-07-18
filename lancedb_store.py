@@ -1061,7 +1061,7 @@ class LanceDBStore:
         table.create_fts_index(text_key, use_tantivy=False, replace=True)
         logger.info("FTS index created/rebuilt on column %r", text_key)
 
-    def ensure_fts_index(self) -> None:
+    def ensure_fts_index(self, *, compact_data: bool = True) -> None:
         """Make sure the native FTS index exists and is optimized.
 
         Creates the index if missing; otherwise merges newly written rows into
@@ -1076,18 +1076,40 @@ class LanceDBStore:
             for idx in table.list_indices()
         )
         if not has_fts:
+            if compact_data:
+                self.prepare_indexing_maintenance()
+                table.checkout_latest()
             table.create_fts_index(text_key, use_tantivy=False)
             logger.info("FTS index created on column %r", text_key)
+            from datetime import date
+
+            self._finish_index_maintenance(table, date.today())
             return
-        self._optimize_and_prune(table)
+        self._optimize_and_prune(table, compact_data=compact_data)
         logger.info("FTS index optimized (incremental merge)")
 
-    def _optimize_and_prune(self, table) -> None:
-        """Per-run Lance maintenance: prune dead versions, merge index deltas,
-        compact data files at most once per calendar day, refresh restore
-        points.
+    def prepare_indexing_maintenance(self) -> None:
+        """Run due data compaction before a memory-heavy indexing phase.
 
-        Full compaction (table.optimize()) rewrites every fragment, and each
+        Flows that will process documents call this against an existing table
+        before allocating document-processing state. Finalization can then
+        merge index deltas and refresh restore points without overlapping the
+        daily full-table rewrite with that state.
+        """
+        from datetime import date
+
+        self._prune_versions("pre-maintenance")
+        self._compact_data_files_if_due(date.today())
+
+    def _optimize_and_prune(self, table, *, compact_data: bool = True) -> None:
+        """Merge index deltas, refresh restore points, and prune old versions.
+
+        ``compact_data`` preserves the all-in-one behavior for ordinary callers.
+        Indexing flows that already attempted pre-processing maintenance disable
+        it here so a failed compaction is not retried while processing state is
+        still resident.
+
+        Full data compaction rewrites every fragment, and each
         retained daily restore-point tag pins the superseded fragments until
         that tag expires — running it every ~15-minute indexing cycle held a
         full rewrite of the table per cycle per tag on disk and grew a ~5 GB
@@ -1106,46 +1128,56 @@ class LanceDBStore:
         in-flight-write protection is only overridden in stopped-service
         repair, never routinely).
 
-        Compaction, tagging, and pruning are housekeeping: failures are
-        logged, never raised, so an indexing run always completes (a failed
-        compaction leaves the marker unwritten and retries next run). Only
-        the index-delta merge propagates, letting the flow fall back to a
-        full FTS rebuild.
+        Compaction, tagging, and pruning are housekeeping: failures are logged,
+        never raised. A failed compaction leaves the marker unwritten for a
+        later run. Only the index-delta merge propagates, letting the flow fall
+        back to a full FTS rebuild.
         """
         from datetime import date
 
-        from core.resilience import call_with_retry
-
         today = date.today()
-        self._prune_versions("pre-maintenance")
+        if compact_data:
+            self._prune_versions("pre-maintenance")
+            self._compact_data_files_if_due(today)
 
-        if self._compaction_due(today):
-            try:
-                def _compact():
-                    # The per-run index merge commits at the dataset level, so
-                    # a cached handle can be behind the latest version — its
-                    # optimize would abort on a Retryable commit conflict.
-                    table.checkout_latest()
-                    table.optimize()  # compacts data files + merges index deltas
+        self._merge_index_deltas()
+        self._finish_index_maintenance(table, today)
 
-                call_with_retry(
-                    _compact,
-                    attempts=3,
-                    backoff=(2.0, 5.0),
-                    label="lance daily compaction",
-                    classify=_is_retryable_commit_conflict,
-                )
-                self._record_compaction(today)
-            except Exception as exc:
-                logger.warning(
-                    "Daily Lance compaction failed (%s); retrying next run", exc
-                )
-                self._merge_index_deltas()
-        else:
-            self._merge_index_deltas()
-
+    def _finish_index_maintenance(self, table, today) -> None:
+        """Tag the latest committed index state, then reclaim expired state."""
         self._manage_restore_points(table, today)
         self._prune_versions("post-expiry")
+
+    def _compact_data_files_if_due(self, today) -> bool:
+        """Best-effort daily data compaction with durable success cadence."""
+        if not self._compaction_due(today):
+            return False
+
+        from core.resilience import call_with_retry
+
+        try:
+            call_with_retry(
+                self._compact_data_files,
+                attempts=3,
+                backoff=(2.0, 5.0),
+                label="lance daily compaction",
+                classify=_is_retryable_commit_conflict,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Daily Lance compaction failed (%s); retrying next run", exc
+            )
+            return False
+
+        self._record_compaction(today)
+        return True
+
+    def _compact_data_files(self) -> None:
+        """Compact data fragments through a fresh dataset handle only."""
+        import lance
+
+        with self._measure_memory("lance_daily_compaction"):
+            lance.dataset(self._dataset_path()).optimize.compact_files()
 
     def _dataset_path(self) -> str:
         return str(Path(self.index_root) / f"{self.table_name}.lance")
