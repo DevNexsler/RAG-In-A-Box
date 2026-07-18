@@ -180,3 +180,18 @@ def test_e2e_real_not_in_default_tiers():
     # The default gate must never include the money-spending stage.
     assert "e2e-real" not in [t.name for t in gate.TIERS]
     assert gate.E2E_REAL_TIER.name == "e2e-real"
+
+
+def test_staging_tiers_fail_closed_against_host_provider_selectors():
+    staging = next(tier for tier in gate.TIERS if tier.name == "staging-e2e")
+
+    assert dict(staging.compose_env) == {
+        "STAGING_CONFIG": "./config.staging.yaml",
+        "E2E_REAL": "0",
+    }
+    assert dict(staging.pytest_env) == {"E2E_REAL": "0"}
+    assert dict(gate.E2E_REAL_TIER.compose_env) == {
+        "STAGING_CONFIG": "./config.staging.realmedia.yaml",
+        "E2E_REAL": "1",
+    }
+    assert dict(gate.E2E_REAL_TIER.pytest_env) == {"E2E_REAL": "1"}
