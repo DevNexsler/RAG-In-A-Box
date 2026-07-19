@@ -979,9 +979,16 @@ def test_dynamic_facets_exclude_internal_narrative_and_identifier_fields():
         "timestamp",
         "url",
         "uri",
+        "facts",
+        "json",
+        "narrative",
+        "case_narrative",
+        "ids",
         "content_type",
         "warning_level",
         "description_kind",
+        "facts_type",
+        "narrative_type",
     }
 
     assert LanceDBStore._dynamic_facet_fields(available) == {
@@ -990,6 +997,8 @@ def test_dynamic_facets_exclude_internal_narrative_and_identifier_fields():
         "content_type",
         "warning_level",
         "description_kind",
+        "facts_type",
+        "narrative_type",
     }
 
 
