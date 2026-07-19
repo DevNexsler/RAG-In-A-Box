@@ -70,3 +70,35 @@ async def test_index_document_route_maps_not_found_to_404(client):
         resp = await client.post("/index/document", json={"rel_path": "nope.pdf"})
     assert resp.status_code == 404
     assert resp.json()["reason"] == "not_found"
+
+
+@pytest.mark.anyio
+async def test_index_document_route_maps_durable_queue_acceptance_to_202(client):
+    queued = {
+        "status": "queued",
+        "reason": "index_write_in_progress",
+        "target": "queued.pdf",
+        "source_name": "documents",
+        "revision": 3,
+    }
+    with patch("flow_index_vault.index_document_flow", return_value=queued):
+        resp = await client.post(
+            "/index/document", json={"rel_path": "queued.pdf"}
+        )
+
+    assert resp.status_code == 202
+    assert resp.json() == queued
+
+
+@pytest.mark.anyio
+async def test_index_document_route_never_returns_202_when_enqueue_fails(client):
+    with patch(
+        "flow_index_vault.index_document_flow",
+        side_effect=OSError("queue disk full"),
+    ):
+        resp = await client.post(
+            "/index/document", json={"rel_path": "queued.pdf"}
+        )
+
+    assert resp.status_code == 500
+    assert resp.json()["reason"] == "index_failed"

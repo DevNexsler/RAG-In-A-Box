@@ -5,6 +5,8 @@ path/doc_id, reusing the same scan/doc_id/diff/extract path, idempotently,
 and respecting the deposit-owned (no_rename) ID-alias convention.
 """
 
+import sqlite3
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -408,6 +410,144 @@ def test_index_document_flow_missing_file_returns_error(tmp_path):
     assert result["status"] == "error"
     assert result["reason"] == "not_found"
     proc.fn.assert_not_called()
+
+
+def test_index_document_flow_durably_queues_during_full_writer_session(
+    tmp_path, monkeypatch
+):
+    from core.index_request_queue import IndexRequestQueue
+    from core.index_write_lock import index_write_lock
+
+    config = _fs_config(tmp_path / "docs", tmp_path / "index")
+    monkeypatch.setattr(fiv, "load_config", lambda _path: config)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_full_writer():
+        with index_write_lock(config["index_root"], "chunks"):
+            acquired.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_full_writer)
+    holder.start()
+    try:
+        assert acquired.wait(5)
+        result = fiv.index_document_flow(target="queued.pdf")
+    finally:
+        release.set()
+        holder.join(5)
+
+    assert result == {
+        "status": "queued",
+        "reason": "index_write_in_progress",
+        "source_name": "documents",
+        "target": "queued.pdf",
+        "revision": 1,
+    }
+    [queued] = IndexRequestQueue(config["index_root"]).pending(
+        "chunks", limit=10
+    )
+    assert queued.target == "queued.pdf"
+
+
+def test_index_document_flow_enqueue_failure_never_attempts_table_lock(
+    tmp_path, monkeypatch
+):
+    config = _fs_config(tmp_path / "docs", tmp_path / "index")
+    monkeypatch.setattr(fiv, "load_config", lambda _path: config)
+
+    with patch(
+        "flow_index_vault.IndexRequestQueue.enqueue",
+        side_effect=sqlite3.OperationalError("disk full"),
+    ), patch("flow_index_vault.index_write_lock") as lock:
+        with pytest.raises(sqlite3.OperationalError, match="disk full"):
+            fiv.index_document_flow(target="queued.pdf")
+
+    lock.assert_not_called()
+
+
+def test_drain_prioritizes_current_request_is_bounded_and_retains_failures(
+    tmp_path,
+):
+    from core.index_request_queue import IndexRequestQueue
+
+    queue = IndexRequestQueue(tmp_path)
+    failed = queue.enqueue("chunks", "documents", "a.pdf")
+    queue.enqueue("chunks", "documents", "b.pdf")
+    current = queue.enqueue("chunks", "mail", "c.pdf")
+    store = object()
+    registry = object()
+    seen = []
+
+    def process(config, request, passed_store, passed_registry):
+        assert passed_store is store
+        assert passed_registry is registry
+        seen.append(request.target)
+        if request.id == failed.id:
+            raise RuntimeError("provider offline")
+        return {"status": "indexed", "target": request.target}
+
+    with patch("flow_index_vault._index_document_unlocked", side_effect=process):
+        results = fiv._drain_index_requests(
+            {},
+            queue,
+            "chunks",
+            store,
+            registry,
+            limit=2,
+            prioritize=(current.source_name, current.target),
+        )
+
+    assert seen == ["c.pdf", "a.pdf"]
+    assert results[("mail", "c.pdf")]["status"] == "indexed"
+    assert results[("documents", "a.pdf")]["status"] == "queued"
+    pending = queue.pending("chunks", limit=10)
+    assert [(item.target, item.attempts) for item in pending] == [
+        ("a.pdf", 1),
+        ("b.pdf", 0),
+    ]
+
+
+def test_drain_keeps_force_revision_enqueued_during_older_processing(tmp_path):
+    from core.index_request_queue import IndexRequestQueue
+
+    queue = IndexRequestQueue(tmp_path)
+    old = queue.enqueue("chunks", "documents", "same.pdf")
+
+    def process(_config, request, _store, _registry):
+        queue.enqueue(
+            request.table_name,
+            request.source_name,
+            request.target,
+            force=True,
+        )
+        return {"status": "indexed"}
+
+    with patch("flow_index_vault._index_document_unlocked", side_effect=process):
+        fiv._drain_index_requests(
+            {}, queue, "chunks", object(), object(), limit=1
+        )
+
+    [pending] = queue.pending("chunks", limit=10)
+    assert pending.id == old.id
+    assert pending.revision == old.revision + 1
+    assert pending.force is True
+
+
+def test_drain_completes_terminal_not_found_request(tmp_path):
+    from core.index_request_queue import IndexRequestQueue
+
+    queue = IndexRequestQueue(tmp_path)
+    queue.enqueue("chunks", "documents", "gone.pdf")
+    with patch(
+        "flow_index_vault._index_document_unlocked",
+        return_value={"status": "error", "reason": "not_found"},
+    ):
+        fiv._drain_index_requests(
+            {}, queue, "chunks", object(), object(), limit=1
+        )
+
+    assert queue.pending("chunks", limit=10) == []
 
 
 def test_index_document_flow_confirmed_blank_clears_ledger_entry(tmp_path):

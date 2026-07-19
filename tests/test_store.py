@@ -1,6 +1,8 @@
 """Tests for LanceDBStore (uses a temp directory, no mocks needed)."""
 
 import multiprocessing
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -93,6 +95,89 @@ def test_insert_nodes_commits_once_without_noop_delete():
         assert set(store.list_doc_ids()) == {"seed.md", "new.md"}
 
 
+def test_known_absent_insert_retry_skips_without_latest_manifest_probe():
+    """A successful full-sweep insert stays idempotent on Prefect retry."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        node = _make_node("new.md", "c:0", "new", [0.2] * 768)
+        store.insert_nodes([node], known_absent=True)
+        before_retry = lance.dataset(_lance_path(tmpdir)).version
+
+        with patch.object(
+            store,
+            "_contains_doc_id_latest",
+            side_effect=AssertionError("normal full-sweep retry must not probe Lance"),
+        ):
+            store.insert_nodes([node], known_absent=True)
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.version == before_retry
+        assert dataset.count_rows("doc_id = 'new.md'") == 1
+
+
+def test_known_absent_insert_recovers_post_commit_exception():
+    """An ambiguous add result is accepted only after latest-manifest proof."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        original_write = store._write_nodes_unlocked
+
+        def commit_then_raise(nodes, *, operation):
+            original_write(nodes, operation=operation)
+            raise RuntimeError("connection dropped after commit")
+
+        with patch.object(store, "_write_nodes_unlocked", side_effect=commit_then_raise):
+            store.insert_nodes(
+                [_make_node("new.md", "c:0", "new", [0.2] * 768)],
+                known_absent=True,
+            )
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.count_rows("doc_id = 'new.md'") == 1
+
+
+def test_exclusive_writer_session_skips_per_document_refresh_and_probe():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes(
+            [_make_node("existing.md", "c:0", "old", [0.1] * 768)]
+        )
+
+        with patch.object(store, "_checkout_latest") as checkout, patch.object(
+            store, "_contains_doc_id_latest"
+        ) as probe:
+            with store.exclusive_writer_session():
+                store.upsert_nodes(
+                    [_make_node("existing.md", "c:0", "new", [0.2] * 768)]
+                )
+                store.insert_nodes(
+                    [_make_node("new.md", "c:0", "new", [0.3] * 768)]
+                )
+                store.delete_by_doc_ids(["existing.md"])
+
+        checkout.assert_not_called()
+        probe.assert_not_called()
+        assert set(store.list_doc_ids()) == {"new.md"}
+
+
+def test_delete_invalidates_completed_insert_cache_for_standalone_reinsert():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        node = _make_node("again.md", "c:0", "restored", [0.1] * 768)
+        store.insert_nodes([node], known_absent=True)
+        store.delete_by_doc_ids(["again.md"])
+
+        store.insert_nodes([node])
+
+        assert store.contains_doc_id("again.md") is True
+        assert store.count_chunks() == 1
+
+
 def test_insert_nodes_is_idempotent_across_store_handles():
     """A stale new-doc snapshot or ambiguous retry must not append duplicates."""
     import lance
@@ -106,9 +191,17 @@ def test_insert_nodes_is_idempotent_across_store_handles():
             _make_node("race.md", "c:0", "targeted write", [0.2] * 768)
         ])
         before_retry = lance.dataset(_lance_path(tmpdir)).version
-        first.insert_nodes([
-            _make_node("race.md", "c:0", "stale sweep write", [0.3] * 768)
-        ])
+        # Refresh the existence probe without checking out the long-lived
+        # writer table. Repeated checkout_latest calls retain large manifest
+        # file caches on fragmented production datasets.
+        with patch.object(
+            first,
+            "_checkout_latest",
+            side_effect=AssertionError("insert must not checkout the writer table"),
+        ):
+            first.insert_nodes([
+                _make_node("race.md", "c:0", "stale sweep write", [0.3] * 768)
+            ])
 
         dataset = lance.dataset(_lance_path(tmpdir))
         assert dataset.count_rows("doc_id = 'race.md'") == 1
@@ -1500,19 +1593,41 @@ def test_pre_index_maintenance_orders_prune_compact_marker():
         ]
 
 
-def test_data_compaction_prefers_streaming_binary_copy():
-    """Compatible fragments should avoid full vector decode/re-encode pressure."""
+def test_data_compaction_runs_binary_copy_in_short_lived_subprocess():
+    """Compaction's native allocations must die before document processing."""
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
-        dataset = MagicMock()
 
-        with patch("lance.dataset", return_value=dataset) as open_dataset:
+        with patch("subprocess.run") as run:
             store._compact_data_files()
 
-        open_dataset.assert_called_once_with(store._dataset_path())
-        dataset.optimize.compact_files.assert_called_once_with(
-            compaction_mode="try_binary_copy"
+        run.assert_called_once_with(
+            [
+                sys.executable,
+                "-m",
+                "core.lance_maintenance",
+                "compact",
+                store._dataset_path(),
+            ],
+            check=True,
+            capture_output=True,
+            close_fds=True,
+            text=True,
         )
+
+
+def test_data_compaction_surfaces_worker_error_for_retry_classification():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        failure = subprocess.CalledProcessError(
+            1,
+            [sys.executable, "-m", "core.lance_maintenance"],
+            stderr="Retryable commit conflict at version 42",
+        )
+
+        with patch("subprocess.run", side_effect=failure):
+            with pytest.raises(RuntimeError, match="Retryable commit conflict"):
+                store._compact_data_files()
 
 
 def test_pre_index_compaction_refreshes_store_for_following_writes():

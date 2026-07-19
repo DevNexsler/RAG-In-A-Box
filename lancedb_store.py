@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 from collections import Counter
 from contextlib import contextmanager, nullcontext
@@ -218,6 +220,8 @@ class LanceDBStore:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
         self._schema_lock = threading.Lock()
+        self._completed_insert_doc_ids: set[str] = set()
+        self._exclusive_writer_depth = 0
         self._memory_observer = None
         self._vs = self._build_vector_store()
         self._ensure_scalar_index()
@@ -238,6 +242,15 @@ class LanceDBStore:
     def set_memory_observer(self, observer: Any | None) -> None:
         """Attach optional index memory instrumentation to storage writes."""
         self._memory_observer = observer
+
+    @contextmanager
+    def exclusive_writer_session(self):
+        """Use one stable handle while an external table lock excludes peers."""
+        self._exclusive_writer_depth += 1
+        try:
+            yield self
+        finally:
+            self._exclusive_writer_depth -= 1
 
     def _measure_memory(self, subphase: str, **fields: Any):
         observer = self._memory_observer
@@ -754,21 +767,33 @@ class LanceDBStore:
         """Replace each document while excluding peer writers."""
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
         with self._serialize_document_writes(doc_ids):
-            self._checkout_latest()
+            if not self._exclusive_writer_depth:
+                self._checkout_latest()
             self._write_nodes_unlocked(nodes, operation="upsert")
 
-    def insert_nodes(self, nodes: list[TextNode]) -> None:
-        """Insert absent documents idempotently without delete-only commits."""
+    def insert_nodes(
+        self, nodes: list[TextNode], *, known_absent: bool = False
+    ) -> None:
+        """Insert documents once, avoiding delete-only transactions.
+
+        Full sweeps pass ``known_absent=True`` while holding the table-level
+        writer session; their authoritative pre-run snapshot therefore needs
+        no per-document Lance refresh. Standalone callers retain a fresh
+        existence probe under the document lock.
+        """
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
         with self._serialize_document_writes(doc_ids):
-            # The flow's pre-run absence snapshot can become stale when a
-            # targeted writer lands first. Refresh and check under the same
-            # cross-process document lock that protects the add, making both
-            # concurrent insertion and ambiguous retry idempotent.
-            self._checkout_latest()
-            existing_doc_ids = {
-                doc_id for doc_id in doc_ids if self.contains_doc_id(doc_id)
-            }
+            existing_doc_ids = doc_ids & self._completed_insert_doc_ids
+            if not known_absent and not self._exclusive_writer_depth:
+                # A standalone caller has no table-level session proving its
+                # snapshot remains current. Probe a fresh, short-lived dataset
+                # while the document lock excludes peer writers.
+                with self._measure_memory("storage_insert_probe"):
+                    existing_doc_ids.update(
+                        doc_id
+                        for doc_id in doc_ids - existing_doc_ids
+                        if self._contains_doc_id_latest(doc_id)
+                    )
             nodes_to_insert = [
                 node
                 for node in nodes
@@ -780,7 +805,30 @@ class LanceDBStore:
                     sorted(existing_doc_ids),
                 )
                 return
-            self._write_nodes_unlocked(nodes_to_insert, operation="insert")
+            inserted_doc_ids = {
+                node.ref_doc_id for node in nodes_to_insert if node.ref_doc_id
+            }
+            try:
+                self._write_nodes_unlocked(nodes_to_insert, operation="insert")
+            except Exception:
+                # Lance commits atomically, but a transport/runtime failure can
+                # be reported after the commit. Probe only this exceptional
+                # path so a Prefect retry cannot append the same document.
+                with self._measure_memory("storage_insert_recovery_probe"):
+                    committed = {
+                        doc_id
+                        for doc_id in inserted_doc_ids
+                        if self._contains_doc_id_latest(doc_id)
+                    }
+                if inserted_doc_ids and committed == inserted_doc_ids:
+                    self._completed_insert_doc_ids.update(committed)
+                    logger.warning(
+                        "Insert raised after commit for doc_ids=%s; treating as complete",
+                        sorted(committed),
+                    )
+                    return
+                raise
+            self._completed_insert_doc_ids.update(inserted_doc_ids)
 
     def _write_nodes_unlocked(
         self, nodes: list[TextNode], *, operation: str
@@ -1001,7 +1049,8 @@ class LanceDBStore:
     def delete_by_doc_ids(self, doc_ids: list[str]) -> None:
         """Remove documents without racing a concurrent rewrite of the same IDs."""
         with self._serialize_document_writes(doc_ids):
-            self._checkout_latest()
+            if not self._exclusive_writer_depth:
+                self._checkout_latest()
             self._delete_by_doc_ids_unlocked(doc_ids)
 
     def _delete_by_doc_ids_unlocked(self, doc_ids: list[str]) -> None:
@@ -1022,6 +1071,8 @@ class LanceDBStore:
                     logger.warning("Failed to delete doc %s: %s", doc_id, e)
                     if first_error is None:
                         first_error = e
+                    continue
+                self._completed_insert_doc_ids.discard(doc_id)
         if first_error is not None:
             raise first_error
 
@@ -1048,6 +1099,18 @@ class LanceDBStore:
             return self._vs.table.count_rows(f"doc_id = '{escaped_doc_id}'") > 0
 
         return self._run_read_with_recovery(_op, False)
+
+    def _contains_doc_id_latest(self, doc_id: str) -> bool:
+        """Probe the latest manifest without mutating the long-lived writer handle."""
+        table_path = self._table_path()
+        if not table_path.exists():
+            return False
+
+        import lance
+
+        escaped_doc_id = self._sql_escape(doc_id)
+        dataset = lance.dataset(str(table_path))
+        return dataset.count_rows(f"doc_id = '{escaped_doc_id}'") > 0
 
     def list_doc_mtimes(self) -> dict[str, float]:
         """Return {doc_id: mtime} for all docs in the store.
@@ -1257,13 +1320,28 @@ class LanceDBStore:
         return True
 
     def _compact_data_files(self) -> None:
-        """Compact through a fresh handle without decoding compatible vectors."""
-        import lance
-
+        """Compact in a worker whose native allocations are released on exit."""
         with self._measure_memory("lance_daily_compaction"):
-            lance.dataset(self._dataset_path()).optimize.compact_files(
-                compaction_mode="try_binary_copy"
-            )
+            command = [
+                sys.executable,
+                "-m",
+                "core.lance_maintenance",
+                "compact",
+                self._dataset_path(),
+            ]
+            try:
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    close_fds=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or str(exc)).strip()
+                raise RuntimeError(
+                    f"Lance compaction worker failed: {detail}"
+                ) from exc
 
     def _dataset_path(self) -> str:
         return str(Path(self.index_root) / f"{self.table_name}.lance")

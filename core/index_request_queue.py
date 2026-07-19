@@ -62,6 +62,7 @@ class IndexRequestQueue:
         )
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        connection.execute("PRAGMA synchronous=FULL")
         return connection
 
     def _initialize(self) -> None:
@@ -70,7 +71,6 @@ class IndexRequestQueue:
                 try:
                     with self._connect() as connection:
                         connection.execute("PRAGMA journal_mode=WAL")
-                        connection.execute("PRAGMA synchronous=FULL")
                         connection.execute(
                             """
                             CREATE TABLE IF NOT EXISTS index_requests (
@@ -136,7 +136,6 @@ class IndexRequestQueue:
         target = normalize_target(target)
         now = _utc_now()
         with self._connect() as connection:
-            connection.execute("PRAGMA synchronous=FULL")
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """

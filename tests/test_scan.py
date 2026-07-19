@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import flow_index_vault as fiv
 
 from flow_index_vault import (
     scan_vault_task,
@@ -18,6 +19,79 @@ from flow_index_vault import (
     _flush_taxonomy_usage,
     write_index_metadata_task,
 )
+
+
+def test_full_writer_loads_config_once_and_clears_runtime_after_lock(tmp_path):
+    config = {
+        "index_root": str(tmp_path / "index"),
+        "lancedb": {"table": "chunks"},
+    }
+    seen = {}
+
+    class ObservedLock:
+        def __enter__(self):
+            assert _RUNTIME == {"active": "targeted"}
+
+        def __exit__(self, *_args):
+            return False
+
+    @fiv._serialize_index_writer(blocking=True)
+    def core(config_path="config.yaml", *, locked_config=None):
+        seen["config"] = locked_config
+        seen["runtime"] = dict(_RUNTIME)
+
+    _RUNTIME.clear()
+    _RUNTIME["active"] = "targeted"
+    with patch("flow_index_vault.load_config", return_value=config) as load, patch(
+        "flow_index_vault.index_write_lock", return_value=ObservedLock()
+    ):
+        core("config.yaml")
+
+    load.assert_called_once_with("config.yaml")
+    assert seen == {"config": config, "runtime": {}}
+
+
+def test_no_change_source_scoped_sweep_drains_other_source_queue(tmp_path):
+    from core.index_request_queue import IndexRequestQueue
+
+    config = {
+        "index_root": str(tmp_path / "index"),
+        "lancedb": {"table": "chunks"},
+        "sources": [
+            {"name": "documents", "type": "filesystem", "root": "/docs"},
+            {"name": "mail", "type": "filesystem", "root": "/mail"},
+        ],
+    }
+    queue = IndexRequestQueue(config["index_root"])
+    queue.enqueue("chunks", "mail", "inbound.pdf")
+    store = MagicMock()
+    registry = MagicMock()
+
+    @fiv._serialize_index_writer(blocking=True)
+    def no_change_core(
+        config_path="config.yaml",
+        source_name=None,
+        *,
+        locked_config=None,
+    ):
+        assert source_name == "documents"
+        _RUNTIME["store"] = store
+        _RUNTIME["doc_id_store"] = registry
+
+    def process(loaded_config, request, passed_store, passed_registry):
+        assert loaded_config is config
+        assert request.source_name == "mail"
+        assert passed_store is store
+        assert passed_registry is registry
+        return {"status": "indexed", "target": request.target}
+
+    with patch("flow_index_vault.load_config", return_value=config), patch(
+        "flow_index_vault._index_document_unlocked", side_effect=process
+    ) as worker:
+        no_change_core("config.yaml", source_name="documents")
+
+    worker.assert_called_once()
+    assert queue.pending("chunks", limit=10) == []
 
 
 # --- _matches_any ---
@@ -758,8 +832,9 @@ def test_process_doc_task_queues_taxonomy_usage_without_worker_write(
             captured["write_mode"] = "upsert"
             captured["metadata"] = nodes[0].metadata
 
-        def insert_nodes(self, nodes):
+        def insert_nodes(self, nodes, *, known_absent=False):
             captured["write_mode"] = "insert"
+            captured["known_absent"] = known_absent
             captured["metadata"] = nodes[0].metadata
 
     class FakeEmbed:
@@ -823,6 +898,8 @@ def test_process_doc_task_queues_taxonomy_usage_without_worker_write(
 
     assert captured["record_taxonomy_usage"] is False
     assert captured["write_mode"] == expected_write_mode
+    if expected_write_mode == "insert":
+        assert captured["known_absent"] is True
     assert accumulator.snapshot() == {
         "folder:Projects/Renovation": 1,
         "tag:renovation": 1,
@@ -869,8 +946,8 @@ def test_scan_symlink_cycle_does_not_hang():
 # --- _RUNTIME cleared at flow start (Fix 3) ---
 
 
-def test_runtime_cleared_at_flow_start():
-    """_RUNTIME should be cleared at the start of index_vault_flow."""
+def test_runtime_not_cleared_until_full_writer_acquires_session():
+    """A waiting/failed full writer must not erase an active targeted runtime."""
     _RUNTIME["stale_key"] = "leftover"
     _RUNTIME["_warnings"] = ["old warning"]
 
@@ -883,8 +960,8 @@ def test_runtime_cleared_at_flow_start():
                 from flow_index_vault import index_vault_flow
                 index_vault_flow.fn("dummy.yaml")
 
-    assert "stale_key" not in _RUNTIME
-    assert "_warnings" not in _RUNTIME
+    assert _RUNTIME["stale_key"] == "leftover"
+    assert _RUNTIME["_warnings"] == ["old warning"]
 
 
 def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
