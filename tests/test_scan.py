@@ -1,6 +1,7 @@
 """Tests for scan_vault_task and glob matching."""
 
 import os
+import inspect
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -36,8 +37,8 @@ def test_full_writer_loads_config_once_and_clears_runtime_after_lock(tmp_path):
             return False
 
     @fiv._serialize_index_writer(blocking=True)
-    def core(config_path="config.yaml", *, locked_config=None):
-        seen["config"] = locked_config
+    def core(config_path="config.yaml"):
+        seen["config"] = fiv._LOCKED_INDEX_CONFIG.get()
         seen["runtime"] = dict(_RUNTIME)
 
     _RUNTIME.clear()
@@ -49,6 +50,13 @@ def test_full_writer_loads_config_once_and_clears_runtime_after_lock(tmp_path):
 
     load.assert_called_once_with("config.yaml")
     assert seen == {"config": config, "runtime": {}}
+
+
+def test_full_flow_public_signature_hides_internal_locked_config():
+    assert list(inspect.signature(fiv.index_vault_flow.fn).parameters) == [
+        "config_path",
+        "source_name",
+    ]
 
 
 def test_no_change_source_scoped_sweep_drains_other_source_queue(tmp_path):
@@ -71,8 +79,6 @@ def test_no_change_source_scoped_sweep_drains_other_source_queue(tmp_path):
     def no_change_core(
         config_path="config.yaml",
         source_name=None,
-        *,
-        locked_config=None,
     ):
         assert source_name == "documents"
         _RUNTIME["store"] = store

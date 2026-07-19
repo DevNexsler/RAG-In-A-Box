@@ -178,6 +178,24 @@ def test_delete_invalidates_completed_insert_cache_for_standalone_reinsert():
         assert store.count_chunks() == 1
 
 
+def test_failed_upsert_after_delete_invalidates_completed_insert_cache():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        node = _make_node("again.md", "c:0", "restored", [0.1] * 768)
+        store.insert_nodes([node], known_absent=True)
+
+        with patch.object(
+            type(store._vs), "add", side_effect=RuntimeError("add failed")
+        ):
+            with pytest.raises(RuntimeError, match="add failed"):
+                store.upsert_nodes([node])
+
+        assert store.contains_doc_id("again.md") is False
+        store.insert_nodes([node])
+        assert store.contains_doc_id("again.md") is True
+        assert store.count_chunks() == 1
+
+
 def test_insert_nodes_is_idempotent_across_store_handles():
     """A stale new-doc snapshot or ambiguous retry must not append duplicates."""
     import lance
@@ -1648,6 +1666,44 @@ def test_pre_index_compaction_refreshes_store_for_following_writes():
 
         assert set(store.list_doc_ids()) == {"a.md", "b.md"}
         assert len(store.keyword_search("quasar", top_k=5)) == 1
+
+
+def test_exclusive_pre_index_compaction_refreshes_parent_handle_exactly_once():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes(
+            [_make_node("seed.md", "c:0", "seed", [0.1] * 768)]
+        )
+
+        with patch.object(store, "_compaction_due", return_value=True), patch.object(
+            store, "_compact_data_files"
+        ), patch.object(store, "_checkout_latest") as checkout:
+            with store.exclusive_writer_session():
+                store.prepare_indexing_maintenance()
+                store.insert_nodes(
+                    [_make_node("new.md", "c:0", "new", [0.2] * 768)]
+                )
+
+        checkout.assert_called_once_with()
+
+
+def test_exclusive_deletion_only_compaction_refreshes_parent_handle_once():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes(
+            [_make_node("seed.md", "c:0", "seed", [0.1] * 768)]
+        )
+        store.create_fts_index()
+
+        with patch.object(store, "_compaction_due", return_value=True), patch.object(
+            store, "_compact_data_files"
+        ), patch.object(store, "_checkout_latest") as checkout, patch.object(
+            store, "_merge_index_deltas"
+        ), patch.object(store, "_finish_index_maintenance"):
+            with store.exclusive_writer_session():
+                store.ensure_fts_index(compact_data=True)
+
+        checkout.assert_called_once_with()
 
 
 def test_post_index_maintenance_skips_compaction_then_merges_tags_and_prunes():

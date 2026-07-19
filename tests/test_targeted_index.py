@@ -466,6 +466,71 @@ def test_index_document_flow_enqueue_failure_never_attempts_table_lock(
     lock.assert_not_called()
 
 
+def test_index_document_flow_rejects_untargetable_source_before_enqueue(
+    tmp_path, monkeypatch
+):
+    config = _fs_config(tmp_path / "docs", tmp_path / "index")
+    config["sources"].append(
+        {"type": "postgres", "name": "database", "query": "SELECT 1"}
+    )
+    monkeypatch.setattr(fiv, "load_config", lambda _path: config)
+
+    with patch("flow_index_vault.IndexRequestQueue") as queue:
+        with pytest.raises(ValueError, match="Unknown source_name"):
+            fiv.index_document_flow(target="x.pdf", source_name="bogus")
+        with pytest.raises(ValueError, match="not a filesystem source"):
+            fiv.index_document_flow(target="x.pdf", source_name="database")
+
+    queue.assert_not_called()
+
+
+def test_index_document_flow_coalesces_relative_absolute_and_alias_targets(
+    tmp_path, monkeypatch
+):
+    from core.index_request_queue import IndexRequestQueue
+    from core.index_write_lock import index_write_lock
+
+    root, aliased = _make_attachment(
+        tmp_path,
+        "email-attachments/report@00abc@.pdf",
+    )
+    config = _fs_config(root, tmp_path / "index")
+    monkeypatch.setattr(fiv, "load_config", lambda _path: config)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_full_writer():
+        with index_write_lock(config["index_root"], "chunks"):
+            acquired.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_full_writer)
+    holder.start()
+    try:
+        assert acquired.wait(5)
+        first = fiv.index_document_flow(
+            target="email-attachments/report.pdf",
+            source_name="documents",
+        )
+        second = fiv.index_document_flow(
+            target=str(aliased.resolve()),
+            source_name="documents",
+            force=True,
+        )
+    finally:
+        release.set()
+        holder.join(5)
+
+    assert first["target"] == second["target"] == (
+        "email-attachments/report@00abc@.pdf"
+    )
+    assert (first["revision"], second["revision"]) == (1, 2)
+    [pending] = IndexRequestQueue(config["index_root"]).pending(
+        "chunks", limit=10
+    )
+    assert pending.force is True
+
+
 def test_drain_prioritizes_current_request_is_bounded_and_retains_failures(
     tmp_path,
 ):

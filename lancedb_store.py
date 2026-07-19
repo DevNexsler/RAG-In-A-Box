@@ -885,6 +885,8 @@ class LanceDBStore:
                             pass  # Table not created yet on first run
                         except Exception as e:
                             logger.warning("Failed to delete old data for %s: %s", doc_id, e)
+                            continue
+                        self._completed_insert_doc_ids.discard(doc_id)
             # Add new nodes
             try:
                 with self._measure_memory("storage_add", **memory_fields):
@@ -1222,7 +1224,7 @@ class LanceDBStore:
         if not has_fts:
             if compact_data:
                 self.prepare_indexing_maintenance()
-                table.checkout_latest()
+                table = self._vs.table
             table.create_fts_index(text_key, use_tantivy=False)
             logger.info("FTS index created on column %r", text_key)
             from datetime import date
@@ -1232,7 +1234,7 @@ class LanceDBStore:
         self._optimize_and_prune(table, compact_data=compact_data)
         logger.info("FTS index optimized (incremental merge)")
 
-    def prepare_indexing_maintenance(self) -> None:
+    def prepare_indexing_maintenance(self) -> bool:
         """Run due data compaction before a memory-heavy indexing phase.
 
         Flows that will process documents call this against an existing table
@@ -1243,7 +1245,7 @@ class LanceDBStore:
         from datetime import date
 
         self._prune_versions("pre-maintenance")
-        self._compact_data_files_if_due(date.today())
+        return self._compact_data_files_if_due(date.today())
 
     def _optimize_and_prune(self, table, *, compact_data: bool = True) -> None:
         """Merge index deltas, refresh restore points, and prune old versions.
@@ -1317,6 +1319,10 @@ class LanceDBStore:
             return False
 
         self._record_compaction(today)
+        # The child committed a new manifest using an independent Lance
+        # session. Refresh the parent's one stable handle exactly once before
+        # any write, merge, or restore-point operation uses it.
+        self._checkout_latest()
         return True
 
     def _compact_data_files(self) -> None:

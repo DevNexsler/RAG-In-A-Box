@@ -42,7 +42,7 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from contextlib import nullcontext
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -108,6 +108,10 @@ _tracer = get_tracer("pipeline")
 # Module-level runtime context populated by the flow, read by tasks.
 # Avoids passing unpickleable objects as Prefect task arguments.
 _RUNTIME: dict[str, Any] = {}
+_LOCKED_INDEX_CONFIG: ContextVar[dict | None] = ContextVar(
+    "locked_index_config",
+    default=None,
+)
 
 
 def _measure_index_memory(subphase: str, doc_id: str):
@@ -1960,7 +1964,6 @@ def _serialize_index_writer(*, blocking: bool):
     def decorate(fn):
         @wraps(fn)
         def locked(config_path: str = "config.yaml", *args, **kwargs):
-            kwargs.pop("locked_config", None)
             config = load_config(config_path)
             index_root = Path(config["index_root"])
             table_name = config.get("lancedb", {}).get("table", "chunks")
@@ -1970,13 +1973,9 @@ def _serialize_index_writer(*, blocking: bool):
                 blocking=blocking,
             ):
                 _RUNTIME.clear()
+                config_token = _LOCKED_INDEX_CONFIG.set(config)
                 try:
-                    result = fn(
-                        config_path,
-                        *args,
-                        locked_config=config,
-                        **kwargs,
-                    )
+                    result = fn(config_path, *args, **kwargs)
                     store = _RUNTIME.get("store")
                     doc_id_store = _RUNTIME.get("doc_id_store")
                     if store is not None and doc_id_store is not None:
@@ -1991,7 +1990,10 @@ def _serialize_index_writer(*, blocking: bool):
                         )
                     return result
                 finally:
-                    _close_exclusive_writer_stores()
+                    try:
+                        _close_exclusive_writer_stores()
+                    finally:
+                        _LOCKED_INDEX_CONFIG.reset(config_token)
 
         return locked
 
@@ -2003,14 +2005,12 @@ def _serialize_index_writer(*, blocking: bool):
 def index_vault_flow(
     config_path: str = "config.yaml",
     source_name: str | None = None,
-    *,
-    locked_config: dict | None = None,
 ) -> None:
     """Scan vault, diff with store, process new/updated docs, delete removed, log stats."""
     _RUNTIME.clear()
     import time
     logger = get_run_logger()
-    config = locked_config if locked_config is not None else load_config(config_path)
+    config = _LOCKED_INDEX_CONFIG.get() or load_config(config_path)
     memory_observer = MemoryObserver.from_config(config, logger)
     _RUNTIME["memory_observer"] = memory_observer
     memory_observer.sample("phase_start", phase="initialize")
@@ -2618,6 +2618,40 @@ def _find_alias_variant(abs_path: Path) -> Path | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _normalize_index_request_target(
+    config: dict,
+    source_name: str,
+    target: str,
+) -> str:
+    """Canonicalize every filesystem alias before it becomes a queue key."""
+    src_cfg = _find_source_config(config, source_name)
+    if src_cfg.get("type", "filesystem") != "filesystem":
+        raise ValueError(f"source {source_name!r} is not a filesystem source")
+
+    raw_target = str(target).strip()
+    if not raw_target:
+        raise ValueError("target must not be empty")
+    if "::" in raw_target:
+        return raw_target
+
+    root = Path(src_cfg["root"]).resolve()
+    candidate = Path(raw_target)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        rel_path = candidate.resolve().relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"target {raw_target!r} is outside source {source_name!r}"
+        ) from exc
+
+    if not candidate.is_file():
+        alias = _find_alias_variant(candidate)
+        if alias is not None:
+            rel_path = alias.resolve().relative_to(root)
+    return rel_path.as_posix()
+
+
 def resolve_single_record(
     config: dict, source_name: str, target: str, doc_id_store: DocIDStore
 ) -> dict | None:
@@ -2963,6 +2997,7 @@ def index_document_flow(
     config = load_config(config_path)
     index_root = Path(config["index_root"])
     table_name = config.get("lancedb", {}).get("table", "chunks")
+    target = _normalize_index_request_target(config, source_name, target)
     queue = IndexRequestQueue(index_root)
     request = queue.enqueue(
         table_name,
