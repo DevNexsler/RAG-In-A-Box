@@ -1,10 +1,14 @@
 """LanceDB storage via LlamaIndex's LanceDBVectorStore. Implements our StorageInterface."""
 
+import fcntl
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 from collections import Counter
 from contextlib import contextmanager, nullcontext
@@ -70,6 +74,8 @@ _DEFAULT_DAILY_RESTORE_POINT_DAYS = 7
 _DAILY_TAG_PREFIX = "daily-"
 _DOCUMENT_WRITE_LOCK_STRIPES = 256
 _COMPACTION_MARKER_SUFFIX = ".last-compaction"
+_PROCESS_DOCUMENT_LOCKS: dict[str, threading.RLock] = {}
+_PROCESS_DOCUMENT_LOCKS_GUARD = threading.Lock()
 
 
 def _lance_version_retention_minutes() -> float:
@@ -214,14 +220,8 @@ class LanceDBStore:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
         self._schema_lock = threading.Lock()
-        # Lance delete+add upserts are not atomic. Duplicate discovery can send
-        # several workers to rewrite one canonical document at once, so stripe
-        # writes by document ID while preserving concurrency across documents.
-        # RLocks allow a canonical metadata rewrite to call upsert_nodes while
-        # already owning the canonical stripe.
-        self._document_write_locks = tuple(
-            threading.RLock() for _ in range(_DOCUMENT_WRITE_LOCK_STRIPES)
-        )
+        self._completed_insert_doc_ids: set[str] = set()
+        self._exclusive_writer_depth = 0
         self._memory_observer = None
         self._vs = self._build_vector_store()
         self._ensure_scalar_index()
@@ -243,6 +243,15 @@ class LanceDBStore:
         """Attach optional index memory instrumentation to storage writes."""
         self._memory_observer = observer
 
+    @contextmanager
+    def exclusive_writer_session(self):
+        """Use one stable handle while an external table lock excludes peers."""
+        self._exclusive_writer_depth += 1
+        try:
+            yield self
+        finally:
+            self._exclusive_writer_depth -= 1
+
     def _measure_memory(self, subphase: str, **fields: Any):
         observer = self._memory_observer
         measure = getattr(observer, "measure", None)
@@ -256,20 +265,50 @@ class LanceDBStore:
 
     @contextmanager
     def _serialize_document_writes(self, doc_ids: set[str] | list[str]):
-        """Serialize non-atomic Lance rewrites that target the same document."""
+        """Serialize same-document rewrites across threads and processes."""
         stripe_indexes = sorted(
             {
-                hash(str(doc_id)) % len(self._document_write_locks)
+                int.from_bytes(
+                    hashlib.blake2b(str(doc_id).encode(), digest_size=2).digest(),
+                    "big",
+                )
+                % _DOCUMENT_WRITE_LOCK_STRIPES
                 for doc_id in doc_ids
                 if doc_id
             }
         )
-        locks = [self._document_write_locks[index] for index in stripe_indexes]
+        lock_root = Path(self.index_root) / ".lancedb-write-locks"
+        lock_paths = [
+            lock_root / f"{self.table_name}-{index:03d}.lock"
+            for index in stripe_indexes
+        ]
+        with _PROCESS_DOCUMENT_LOCKS_GUARD:
+            locks = [
+                _PROCESS_DOCUMENT_LOCKS.setdefault(
+                    str(path.resolve()), threading.RLock()
+                )
+                for path in lock_paths
+            ]
         for lock in locks:
             lock.acquire()
+        lock_files = []
         try:
+            lock_root.mkdir(parents=True, exist_ok=True)
+            for path in lock_paths:
+                lock_file = path.open("a+")
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    lock_file.close()
+                    raise
+                lock_files.append(lock_file)
             yield
         finally:
+            for lock_file in reversed(lock_files):
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                finally:
+                    lock_file.close()
             for lock in reversed(locks):
                 lock.release()
 
@@ -343,9 +382,15 @@ class LanceDBStore:
         self._ensure_scalar_index()
 
     def _ensure_scalar_index(self) -> None:
-        """Create a BTREE scalar index on doc_id for O(log n) filtered lookups."""
+        """Create the doc-id BTree once; never replace it on routine opens."""
         try:
-            self._vs.table.create_scalar_index("doc_id", index_type="BTREE", replace=True)
+            table = self._vs.table
+            for index in table.list_indices():
+                columns = list(getattr(index, "columns", ()) or ())
+                index_type = str(getattr(index, "index_type", "")).upper()
+                if columns == ["doc_id"] and index_type == "BTREE":
+                    return
+            table.create_scalar_index("doc_id", index_type="BTREE", replace=True)
         except TableNotFoundError:
             pass  # Table not created yet on first run
         except Exception as e:
@@ -396,6 +441,13 @@ class LanceDBStore:
 
     def _reopen_vector_store(self) -> None:
         self._vs = self._build_vector_store()
+
+    def _checkout_latest(self) -> None:
+        """Refresh an existing Lance table handle without rebuilding the store."""
+        try:
+            self._vs.table.checkout_latest()
+        except TableNotFoundError:
+            pass
 
     def _run_read_with_recovery(self, operation, default_on_missing):
         try:
@@ -712,14 +764,78 @@ class LanceDBStore:
     # --- StorageInterface methods ---
 
     def upsert_nodes(self, nodes: list[TextNode]) -> None:
-        """Atomically replace each document relative to peer writer threads."""
+        """Replace each document while excluding peer writers."""
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
         with self._serialize_document_writes(doc_ids):
-            self._upsert_nodes_unlocked(nodes)
+            if not self._exclusive_writer_depth:
+                self._checkout_latest()
+            self._write_nodes_unlocked(nodes, operation="upsert")
 
-    def _upsert_nodes_unlocked(self, nodes: list[TextNode]) -> None:
-        """Delete existing nodes for each doc_id, then add new ones."""
-        with _tracer.start_as_current_span("store.upsert"):
+    def insert_nodes(
+        self, nodes: list[TextNode], *, known_absent: bool = False
+    ) -> None:
+        """Insert documents once, avoiding delete-only transactions.
+
+        Full sweeps pass ``known_absent=True`` while holding the table-level
+        writer session; their authoritative pre-run snapshot therefore needs
+        no per-document Lance refresh. Standalone callers retain a fresh
+        existence probe under the document lock.
+        """
+        doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
+        with self._serialize_document_writes(doc_ids):
+            existing_doc_ids = doc_ids & self._completed_insert_doc_ids
+            if not known_absent and not self._exclusive_writer_depth:
+                # A standalone caller has no table-level session proving its
+                # snapshot remains current. Probe a fresh, short-lived dataset
+                # while the document lock excludes peer writers.
+                with self._measure_memory("storage_insert_probe"):
+                    existing_doc_ids.update(
+                        doc_id
+                        for doc_id in doc_ids - existing_doc_ids
+                        if self._contains_doc_id_latest(doc_id)
+                    )
+            nodes_to_insert = [
+                node
+                for node in nodes
+                if not node.ref_doc_id or node.ref_doc_id not in existing_doc_ids
+            ]
+            if not nodes_to_insert:
+                logger.info(
+                    "Skipped insert for documents already present: %s",
+                    sorted(existing_doc_ids),
+                )
+                return
+            inserted_doc_ids = {
+                node.ref_doc_id for node in nodes_to_insert if node.ref_doc_id
+            }
+            try:
+                self._write_nodes_unlocked(nodes_to_insert, operation="insert")
+            except Exception:
+                # Lance commits atomically, but a transport/runtime failure can
+                # be reported after the commit. Probe only this exceptional
+                # path so a Prefect retry cannot append the same document.
+                with self._measure_memory("storage_insert_recovery_probe"):
+                    committed = {
+                        doc_id
+                        for doc_id in inserted_doc_ids
+                        if self._contains_doc_id_latest(doc_id)
+                    }
+                if inserted_doc_ids and committed == inserted_doc_ids:
+                    self._completed_insert_doc_ids.update(committed)
+                    logger.warning(
+                        "Insert raised after commit for doc_ids=%s; treating as complete",
+                        sorted(committed),
+                    )
+                    return
+                raise
+            self._completed_insert_doc_ids.update(inserted_doc_ids)
+
+    def _write_nodes_unlocked(
+        self, nodes: list[TextNode], *, operation: str
+    ) -> None:
+        """Write nodes, deleting prior chunks only for replacement updates."""
+        delete_existing = operation == "upsert"
+        with _tracer.start_as_current_span(f"store.{operation}"):
             if not nodes:
                 return
 
@@ -756,25 +872,38 @@ class LanceDBStore:
                             if new_fields:
                                 self._evolve_metadata_schema(new_fields)
 
-            # Delete old data for those doc_ids first
-            with self._measure_memory("storage_delete", **memory_fields):
-                for doc_id in doc_ids:
-                    try:
-                        self._vs.delete(doc_id)
-                    except TableNotFoundError:
-                        pass  # Table not created yet on first run
-                    except Exception as e:
-                        logger.warning("Failed to delete old data for %s: %s", doc_id, e)
+            # New documents are proven absent by the flow diff. Avoid a no-op
+            # delete: Lance commits it as a full metadata version anyway, so a
+            # large insert batch otherwise doubles manifests and retained
+            # transaction state before final pruning.
+            if delete_existing:
+                with self._measure_memory("storage_delete", **memory_fields):
+                    for doc_id in doc_ids:
+                        try:
+                            self._vs.delete(doc_id)
+                        except TableNotFoundError:
+                            pass  # Table not created yet on first run
+                        except Exception as e:
+                            logger.warning("Failed to delete old data for %s: %s", doc_id, e)
+                            continue
+                        self._completed_insert_doc_ids.discard(doc_id)
             # Add new nodes
             try:
                 with self._measure_memory("storage_add", **memory_fields):
                     self._vs.add(nodes)
             except Exception:
-                logger.critical(
-                    "Failed to add %d nodes for doc_ids=%s after old chunks were deleted; "
-                    "these docs will self-heal on the next index run",
-                    len(nodes), sorted(doc_ids),
-                )
+                if delete_existing:
+                    logger.critical(
+                        "Failed to add %d nodes for doc_ids=%s after old chunks were deleted; "
+                        "these docs will self-heal on the next index run",
+                        len(nodes), sorted(doc_ids),
+                    )
+                else:
+                    logger.critical(
+                        "Failed to insert %d nodes for doc_ids=%s; "
+                        "these docs will self-heal on the next index run",
+                        len(nodes), sorted(doc_ids),
+                    )
                 raise
 
     def _load_unique_canonical_rows(
@@ -818,6 +947,7 @@ class LanceDBStore:
     ) -> None:
         """Single-flight canonical metadata rewrites by canonical document."""
         with self._serialize_document_writes([canonical_doc_id]):
+            self._checkout_latest()
             self._update_canonical_duplicate_metadata_unlocked(
                 canonical_doc_id, duplicate_refs
             )
@@ -916,11 +1046,13 @@ class LanceDBStore:
             node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=canonical_doc_id)
             canonical_nodes.append(node)
 
-        self.upsert_nodes(canonical_nodes)
+        self._write_nodes_unlocked(canonical_nodes, operation="upsert")
 
     def delete_by_doc_ids(self, doc_ids: list[str]) -> None:
         """Remove documents without racing a concurrent rewrite of the same IDs."""
         with self._serialize_document_writes(doc_ids):
+            if not self._exclusive_writer_depth:
+                self._checkout_latest()
             self._delete_by_doc_ids_unlocked(doc_ids)
 
     def _delete_by_doc_ids_unlocked(self, doc_ids: list[str]) -> None:
@@ -941,6 +1073,8 @@ class LanceDBStore:
                     logger.warning("Failed to delete doc %s: %s", doc_id, e)
                     if first_error is None:
                         first_error = e
+                    continue
+                self._completed_insert_doc_ids.discard(doc_id)
         if first_error is not None:
             raise first_error
 
@@ -967,6 +1101,18 @@ class LanceDBStore:
             return self._vs.table.count_rows(f"doc_id = '{escaped_doc_id}'") > 0
 
         return self._run_read_with_recovery(_op, False)
+
+    def _contains_doc_id_latest(self, doc_id: str) -> bool:
+        """Probe the latest manifest without mutating the long-lived writer handle."""
+        table_path = self._table_path()
+        if not table_path.exists():
+            return False
+
+        import lance
+
+        escaped_doc_id = self._sql_escape(doc_id)
+        dataset = lance.dataset(str(table_path))
+        return dataset.count_rows(f"doc_id = '{escaped_doc_id}'") > 0
 
     def list_doc_mtimes(self) -> dict[str, float]:
         """Return {doc_id: mtime} for all docs in the store.
@@ -1061,7 +1207,7 @@ class LanceDBStore:
         table.create_fts_index(text_key, use_tantivy=False, replace=True)
         logger.info("FTS index created/rebuilt on column %r", text_key)
 
-    def ensure_fts_index(self) -> None:
+    def ensure_fts_index(self, *, compact_data: bool = True) -> None:
         """Make sure the native FTS index exists and is optimized.
 
         Creates the index if missing; otherwise merges newly written rows into
@@ -1076,18 +1222,40 @@ class LanceDBStore:
             for idx in table.list_indices()
         )
         if not has_fts:
+            if compact_data:
+                self.prepare_indexing_maintenance()
+                table = self._vs.table
             table.create_fts_index(text_key, use_tantivy=False)
             logger.info("FTS index created on column %r", text_key)
+            from datetime import date
+
+            self._finish_index_maintenance(table, date.today())
             return
-        self._optimize_and_prune(table)
+        self._optimize_and_prune(table, compact_data=compact_data)
         logger.info("FTS index optimized (incremental merge)")
 
-    def _optimize_and_prune(self, table) -> None:
-        """Per-run Lance maintenance: prune dead versions, merge index deltas,
-        compact data files at most once per calendar day, refresh restore
-        points.
+    def prepare_indexing_maintenance(self) -> bool:
+        """Run due data compaction before a memory-heavy indexing phase.
 
-        Full compaction (table.optimize()) rewrites every fragment, and each
+        Flows that will process documents call this against an existing table
+        before allocating document-processing state. Finalization can then
+        merge index deltas and refresh restore points without overlapping the
+        daily full-table rewrite with that state.
+        """
+        from datetime import date
+
+        self._prune_versions("pre-maintenance")
+        return self._compact_data_files_if_due(date.today())
+
+    def _optimize_and_prune(self, table, *, compact_data: bool = True) -> None:
+        """Merge index deltas, refresh restore points, and prune old versions.
+
+        ``compact_data`` preserves the all-in-one behavior for ordinary callers.
+        Indexing flows that already attempted pre-processing maintenance disable
+        it here so a failed compaction is not retried while processing state is
+        still resident.
+
+        Full data compaction rewrites every fragment, and each
         retained daily restore-point tag pins the superseded fragments until
         that tag expires — running it every ~15-minute indexing cycle held a
         full rewrite of the table per cycle per tag on disk and grew a ~5 GB
@@ -1106,46 +1274,80 @@ class LanceDBStore:
         in-flight-write protection is only overridden in stopped-service
         repair, never routinely).
 
-        Compaction, tagging, and pruning are housekeeping: failures are
-        logged, never raised, so an indexing run always completes (a failed
-        compaction leaves the marker unwritten and retries next run). Only
-        the index-delta merge propagates, letting the flow fall back to a
-        full FTS rebuild.
+        Compaction, tagging, and pruning are housekeeping: failures are logged,
+        never raised. A failed compaction leaves the marker unwritten for a
+        later run. Only the index-delta merge propagates, letting the flow fall
+        back to a full FTS rebuild.
         """
         from datetime import date
 
+        today = date.today()
+        if compact_data:
+            self._prune_versions("pre-maintenance")
+            self._compact_data_files_if_due(today)
+
+        self._merge_index_deltas()
+        self._finish_index_maintenance(table, today)
+
+    def _finish_index_maintenance(self, table, today) -> None:
+        """Stage a safe tag, expire/prune, then retag exact latest."""
+        if not self._tag_latest_restore_point(table, today):
+            return
+        self._expire_restore_points(table, today)
+        self._prune_versions("post-expiry")
+        self._tag_latest_restore_point(table, today)
+
+    def _compact_data_files_if_due(self, today) -> bool:
+        """Best-effort daily data compaction with durable success cadence."""
+        if not self._compaction_due(today):
+            return False
+
         from core.resilience import call_with_retry
 
-        today = date.today()
-        self._prune_versions("pre-maintenance")
+        try:
+            call_with_retry(
+                self._compact_data_files,
+                attempts=3,
+                backoff=(2.0, 5.0),
+                label="lance daily compaction",
+                classify=_is_retryable_commit_conflict,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Daily Lance compaction failed (%s); retrying next run", exc
+            )
+            return False
 
-        if self._compaction_due(today):
+        self._record_compaction(today)
+        # The child committed a new manifest using an independent Lance
+        # session. Refresh the parent's one stable handle exactly once before
+        # any write, merge, or restore-point operation uses it.
+        self._checkout_latest()
+        return True
+
+    def _compact_data_files(self) -> None:
+        """Compact in a worker whose native allocations are released on exit."""
+        with self._measure_memory("lance_daily_compaction"):
+            command = [
+                sys.executable,
+                "-m",
+                "core.lance_maintenance",
+                "compact",
+                self._dataset_path(),
+            ]
             try:
-                def _compact():
-                    # The per-run index merge commits at the dataset level, so
-                    # a cached handle can be behind the latest version — its
-                    # optimize would abort on a Retryable commit conflict.
-                    table.checkout_latest()
-                    table.optimize()  # compacts data files + merges index deltas
-
-                call_with_retry(
-                    _compact,
-                    attempts=3,
-                    backoff=(2.0, 5.0),
-                    label="lance daily compaction",
-                    classify=_is_retryable_commit_conflict,
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    close_fds=True,
+                    text=True,
                 )
-                self._record_compaction(today)
-            except Exception as exc:
-                logger.warning(
-                    "Daily Lance compaction failed (%s); retrying next run", exc
-                )
-                self._merge_index_deltas()
-        else:
-            self._merge_index_deltas()
-
-        self._manage_restore_points(table, today)
-        self._prune_versions("post-expiry")
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or str(exc)).strip()
+                raise RuntimeError(
+                    f"Lance compaction worker failed: {detail}"
+                ) from exc
 
     def _dataset_path(self) -> str:
         return str(Path(self.index_root) / f"{self.table_name}.lance")
@@ -1231,16 +1433,19 @@ class LanceDBStore:
         """Keep exactly N daily version tags (today plus N-1 prior days) as
         logical restore points.
 
-        Points today's `daily-<date>` tag at the current (just-compacted)
-        version and drops daily tags beyond the window so their versions
-        become reclaimable. N = 0 disables the feature and removes previously
-        created daily tags; tags that are not ours (no daily- date encoding)
-        are never touched. Best-effort: any failure is logged, never raised
-        (a missed tag is reconciled next run)."""
+        Compatibility wrapper for callers outside the indexing finalizer. The
+        finalizer stages today's tag before destructive work, expires old
+        tags, prunes, then retags because cleanup can commit a metadata-only
+        Lance version.
+        """
+        if not self._tag_latest_restore_point(table, today):
+            return
+        self._expire_restore_points(table, today)
+
+    def _expire_restore_points(self, table, today) -> None:
+        """Drop expired daily tags before pruning; never touch manual tags."""
         days = _daily_restore_point_days()
         try:
-            # Tag the true latest version, not a stale cached one — a tag on
-            # an old version pins its superseded data files (#0232).
             table.checkout_latest()
             tags = table.tags
             existing = set(tags.list())
@@ -1251,13 +1456,6 @@ class LanceDBStore:
                         tags.delete(tag_name)
                 return
 
-            name = _daily_tag_name(today)
-            version = table.version
-            if name in existing:
-                tags.update(name, version)
-            else:
-                tags.create(name, version)
-
             from datetime import timedelta
 
             cutoff = today - timedelta(days=days - 1)
@@ -1266,7 +1464,28 @@ class LanceDBStore:
                 if tag_date is not None and tag_date < cutoff:
                     tags.delete(tag_name)
         except Exception as exc:
+            logger.warning("Daily restore-point expiry skipped this run: %s", exc)
+
+    def _tag_latest_restore_point(self, table, today) -> bool:
+        """Pin latest state, returning false when destructive work must stop."""
+        if _daily_restore_point_days() <= 0:
+            return True
+        try:
+            # Tag the true latest version, not a stale cached one — a tag on
+            # an old version pins its superseded data files (#0232).
+            table.checkout_latest()
+            tags = table.tags
+            existing = set(tags.list())
+            name = _daily_tag_name(today)
+            version = table.version
+            if name in existing:
+                tags.update(name, version)
+            else:
+                tags.create(name, version)
+            return True
+        except Exception as exc:
             logger.warning("Daily restore-point tagging skipped this run: %s", exc)
+            return False
 
     def fts_available(self) -> bool:
         """Check if the FTS/tantivy index is operational (health check for file_status)."""
@@ -1404,6 +1623,52 @@ class LanceDBStore:
     # Metadata fields that should NOT be faceted (structural/numeric, not categorical)
     _NON_FACET_FIELDS = {"doc_id", "loc", "snippet", "mtime", "size", "title", "created"}
     _SAFE_CONTEXT_FACET_FIELDS = {"enr_context_confidence"}
+    _FACET_SCAN_BATCH_SIZE = 1024
+    _DYNAMIC_NON_FACET_FIELDS = {
+        "body",
+        "content",
+        "custom_meta",
+        "date",
+        "description",
+        "dimensions",
+        "facts",
+        "filename",
+        "hash",
+        "id",
+        "ids",
+        "json",
+        "modified",
+        "narrative",
+        "path",
+        "summary",
+        "text",
+        "timestamp",
+        "updated",
+        "uri",
+        "url",
+        "warning",
+    }
+    _DYNAMIC_NON_FACET_SUFFIXES = (
+        "_at",
+        "_body",
+        "_bytes",
+        "_content",
+        "_description",
+        "_facts",
+        "_filename",
+        "_hash",
+        "_id",
+        "_ids",
+        "_json",
+        "_narrative",
+        "_path",
+        "_summary",
+        "_text",
+        "_timestamp",
+        "_uri",
+        "_url",
+        "_warning",
+    )
 
     @classmethod
     def _dynamic_facet_fields(cls, available: set[str]) -> set[str]:
@@ -1413,21 +1678,26 @@ class LanceDBStore:
         return {
             field
             for field in candidates
-            if not field.startswith("enr_context_") or field in cls._SAFE_CONTEXT_FACET_FIELDS
+            if (
+                not field.startswith("_")
+                and not field.startswith("dup_")
+                and field not in cls._DYNAMIC_NON_FACET_FIELDS
+                and not field.endswith(cls._DYNAMIC_NON_FACET_SUFFIXES)
+                and (
+                    not field.startswith("enr_context_")
+                    or field in cls._SAFE_CONTEXT_FACET_FIELDS
+                )
+            )
         }
 
     def facets(self) -> dict:
         """Return distinct values and doc counts for all filterable fields.
 
-        Uses column projection to load only metadata fields — no vectors or text.
-        Deduplicates by doc_id so counts reflect documents, not chunks.
+        Streams bounded batches containing only metadata fields — no vectors or
+        text. Deduplicates by doc_id across batches so counts reflect documents,
+        not chunks.
         Tags are split on commas and counted individually.
         Dynamic fields (not in _FACET_KEY_MAP) are automatically included.
-
-        TODO(perf): This does a full table scan — O(chunks). Fine at ~15K chunks
-        (~200ms) but will get slow at 50K+. When that happens, write a
-        facets_cache.json at end of index_vault_flow and read from it here.
-        Cache invalidation is trivial: indexing is the only writer.
         """
         total_chunks = self.count_chunks()
         if total_chunks == 0:
@@ -1448,48 +1718,60 @@ class LanceDBStore:
             if "tags" in available:
                 projection["tags"] = "metadata.tags"
 
-            t = self._vs.table.search(None).select(projection).to_arrow()
+            batches = (
+                self._vs.table.search(None)
+                .select(projection)
+                .to_batches(batch_size=self._FACET_SCAN_BATCH_SIZE)
+            )
 
-            if len(t) == 0:
-                return {"total_docs": 0, "total_chunks": total_chunks}
-
-            # Deduplicate by doc_id and count facet values
+            # Deduplicate by doc_id and count facet values across batches.
             seen: set[str] = set()
             all_counted_fields = set(self._FACET_KEY_MAP.keys()) | dynamic_fields
             counters: dict[str, Counter] = {f: Counter() for f in all_counted_fields}
             tag_counter: Counter = Counter()
 
-            doc_ids = t["doc_id"].to_pylist()
-            field_columns: dict[str, list] = {}
-            for f in all_counted_fields:
-                try:
-                    field_columns[f] = t[f].to_pylist()
-                except KeyError:
-                    field_columns[f] = [None] * len(t)
-            try:
-                tags_col = t["tags"].to_pylist()
-            except KeyError:
-                tags_col = [None] * len(t)
-
-            for i, did in enumerate(doc_ids):
-                if not did or did in seen:
+            for batch in batches:
+                row_count = batch.num_rows
+                if row_count == 0:
                     continue
-                seen.add(did)
+                names = set(batch.schema.names)
+                doc_ids = batch.column(batch.schema.get_field_index("doc_id")).to_pylist()
+                field_columns = {
+                    field: (
+                        batch.column(batch.schema.get_field_index(field)).to_pylist()
+                        if field in names
+                        else [None] * row_count
+                    )
+                    for field in all_counted_fields
+                }
+                tags_col = (
+                    batch.column(batch.schema.get_field_index("tags")).to_pylist()
+                    if "tags" in names
+                    else [None] * row_count
+                )
 
-                for f in all_counted_fields:
-                    val = field_columns[f][i]
-                    if val and str(val).strip():
-                        for item in str(val).split(","):
-                            item = item.strip()
-                            if item:
-                                counters[f][item] += 1
+                for i, did in enumerate(doc_ids):
+                    if not did or did in seen:
+                        continue
+                    seen.add(did)
 
-                raw_tags = tags_col[i]
-                if raw_tags and str(raw_tags).strip():
-                    for tag in str(raw_tags).split(","):
-                        tag = tag.strip()
-                        if tag:
-                            tag_counter[tag] += 1
+                    for field in all_counted_fields:
+                        value = field_columns[field][i]
+                        if value and str(value).strip():
+                            for item in str(value).split(","):
+                                item = item.strip()
+                                if item:
+                                    counters[field][item] += 1
+
+                    raw_tags = tags_col[i]
+                    if raw_tags and str(raw_tags).strip():
+                        for tag in str(raw_tags).split(","):
+                            tag = tag.strip()
+                            if tag:
+                                tag_counter[tag] += 1
+
+            if not seen:
+                return {"total_docs": 0, "total_chunks": total_chunks}
 
             def _to_list(counter: Counter) -> list[dict]:
                 return [{"value": v, "count": c} for v, c in counter.most_common()]

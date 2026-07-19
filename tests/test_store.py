@@ -1,11 +1,14 @@
 """Tests for LanceDBStore (uses a temp directory, no mocks needed)."""
 
+import multiprocessing
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -31,6 +34,21 @@ def _make_node(doc_id: str, loc: str, text: str, vector: list[float]) -> TextNod
     )
     node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
     return node
+
+
+def _hold_document_lock(index_root, acquired, release):
+    store = LanceDBStore(index_root, "test_chunks")
+    with store._serialize_document_writes(["race.md"]):
+        acquired.set()
+        if not release.wait(10):
+            raise TimeoutError("parent did not release document lock")
+
+
+def _enter_document_lock(index_root, started, acquired):
+    store = LanceDBStore(index_root, "test_chunks")
+    started.set()
+    with store._serialize_document_writes(["race.md"]):
+        acquired.set()
 
 
 def test_upsert_and_list():
@@ -59,6 +77,261 @@ def test_upsert_replaces():
 
         doc_ids = store.list_doc_ids()
         assert doc_ids == ["a.md"]
+
+
+def test_insert_nodes_commits_once_without_noop_delete():
+    """Known-new documents must not create a delete-only Lance version."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        before = lance.dataset(_lance_path(tmpdir)).version
+
+        store.insert_nodes([_make_node("new.md", "c:0", "new", [0.2] * 768)])
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.version == before + 1
+        assert set(store.list_doc_ids()) == {"seed.md", "new.md"}
+
+
+def test_known_absent_insert_retry_skips_without_latest_manifest_probe():
+    """A successful full-sweep insert stays idempotent on Prefect retry."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        node = _make_node("new.md", "c:0", "new", [0.2] * 768)
+        store.insert_nodes([node], known_absent=True)
+        before_retry = lance.dataset(_lance_path(tmpdir)).version
+
+        with patch.object(
+            store,
+            "_contains_doc_id_latest",
+            side_effect=AssertionError("normal full-sweep retry must not probe Lance"),
+        ):
+            store.insert_nodes([node], known_absent=True)
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.version == before_retry
+        assert dataset.count_rows("doc_id = 'new.md'") == 1
+
+
+def test_known_absent_insert_recovers_post_commit_exception():
+    """An ambiguous add result is accepted only after latest-manifest proof."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        original_write = store._write_nodes_unlocked
+
+        def commit_then_raise(nodes, *, operation):
+            original_write(nodes, operation=operation)
+            raise RuntimeError("connection dropped after commit")
+
+        with patch.object(store, "_write_nodes_unlocked", side_effect=commit_then_raise):
+            store.insert_nodes(
+                [_make_node("new.md", "c:0", "new", [0.2] * 768)],
+                known_absent=True,
+            )
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.count_rows("doc_id = 'new.md'") == 1
+
+
+def test_exclusive_writer_session_skips_per_document_refresh_and_probe():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes(
+            [_make_node("existing.md", "c:0", "old", [0.1] * 768)]
+        )
+
+        with patch.object(store, "_checkout_latest") as checkout, patch.object(
+            store, "_contains_doc_id_latest"
+        ) as probe:
+            with store.exclusive_writer_session():
+                store.upsert_nodes(
+                    [_make_node("existing.md", "c:0", "new", [0.2] * 768)]
+                )
+                store.insert_nodes(
+                    [_make_node("new.md", "c:0", "new", [0.3] * 768)]
+                )
+                store.delete_by_doc_ids(["existing.md"])
+
+        checkout.assert_not_called()
+        probe.assert_not_called()
+        assert set(store.list_doc_ids()) == {"new.md"}
+
+
+def test_delete_invalidates_completed_insert_cache_for_standalone_reinsert():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        node = _make_node("again.md", "c:0", "restored", [0.1] * 768)
+        store.insert_nodes([node], known_absent=True)
+        store.delete_by_doc_ids(["again.md"])
+
+        store.insert_nodes([node])
+
+        assert store.contains_doc_id("again.md") is True
+        assert store.count_chunks() == 1
+
+
+def test_failed_upsert_after_delete_invalidates_completed_insert_cache():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        node = _make_node("again.md", "c:0", "restored", [0.1] * 768)
+        store.insert_nodes([node], known_absent=True)
+
+        with patch.object(
+            type(store._vs), "add", side_effect=RuntimeError("add failed")
+        ):
+            with pytest.raises(RuntimeError, match="add failed"):
+                store.upsert_nodes([node])
+
+        assert store.contains_doc_id("again.md") is False
+        store.insert_nodes([node])
+        assert store.contains_doc_id("again.md") is True
+        assert store.count_chunks() == 1
+
+
+def test_insert_nodes_is_idempotent_across_store_handles():
+    """A stale new-doc snapshot or ambiguous retry must not append duplicates."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        first = LanceDBStore(tmpdir, "test_chunks")
+        first.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        second = LanceDBStore(tmpdir, "test_chunks")
+
+        second.upsert_nodes([
+            _make_node("race.md", "c:0", "targeted write", [0.2] * 768)
+        ])
+        before_retry = lance.dataset(_lance_path(tmpdir)).version
+        # Refresh the existence probe without checking out the long-lived
+        # writer table. Repeated checkout_latest calls retain large manifest
+        # file caches on fragmented production datasets.
+        with patch.object(
+            first,
+            "_checkout_latest",
+            side_effect=AssertionError("insert must not checkout the writer table"),
+        ):
+            first.insert_nodes([
+                _make_node("race.md", "c:0", "stale sweep write", [0.3] * 768)
+            ])
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.count_rows("doc_id = 'race.md'") == 1
+        assert dataset.version == before_retry
+
+
+def test_concurrent_insert_and_upsert_do_not_leave_duplicate_rows():
+    """Two real handles serialize the stale-snapshot insert/upsert race."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        insert_store = LanceDBStore(tmpdir, "test_chunks")
+        insert_store.upsert_nodes([
+            _make_node("seed.md", "c:0", "seed", [0.1] * 768)
+        ])
+        upsert_store = LanceDBStore(tmpdir, "test_chunks")
+        barrier = threading.Barrier(2)
+
+        def insert():
+            barrier.wait()
+            insert_store.insert_nodes([
+                _make_node("race.md", "c:0", "sweep", [0.2] * 768)
+            ])
+
+        def upsert():
+            barrier.wait()
+            upsert_store.upsert_nodes([
+                _make_node("race.md", "c:0", "targeted", [0.3] * 768)
+            ])
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(insert), pool.submit(upsert)]
+            for future in futures:
+                future.result(timeout=10)
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.count_rows("doc_id = 'race.md'") == 1
+
+
+def test_document_write_lock_excludes_another_process():
+    """The filesystem lock—not only process-local RLocks—guards a document."""
+    context = multiprocessing.get_context("spawn")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        holder_acquired = context.Event()
+        release_holder = context.Event()
+        contender_started = context.Event()
+        contender_acquired = context.Event()
+        holder = context.Process(
+            target=_hold_document_lock,
+            args=(tmpdir, holder_acquired, release_holder),
+        )
+        contender = context.Process(
+            target=_enter_document_lock,
+            args=(tmpdir, contender_started, contender_acquired),
+        )
+        holder.start()
+        try:
+            assert holder_acquired.wait(10)
+            contender.start()
+            assert contender_started.wait(10)
+            assert not contender_acquired.wait(0.5)
+        finally:
+            release_holder.set()
+            holder.join(10)
+            if contender.pid is not None:
+                contender.join(10)
+            for process in (holder, contender):
+                if process.pid is not None and process.is_alive():
+                    process.terminate()
+                    process.join(5)
+
+        assert holder.exitcode == 0
+        assert contender.exitcode == 0
+        assert contender_acquired.is_set()
+
+
+def test_reopening_store_does_not_replace_existing_scalar_index():
+    """Read-path construction must not create a new Lance version each time."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("a.md", "c:0", "hello", [0.1] * 768)])
+
+        LanceDBStore(tmpdir, "test_chunks")
+        version_with_index = lance.dataset(_lance_path(tmpdir)).version
+        reopened = LanceDBStore(tmpdir, "test_chunks")
+
+        assert lance.dataset(_lance_path(tmpdir)).version == version_with_index
+        assert any(
+            list(index.columns) == ["doc_id"]
+            and str(index.index_type).upper() == "BTREE"
+            for index in reopened._vs.table.list_indices()
+        )
+
+
+def test_reopening_store_repairs_wrong_doc_id_index_type():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("a.md", "c:0", "hello", [0.1] * 768)])
+        table = LanceDBStore(tmpdir, "test_chunks")._vs.table
+        table.create_scalar_index("doc_id", index_type="BITMAP", replace=True)
+
+        reopened = LanceDBStore(tmpdir, "test_chunks")
+
+        assert any(
+            list(index.columns) == ["doc_id"]
+            and str(index.index_type).upper() == "BTREE"
+            for index in reopened._vs.table.list_indices()
+        )
 
 
 def test_delete_by_doc_ids():
@@ -241,6 +514,55 @@ def test_facets_counts():
         folder_values = {f["value"] for f in facets["folders"]}
         assert "Projects" in folder_values
         assert "Archive" in folder_values
+
+
+def test_facets_streams_projected_rows_without_materializing_full_table():
+    """Large indexes must not become one in-memory Arrow table for facets."""
+    from lancedb.query import LanceEmptyQueryBuilder
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "a.md",
+                "c:0",
+                "hello",
+                vec,
+                tags="recipe,korean",
+                folder="Projects",
+            ),
+            _make_node_with_meta(
+                "a.md",
+                "c:1",
+                "world",
+                vec,
+                tags="recipe,korean",
+                folder="Projects",
+            ),
+            _make_node_with_meta(
+                "b.md",
+                "c:0",
+                "other",
+                vec,
+                tags="finance",
+                folder="Archive",
+            ),
+        ])
+
+        with patch.object(
+            LanceEmptyQueryBuilder,
+            "to_arrow",
+            side_effect=AssertionError("facets must stream bounded batches"),
+        ):
+            facets = store.facets()
+
+        assert facets["total_docs"] == 2
+        assert facets["total_chunks"] == 3
+        assert {row["value"] for row in facets["folders"]} == {
+            "Projects",
+            "Archive",
+        }
 
 
 def test_search_hit_has_mtime():
@@ -635,6 +957,51 @@ def test_context_narrative_metadata_excluded_from_dynamic_facets():
         assert "enr_context_warning" not in facets
 
 
+def test_dynamic_facets_exclude_internal_narrative_and_identifier_fields():
+    available = {
+        "section",
+        "priority",
+        "_node_content",
+        "message_body",
+        "enr_summary",
+        "enr_key_facts",
+        "custom_meta",
+        "source_message_id",
+        "content_hash",
+        "sidecar_path",
+        "updated_at",
+        "dup_sources",
+        "file_size_bytes",
+        "id",
+        "path",
+        "filename",
+        "hash",
+        "timestamp",
+        "url",
+        "uri",
+        "facts",
+        "json",
+        "narrative",
+        "case_narrative",
+        "ids",
+        "content_type",
+        "warning_level",
+        "description_kind",
+        "facts_type",
+        "narrative_type",
+    }
+
+    assert LanceDBStore._dynamic_facet_fields(available) == {
+        "section",
+        "priority",
+        "content_type",
+        "warning_level",
+        "description_kind",
+        "facts_type",
+        "narrative_type",
+    }
+
+
 def test_extra_metadata_in_get_chunk():
     """Dynamic fields should be visible in get_chunk results."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1024,6 +1391,49 @@ def test_ensure_fts_index_creates_when_missing():
         assert len(hits) == 1
 
 
+def test_ensure_fts_index_missing_path_tags_exact_latest_without_data_compaction():
+    """Creating missing FTS still finalizes restore metadata, without rewrite."""
+    from datetime import date
+
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+
+        with patch.object(store, "_compact_data_files") as compact:
+            store.ensure_fts_index(compact_data=False)
+
+        tag = f"daily-{date.today().isoformat()}"
+        compact.assert_not_called()
+        assert lance.dataset(_lance_path(tmpdir), version=tag).version == (
+            lance.dataset(_lance_path(tmpdir)).version
+        )
+
+
+def test_ensure_fts_index_missing_path_honors_requested_data_compaction():
+    """Delete-only/all-in-one callers compact before creating missing FTS."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+
+        with patch.object(
+            store, "_compact_data_files", wraps=store._compact_data_files
+        ) as compact:
+            store.ensure_fts_index(compact_data=True)
+
+        compact.assert_called_once_with()
+        assert _compaction_marker(tmpdir).read_text().strip() == date.today().isoformat()
+
+
 def _lance_path(tmpdir: str, table: str = "test_chunks") -> str:
     return str(Path(tmpdir) / f"{table}.lance")
 
@@ -1032,6 +1442,8 @@ def test_ensure_fts_index_creates_todays_daily_restore_point():
     """A routine indexing run tags the current version as today's restore
     point (daily-<date>), pointing at the latest version."""
     from datetime import date
+
+    import lance
 
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
@@ -1045,6 +1457,9 @@ def test_ensure_fts_index_creates_todays_daily_restore_point():
         tags = store._vs.table.tags.list()
         today_tag = f"daily-{date.today().isoformat()}"
         assert today_tag in tags
+        assert lance.dataset(_lance_path(tmpdir), version=today_tag).version == (
+            lance.dataset(_lance_path(tmpdir)).version
+        )
 
 
 def test_daily_restore_point_is_revertible_after_more_writes():
@@ -1149,8 +1564,7 @@ def test_restore_points_disabled_when_days_zero():
 
 
 def test_ensure_fts_index_prune_failure_is_non_fatal():
-    """If version pruning raises, the indexing run still completes (housekeeping
-    must never fail an index update)."""
+    """A dataset-level prune failure is swallowed by the prune boundary."""
     from unittest.mock import patch
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1162,7 +1576,7 @@ def test_ensure_fts_index_prune_failure_is_non_fatal():
         store.create_fts_index()
         with patch("core.resilience.time.sleep", lambda *_: None):
             with patch("lance.dataset", side_effect=RuntimeError("disk gone")):
-                store.ensure_fts_index()  # must not raise
+                store._prune_versions("test")  # must not raise
         # index still works after a prune failure
         assert len(store.keyword_search("banana", top_k=5)) == 1
 
@@ -1259,10 +1673,331 @@ def _fts_unindexed_rows(tmpdir: str) -> int:
     return table.index_stats(name).num_unindexed_rows
 
 
+def test_pre_index_maintenance_orders_prune_compact_marker():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        order: list[str] = []
+
+        with (
+            patch.object(store, "_compaction_due", return_value=True),
+            patch.object(
+                store,
+                "_prune_versions",
+                side_effect=lambda label: order.append(f"prune:{label}"),
+            ),
+            patch.object(
+                store,
+                "_compact_data_files",
+                side_effect=lambda: order.append("compact"),
+            ),
+            patch.object(
+                store,
+                "_record_compaction",
+                side_effect=lambda _day: order.append("marker"),
+            ),
+        ):
+            store.prepare_indexing_maintenance()
+
+        assert order == [
+            "prune:pre-maintenance",
+            "compact",
+            "marker",
+        ]
+
+
+def test_data_compaction_runs_binary_copy_in_short_lived_subprocess():
+    """Compaction's native allocations must die before document processing."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+
+        with patch("subprocess.run") as run:
+            store._compact_data_files()
+
+        run.assert_called_once_with(
+            [
+                sys.executable,
+                "-m",
+                "core.lance_maintenance",
+                "compact",
+                store._dataset_path(),
+            ],
+            check=True,
+            capture_output=True,
+            close_fds=True,
+            text=True,
+        )
+
+
+def test_data_compaction_surfaces_worker_error_for_retry_classification():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        failure = subprocess.CalledProcessError(
+            1,
+            [sys.executable, "-m", "core.lance_maintenance"],
+            stderr="Retryable commit conflict at version 42",
+        )
+
+        with patch("subprocess.run", side_effect=failure):
+            with pytest.raises(RuntimeError, match="Retryable commit conflict"):
+                store._compact_data_files()
+
+
+def test_pre_index_compaction_refreshes_store_for_following_writes():
+    """The long-lived LanceDB handle must follow fresh-handle compaction."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+        store.create_fts_index()
+
+        store.prepare_indexing_maintenance()
+        store.upsert_nodes(
+            [_make_node_with_meta("b.md", "c:0", "quasar", vec, source_type="md")]
+        )
+        store.ensure_fts_index(compact_data=False)
+
+        assert set(store.list_doc_ids()) == {"a.md", "b.md"}
+        assert len(store.keyword_search("quasar", top_k=5)) == 1
+
+
+def test_exclusive_pre_index_compaction_refreshes_parent_handle_exactly_once():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes(
+            [_make_node("seed.md", "c:0", "seed", [0.1] * 768)]
+        )
+
+        with patch.object(store, "_compaction_due", return_value=True), patch.object(
+            store, "_compact_data_files"
+        ), patch.object(store, "_checkout_latest") as checkout:
+            with store.exclusive_writer_session():
+                store.prepare_indexing_maintenance()
+                store.insert_nodes(
+                    [_make_node("new.md", "c:0", "new", [0.2] * 768)]
+                )
+
+        checkout.assert_called_once_with()
+
+
+def test_exclusive_deletion_only_compaction_refreshes_parent_handle_once():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes(
+            [_make_node("seed.md", "c:0", "seed", [0.1] * 768)]
+        )
+        store.create_fts_index()
+
+        with patch.object(store, "_compaction_due", return_value=True), patch.object(
+            store, "_compact_data_files"
+        ), patch.object(store, "_checkout_latest") as checkout, patch.object(
+            store, "_merge_index_deltas"
+        ), patch.object(store, "_finish_index_maintenance"):
+            with store.exclusive_writer_session():
+                store.ensure_fts_index(compact_data=True)
+
+        checkout.assert_called_once_with()
+
+
+def test_post_index_maintenance_skips_compaction_then_merges_tags_and_prunes():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        order: list[str] = []
+
+        with (
+            patch.object(
+                store,
+                "_prune_versions",
+                side_effect=lambda label: order.append(f"prune:{label}"),
+            ),
+            patch.object(
+                store,
+                "_compact_data_files",
+                side_effect=lambda: order.append("compact"),
+            ),
+            patch.object(
+                store,
+                "_merge_index_deltas",
+                side_effect=lambda: order.append("merge"),
+            ),
+            patch.object(
+                store,
+                "_expire_restore_points",
+                side_effect=lambda _table, _day: order.append("expire"),
+            ),
+            patch.object(
+                store,
+                "_tag_latest_restore_point",
+                side_effect=lambda _table, _day: (order.append("tag"), True)[1],
+            ),
+        ):
+            store._optimize_and_prune(table, compact_data=False)
+
+        assert order == [
+            "merge",
+            "tag",
+            "expire",
+            "prune:post-expiry",
+            "tag",
+        ]
+
+
+def test_post_prune_restore_point_tracks_exact_latest_version():
+    """Cleanup may commit a new manifest; today's tag must follow that version."""
+    from datetime import date
+
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+        store.create_fts_index()
+
+        def commit_prune_manifest(_label):
+            store.upsert_nodes(
+                [_make_node_with_meta("b.md", "c:0", "quasar", vec, source_type="md")]
+            )
+
+        with patch.object(store, "_prune_versions", side_effect=commit_prune_manifest):
+            store._finish_index_maintenance(store._vs.table, date.today())
+
+        tag = f"daily-{date.today().isoformat()}"
+        assert lance.dataset(_lance_path(tmpdir), version=tag).version == (
+            lance.dataset(_lance_path(tmpdir)).version
+        )
+
+
+def test_staging_tag_failure_aborts_expiry_and_prune():
+    """Never destroy restore state when today's safety tag cannot be staged."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        with (
+            patch.object(store, "_tag_latest_restore_point", return_value=False) as tag,
+            patch.object(store, "_expire_restore_points") as expire,
+            patch.object(store, "_prune_versions") as prune,
+        ):
+            store._finish_index_maintenance(table, date.today())
+
+        tag.assert_called_once_with(table, date.today())
+        expire.assert_not_called()
+        prune.assert_not_called()
+
+
+def test_final_tag_failure_preserves_staged_readable_restore_point():
+    """Never prune without first pinning a snapshot that survives retag failure."""
+    from datetime import date
+
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes(
+            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
+        )
+        store.create_fts_index()
+        original_tag = store._tag_latest_restore_point
+        tag_calls = 0
+
+        def fail_final_tag(table, today):
+            nonlocal tag_calls
+            tag_calls += 1
+            if tag_calls == 2:
+                return False
+            return original_tag(table, today)
+
+        def commit_prune_manifest(_label):
+            store.upsert_nodes(
+                [_make_node_with_meta("b.md", "c:0", "quasar", vec, source_type="md")]
+            )
+
+        with (
+            patch.object(store, "_tag_latest_restore_point", side_effect=fail_final_tag),
+            patch.object(store, "_prune_versions", side_effect=commit_prune_manifest),
+        ):
+            store._finish_index_maintenance(store._vs.table, date.today())
+
+        tag = f"daily-{date.today().isoformat()}"
+        assert tag_calls == 2
+        assert lance.dataset(_lance_path(tmpdir), version=tag).count_rows() == 1
+        assert lance.dataset(_lance_path(tmpdir)).count_rows() == 2
+
+
+def test_current_marker_skips_compaction_but_merges_indices():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        with (
+            patch.object(store, "_compaction_due", return_value=False),
+            patch.object(store, "_prune_versions"),
+            patch.object(store, "_compact_data_files") as compact,
+            patch.object(store, "_merge_index_deltas") as merge,
+            patch.object(store, "_expire_restore_points"),
+            patch.object(store, "_tag_latest_restore_point"),
+        ):
+            store._optimize_and_prune(table)
+
+        compact.assert_not_called()
+        merge.assert_called_once_with()
+
+
+def test_compaction_failure_leaves_marker_absent_and_still_merges_indices():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        with (
+            patch.object(store, "_compaction_due", return_value=True),
+            patch.object(store, "_prune_versions"),
+            patch.object(
+                store,
+                "_compact_data_files",
+                side_effect=RuntimeError("disk hiccup"),
+            ) as compact,
+            patch.object(store, "_merge_index_deltas") as merge,
+            patch.object(store, "_expire_restore_points"),
+            patch.object(store, "_tag_latest_restore_point"),
+        ):
+            store._optimize_and_prune(table)
+
+        assert compact.call_count == 1
+        merge.assert_called_once_with()
+        assert not _compaction_marker(tmpdir).exists()
+
+
+def test_index_merge_failure_after_successful_compaction_keeps_compaction_marker():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        table = MagicMock()
+        with (
+            patch.object(store, "_compaction_due", return_value=True),
+            patch.object(store, "_prune_versions"),
+            patch.object(store, "_compact_data_files"),
+            patch.object(
+                store,
+                "_merge_index_deltas",
+                side_effect=RuntimeError("index merge failed"),
+            ),
+            patch.object(store, "_expire_restore_points") as expire,
+            patch.object(store, "_tag_latest_restore_point") as tag,
+        ):
+            with pytest.raises(RuntimeError, match="index merge failed"):
+                store._optimize_and_prune(table)
+
+        assert _compaction_marker(tmpdir).exists()
+        expire.assert_not_called()
+        tag.assert_not_called()
+
+
 def test_first_maintenance_run_compacts_and_records_marker():
-    """The first ensure_fts_index of the day runs the full table.optimize()
-    (data compaction) and records the date in a durable marker outside the
-    dataset directory."""
+    """First daily maintenance compacts data and records durable cadence."""
     from datetime import date
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1270,8 +2005,9 @@ def test_first_maintenance_run_compacts_and_records_marker():
         vec = [0.0] * 768
         store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
         store.create_fts_index()
-        table = store._vs.table
-        with patch.object(table, "optimize", wraps=table.optimize) as spy:
+        with patch.object(
+            store, "_compact_data_files", wraps=store._compact_data_files
+        ) as spy:
             store.ensure_fts_index()
 
         assert spy.call_count == 1
@@ -1292,8 +2028,9 @@ def test_maintenance_compacts_at_most_once_per_day():
         store.ensure_fts_index()  # first run today: compacts + writes marker
 
         store.upsert_nodes([_make_node_with_meta("b.md", "c:0", "quasar telescope", vec, source_type="md")])
-        table = store._vs.table
-        with patch.object(table, "optimize", wraps=table.optimize) as spy:
+        with patch.object(
+            store, "_compact_data_files", wraps=store._compact_data_files
+        ) as spy:
             store.ensure_fts_index()  # same calendar day: no data rewrite
 
         assert spy.call_count == 0                  # data compaction skipped
@@ -1312,8 +2049,9 @@ def test_maintenance_compacts_again_when_marker_is_stale():
         store.ensure_fts_index()
         _compaction_marker(tmpdir).write_text("2020-01-01")
 
-        table = store._vs.table
-        with patch.object(table, "optimize", wraps=table.optimize) as spy:
+        with patch.object(
+            store, "_compact_data_files", wraps=store._compact_data_files
+        ) as spy:
             store.ensure_fts_index()
 
         assert spy.call_count == 1
@@ -1328,7 +2066,9 @@ def test_compaction_failure_is_non_fatal_and_retried_next_run():
         store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
         store.create_fts_index()
 
-        with patch.object(store._vs.table, "optimize", side_effect=RuntimeError("disk hiccup")):
+        with patch.object(
+            store, "_compact_data_files", side_effect=RuntimeError("disk hiccup")
+        ):
             store.ensure_fts_index()  # must not raise
 
         assert not _compaction_marker(tmpdir).exists()

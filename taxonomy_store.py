@@ -274,13 +274,61 @@ class TaxonomyStore:
             self.update(entry_id, usage_count=existing.get("usage_count", 0) + 1)
 
     def increment_usage_many(self, counts: dict[str, int]) -> None:
-        """Apply queued usage_count increments serially."""
-        for entry_id, delta in sorted(counts.items()):
-            if delta <= 0:
-                continue
-            existing = self.get(entry_id)
-            if existing is not None:
-                self.update(entry_id, usage_count=existing.get("usage_count", 0) + int(delta))
+        """Apply usage increments in one vector-preserving Lance transaction.
+
+        The public ``get`` result deliberately omits vectors. Routing usage-only
+        updates through ``update`` therefore regenerated every embedding and
+        committed a delete plus add per taxonomy entry. Project only IDs and
+        counters, then merge only those columns for known changed rows. Lance
+        preserves all unmentioned columns, including vectors and concurrent
+        metadata changes.
+        """
+        increments = {
+            str(entry_id): int(delta)
+            for entry_id, delta in counts.items()
+            if int(delta) > 0
+        }
+        if not increments:
+            return
+        self._ensure_table()
+        if self._table is None:
+            return
+
+        quoted_ids = ", ".join(
+            f"'{_sql_escape(entry_id)}'" for entry_id in increments
+        )
+        current = (
+            self._table.search()
+            .where(f"id IN ({quoted_ids})")
+            .select(["id", "usage_count"])
+            .limit(len(increments))
+            .to_arrow()
+        )
+        ids = current["id"].to_pylist()
+        selected = [index for index, entry_id in enumerate(ids) if entry_id in increments]
+        if not selected:
+            return
+
+        updates = current.take(pa.array(selected, type=pa.int64()))
+        usage_index = updates.schema.get_field_index("usage_count")
+        usage_type = updates.schema.field(usage_index).type
+        updated_counts = pa.array(
+            [
+                int(value) + increments[str(entry_id)]
+                for entry_id, value in zip(
+                    updates["id"].to_pylist(),
+                    updates["usage_count"].to_pylist(),
+                    strict=True,
+                )
+            ],
+            type=usage_type,
+        )
+        updates = updates.set_column(usage_index, "usage_count", updated_counts)
+        (
+            self._table.merge_insert("id")
+            .when_matched_update_all()
+            .execute(updates)
+        )
 
     # --- Query ---
 

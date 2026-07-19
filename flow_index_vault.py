@@ -42,7 +42,8 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from contextlib import nullcontext
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -68,6 +69,8 @@ from communication_context import (
     repair_sidecar_context,
 )
 from core.config import load_config
+from core.index_request_queue import IndexRequest, IndexRequestQueue
+from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment
@@ -105,6 +108,10 @@ _tracer = get_tracer("pipeline")
 # Module-level runtime context populated by the flow, read by tasks.
 # Avoids passing unpickleable objects as Prefect task arguments.
 _RUNTIME: dict[str, Any] = {}
+_LOCKED_INDEX_CONFIG: ContextVar[dict | None] = ContextVar(
+    "locked_index_config",
+    default=None,
+)
 
 
 def _measure_index_memory(subphase: str, doc_id: str):
@@ -1527,9 +1534,17 @@ def _process_doc_task(
                 node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
                 nodes.append(node)
 
-        # --- Upsert into store ---
-        store.upsert_nodes(nodes)
-        logger.info(f"Upserted {len(nodes)} chunks: {doc_id}")
+        # --- Persist into store ---
+        # The scan/diff proves which documents are absent. Insert those
+        # directly: a no-match Lance delete still commits a metadata version,
+        # doubling retained manifests for large new-document batches.
+        if doc_id in _RUNTIME.get("storage_insert_doc_ids", set()):
+            store.insert_nodes(nodes, known_absent=True)
+            write_mode = "Inserted"
+        else:
+            store.upsert_nodes(nodes)
+            write_mode = "Upserted"
+        logger.info(f"{write_mode} {len(nodes)} chunks: {doc_id}")
 
         chunks = []
         for node in nodes:
@@ -1930,13 +1945,72 @@ def _scan_and_register_sources(
 # --- Flow ---
 
 
+def _activate_exclusive_writer_store(store):
+    """Keep one store handle stable for the externally locked table session."""
+    session = store.exclusive_writer_session()
+    session.__enter__()
+    _RUNTIME.setdefault("_exclusive_writer_contexts", []).append(session)
+    return store
+
+
+def _close_exclusive_writer_stores() -> None:
+    contexts = list(_RUNTIME.pop("_exclusive_writer_contexts", []))
+    for session in reversed(contexts):
+        session.__exit__(None, None, None)
+
+
+def _serialize_index_writer(*, blocking: bool):
+    """Wrap a full or targeted flow in one table-level writer session."""
+    def decorate(fn):
+        @wraps(fn)
+        def locked(config_path: str = "config.yaml", *args, **kwargs):
+            config = load_config(config_path)
+            index_root = Path(config["index_root"])
+            table_name = config.get("lancedb", {}).get("table", "chunks")
+            with index_write_lock(
+                index_root,
+                table_name,
+                blocking=blocking,
+            ):
+                _RUNTIME.clear()
+                config_token = _LOCKED_INDEX_CONFIG.set(config)
+                try:
+                    result = fn(config_path, *args, **kwargs)
+                    store = _RUNTIME.get("store")
+                    doc_id_store = _RUNTIME.get("doc_id_store")
+                    if store is not None and doc_id_store is not None:
+                        queue_cfg = config.get("index_queue", {})
+                        _drain_index_requests(
+                            config,
+                            IndexRequestQueue(index_root),
+                            table_name,
+                            store,
+                            doc_id_store,
+                            limit=queue_cfg.get("full_drain_limit", 1_000),
+                        )
+                    return result
+                finally:
+                    try:
+                        _close_exclusive_writer_stores()
+                    finally:
+                        _LOCKED_INDEX_CONFIG.reset(config_token)
+
+        return locked
+
+    return decorate
+
+
 @flow(name="index_vault_flow")
-def index_vault_flow(config_path: str = "config.yaml", source_name: str | None = None) -> None:
+@_serialize_index_writer(blocking=True)
+def index_vault_flow(
+    config_path: str = "config.yaml",
+    source_name: str | None = None,
+) -> None:
     """Scan vault, diff with store, process new/updated docs, delete removed, log stats."""
     _RUNTIME.clear()
     import time
     logger = get_run_logger()
-    config = load_config(config_path)
+    config = _LOCKED_INDEX_CONFIG.get() or load_config(config_path)
     memory_observer = MemoryObserver.from_config(config, logger)
     _RUNTIME["memory_observer"] = memory_observer
     memory_observer.sample("phase_start", phase="initialize")
@@ -1952,7 +2026,14 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
 
     # --- Build components from config (stored in _RUNTIME for tasks) ---
     table_name = config.get("lancedb", {}).get("table", "chunks")
-    store = open_store_with_recovery(index_root, table_name, logger_obj=logger, auto_recover=True)
+    store = _activate_exclusive_writer_store(
+        open_store_with_recovery(
+            index_root,
+            table_name,
+            logger_obj=logger,
+            auto_recover=True,
+        )
+    )
     store.set_memory_observer(memory_observer)
 
     # Persistent document ID registry
@@ -2153,7 +2234,9 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
                     db.drop_table(table_name)
                 except Exception as exc:
                     logger.warning("Failed to drop table during migration: %s", exc)
-                store = LanceDBStore(index_root, table_name)
+                store = _activate_exclusive_writer_store(
+                    LanceDBStore(index_root, table_name)
+                )
                 store.set_memory_observer(memory_observer)
                 _RUNTIME["store"] = store
 
@@ -2187,6 +2270,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
     )
 
     stored_mtimes = store.list_doc_mtimes()
+    active_table_has_docs = bool(stored_mtimes)
     stored_change_hashes = store.list_doc_change_hashes()
     if source_name:
         source_prefix = f"{source_name}::"
@@ -2270,6 +2354,11 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
 
     docs_to_process = to_add_or_update
     docs_to_delete = to_delete
+    storage_insert_doc_ids = {
+        str(doc["doc_id"])
+        for doc in docs_to_process
+        if str(doc["doc_id"]) not in stored_mtimes
+    }
     shadow_table_name = f"{table_name}__shadow"
     if using_shadow_rebuild:
         logger.info(
@@ -2278,12 +2367,33 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
             changed_doc_count,
             len(scanned),
         )
-        store = LanceDBStore(index_root, shadow_table_name)
+        store = _activate_exclusive_writer_store(
+            LanceDBStore(index_root, shadow_table_name)
+        )
         store.set_memory_observer(memory_observer)
         store.reset_table()
         _RUNTIME["store"] = store
         docs_to_process = scanned
         docs_to_delete = []
+        storage_insert_doc_ids = {str(doc["doc_id"]) for doc in docs_to_process}
+
+    _RUNTIME["storage_insert_doc_ids"] = storage_insert_doc_ids
+
+    # A daily full-table compaction can consume several GiB on the production
+    # corpus. Run it before document processing creates its own resident state,
+    # but only for an existing active table. Fresh/shadow tables do not exist
+    # yet; deletion-only runs keep delete -> compaction ordering in finalization.
+    pre_index_maintenance_attempted = bool(
+        docs_to_process and active_table_has_docs and not using_shadow_rebuild
+    )
+    if pre_index_maintenance_attempted:
+        memory_observer.sample("phase_start", phase="pre_index_maintenance")
+        _write_heartbeat(index_root)
+        try:
+            store.prepare_indexing_maintenance()
+        finally:
+            _write_heartbeat(index_root)
+            memory_observer.sample("phase_finish", phase="pre_index_maintenance")
 
     concurrency = int(enrichment_cfg.get("concurrency", 1) or 1)
     if concurrency > 1:
@@ -2340,7 +2450,12 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
                 store.create_fts_index()
             else:
                 try:
-                    store.ensure_fts_index()
+                    final_compact_data = bool(
+                        active_table_has_docs
+                        and not using_shadow_rebuild
+                        and not pre_index_maintenance_attempted
+                    )
+                    store.ensure_fts_index(compact_data=final_compact_data)
                 except Exception as exc:
                     # A corrupt inverted index fails the incremental merge
                     # deterministically, so retrying next run can never succeed
@@ -2389,7 +2504,7 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         _RUNTIME.setdefault("_warnings", []).append(f"corruption_detected: {exc}")
         recovered_store = _recover_corrupt_table(index_root, table_name, logger)
         if recovered_store:
-            store = recovered_store
+            store = _activate_exclusive_writer_store(recovered_store)
             store.set_memory_observer(memory_observer)
             _RUNTIME["store"] = store
             try:
@@ -2457,9 +2572,6 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
 # process_doc_task path, so behavior matches the full flow per document.
 # ---------------------------------------------------------------------------
 
-_SINGLE_DOC_LOCK = threading.Lock()
-
-
 def _find_source_config(config: dict, source_name: str) -> dict:
     for s in config.get("sources", []):
         if isinstance(s, dict) and str(s.get("name") or "").strip() == source_name:
@@ -2504,6 +2616,40 @@ def _find_alias_variant(abs_path: Path) -> Path | None:
         return None
     matches = sorted(parent.glob(f"{glob_escape(stem)}@*@{glob_escape(suffix)}"))
     return matches[0] if len(matches) == 1 else None
+
+
+def _normalize_index_request_target(
+    config: dict,
+    source_name: str,
+    target: str,
+) -> str:
+    """Canonicalize every filesystem alias before it becomes a queue key."""
+    src_cfg = _find_source_config(config, source_name)
+    if src_cfg.get("type", "filesystem") != "filesystem":
+        raise ValueError(f"source {source_name!r} is not a filesystem source")
+
+    raw_target = str(target).strip()
+    if not raw_target:
+        raise ValueError("target must not be empty")
+    if "::" in raw_target:
+        return raw_target
+
+    root = Path(src_cfg["root"]).resolve()
+    candidate = Path(raw_target)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        rel_path = candidate.resolve().relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"target {raw_target!r} is outside source {source_name!r}"
+        ) from exc
+
+    if not candidate.is_file():
+        alias = _find_alias_variant(candidate)
+        if alias is not None:
+            rel_path = alias.resolve().relative_to(root)
+    return rel_path.as_posix()
 
 
 def resolve_single_record(
@@ -2623,9 +2769,11 @@ def _build_single_doc_runtime(
         except Exception:
             llm_generator = None
 
+    exclusive_contexts = _RUNTIME.get("_exclusive_writer_contexts", [])
     _RUNTIME.clear()
     _RUNTIME.update(
         {
+            "_exclusive_writer_contexts": exclusive_contexts,
             "store": store,
             "memory_observer": memory_observer,
             "doc_id_store": doc_id_store,
@@ -2679,10 +2827,8 @@ def _update_index_metadata_after_single_doc(index_root: str | Path, store) -> No
         meta["doc_count"] = doc_count
         meta["chunk_count"] = chunk_count
     meta["last_doc_indexed_at"] = datetime.now(timezone.utc).isoformat()
-    # PID-salted tmp name: the REST and MCP processes share this directory but
-    # _SINGLE_DOC_LOCK is per-process, so a fixed .tmp path could be written by
-    # both at once and rename a torn JSON into place (silently dropping the
-    # sweep's warning fields on the next merge-read).
+    # PID-salted tmp name remains defense in depth for administrative callers
+    # that update metadata outside the table writer session.
     tmp_path = Path(f"{path}.{os.getpid()}.tmp")
     tmp_path.write_text(json.dumps(meta, indent=2))
     tmp_path.replace(path)  # atomic: readers never see a partial file
@@ -2730,63 +2876,165 @@ def _record_single_doc_outcome(index_root: Path, doc: dict) -> None:
             )
 
 
+def _index_document_unlocked(
+    config: dict,
+    request: IndexRequest,
+    store,
+    doc_id_store: DocIDStore,
+) -> dict:
+    """Process one queued request while the caller owns the table session."""
+    index_root = Path(config["index_root"])
+    index_root.mkdir(parents=True, exist_ok=True)
+    record = resolve_single_record(
+        config,
+        request.source_name,
+        request.target,
+        doc_id_store,
+    )
+    if record is None:
+        return {
+            "status": "error",
+            "reason": "not_found",
+            "target": request.target,
+            "source_name": request.source_name,
+        }
+
+    if not request.force:
+        to_process, _ = diff_index_task.fn(
+            [record], store.list_doc_mtimes(), store.list_doc_change_hashes()
+        )
+        if not to_process:
+            return {
+                "status": "skipped",
+                "reason": "unchanged",
+                "doc_id": record["doc_id"],
+                "rel_path": record["rel_path"],
+            }
+
+    _build_single_doc_runtime(
+        config,
+        store,
+        doc_id_store,
+        request.source_name,
+        record,
+    )
+    begin_degradation_capture()
+    process_doc_task.fn(record)
+    _record_single_doc_outcome(index_root, record)
+    # Signal serving processes to reopen their cached store handle so the doc
+    # is searchable immediately. FTS visibility still awaits the next sweep.
+    _update_index_metadata_after_single_doc(index_root, store)
+    return {
+        "status": "indexed",
+        "doc_id": record["doc_id"],
+        "rel_path": record["rel_path"],
+    }
+
+
+def _drain_index_requests(
+    config: dict,
+    queue: IndexRequestQueue,
+    table_name: str,
+    store,
+    doc_id_store: DocIDStore,
+    *,
+    limit: int,
+    prioritize: tuple[str, str] | None = None,
+) -> dict[tuple[str, str], dict]:
+    """Process one bounded queue snapshot without retrying failures in-place."""
+    results: dict[tuple[str, str], dict] = {}
+    for request in queue.pending(
+        table_name,
+        limit=max(1, int(limit)),
+        prioritize=prioritize,
+    ):
+        key = (request.source_name, request.target)
+        try:
+            result = _index_document_unlocked(
+                config,
+                request,
+                store,
+                doc_id_store,
+            )
+        except Exception as exc:  # retained for a later session
+            queue.fail(request, str(exc))
+            _get_logger().exception(
+                "Queued targeted index failed for %s:%s",
+                request.source_name,
+                request.target,
+            )
+            results[key] = {
+                "status": "queued",
+                "reason": "retry_pending",
+                "source_name": request.source_name,
+                "target": request.target,
+                "revision": request.revision,
+            }
+            continue
+
+        if result.get("status") == "error" and result.get("reason") != "not_found":
+            queue.fail(request, str(result))
+            results[key] = {
+                "status": "queued",
+                "reason": "retry_pending",
+                "source_name": request.source_name,
+                "target": request.target,
+                "revision": request.revision,
+            }
+            continue
+        queue.complete(request)
+        results[key] = result
+    return results
+
+
 def index_document_flow(
     config_path: str = "config.yaml",
     target: str = "",
     source_name: str = "documents",
     force: bool = False,
 ) -> dict:
-    """Index a single document by path/rel_path/doc_id.
-
-    Idempotent: an unchanged file (content-hash-first, mtime fallback — same
-    rule as the full flow's diff) is skipped without re-OCR unless force=True.
-    On index, process_doc_task emits the document.indexed webhook exactly as
-    the full flow does, so downstream enrichment backfill is unchanged.
-    """
+    """Durably accept and, when possible, index one target under a table session."""
     config = load_config(config_path)
     index_root = Path(config["index_root"])
-    index_root.mkdir(parents=True, exist_ok=True)
     table_name = config.get("lancedb", {}).get("table", "chunks")
+    target = _normalize_index_request_target(config, source_name, target)
+    queue = IndexRequestQueue(index_root)
+    request = queue.enqueue(
+        table_name,
+        source_name,
+        target,
+        force=force,
+    )
+    queued_result = {
+        "status": "queued",
+        "reason": "index_write_in_progress",
+        "source_name": request.source_name,
+        "target": request.target,
+        "revision": request.revision,
+    }
 
-    with _SINGLE_DOC_LOCK:
-        store = open_store_with_recovery(
-            index_root, table_name, logger_obj=_get_logger(), auto_recover=True
-        )
-        doc_id_store = DocIDStore(index_root / "doc_registry.db")
-
-        record = resolve_single_record(config, source_name, target, doc_id_store)
-        if record is None:
-            return {
-                "status": "error",
-                "reason": "not_found",
-                "target": str(target),
-                "source_name": source_name,
-            }
-
-        if not force:
-            to_process, _ = diff_index_task.fn(
-                [record], store.list_doc_mtimes(), store.list_doc_change_hashes()
+    try:
+        session = index_write_lock(index_root, table_name, blocking=False)
+        with session:
+            store = open_store_with_recovery(
+                index_root,
+                table_name,
+                logger_obj=_get_logger(),
+                auto_recover=True,
             )
-            if not to_process:
-                return {
-                    "status": "skipped",
-                    "reason": "unchanged",
-                    "doc_id": record["doc_id"],
-                    "rel_path": record["rel_path"],
-                }
+            doc_id_store = DocIDStore(index_root / "doc_registry.db")
+            queue_cfg = config.get("index_queue", {})
+            with store.exclusive_writer_session():
+                results = _drain_index_requests(
+                    config,
+                    queue,
+                    table_name,
+                    store,
+                    doc_id_store,
+                    limit=queue_cfg.get("targeted_drain_limit", 16),
+                    prioritize=(request.source_name, request.target),
+                )
+    except IndexWriteLockBusy:
+        return queued_result
 
-        _build_single_doc_runtime(config, store, doc_id_store, source_name, record)
-        begin_degradation_capture()
-        process_doc_task.fn(record)
-        _record_single_doc_outcome(index_root, record)
-        # Signal serving processes to reopen their cached store handle so the
-        # doc is searchable immediately. NOTE: the FTS index is deliberately
-        # NOT rebuilt here (it is rebuilt once per full sweep), so keyword-
-        # search visibility of this doc still awaits the next sweep; vector
-        # search sees it right away.
-        _update_index_metadata_after_single_doc(index_root, store)
-        return {
-            "status": "indexed",
-            "doc_id": record["doc_id"],
-            "rel_path": record["rel_path"],
-        }
+    return results.get((request.source_name, request.target), queued_result)

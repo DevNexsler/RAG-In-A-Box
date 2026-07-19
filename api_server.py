@@ -288,7 +288,10 @@ async def index_document(request: Request) -> JSONResponse:
             status_code=500,
         )
 
-    status_code = 404 if result.get("status") == "error" else 200
+    if result.get("status") == "queued":
+        status_code = 202
+    else:
+        status_code = 404 if result.get("status") == "error" else 200
     return JSONResponse(result, status_code=status_code)
 
 

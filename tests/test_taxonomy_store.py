@@ -117,6 +117,45 @@ class TestIncrementUsage:
     def test_increment_nonexistent_no_error(self, populated_store):
         populated_store.increment_usage("tag:nonexistent")  # should not raise
 
+    def test_increment_many_preserves_vectors_without_reembedding_or_per_row_commits(
+        self, tmp_path
+    ):
+        embed_calls: list[str] = []
+
+        def tracked_embed(text: str) -> list[float]:
+            embed_calls.append(text)
+            return _fake_embed(text)
+
+        store = TaxonomyStore(tmp_path, table_name="taxonomy", embed_fn=tracked_embed)
+        store.add("tag", "alpha", "Alpha description", usage_count=2)
+        store.add("tag", "beta", "Beta description", usage_count=4)
+        before = {
+            row["id"]: row["vector"]
+            for row in store._table.to_arrow().to_pylist()
+        }
+        version_before = store._table.version
+        embed_calls.clear()
+
+        store.increment_usage_many(
+            {
+                "tag:alpha": 3,
+                "tag:beta": 7,
+                "tag:missing": 5,
+                "tag:ignored": 0,
+            }
+        )
+
+        assert embed_calls == []
+        assert store._table.version == version_before + 1
+        assert store.get("tag:alpha")["usage_count"] == 5
+        assert store.get("tag:beta")["usage_count"] == 11
+        assert store.get("tag:missing") is None
+        after = {
+            row["id"]: row["vector"]
+            for row in store._table.to_arrow().to_pylist()
+        }
+        assert after == before
+
 
 # ---------------------------------------------------------------------------
 # Query Tests
