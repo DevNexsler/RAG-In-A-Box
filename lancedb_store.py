@@ -1,5 +1,7 @@
 """LanceDB storage via LlamaIndex's LanceDBVectorStore. Implements our StorageInterface."""
 
+import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -70,6 +72,8 @@ _DEFAULT_DAILY_RESTORE_POINT_DAYS = 7
 _DAILY_TAG_PREFIX = "daily-"
 _DOCUMENT_WRITE_LOCK_STRIPES = 256
 _COMPACTION_MARKER_SUFFIX = ".last-compaction"
+_PROCESS_DOCUMENT_LOCKS: dict[str, threading.RLock] = {}
+_PROCESS_DOCUMENT_LOCKS_GUARD = threading.Lock()
 
 
 def _lance_version_retention_minutes() -> float:
@@ -214,14 +218,6 @@ class LanceDBStore:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
         self._schema_lock = threading.Lock()
-        # Lance delete+add upserts are not atomic. Duplicate discovery can send
-        # several workers to rewrite one canonical document at once, so stripe
-        # writes by document ID while preserving concurrency across documents.
-        # RLocks allow a canonical metadata rewrite to call upsert_nodes while
-        # already owning the canonical stripe.
-        self._document_write_locks = tuple(
-            threading.RLock() for _ in range(_DOCUMENT_WRITE_LOCK_STRIPES)
-        )
         self._memory_observer = None
         self._vs = self._build_vector_store()
         self._ensure_scalar_index()
@@ -256,20 +252,50 @@ class LanceDBStore:
 
     @contextmanager
     def _serialize_document_writes(self, doc_ids: set[str] | list[str]):
-        """Serialize non-atomic Lance rewrites that target the same document."""
+        """Serialize same-document rewrites across threads and processes."""
         stripe_indexes = sorted(
             {
-                hash(str(doc_id)) % len(self._document_write_locks)
+                int.from_bytes(
+                    hashlib.blake2b(str(doc_id).encode(), digest_size=2).digest(),
+                    "big",
+                )
+                % _DOCUMENT_WRITE_LOCK_STRIPES
                 for doc_id in doc_ids
                 if doc_id
             }
         )
-        locks = [self._document_write_locks[index] for index in stripe_indexes]
+        lock_root = Path(self.index_root) / ".lancedb-write-locks"
+        lock_paths = [
+            lock_root / f"{self.table_name}-{index:03d}.lock"
+            for index in stripe_indexes
+        ]
+        with _PROCESS_DOCUMENT_LOCKS_GUARD:
+            locks = [
+                _PROCESS_DOCUMENT_LOCKS.setdefault(
+                    str(path.resolve()), threading.RLock()
+                )
+                for path in lock_paths
+            ]
         for lock in locks:
             lock.acquire()
+        lock_files = []
         try:
+            lock_root.mkdir(parents=True, exist_ok=True)
+            for path in lock_paths:
+                lock_file = path.open("a+")
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    lock_file.close()
+                    raise
+                lock_files.append(lock_file)
             yield
         finally:
+            for lock_file in reversed(lock_files):
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                finally:
+                    lock_file.close()
             for lock in reversed(locks):
                 lock.release()
 
@@ -402,6 +428,13 @@ class LanceDBStore:
 
     def _reopen_vector_store(self) -> None:
         self._vs = self._build_vector_store()
+
+    def _checkout_latest(self) -> None:
+        """Refresh an existing Lance table handle without rebuilding the store."""
+        try:
+            self._vs.table.checkout_latest()
+        except TableNotFoundError:
+            pass
 
     def _run_read_with_recovery(self, operation, default_on_missing):
         try:
@@ -718,22 +751,43 @@ class LanceDBStore:
     # --- StorageInterface methods ---
 
     def upsert_nodes(self, nodes: list[TextNode]) -> None:
-        """Atomically replace each document relative to peer writer threads."""
+        """Replace each document while excluding peer writers."""
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
         with self._serialize_document_writes(doc_ids):
-            self._write_nodes_unlocked(nodes, delete_existing=True)
+            self._checkout_latest()
+            self._write_nodes_unlocked(nodes, operation="upsert")
 
     def insert_nodes(self, nodes: list[TextNode]) -> None:
-        """Insert documents known absent without a delete-only transaction."""
+        """Insert absent documents idempotently without delete-only commits."""
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
         with self._serialize_document_writes(doc_ids):
-            self._write_nodes_unlocked(nodes, delete_existing=False)
+            # The flow's pre-run absence snapshot can become stale when a
+            # targeted writer lands first. Refresh and check under the same
+            # cross-process document lock that protects the add, making both
+            # concurrent insertion and ambiguous retry idempotent.
+            self._checkout_latest()
+            existing_doc_ids = {
+                doc_id for doc_id in doc_ids if self.contains_doc_id(doc_id)
+            }
+            nodes_to_insert = [
+                node
+                for node in nodes
+                if not node.ref_doc_id or node.ref_doc_id not in existing_doc_ids
+            ]
+            if not nodes_to_insert:
+                logger.info(
+                    "Skipped insert for documents already present: %s",
+                    sorted(existing_doc_ids),
+                )
+                return
+            self._write_nodes_unlocked(nodes_to_insert, operation="insert")
 
     def _write_nodes_unlocked(
-        self, nodes: list[TextNode], *, delete_existing: bool
+        self, nodes: list[TextNode], *, operation: str
     ) -> None:
         """Write nodes, deleting prior chunks only for replacement updates."""
-        with _tracer.start_as_current_span("store.upsert"):
+        delete_existing = operation == "upsert"
+        with _tracer.start_as_current_span(f"store.{operation}"):
             if not nodes:
                 return
 
@@ -788,11 +842,18 @@ class LanceDBStore:
                 with self._measure_memory("storage_add", **memory_fields):
                     self._vs.add(nodes)
             except Exception:
-                logger.critical(
-                    "Failed to add %d nodes for doc_ids=%s after old chunks were deleted; "
-                    "these docs will self-heal on the next index run",
-                    len(nodes), sorted(doc_ids),
-                )
+                if delete_existing:
+                    logger.critical(
+                        "Failed to add %d nodes for doc_ids=%s after old chunks were deleted; "
+                        "these docs will self-heal on the next index run",
+                        len(nodes), sorted(doc_ids),
+                    )
+                else:
+                    logger.critical(
+                        "Failed to insert %d nodes for doc_ids=%s; "
+                        "these docs will self-heal on the next index run",
+                        len(nodes), sorted(doc_ids),
+                    )
                 raise
 
     def _load_unique_canonical_rows(
@@ -836,6 +897,7 @@ class LanceDBStore:
     ) -> None:
         """Single-flight canonical metadata rewrites by canonical document."""
         with self._serialize_document_writes([canonical_doc_id]):
+            self._checkout_latest()
             self._update_canonical_duplicate_metadata_unlocked(
                 canonical_doc_id, duplicate_refs
             )
@@ -934,11 +996,12 @@ class LanceDBStore:
             node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=canonical_doc_id)
             canonical_nodes.append(node)
 
-        self.upsert_nodes(canonical_nodes)
+        self._write_nodes_unlocked(canonical_nodes, operation="upsert")
 
     def delete_by_doc_ids(self, doc_ids: list[str]) -> None:
         """Remove documents without racing a concurrent rewrite of the same IDs."""
         with self._serialize_document_writes(doc_ids):
+            self._checkout_latest()
             self._delete_by_doc_ids_unlocked(doc_ids)
 
     def _delete_by_doc_ids_unlocked(self, doc_ids: list[str]) -> None:

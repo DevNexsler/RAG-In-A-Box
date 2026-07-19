@@ -1,5 +1,6 @@
 """Tests for LanceDBStore (uses a temp directory, no mocks needed)."""
 
+import multiprocessing
 import tempfile
 import threading
 import time
@@ -31,6 +32,21 @@ def _make_node(doc_id: str, loc: str, text: str, vector: list[float]) -> TextNod
     )
     node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
     return node
+
+
+def _hold_document_lock(index_root, acquired, release):
+    store = LanceDBStore(index_root, "test_chunks")
+    with store._serialize_document_writes(["race.md"]):
+        acquired.set()
+        if not release.wait(10):
+            raise TimeoutError("parent did not release document lock")
+
+
+def _enter_document_lock(index_root, started, acquired):
+    store = LanceDBStore(index_root, "test_chunks")
+    started.set()
+    with store._serialize_document_writes(["race.md"]):
+        acquired.set()
 
 
 def test_upsert_and_list():
@@ -75,6 +91,100 @@ def test_insert_nodes_commits_once_without_noop_delete():
         dataset = lance.dataset(_lance_path(tmpdir))
         assert dataset.version == before + 1
         assert set(store.list_doc_ids()) == {"seed.md", "new.md"}
+
+
+def test_insert_nodes_is_idempotent_across_store_handles():
+    """A stale new-doc snapshot or ambiguous retry must not append duplicates."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        first = LanceDBStore(tmpdir, "test_chunks")
+        first.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        second = LanceDBStore(tmpdir, "test_chunks")
+
+        second.upsert_nodes([
+            _make_node("race.md", "c:0", "targeted write", [0.2] * 768)
+        ])
+        before_retry = lance.dataset(_lance_path(tmpdir)).version
+        first.insert_nodes([
+            _make_node("race.md", "c:0", "stale sweep write", [0.3] * 768)
+        ])
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.count_rows("doc_id = 'race.md'") == 1
+        assert dataset.version == before_retry
+
+
+def test_concurrent_insert_and_upsert_do_not_leave_duplicate_rows():
+    """Two real handles serialize the stale-snapshot insert/upsert race."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        insert_store = LanceDBStore(tmpdir, "test_chunks")
+        insert_store.upsert_nodes([
+            _make_node("seed.md", "c:0", "seed", [0.1] * 768)
+        ])
+        upsert_store = LanceDBStore(tmpdir, "test_chunks")
+        barrier = threading.Barrier(2)
+
+        def insert():
+            barrier.wait()
+            insert_store.insert_nodes([
+                _make_node("race.md", "c:0", "sweep", [0.2] * 768)
+            ])
+
+        def upsert():
+            barrier.wait()
+            upsert_store.upsert_nodes([
+                _make_node("race.md", "c:0", "targeted", [0.3] * 768)
+            ])
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(insert), pool.submit(upsert)]
+            for future in futures:
+                future.result(timeout=10)
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.count_rows("doc_id = 'race.md'") == 1
+
+
+def test_document_write_lock_excludes_another_process():
+    """The filesystem lock—not only process-local RLocks—guards a document."""
+    context = multiprocessing.get_context("spawn")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        holder_acquired = context.Event()
+        release_holder = context.Event()
+        contender_started = context.Event()
+        contender_acquired = context.Event()
+        holder = context.Process(
+            target=_hold_document_lock,
+            args=(tmpdir, holder_acquired, release_holder),
+        )
+        contender = context.Process(
+            target=_enter_document_lock,
+            args=(tmpdir, contender_started, contender_acquired),
+        )
+        holder.start()
+        try:
+            assert holder_acquired.wait(10)
+            contender.start()
+            assert contender_started.wait(10)
+            assert not contender_acquired.wait(0.5)
+        finally:
+            release_holder.set()
+            holder.join(10)
+            if contender.pid is not None:
+                contender.join(10)
+            for process in (holder, contender):
+                if process.pid is not None and process.is_alive():
+                    process.terminate()
+                    process.join(5)
+
+        assert holder.exitcode == 0
+        assert contender.exitcode == 0
+        assert contender_acquired.is_set()
 
 
 def test_reopening_store_does_not_replace_existing_scalar_index():

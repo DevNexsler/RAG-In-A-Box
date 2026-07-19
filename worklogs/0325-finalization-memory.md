@@ -209,6 +209,43 @@ pytest -q tests/test_taxonomy_store.py tests/test_store.py tests/test_scan.py
 205 passed, 246 warnings in 11.38s
 ```
 
+Review then reproduced a stale-snapshot race with two real store handles. A
+targeted upsert could land after the full sweep captured absence but before its
+insert, leaving two physical rows for one chunk; an ambiguous retry had the
+same failure mode. The persisted duplicate could survive later incremental
+diffs because its mtime still looked current.
+
+Document writes now take stable, ordered stripe locks at both process and
+filesystem scope. `fcntl.flock` coordinates independent API/indexer processes
+sharing an index volume; the process-local `RLock` also coordinates separate
+store handles in one server. Under that lock, insert checks out the latest
+Lance manifest and skips already-present document IDs. Upsert, delete, and
+canonical metadata replacement use the same exclusion boundary, so the
+existence check and add cannot race another supported write entrypoint. The
+refresh uses Lance's lightweight `checkout_latest()` rather than reconstructing
+the vector store per document.
+
+Regression coverage proves the original two-handle stale snapshot/retry leaves
+one row and no new version, concurrent insert/upsert leaves one row, and a
+spawned second process cannot enter the same document stripe while another
+process owns it. Flow tests independently prove insert IDs derive from the
+pre-run `stored_mtimes` snapshot and changed/existing documents still select
+upsert. Storage tracing and failure logs now distinguish insert from upsert.
+
+```text
+pytest -q tests/test_store.py -k 'insert_nodes or concurrent_insert_and_upsert or document_write_lock_excludes'
+4 passed, 104 deselected
+
+pytest -q tests/test_scan.py -k 'flow_derives_storage_write_mode or process_doc_task_queues_taxonomy_usage'
+4 passed, 54 deselected
+
+ruff check lancedb_store.py core/storage.py flow_index_vault.py tests/test_store.py tests/test_scan.py
+All checks passed!
+
+make test-unit
+1250 passed, 270 deselected, 401 warnings in 104.13s
+```
+
 ## Frozen-head evidence and remaining release gate
 
 Commit `37d2bd5998acad4f59805b0cbae2b3e530900c31` passed the repository gate:

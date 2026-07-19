@@ -729,7 +729,16 @@ def test_include_repaired_sidecar_docs_forces_reindex_without_duplicates():
     ]
 
 
-def test_process_doc_task_queues_taxonomy_usage_without_worker_write(monkeypatch):
+@pytest.mark.parametrize(
+    ("insert_doc_ids", "expected_write_mode"),
+    [
+        ({"documents::photo"}, "insert"),
+        (set(), "upsert"),
+    ],
+)
+def test_process_doc_task_queues_taxonomy_usage_without_worker_write(
+    monkeypatch, insert_doc_ids, expected_write_mode
+):
     """Document workers queue taxonomy usage instead of writing taxonomy.lance."""
     from extractors import ExtractionResult
     from flow_index_vault import process_doc_task
@@ -797,7 +806,7 @@ def test_process_doc_task_queues_taxonomy_usage_without_worker_write(monkeypatch
             "llm_generator": object(),
             "taxonomy_store": object(),
             "taxonomy_usage": accumulator,
-            "storage_insert_doc_ids": {"documents::photo"},
+            "storage_insert_doc_ids": insert_doc_ids,
         }
     )
 
@@ -813,7 +822,7 @@ def test_process_doc_task_queues_taxonomy_usage_without_worker_write(monkeypatch
     )
 
     assert captured["record_taxonomy_usage"] is False
-    assert captured["write_mode"] == "insert"
+    assert captured["write_mode"] == expected_write_mode
     assert accumulator.snapshot() == {
         "folder:Projects/Renovation": 1,
         "tag:renovation": 1,
@@ -1114,6 +1123,37 @@ def test_fresh_store_skips_precompaction_and_creates_fts_after_processing(tmp_pa
     assert events == ["process"]
     fake_store.prepare_indexing_maintenance.assert_not_called()
     fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
+
+
+@pytest.mark.parametrize(
+    ("stored_mtimes", "expected_insert_ids"),
+    [
+        ({}, {"documents::doc-1"}),
+        ({"documents::doc-1": 1.0}, set()),
+    ],
+)
+def test_flow_derives_storage_write_mode_from_authoritative_snapshot(
+    tmp_path, stored_mtimes, expected_insert_ids
+):
+    """Only docs absent from the pre-run store snapshot use insert semantics."""
+    captured: list[set[str]] = []
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = list(stored_mtimes)
+    fake_store.list_doc_mtimes.return_value = stored_mtimes
+    fake_store.list_doc_change_hashes.return_value = {}
+    fake_store.count_chunks.return_value = len(stored_mtimes)
+    fake_store.fts_available.return_value = bool(stored_mtimes)
+
+    _run_flow_with_fts_store(
+        tmp_path,
+        fake_store,
+        _changed_doc_diff(),
+        process_side_effect=lambda *_args, **_kwargs: captured.append(
+            set(_RUNTIME["storage_insert_doc_ids"])
+        ) or [],
+    )
+
+    assert captured == [expected_insert_ids]
 
 
 def test_new_source_in_populated_shared_table_still_compacts_before_processing(

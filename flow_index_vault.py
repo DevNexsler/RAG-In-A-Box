@@ -1533,9 +1533,11 @@ def _process_doc_task(
         # doubling retained manifests for large new-document batches.
         if doc_id in _RUNTIME.get("storage_insert_doc_ids", set()):
             store.insert_nodes(nodes)
+            write_mode = "Inserted"
         else:
             store.upsert_nodes(nodes)
-        logger.info(f"Upserted {len(nodes)} chunks: {doc_id}")
+            write_mode = "Upserted"
+        logger.info(f"{write_mode} {len(nodes)} chunks: {doc_id}")
 
         chunks = []
         for node in nodes:

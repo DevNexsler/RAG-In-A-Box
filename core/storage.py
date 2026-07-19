@@ -107,6 +107,10 @@ class StorageInterface(Protocol):
         """Replace all nodes for each doc_id in this batch."""
         ...
 
+    def insert_nodes(self, nodes: list[TextNode]) -> None:
+        """Insert nodes for documents not already present, idempotently."""
+        ...
+
     def delete_by_doc_ids(self, doc_ids: list[str]) -> None:
         """Remove all node rows for the given doc_ids."""
         ...
