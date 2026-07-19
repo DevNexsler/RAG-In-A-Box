@@ -746,6 +746,11 @@ def test_process_doc_task_queues_taxonomy_usage_without_worker_write(monkeypatch
 
     class FakeStore:
         def upsert_nodes(self, nodes):
+            captured["write_mode"] = "upsert"
+            captured["metadata"] = nodes[0].metadata
+
+        def insert_nodes(self, nodes):
+            captured["write_mode"] = "insert"
             captured["metadata"] = nodes[0].metadata
 
     class FakeEmbed:
@@ -792,6 +797,7 @@ def test_process_doc_task_queues_taxonomy_usage_without_worker_write(monkeypatch
             "llm_generator": object(),
             "taxonomy_store": object(),
             "taxonomy_usage": accumulator,
+            "storage_insert_doc_ids": {"documents::photo"},
         }
     )
 
@@ -807,6 +813,7 @@ def test_process_doc_task_queues_taxonomy_usage_without_worker_write(monkeypatch
     )
 
     assert captured["record_taxonomy_usage"] is False
+    assert captured["write_mode"] == "insert"
     assert accumulator.snapshot() == {
         "folder:Projects/Renovation": 1,
         "tag:renovation": 1,

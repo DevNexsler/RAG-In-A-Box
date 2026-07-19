@@ -172,6 +172,43 @@ pytest -q tests/test_taxonomy_store.py tests/test_store.py tests/test_scan.py
 
 The warnings were existing LanceDB deprecations and Prefect missing-flow-context logging warnings. A Prefect temporary-server logger emitted a post-pytest closed-stream logging error after the successful result; pytest exit remained 0.
 
+### Representative workload follow-up
+
+The clean-image due-marker gate was extended to 1,624 nonempty synthetic Zoho
+Cliq rows with production chunking, embedding batch size 64/concurrency 2, and
+simulated LiteLLM enrichment at concurrency 8. The resource guard stopped the
+first valid run during processing after 1,289 successful documents:
+
+```text
+pre-maintenance/compaction cgroup peak: 5,886,984,192 bytes
+process cgroup peak: 8,059,576,320 bytes (7.5 GiB guard: 8,053,063,680)
+process RSS at stop: 3,587,010,560 bytes
+peak PIDs: 450
+memory.events max/oom/oom_kill deltas: 0/0/0
+```
+
+The partial table advanced from version 50,462 to 53,046 for about 1,290 new
+documents: two versions per document, plus maintenance. The flow routed every
+new document through replacement upsert. Lance commits a no-match delete as a
+metadata version, then commits the add as another version, doubling retained
+manifests and transaction state while fragments accumulate.
+
+The flow now derives insert-only IDs from the authoritative pre-run
+`stored_mtimes` snapshot (all scanned IDs for an empty shadow table). Known-new
+documents use `LanceDBStore.insert_nodes`, which shares schema validation and
+write locking with upsert but omits the proven-no-op delete. Existing updates
+retain delete-plus-add replacement semantics. Regression coverage proves a new
+insert advances Lance exactly one version and that the document worker selects
+the insert route. Focused verification after this correction:
+
+```text
+ruff check flow_index_vault.py lancedb_store.py tests/test_scan.py tests/test_store.py
+All checks passed!
+
+pytest -q tests/test_taxonomy_store.py tests/test_store.py tests/test_scan.py
+205 passed, 246 warnings in 11.38s
+```
+
 ## Frozen-head evidence and remaining release gate
 
 Commit `37d2bd5998acad4f59805b0cbae2b3e530900c31` passed the repository gate:

@@ -1527,8 +1527,14 @@ def _process_doc_task(
                 node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
                 nodes.append(node)
 
-        # --- Upsert into store ---
-        store.upsert_nodes(nodes)
+        # --- Persist into store ---
+        # The scan/diff proves which documents are absent. Insert those
+        # directly: a no-match Lance delete still commits a metadata version,
+        # doubling retained manifests for large new-document batches.
+        if doc_id in _RUNTIME.get("storage_insert_doc_ids", set()):
+            store.insert_nodes(nodes)
+        else:
+            store.upsert_nodes(nodes)
         logger.info(f"Upserted {len(nodes)} chunks: {doc_id}")
 
         chunks = []
@@ -2271,6 +2277,11 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
 
     docs_to_process = to_add_or_update
     docs_to_delete = to_delete
+    storage_insert_doc_ids = {
+        str(doc["doc_id"])
+        for doc in docs_to_process
+        if str(doc["doc_id"]) not in stored_mtimes
+    }
     shadow_table_name = f"{table_name}__shadow"
     if using_shadow_rebuild:
         logger.info(
@@ -2285,6 +2296,9 @@ def index_vault_flow(config_path: str = "config.yaml", source_name: str | None =
         _RUNTIME["store"] = store
         docs_to_process = scanned
         docs_to_delete = []
+        storage_insert_doc_ids = {str(doc["doc_id"]) for doc in docs_to_process}
+
+    _RUNTIME["storage_insert_doc_ids"] = storage_insert_doc_ids
 
     # A daily full-table compaction can consume several GiB on the production
     # corpus. Run it before document processing creates its own resident state,

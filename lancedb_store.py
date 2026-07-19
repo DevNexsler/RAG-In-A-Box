@@ -721,10 +721,18 @@ class LanceDBStore:
         """Atomically replace each document relative to peer writer threads."""
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
         with self._serialize_document_writes(doc_ids):
-            self._upsert_nodes_unlocked(nodes)
+            self._write_nodes_unlocked(nodes, delete_existing=True)
 
-    def _upsert_nodes_unlocked(self, nodes: list[TextNode]) -> None:
-        """Delete existing nodes for each doc_id, then add new ones."""
+    def insert_nodes(self, nodes: list[TextNode]) -> None:
+        """Insert documents known absent without a delete-only transaction."""
+        doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
+        with self._serialize_document_writes(doc_ids):
+            self._write_nodes_unlocked(nodes, delete_existing=False)
+
+    def _write_nodes_unlocked(
+        self, nodes: list[TextNode], *, delete_existing: bool
+    ) -> None:
+        """Write nodes, deleting prior chunks only for replacement updates."""
         with _tracer.start_as_current_span("store.upsert"):
             if not nodes:
                 return
@@ -762,15 +770,19 @@ class LanceDBStore:
                             if new_fields:
                                 self._evolve_metadata_schema(new_fields)
 
-            # Delete old data for those doc_ids first
-            with self._measure_memory("storage_delete", **memory_fields):
-                for doc_id in doc_ids:
-                    try:
-                        self._vs.delete(doc_id)
-                    except TableNotFoundError:
-                        pass  # Table not created yet on first run
-                    except Exception as e:
-                        logger.warning("Failed to delete old data for %s: %s", doc_id, e)
+            # New documents are proven absent by the flow diff. Avoid a no-op
+            # delete: Lance commits it as a full metadata version anyway, so a
+            # large insert batch otherwise doubles manifests and retained
+            # transaction state before final pruning.
+            if delete_existing:
+                with self._measure_memory("storage_delete", **memory_fields):
+                    for doc_id in doc_ids:
+                        try:
+                            self._vs.delete(doc_id)
+                        except TableNotFoundError:
+                            pass  # Table not created yet on first run
+                        except Exception as e:
+                            logger.warning("Failed to delete old data for %s: %s", doc_id, e)
             # Add new nodes
             try:
                 with self._measure_memory("storage_add", **memory_fields):

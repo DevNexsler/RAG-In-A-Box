@@ -61,6 +61,22 @@ def test_upsert_replaces():
         assert doc_ids == ["a.md"]
 
 
+def test_insert_nodes_commits_once_without_noop_delete():
+    """Known-new documents must not create a delete-only Lance version."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        before = lance.dataset(_lance_path(tmpdir)).version
+
+        store.insert_nodes([_make_node("new.md", "c:0", "new", [0.2] * 768)])
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert dataset.version == before + 1
+        assert set(store.list_doc_ids()) == {"seed.md", "new.md"}
+
+
 def test_reopening_store_does_not_replace_existing_scalar_index():
     """Read-path construction must not create a new Lance version each time."""
     import lance
