@@ -1625,31 +1625,44 @@ class LanceDBStore:
     _SAFE_CONTEXT_FACET_FIELDS = {"enr_context_confidence"}
     _FACET_SCAN_BATCH_SIZE = 1024
     _DYNAMIC_NON_FACET_FIELDS = {
-        "custom_meta",
-        "date",
-        "dimensions",
-        "modified",
-        "updated",
-    }
-    _DYNAMIC_NON_FACET_TOKENS = {
         "body",
         "content",
+        "custom_meta",
+        "date",
         "description",
-        "facts",
-        "json",
-        "narrative",
+        "dimensions",
+        "filename",
+        "hash",
+        "id",
+        "modified",
+        "path",
         "summary",
         "text",
+        "timestamp",
+        "updated",
+        "uri",
+        "url",
         "warning",
     }
     _DYNAMIC_NON_FACET_SUFFIXES = (
         "_at",
+        "_body",
         "_bytes",
+        "_content",
+        "_description",
+        "_facts",
         "_filename",
         "_hash",
         "_id",
         "_ids",
+        "_json",
         "_path",
+        "_summary",
+        "_text",
+        "_timestamp",
+        "_uri",
+        "_url",
+        "_warning",
     )
 
     @classmethod
@@ -1665,7 +1678,6 @@ class LanceDBStore:
                 and not field.startswith("dup_")
                 and field not in cls._DYNAMIC_NON_FACET_FIELDS
                 and not field.endswith(cls._DYNAMIC_NON_FACET_SUFFIXES)
-                and not (set(field.split("_")) & cls._DYNAMIC_NON_FACET_TOKENS)
                 and (
                     not field.startswith("enr_context_")
                     or field in cls._SAFE_CONTEXT_FACET_FIELDS

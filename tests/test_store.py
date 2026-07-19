@@ -972,9 +972,25 @@ def test_dynamic_facets_exclude_internal_narrative_and_identifier_fields():
         "updated_at",
         "dup_sources",
         "file_size_bytes",
+        "id",
+        "path",
+        "filename",
+        "hash",
+        "timestamp",
+        "url",
+        "uri",
+        "content_type",
+        "warning_level",
+        "description_kind",
     }
 
-    assert LanceDBStore._dynamic_facet_fields(available) == {"section", "priority"}
+    assert LanceDBStore._dynamic_facet_fields(available) == {
+        "section",
+        "priority",
+        "content_type",
+        "warning_level",
+        "description_kind",
+    }
 
 
 def test_extra_metadata_in_get_chunk():
