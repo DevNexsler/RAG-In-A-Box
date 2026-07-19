@@ -1624,6 +1624,33 @@ class LanceDBStore:
     _NON_FACET_FIELDS = {"doc_id", "loc", "snippet", "mtime", "size", "title", "created"}
     _SAFE_CONTEXT_FACET_FIELDS = {"enr_context_confidence"}
     _FACET_SCAN_BATCH_SIZE = 1024
+    _DYNAMIC_NON_FACET_FIELDS = {
+        "custom_meta",
+        "date",
+        "dimensions",
+        "modified",
+        "updated",
+    }
+    _DYNAMIC_NON_FACET_TOKENS = {
+        "body",
+        "content",
+        "description",
+        "facts",
+        "json",
+        "narrative",
+        "summary",
+        "text",
+        "warning",
+    }
+    _DYNAMIC_NON_FACET_SUFFIXES = (
+        "_at",
+        "_bytes",
+        "_filename",
+        "_hash",
+        "_id",
+        "_ids",
+        "_path",
+    )
 
     @classmethod
     def _dynamic_facet_fields(cls, available: set[str]) -> set[str]:
@@ -1633,7 +1660,17 @@ class LanceDBStore:
         return {
             field
             for field in candidates
-            if not field.startswith("enr_context_") or field in cls._SAFE_CONTEXT_FACET_FIELDS
+            if (
+                not field.startswith("_")
+                and not field.startswith("dup_")
+                and field not in cls._DYNAMIC_NON_FACET_FIELDS
+                and not field.endswith(cls._DYNAMIC_NON_FACET_SUFFIXES)
+                and not (set(field.split("_")) & cls._DYNAMIC_NON_FACET_TOKENS)
+                and (
+                    not field.startswith("enr_context_")
+                    or field in cls._SAFE_CONTEXT_FACET_FIELDS
+                )
+            )
         }
 
     def facets(self) -> dict:

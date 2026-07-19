@@ -957,6 +957,26 @@ def test_context_narrative_metadata_excluded_from_dynamic_facets():
         assert "enr_context_warning" not in facets
 
 
+def test_dynamic_facets_exclude_internal_narrative_and_identifier_fields():
+    available = {
+        "section",
+        "priority",
+        "_node_content",
+        "message_body",
+        "enr_summary",
+        "enr_key_facts",
+        "custom_meta",
+        "source_message_id",
+        "content_hash",
+        "sidecar_path",
+        "updated_at",
+        "dup_sources",
+        "file_size_bytes",
+    }
+
+    assert LanceDBStore._dynamic_facet_fields(available) == {"section", "priority"}
+
+
 def test_extra_metadata_in_get_chunk():
     """Dynamic fields should be visible in get_chunk results."""
     with tempfile.TemporaryDirectory() as tmpdir:
