@@ -246,6 +246,106 @@ make test-unit
 1250 passed, 270 deselected, 401 warnings in 104.13s
 ```
 
+### Representative race-fix follow-up
+
+The first exact-`ff9be10` 1,624-document due-marker candidate exposed a
+resource regression in the race correction, not the original compaction path.
+Pre-index compaction peaked at 4,931,870,720 cgroup bytes and finished with the
+indexer at 2,087,739,392 RSS. During early processing, repeated
+`checkout_latest()` calls on the long-lived writer table retained manifest file
+cache and descriptors: cgroup memory jumped from about 5.15 GB to
+8,108,650,496 bytes by roughly document 158 while indexer RSS remained about
+2.44 GB. The 1,024-descriptor diagnostic container then produced `EMFILE`.
+The 7.5 GiB guard killed it; memory-event deltas remained max/oom/oom_kill
+`0/0/0`, PIDs peaked at 364, and Docker reported `OOMKilled=false`.
+
+An A/B diagnostic replaced checkout with one fresh `lance.dataset` existence
+probe per document and used production's 65,535 descriptor limit. That removed
+the memory spike: at 220 documents cgroup memory was 5.214 GB, indexer RSS
+2.533 GB, and failures remained zero. It was still unsuitable: native dataset
+construction accumulated tasks until the 480-PID guard fired around 700
+documents (5.602 GB memory, no OOM events). Per-document latest-manifest
+construction is therefore rejected, even though it fixed the cache symptom.
+
+The durable correction serializes full-sweep and targeted writers at table
+session scope with a process `RLock` plus `flock`. Full sweeps block; targeted
+writes return an explicit busy result for retry instead of racing the sweep.
+The full sweep's pre-run absence snapshot stays authoritative for the session,
+so normal new-document inserts perform one add and no Lance refresh/probe.
+Successful insert IDs are remembered by the store so a same-process Prefect
+retry is a no-op. Only standalone inserts and an exceptional ambiguous
+post-commit error use a fresh latest-manifest proof under the document lock.
+
+Regression coverage includes spawned-process table-session exclusion,
+targeted busy behavior, direct two-handle stale-snapshot idempotence,
+same-process concurrent insert/upsert, normal known-absent retry without a
+manifest probe/version, and post-commit exception recovery. Verification:
+
+```text
+focused writer/race/retry tests: 7 passed
+ruff check: All checks passed!
+make test-unit: 1254 passed, 270 deselected, 405 warnings in 110.86s
+```
+
+### Durable writer-session and compaction-worker correction
+
+The first table-session diagnostic fixed the per-document refresh/PID failure
+and completed all 1,624 documents plus finalization with zero document failures.
+It still crossed the 7.5 GiB guard after the Prefect flow reported Completed:
+
+```text
+process: 1,624/1,624 successful; RSS finish 3,398,172,672 bytes
+finalize: completed; RSS finish 3,776,741,376 bytes
+cgroup guard peak: 8,073,150,464 bytes
+peak PIDs: 432
+memory.events max/oom/oom_kill deltas: 0/0/0
+Docker OOMKilled: false
+```
+
+This isolated the remaining resource ownership: binary-copy compaction ran in
+the long-lived indexer, so its native Lance/Arrow state survived into document
+processing and process teardown. Compaction now runs through
+`python -m core.lance_maintenance compact <dataset>` in a short-lived child with
+closed inherited descriptors. The parent owns the table session, waits for the
+child, records successful cadence, refreshes its one stable Lance handle exactly
+once, and only then processes documents. Child stderr remains visible to the
+existing retryable-commit-conflict classifier.
+
+Review also rejected the initial nonblocking `busy` response: CDS is
+fire-and-forget and did not inspect a successful HTTP body, so a request arriving
+after the full sweep's scan could be lost. Targeted requests are now committed
+to a WAL/`synchronous=FULL` SQLite queue before any table-lock attempt. Duplicate
+filesystem aliases coalesce by source-relative canonical path; force only
+escalates; monotonically increasing revisions prevent a concurrent escalation
+from being deleted by an older completion. Full sweeps and opportunistic
+targeted sessions drain bounded snapshots under the same table lock and one
+store/registry handle. Failures remain pending with attempts/error metadata;
+terminal not-found requests complete; REST returns HTTP 202 only after durable
+acceptance. Unknown/non-filesystem sources fail validation before enqueue.
+
+The table session uses process `RLock` depth plus `flock`; nested same-thread
+acquisition shares the outer descriptor and cleanup always releases the process
+lock. Full-flow configuration is passed internally through a `ContextVar`, so
+the public Prefect schema remains only `config_path`/`source_name` and a waiting
+full writer cannot erase another active runtime. Session-locked insert, upsert,
+and delete skip per-document Lance refresh/reopen; standalone calls retain their
+latest-manifest checks. Successful public or internal deletes invalidate the
+same-process completed-insert cache, including failed-upsert-after-delete repair.
+
+Checkpoint verification before the final exact-SHA gate:
+
+```text
+focused queue/lock/targeted/scan/store/compaction: 222 passed, 0 failed
+ruff check + git diff --check: pass
+full unit checkpoint: 1,276 passed, 270 deselected, 411 warnings
+full integration checkpoint: 77 passed, 1,469 deselected, 134 warnings
+```
+
+The unit/integration totals preceded the final review corrections (centralized
+post-child refresh, alias coalescing, permanent-source validation, and internal
+delete cache invalidation); the final frozen SHA must rerun every deterministic
+gate before candidate qualification.
+
 ## Frozen-head evidence and remaining release gate
 
 Commit `37d2bd5998acad4f59805b0cbae2b3e530900c31` passed the repository gate:
