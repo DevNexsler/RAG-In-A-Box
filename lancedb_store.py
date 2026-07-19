@@ -1623,6 +1623,7 @@ class LanceDBStore:
     # Metadata fields that should NOT be faceted (structural/numeric, not categorical)
     _NON_FACET_FIELDS = {"doc_id", "loc", "snippet", "mtime", "size", "title", "created"}
     _SAFE_CONTEXT_FACET_FIELDS = {"enr_context_confidence"}
+    _FACET_SCAN_BATCH_SIZE = 1024
 
     @classmethod
     def _dynamic_facet_fields(cls, available: set[str]) -> set[str]:
@@ -1638,15 +1639,11 @@ class LanceDBStore:
     def facets(self) -> dict:
         """Return distinct values and doc counts for all filterable fields.
 
-        Uses column projection to load only metadata fields — no vectors or text.
-        Deduplicates by doc_id so counts reflect documents, not chunks.
+        Streams bounded batches containing only metadata fields — no vectors or
+        text. Deduplicates by doc_id across batches so counts reflect documents,
+        not chunks.
         Tags are split on commas and counted individually.
         Dynamic fields (not in _FACET_KEY_MAP) are automatically included.
-
-        TODO(perf): This does a full table scan — O(chunks). Fine at ~15K chunks
-        (~200ms) but will get slow at 50K+. When that happens, write a
-        facets_cache.json at end of index_vault_flow and read from it here.
-        Cache invalidation is trivial: indexing is the only writer.
         """
         total_chunks = self.count_chunks()
         if total_chunks == 0:
@@ -1667,48 +1664,60 @@ class LanceDBStore:
             if "tags" in available:
                 projection["tags"] = "metadata.tags"
 
-            t = self._vs.table.search(None).select(projection).to_arrow()
+            batches = (
+                self._vs.table.search(None)
+                .select(projection)
+                .to_batches(batch_size=self._FACET_SCAN_BATCH_SIZE)
+            )
 
-            if len(t) == 0:
-                return {"total_docs": 0, "total_chunks": total_chunks}
-
-            # Deduplicate by doc_id and count facet values
+            # Deduplicate by doc_id and count facet values across batches.
             seen: set[str] = set()
             all_counted_fields = set(self._FACET_KEY_MAP.keys()) | dynamic_fields
             counters: dict[str, Counter] = {f: Counter() for f in all_counted_fields}
             tag_counter: Counter = Counter()
 
-            doc_ids = t["doc_id"].to_pylist()
-            field_columns: dict[str, list] = {}
-            for f in all_counted_fields:
-                try:
-                    field_columns[f] = t[f].to_pylist()
-                except KeyError:
-                    field_columns[f] = [None] * len(t)
-            try:
-                tags_col = t["tags"].to_pylist()
-            except KeyError:
-                tags_col = [None] * len(t)
-
-            for i, did in enumerate(doc_ids):
-                if not did or did in seen:
+            for batch in batches:
+                row_count = batch.num_rows
+                if row_count == 0:
                     continue
-                seen.add(did)
+                names = set(batch.schema.names)
+                doc_ids = batch.column(batch.schema.get_field_index("doc_id")).to_pylist()
+                field_columns = {
+                    field: (
+                        batch.column(batch.schema.get_field_index(field)).to_pylist()
+                        if field in names
+                        else [None] * row_count
+                    )
+                    for field in all_counted_fields
+                }
+                tags_col = (
+                    batch.column(batch.schema.get_field_index("tags")).to_pylist()
+                    if "tags" in names
+                    else [None] * row_count
+                )
 
-                for f in all_counted_fields:
-                    val = field_columns[f][i]
-                    if val and str(val).strip():
-                        for item in str(val).split(","):
-                            item = item.strip()
-                            if item:
-                                counters[f][item] += 1
+                for i, did in enumerate(doc_ids):
+                    if not did or did in seen:
+                        continue
+                    seen.add(did)
 
-                raw_tags = tags_col[i]
-                if raw_tags and str(raw_tags).strip():
-                    for tag in str(raw_tags).split(","):
-                        tag = tag.strip()
-                        if tag:
-                            tag_counter[tag] += 1
+                    for field in all_counted_fields:
+                        value = field_columns[field][i]
+                        if value and str(value).strip():
+                            for item in str(value).split(","):
+                                item = item.strip()
+                                if item:
+                                    counters[field][item] += 1
+
+                    raw_tags = tags_col[i]
+                    if raw_tags and str(raw_tags).strip():
+                        for tag in str(raw_tags).split(","):
+                            tag = tag.strip()
+                            if tag:
+                                tag_counter[tag] += 1
+
+            if not seen:
+                return {"total_docs": 0, "total_chunks": total_chunks}
 
             def _to_list(counter: Counter) -> list[dict]:
                 return [{"value": v, "count": c} for v, c in counter.most_common()]

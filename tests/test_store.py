@@ -516,6 +516,55 @@ def test_facets_counts():
         assert "Archive" in folder_values
 
 
+def test_facets_streams_projected_rows_without_materializing_full_table():
+    """Large indexes must not become one in-memory Arrow table for facets."""
+    from lancedb.query import LanceEmptyQueryBuilder
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "a.md",
+                "c:0",
+                "hello",
+                vec,
+                tags="recipe,korean",
+                folder="Projects",
+            ),
+            _make_node_with_meta(
+                "a.md",
+                "c:1",
+                "world",
+                vec,
+                tags="recipe,korean",
+                folder="Projects",
+            ),
+            _make_node_with_meta(
+                "b.md",
+                "c:0",
+                "other",
+                vec,
+                tags="finance",
+                folder="Archive",
+            ),
+        ])
+
+        with patch.object(
+            LanceEmptyQueryBuilder,
+            "to_arrow",
+            side_effect=AssertionError("facets must stream bounded batches"),
+        ):
+            facets = store.facets()
+
+        assert facets["total_docs"] == 2
+        assert facets["total_chunks"] == 3
+        assert {row["value"] for row in facets["folders"]} == {
+            "Projects",
+            "Archive",
+        }
+
+
 def test_search_hit_has_mtime():
     """Verify mtime is passed through on SearchHit from vector_search."""
     import time
