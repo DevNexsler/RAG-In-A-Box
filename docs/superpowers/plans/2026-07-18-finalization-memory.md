@@ -111,7 +111,7 @@ Run affected store/flow tests plus same-day control, due-day retry, restore-poin
 **Files:**
 - Modify: `worklogs/0325-finalization-memory.md`
 
-- [ ] **Step 1: Verify scope and freeze tracked tree**
+- [x] **Step 1: Verify scope and freeze tracked tree**
 
 Run GitNexus detect-changes and inspect `git diff --check`, `git status`, and all d=1 dependents. Finalize tracked worklog evidence available so far, commit source/tests/docs/worklog, and record exact commit tree. Do not change tracked files after qualification starts; append later candidate evidence to PR/ticket, or commit and repeat all qualification against the new SHA.
 
@@ -125,7 +125,7 @@ Build production-shaped image from exact commit, record OCI revision and digest,
 
 - [ ] **Step 4: Run exact-SHA live candidate**
 
-Use fresh snapshot clones, isolated network/state/ports/credentials, 8 GiB/512 PID limits, and production entrypoint shape. Seed one isolated changed input before each run so `should_update_fts` is true. Exercise due compaction and current-marker neighbor paths through actual supervised MCP `file_index_update`; wait for durable terminal success, then call MCP search and facets. Continuously sample and abort on memory >= 7.5 GiB, PIDs >= 480, or any `memory.events max/oom/oom_kill` increment. Require recorded observer order `pre_index_maintenance` finish before `process` start and `finalize` after `process` finish, one daily-marker write, and today's restore tag pointing at the exact latest post-run version. Also require peak memory `< 7.5 GiB`, peak PIDs `< 480`, events unchanged, health green, restart 0, OOM false, one Prefect server maximum, physical rows equal unique chunk IDs, seeded content searchable, facets healthy, and cleanup proof.
+Use fresh snapshot clones, isolated network/state/ports/credentials, 8 GiB/512 PID limits, and production entrypoint shape. Process at least 1,624 nonempty, communication-shaped documents in each path with production chunking, embedding batch size 64/concurrency 2, and simulated LiteLLM enrichment at concurrency 8; require production-equivalent writes/chunks and keep every outbound call on the simulator. Exercise due compaction and current-marker neighbor paths through actual supervised MCP `file_index_update`; wait for durable terminal success, then call MCP search and facets. Continuously sample and abort on memory >= 7.5 GiB, PIDs >= 480, or any `memory.events max/oom/oom_kill` increment. Require recorded observer order `pre_index_maintenance` finish before `process` start and `finalize` after `process` finish, separate compaction/process/finalize peaks, taxonomy batch-path evidence, one daily-marker write, and today's restore tag pointing at the exact latest post-run version. Also require peak memory `< 7.5 GiB`, peak PIDs `< 480`, events unchanged, health green, restart 0, OOM false, one Prefect server maximum, physical rows equal unique chunk IDs, seeded content searchable, facets healthy, and cleanup proof.
 
 - [ ] **Step 5: Verify qualified identity and external evidence**
 

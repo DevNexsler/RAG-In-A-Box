@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Profile doc-organizer finalization against an isolated Lance snapshot.
+"""Profile the pre-fix finalization baseline on an isolated Lance snapshot.
 
-This operator harness intentionally calls the same private maintenance steps as
-``LanceDBStore._optimize_and_prune`` so phase-level cgroup peaks identify the
-responsible boundary. It must never be pointed at production state.
+This diagnostic harness intentionally preserves the old optimization calls and
+maintenance ordering that were under investigation. It records a baseline and
+tests root-cause hypotheses; it does not mirror the shipped implementation and
+is not a release-qualification harness. It must never target production state.
 """
 
 from __future__ import annotations

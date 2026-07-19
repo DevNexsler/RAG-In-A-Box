@@ -172,6 +172,31 @@ pytest -q tests/test_taxonomy_store.py tests/test_store.py tests/test_scan.py
 
 The warnings were existing LanceDB deprecations and Prefect missing-flow-context logging warnings. A Prefect temporary-server logger emitted a post-pytest closed-stream logging error after the successful result; pytest exit remained 0.
 
-## Qualification
+## Frozen-head evidence and remaining release gate
 
-Pending frozen-SHA full gate and isolated production-shaped live candidate evidence.
+Commit `37d2bd5998acad4f59805b0cbae2b3e530900c31` passed the repository gate:
+
+```text
+static: PASS (1,513 tests collected)
+unit: 1,243 passed
+integration: 77 passed
+staging E2E: 27 passed; tool coverage 21/21 client and 21/21 server traces
+live: 162 passed, 4 skipped
+artifacts: .evals/gate-runs/20260718-125347
+```
+
+An initial isolated candidate exercised due-compaction and current-marker paths
+against the 45,083-row snapshot. It proved the phase order, exact latest restore
+tag, search/facets, row uniqueness, zero cgroup/OOM events, and the 8 GiB/512 PID
+envelope for a one-document change. That image is not a release artifact: its
+build context contained ignored local files, it was removed during cleanup, and
+the one-document workload did not establish post-compaction headroom for the
+production-sized communication batch.
+
+Release qualification therefore remains external to this frozen tree, as Task
+4 requires. The final commit must pass the full gate, then a clean-context image
+from that exact SHA must run both due and current-marker candidates with at
+least 1,624 nonempty, communication-shaped documents, production chunking,
+embedding batch size 64/concurrency 2, and simulated LiteLLM enrichment at
+concurrency 8. The PR records those post-freeze results without changing the
+qualified SHA.
