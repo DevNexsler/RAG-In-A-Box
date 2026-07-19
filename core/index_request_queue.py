@@ -21,7 +21,7 @@ def _utc_now() -> str:
 
 
 def normalize_target(target: str) -> str:
-    """Return one portable queue key for equivalent relative/absolute paths."""
+    """Normalize separators and dot segments in a source-relative queue key."""
     value = str(target).strip().replace("\\", "/")
     if not value:
         raise ValueError("target must not be empty")
