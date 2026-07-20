@@ -9,9 +9,10 @@ Regression tests for ticket #0390 (193 collisions / 66 ids since April;
 IDs 00001+00002 re-pointed to unrelated producer files on 2026-07-19).
 """
 
+import json
 from glob import escape as glob_escape
 
-from doc_id_store import DocIDStore
+from doc_id_store import DocIDStore, extract_id_from_filename
 from flow_index_vault import scan_filesystem_records
 
 
@@ -243,3 +244,44 @@ def test_moved_file_with_matching_content_hash_keeps_id(tmp_path):
     assert registry.lookup_path(owner_id) == f"archive/{owner_name}"
     moves = registry.audit_log(doc_id=owner_id, event=DocIDStore.MOVED)
     assert moves, "a genuine move is still recorded as moved"
+
+
+def test_conflicting_communication_sidecar_is_retokenized_but_not_indexed(tmp_path):
+    """Excluded sidecars still participate in global token adjudication.
+
+    Production's remaining duplicate-token pairs were communication sidecars:
+    the scan skipped them before checking the filename token, so a full-vault
+    remediation pass could never reach zero duplicate live tokens.
+    """
+    registry, owner_id, owner_rel = _vault_with_owner(tmp_path)
+
+    deposit = tmp_path / "email-attachments"
+    deposit.mkdir()
+    sidecar = deposit / f"message__mm0@{owner_id}@.json"
+    sidecar.write_text(json.dumps({
+        "schema_version": 2,
+        "message": {"source_message_id": "msg-1"},
+        "media": {"storage_path": "message__mm0.jpg"},
+    }))
+
+    records = scan_filesystem_records(
+        tmp_path, ["**/*.md", "**/*.json"], [], doc_id_store=registry
+    )
+
+    assert registry.lookup_path(owner_id) == owner_rel
+    assert not any(r["rel_path"].endswith(".json") for r in records)
+    renamed = list(deposit.glob("message__mm0@*.json"))
+    assert len(renamed) == 1
+    fresh_id = extract_id_from_filename(renamed[0].name)
+    assert fresh_id is not None and fresh_id != owner_id
+    fresh_rel = str(renamed[0].relative_to(tmp_path))
+    assert registry.lookup_path(fresh_id) == fresh_rel
+
+    collisions = registry.audit_log(doc_id=owner_id, event=DocIDStore.COLLISION)
+    assert len(collisions) == 1
+    scan_filesystem_records(
+        tmp_path, ["**/*.md", "**/*.json"], [], doc_id_store=registry
+    )
+    assert registry.audit_log(
+        doc_id=owner_id, event=DocIDStore.COLLISION
+    ) == collisions
