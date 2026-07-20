@@ -1388,6 +1388,145 @@ def test_registry_source_stats_dedupes_legacy_and_namespaced_document_ids(tmp_pa
     assert stats["sor"]["id_alias_count"] == 0
 
 
+# ---------------------------------------------------------------------------
+# Registry coverage lifecycle classification (#0382)
+#
+# Registry history is not the same as "currently indexable": a group whose
+# backing file was deleted, or whose file is intentionally empty (the scan
+# skips zero-byte files), must not be reported as a missing indexable doc —
+# while a genuinely present, non-empty, unindexed file must stay missing.
+# ---------------------------------------------------------------------------
+
+
+def _coverage_fixture(tmp_path):
+    """Registry with one present, one zero-byte, and one deleted backing file."""
+    from doc_id_store import DocIDStore
+
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "present.md").write_text("hello")
+    (root / "empty.pdf").write_bytes(b"")
+    # deleted.md intentionally never created — deleted-filesystem-object class
+
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("documents::00001", "present.md", source_name="documents")
+    registry.register("documents::00002", "empty.pdf", source_name="documents")
+    registry.register("documents::00003", "deleted.md", source_name="documents")
+    registry.close()
+
+    config = {
+        "index_root": str(tmp_path),
+        "sources": [{"type": "filesystem", "name": "documents", "root": str(root)}],
+    }
+    stats, error = mcp_server._registry_source_stats(tmp_path)
+    assert error is None
+    return config, stats
+
+
+def test_registry_coverage_classifies_deleted_and_empty_groups(tmp_path):
+    config, stats = _coverage_fixture(tmp_path)
+
+    coverage, error = mcp_server._registry_coverage(
+        index_root=tmp_path,
+        config=config,
+        registry_stats=stats,
+        indexed_doc_ids=set(),
+    )
+
+    assert error is None
+    counts = coverage["documents"]
+    assert counts["deleted_object_group_count"] == 1
+    assert counts["intentionally_empty_group_count"] == 1
+    # present.md is a real gap — must NOT be hidden by the new classes
+    assert counts["missing_group_count"] == 1
+    assert counts["covered_group_count"] == 2
+
+
+def test_registry_coverage_unavailable_root_does_not_classify_as_deleted(tmp_path):
+    """If the source root itself is gone (unmounted NAS), absence proves
+    nothing — groups must stay missing so the outage remains visible."""
+    config, stats = _coverage_fixture(tmp_path)
+    config["sources"][0]["root"] = str(tmp_path / "unmounted")
+
+    coverage, error = mcp_server._registry_coverage(
+        index_root=tmp_path,
+        config=config,
+        registry_stats=stats,
+        indexed_doc_ids=set(),
+    )
+
+    assert error is None
+    counts = coverage["documents"]
+    assert counts["deleted_object_group_count"] == 0
+    assert counts["intentionally_empty_group_count"] == 0
+    assert counts["missing_group_count"] == 3
+
+
+def test_registry_coverage_database_source_rows_stay_missing(tmp_path):
+    """Database-backed sources have no filesystem root to probe: vanished rows
+    stay missing until the indexing run's registry reap removes them."""
+    from doc_id_store import DocIDStore
+
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("sor::task/1", "task/1", source_name="sor")
+    registry.close()
+    stats, error = mcp_server._registry_source_stats(tmp_path)
+    assert error is None
+
+    coverage, cov_error = mcp_server._registry_coverage(
+        index_root=tmp_path,
+        config={"index_root": str(tmp_path), "sources": [{"type": "postgres", "name": "sor"}]},
+        registry_stats=stats,
+        indexed_doc_ids=set(),
+    )
+
+    assert cov_error is None
+    assert coverage["sor"]["missing_group_count"] == 1
+    assert coverage["sor"]["deleted_object_group_count"] == 0
+
+
+def test_deep_health_green_when_only_gaps_are_deleted_or_empty(tmp_path):
+    """A source whose unindexed registry history is all deleted/zero-byte
+    backing objects is healthy — deep health reports ok with explicit counts."""
+    from doc_id_store import DocIDStore
+
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "indexed.md").write_text("indexed content")
+    (root / "empty.pdf").write_bytes(b"")
+
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("documents::00001", "indexed.md", source_name="documents")
+    registry.register("documents::00002", "empty.pdf", source_name="documents")
+    registry.register("documents::00003", "deleted.md", source_name="documents")
+    registry.close()
+
+    mock_store = MagicMock()
+    mock_store.list_recent_docs.return_value = [
+        {"doc_id": "documents::00001", "mtime": 1000.0}
+    ]
+
+    payload = mcp_server._compute_deep_health(
+        store=mock_store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [{"type": "filesystem", "name": "documents", "root": str(root)}],
+        },
+        doc_ids=["documents::00001"],
+        chunk_count=1,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-07-19T00:00:00Z",
+    )
+
+    documents = payload["sources"]["documents"]
+    assert documents["status"] == "ok"
+    assert documents["deleted_object_group_count"] == 1
+    assert documents["intentionally_empty_group_count"] == 1
+    assert documents["unindexed_registry_doc_count"] == 0
+    assert payload["overall"] == "ok"
+
+
 def test_registry_source_stats_groups_reassigned_ids_by_natural_path(tmp_path):
     """Repeated ID injection must not turn one physical source path into gaps."""
     from doc_id_store import DocIDStore
@@ -1427,6 +1566,9 @@ def test_deep_health_uses_hash_group_and_ledger_coverage(
     registry.register("sidecar", "sidecar.json", source_name="documents")
     if include_missing:
         registry.register("missing", "missing.md", source_name="documents")
+        # The gap is only a gap because the file is really there, unindexed —
+        # an absent backing file would be the deleted-object class instead.
+        (docs_root / "missing.md").write_text("present but unindexed")
 
     digest = blake3.blake3(b"same source bytes").digest()
     registry.claim_canonical_by_exact_hash(

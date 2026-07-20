@@ -267,3 +267,26 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
     raw["dedupe"] = dedupe
 
     return raw
+
+
+def filesystem_source_roots(config: Mapping[str, Any]) -> dict[str, Path]:
+    """Return {source_name: root} for every filesystem-backed source.
+
+    Handles both new-style ``sources:`` configs and raw legacy dicts whose
+    ``documents_root``/``vault_root`` was never shimmed into a source entry.
+    Only filesystem sources appear — database-backed sources have no root to
+    probe, which is how callers distinguish "can stat the backing object"
+    from "the scan diff is the only presence authority".
+    """
+    roots: dict[str, Path] = {}
+    for source in config.get("sources") or []:
+        if not isinstance(source, dict) or source.get("type") != "filesystem":
+            continue
+        name = str(source.get("name") or "documents")
+        root = source.get("root")
+        if root:
+            roots[name] = Path(str(root))
+    legacy_root = config.get("documents_root") or config.get("vault_root")
+    if legacy_root and "documents" not in roots:
+        roots["documents"] = Path(str(legacy_root))
+    return roots

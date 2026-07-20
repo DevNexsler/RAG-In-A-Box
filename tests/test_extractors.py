@@ -555,6 +555,90 @@ def test_extract_video_empty_analysis_notes_nothing():
     assert collect_degradations() == []
 
 
+# --- Media policy rejections (#0382) ---
+# A deterministic policy rejection (file exceeds media.max_file_size_mb) is an
+# intentional skip: skip ledger, not degraded ledger, and no "extraction
+# failed" log line — that wording is what the provider-failure scanner alerts
+# on, and policy rejections were paging as backend outages.
+
+
+def test_extract_video_policy_rejection_is_skip_not_failure(caplog):
+    import logging
+
+    from providers.media.base import MediaPolicyError
+    from extractors import (
+        begin_degradation_capture,
+        collect_degradations,
+        collect_skips,
+        extract_video,
+    )
+
+    begin_degradation_capture()
+    with caplog.at_level(logging.INFO, logger="extractors"):
+        result = extract_video(
+            "/fake/walkthrough.mp4",
+            media_provider=_FakeMedia(
+                exc=MediaPolicyError("walkthrough.mp4 is 159613616 bytes, exceeds media.max_file_size_mb=50")
+            ),
+        )
+    assert collect_degradations() == []
+    assert collect_skips() == ["media_policy_rejected"]
+    assert result.full_text == ""
+    assert "extraction failed" not in caplog.text
+    assert "skipped by media policy" in caplog.text
+
+
+def test_extract_audio_policy_rejection_is_skip_not_failure(caplog):
+    import logging
+
+    from providers.media.base import MediaPolicyError
+    from extractors import (
+        begin_degradation_capture,
+        collect_degradations,
+        collect_skips,
+        extract_audio,
+    )
+
+    begin_degradation_capture()
+    with caplog.at_level(logging.INFO, logger="extractors"):
+        extract_audio(
+            "/fake/voicemail.mp3",
+            media_provider=_FakeMedia(exc=MediaPolicyError("too big")),
+        )
+    assert collect_degradations() == []
+    assert collect_skips() == ["media_policy_rejected"]
+    assert "extraction failed" not in caplog.text
+    assert "skipped by media policy" in caplog.text
+
+
+def test_extract_video_oversize_rejection_uses_size_skip_reason():
+    # The provider's oversize error is a MediaPolicyError subclass carrying a
+    # specific ledger token, so the skip ledger records *why*.
+    from providers.media.openrouter_media import MediaFileTooLargeError
+    from extractors import begin_degradation_capture, collect_skips, extract_video
+
+    begin_degradation_capture()
+    extract_video(
+        "/fake/clip.mp4",
+        media_provider=_FakeMedia(exc=MediaFileTooLargeError("clip.mp4 exceeds cap")),
+    )
+    assert collect_skips() == ["media_file_too_large"]
+
+
+def test_extract_video_backend_failure_still_logs_extraction_failed(caplog):
+    # Genuine backend failures must stay observable: the "extraction failed"
+    # line is the provider-failure scanner's trigger and must not change.
+    import logging
+
+    from extractors import begin_degradation_capture, collect_degradations, extract_video
+
+    begin_degradation_capture()
+    with caplog.at_level(logging.WARNING, logger="extractors"):
+        extract_video("/fake/clip.mp4", media_provider=_FakeMedia(boom=True))
+    assert [d.reason for d in collect_degradations()] == ["video_extract_failed"]
+    assert "Video extraction failed" in caplog.text
+
+
 # --- Dispatcher ---
 
 

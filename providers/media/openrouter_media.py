@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 
 from core.resilience import TransientError
+from providers.media.base import MediaPolicyError
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +67,10 @@ _VIDEO_MIME_BY_EXT = {
 }
 
 
-class MediaFileTooLargeError(ValueError):
+class MediaFileTooLargeError(MediaPolicyError):
     """Raised when a local media file exceeds configured upload size."""
+
+    skip_reason = "media_file_too_large"
 
 
 class OpenRouterMediaProvider:
