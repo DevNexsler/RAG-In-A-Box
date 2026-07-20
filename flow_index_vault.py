@@ -474,13 +474,17 @@ def scan_filesystem_records(
                 logger.warning("Skipping empty file: %s", rel_str)
                 continue
 
-            # Skip communication sidecars: these *.json files are attachment
-            # metadata consumed by the communication-context provider, not
-            # standalone documents. The message context they carry is already
-            # folded into their sibling attachment's enrichment, so indexing
-            # them adds nothing and re-processing thousands of them every run
-            # is pure waste.
-            if fname.lower().endswith(".json") and _is_communication_sidecar(full_path):
+            # Communication sidecars are metadata, not standalone documents.
+            # Tokenless sidecars can skip immediately. Token-bearing sidecars
+            # still need global identity adjudication below: producer-minted
+            # tokens otherwise survive every audit sweep and keep colliding
+            # with live documents. They are excluded from records after any
+            # required re-tokenization, so they are never indexed on their own.
+            is_communication_sidecar = (
+                fname.lower().endswith(".json")
+                and _is_communication_sidecar(full_path)
+            )
+            if is_communication_sidecar and extract_id_from_filename(fname) is None:
                 continue
 
             # --- Persistent doc_id assignment ---
@@ -624,6 +628,9 @@ def scan_filesystem_records(
             elif not doc_id_store:
                 # Fallback: no doc_id_store (shouldn't happen in normal flow)
                 doc_id = rel_str
+
+            if is_communication_sidecar:
+                continue
 
             records.append({
                 "doc_id": doc_id,
