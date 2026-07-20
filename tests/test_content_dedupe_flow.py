@@ -593,3 +593,71 @@ def test_dedupe_disabled_indexes_everything(runtime):
     doc_ids = set(r["doc_id"] for r in
                   store._vs.table.to_lance().to_table(columns=["doc_id"]).to_pylist())
     assert {"documents::00001", "documents::00002"} <= doc_ids
+
+
+def test_edited_canonical_with_cohort_reclaims_new_identity(runtime):
+    """In-place edit of a canonical with live duplicates must not fail open.
+
+    Before #0390 the stranded-cohort rejection was swallowed ("indexing
+    normally"), so the registry kept the old hash identity while the index
+    held the new content — and any forged claim on the ID clobbered the
+    canonical's chunks the same way. The gate now dissolves the stale cohort
+    and claims the new identity.
+    """
+    docs_root, store, registry = runtime
+    body = "# Lease\nSame bytes, attached to two emails." * 10
+    a = _make_doc(docs_root, "notes/lease.md", body, "00001")
+    b = _make_doc(docs_root, "email-attachments/dan/lease-copy.md", body, "00002")
+    _register(registry, a)
+    _register(registry, b)
+    fiv.process_doc_task.fn(a)
+    fiv.process_doc_task.fn(b)  # becomes duplicate of 00001
+
+    new_body = "# Lease v2\nCompletely revised terms." * 10
+    p = docs_root / "notes/lease.md"
+    p.write_text(new_body)
+    a2 = {**a, "mtime": p.stat().st_mtime, "size": p.stat().st_size}
+    fiv.process_doc_task.fn(a2)
+
+    raw = new_body.encode("utf-8")
+    row = registry.find_canonical_by_exact_hash(
+        len(raw), blake3.blake3(raw).digest(), "blake3"
+    )
+    assert row is not None and row["doc_id"] == "00001", (
+        "edited canonical must claim its new content identity"
+    )
+    # The stale cohort is dissolved: the old copy re-elects on its next pass.
+    assert registry.duplicate_refs_for_canonical("00001") == []
+    assert "documents::00001" in store.list_doc_ids()
+
+
+def test_edited_canonical_matching_other_canonical_becomes_duplicate(runtime):
+    """An edit that makes a cohort's canonical equal another doc's bytes."""
+    docs_root, store, registry = runtime
+    body_a = "# Notes A\noriginal content of the first cohort." * 10
+    body_c = "# Standalone\nentirely different document." * 10
+    a = _make_doc(docs_root, "notes/a.md", body_a, "00001")
+    b = _make_doc(docs_root, "copies/a-copy.md", body_a, "00002")
+    c = _make_doc(docs_root, "notes/c.md", body_c, "00003")
+    for doc in (a, b, c):
+        _register(registry, doc)
+        fiv.process_doc_task.fn(doc)
+
+    # Edit A in place so its bytes now equal C's.
+    p = docs_root / "notes/a.md"
+    p.write_text(body_c)
+    a2 = {**a, "mtime": p.stat().st_mtime, "size": p.stat().st_size}
+    fiv.process_doc_task.fn(a2)
+
+    rows = {r["doc_id"]: r for r in map(
+        registry._registry_row_to_dict,
+        registry._conn.execute(
+            "SELECT doc_id, rel_path, created, source_name, size_bytes, content_hash,"
+            " hash_algo, dedupe_status, canonical_doc_id, archive_path,"
+            " duplicate_reason, duplicate_of_doc_id, first_seen_at, last_seen_at"
+            " FROM doc_registry WHERE doc_id IN ('00001', '00003')"
+        ).fetchall(),
+    )}
+    assert rows["00001"]["dedupe_status"] == "duplicate"
+    assert rows["00001"]["canonical_doc_id"] == "00003"
+    assert rows["00003"]["dedupe_status"] == "canonical"

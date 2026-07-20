@@ -91,7 +91,8 @@ from providers.embed.base import EmbedProvider
 from providers.media import DEFAULT_VIDEO_MODEL, build_media_provider
 from providers.ocr import build_ocr_provider
 from doc_id_store import (
-    DocIDStore, extract_id_from_filename, inject_id_into_filename,
+    DocIDStore, StrandedCohortError, extract_id_from_filename,
+    inject_id_into_filename,
     strip_id_from_filename as _strip_id_from_filename,
 )
 from core.tracing import get_tracer, setup_tracing
@@ -405,6 +406,14 @@ def scan_filesystem_records(
     any file it no longer sees, so renaming creates an endless duplicate loop
     (deposit -> rename -> "missing" -> re-deposit). Those files keep their
     names; their doc_id lives only in the registry, keyed by relative path.
+
+    A filename token is an identity *claim*, not a grant: external producers
+    mint their own @NNNNN@ tokens (attachment counters, review copies), so a
+    token is only honored when this registry issued it — and only re-pointed
+    to a new path when the registered file is actually gone (a real move).
+    Any other claim gets a fresh ID. The one exception is a scan over an
+    empty registry (lost/rebuilt), where filenames are the only surviving
+    ID record and every token is adopted as-is.
     """
     root = Path(vault_root)
     norm_prefixes = [p.strip("/") + "/" for p in (no_rename_prefixes or []) if p.strip("/")]
@@ -413,6 +422,8 @@ def scan_filesystem_records(
 
     if logger is None:
         logger = _get_logger()
+
+    adopt_unknown_ids = doc_id_store is not None and doc_id_store.count() == 0
 
     records = []
     # Track IDs seen this scan to detect collisions (two files with same @XXXXX@)
@@ -481,12 +492,46 @@ def scan_filesystem_records(
                     )
                     existing_id = None  # fall through to "no ID" path below
                 else:
-                    doc_id = existing_id
-                    seen_ids[doc_id] = rel_str
-                    # Register/update mapping in SQLite
-                    stored_path = doc_id_store.lookup_path(doc_id)
-                    if stored_path != rel_str:
-                        doc_id_store.register(doc_id, rel_str)
+                    stored_path = doc_id_store.lookup_path(existing_id)
+                    if stored_path is None and not adopt_unknown_ids:
+                        # Token this registry never issued (producer-minted or
+                        # copied in from elsewhere) — not an identity claim.
+                        # Adopting it would also plant a collision in the
+                        # counter's future ID space.
+                        logger.warning(
+                            "Unissued ID %s on %s — assigning fresh ID",
+                            existing_id, rel_str,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.COLLISION, existing_id, rel_str,
+                            detail="token never issued by this registry",
+                        )
+                        existing_id = None  # fall through to "no ID" path below
+                    elif (
+                        stored_path is not None
+                        and stored_path != rel_str
+                        and (root / stored_path).is_file()
+                    ):
+                        # The ID's registered file still exists elsewhere, so
+                        # this is a copy or a forged claim, not a move — the
+                        # registered owner keeps the ID regardless of which
+                        # file the walk visits first.
+                        logger.warning(
+                            "ID %s belongs to %s which still exists — re-assigning %s",
+                            existing_id, stored_path, rel_str,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.COLLISION, existing_id, rel_str,
+                            detail=f"still owned by {stored_path}",
+                        )
+                        existing_id = None  # fall through to "no ID" path below
+                    else:
+                        doc_id = existing_id
+                        seen_ids[doc_id] = rel_str
+                        # Register/update mapping in SQLite (a real move, or a
+                        # bootstrap adoption on an empty registry)
+                        if stored_path != rel_str:
+                            doc_id_store.register(doc_id, rel_str)
 
             if existing_id is None and doc_id_store and any(
                 rel_str.startswith(p) for p in norm_prefixes
@@ -1096,6 +1141,35 @@ def _reset_invalid_dedupe_cohort(
     return affected
 
 
+def _run_identity_op_with_stranded_cohort_recovery(
+    operation,
+    registry: DocIDStore,
+    store: LanceDBStore,
+    bare_id: str,
+    source_name: str,
+    logger,
+):
+    """Run a registry identity operation, recovering a stranded cohort once.
+
+    A ``StrandedCohortError`` means this document's bytes changed while old
+    duplicates still point at it as canonical (an in-place edit). Failing open
+    here would index the new content under an identity the registry still
+    records with the old hash. Instead, dissolve the stale cohort — members
+    are reopened for re-election on their next pass — and retry the operation
+    against the now-unreferenced identity.
+    """
+    try:
+        return operation()
+    except StrandedCohortError:
+        logger.warning(
+            "Content changed under canonical %s while its cohort still points "
+            "to it — dissolving stale cohort and re-claiming",
+            bare_id,
+        )
+        _reset_invalid_dedupe_cohort(registry, store, bare_id, source_name, logger)
+        return operation()
+
+
 def _process_doc_task(
     doc: dict,
     *,
@@ -1197,14 +1271,17 @@ def _process_doc_task(
                 if winner is not None and winner.get("doc_id") != bare_id:
                     canonical_ns = f"{source_name}::{winner['doc_id']}"
                     if store.contains_doc_id(canonical_ns):
-                        registry.update_dedupe_identity(
-                            bare_id,
-                            size_bytes=len(raw_bytes),
-                            content_hash=digest,
-                            hash_algo="blake3",
-                            dedupe_status="duplicate",
-                            canonical_doc_id=winner["doc_id"],
-                            duplicate_reason="exact content match at index time",
+                        _run_identity_op_with_stranded_cohort_recovery(
+                            lambda: registry.update_dedupe_identity(
+                                bare_id,
+                                size_bytes=len(raw_bytes),
+                                content_hash=digest,
+                                hash_algo="blake3",
+                                dedupe_status="duplicate",
+                                canonical_doc_id=winner["doc_id"],
+                                duplicate_reason="exact content match at index time",
+                            ),
+                            registry, store, bare_id, source_name, logger,
                         )
                     else:
                         logger.warning(
@@ -1216,12 +1293,15 @@ def _process_doc_task(
                         )
                         winner = None
                 if winner is None:
-                    winner = registry.claim_canonical_by_exact_hash(
-                        bare_id,
-                        len(raw_bytes),
-                        digest,
-                        hash_algo="blake3",
-                        duplicate_reason="exact content match at index time",
+                    winner = _run_identity_op_with_stranded_cohort_recovery(
+                        lambda: registry.claim_canonical_by_exact_hash(
+                            bare_id,
+                            len(raw_bytes),
+                            digest,
+                            hash_algo="blake3",
+                            duplicate_reason="exact content match at index time",
+                        ),
+                        registry, store, bare_id, source_name, logger,
                     )
             except Exception as exc:
                 logger.warning("Dedupe gate failed for %s (indexing normally): %s", doc_id, exc)
