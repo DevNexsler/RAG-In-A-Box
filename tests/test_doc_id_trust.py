@@ -147,3 +147,40 @@ def test_next_id_skips_ids_already_registered_or_retired(tmp_path):
     assert fresh == "00003"
     assert registry.lookup_path(fresh) is None
     assert not registry.is_retired(fresh)
+
+
+def test_adjudicated_deposit_token_logs_collision_only_once(tmp_path):
+    """A no-rename deposit's foreign token is adjudicated once, then silent.
+
+    Deposit-owned files keep their producer-minted token forever (renaming
+    them creates a re-deposit loop), so the registry resolves them by path.
+    Only the first sweep may record the collision — re-logging the same
+    adjudication every sweep buries the audit log and makes "new collision
+    events" useless as a health signal.
+    """
+    registry, owner_id, _owner_rel = _vault_with_owner(tmp_path)
+
+    deposit = tmp_path / "email-attachments"
+    deposit.mkdir()
+    deposit_rel = f"email-attachments/junk.metadata-only@{owner_id}@.md"
+    (tmp_path / deposit_rel).write_text(
+        "producer metadata carrying the owner's token"
+    )
+
+    def sweep():
+        return scan_filesystem_records(
+            tmp_path, ["**/*.md"], [],
+            doc_id_store=registry,
+            no_rename_prefixes=["email-attachments/"],
+        )
+
+    first = {r["rel_path"]: r["doc_id"] for r in sweep()}
+    assigned = first[deposit_rel]
+    assert assigned != owner_id
+    events = registry.audit_log(doc_id=owner_id, event=DocIDStore.COLLISION)
+    assert len(events) == 1  # the adjudication itself is recorded
+
+    second = {r["rel_path"]: r["doc_id"] for r in sweep()}
+    assert second[deposit_rel] == assigned  # identity is stable...
+    events = registry.audit_log(doc_id=owner_id, event=DocIDStore.COLLISION)
+    assert len(events) == 1  # ...and re-adjudicated silently
