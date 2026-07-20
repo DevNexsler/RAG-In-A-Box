@@ -72,6 +72,7 @@ from core.config import load_config
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
+from core.dedupe import compute_file_identity
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
@@ -387,6 +388,26 @@ def _is_communication_sidecar(path: Path) -> bool:
 # --- Tasks (one responsibility each) ---
 
 
+def _file_matches_stored_identity(
+    doc_id_store: DocIDStore, doc_id: str, full_path: Path
+) -> bool:
+    """True if full_path's bytes match the registry's recorded content identity.
+
+    Rows that predate the dedupe pass carry no hash and cannot be checked —
+    treat those as matching rather than refusing every legacy move.
+    """
+    stored = doc_id_store.stored_file_identity(doc_id)
+    if stored is None:
+        return True
+    size_bytes, content_hash = stored
+    try:
+        if full_path.stat().st_size != size_bytes:
+            return False
+        return compute_file_identity(full_path).content_hash == content_hash
+    except OSError:
+        return False
+
+
 def scan_filesystem_records(
     vault_root: str | Path,
     include: list[str],
@@ -533,6 +554,28 @@ def scan_filesystem_records(
                             doc_id_store.log_event(
                                 DocIDStore.COLLISION, existing_id, rel_str,
                                 detail=f"still owned by {stored_path}",
+                            )
+                        existing_id = None  # fall through to "no ID" path below
+                    elif (
+                        stored_path is not None
+                        and stored_path != rel_str
+                        and not _file_matches_stored_identity(
+                            doc_id_store, existing_id, full_path
+                        )
+                    ):
+                        # The registered file is gone, but these bytes don't
+                        # match the row's recorded content identity — a
+                        # vanished owner's token re-surfacing on unrelated
+                        # content (producer copy), not a move.
+                        if not path_adjudicated:
+                            logger.warning(
+                                "ID %s vanished from %s but %s carries different "
+                                "content — assigning fresh ID",
+                                existing_id, stored_path, rel_str,
+                            )
+                            doc_id_store.log_event(
+                                DocIDStore.COLLISION, existing_id, rel_str,
+                                detail=f"content mismatch with vanished {stored_path}",
                             )
                         existing_id = None  # fall through to "no ID" path below
                     else:
