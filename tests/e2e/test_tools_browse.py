@@ -1,12 +1,19 @@
 """Browse/observability tool surface: list, recent, facets, folders, status,
 audit log, targeted re-index, and the scoped incremental sweep."""
+import subprocess
 import time
+from datetime import datetime, timezone
 
 import anyio
 import pytest
 
 from tests.e2e.client import get_hook_events
-from tests.e2e.conftest import EXPECTED_CORPUS_DOCS, NOTE_PHRASE, wait_for_index
+from tests.e2e.conftest import (
+    COMPOSE_FILE,
+    EXPECTED_CORPUS_DOCS,
+    NOTE_PHRASE,
+    wait_for_index,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -123,6 +130,30 @@ async def test_index_update_scoped_sweep(indexed_corpus, mcp_session):
     # control action — its only parameter is source_name. Exercise the benign
     # scoped form: a sor-only incremental sweep (no changes → no-op) and verify
     # the index converges back to idle with the corpus intact.
+    retained_warning = (
+        f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S},000 "
+        "WARNING midday OCR failure"
+    )
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            "doc-organizer-staging",
+            "sh",
+            "-c",
+            'printf "%s\\n" "$1" >> /data/index/indexer.log',
+            "sh",
+            retained_warning,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
     started = await mcp_session.call_tool_json(
         "file_index_update", {"source_name": "sor"})
     assert started.get("status") == "started", started
@@ -147,3 +178,21 @@ async def test_index_update_scoped_sweep(indexed_corpus, mcp_session):
     status = await wait_for_index(mcp_session, min_docs=EXPECTED_CORPUS_DOCS)
     assert status["doc_count"] >= EXPECTED_CORPUS_DOCS
     assert not status.get("indexer_running")
+
+    log = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(COMPOSE_FILE),
+            "exec",
+            "-T",
+            "doc-organizer-staging",
+            "cat",
+            "/data/index/indexer.log",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert retained_warning in log
