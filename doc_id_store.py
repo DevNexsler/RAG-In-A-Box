@@ -200,6 +200,12 @@ class DocIDStore:
             "CREATE INDEX IF NOT EXISTS idx_doc_registry_size_hash "
             "ON doc_registry(size_bytes, content_hash)"
         )
+        # lookup_id is on the per-file scan path (deposit-owned files resolve
+        # by path every sweep); without this index each lookup is a full scan.
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_registry_rel_path "
+            "ON doc_registry(rel_path)"
+        )
         c.execute(
             "UPDATE doc_registry SET first_seen_at = created "
             "WHERE first_seen_at IS NULL"

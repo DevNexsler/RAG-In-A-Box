@@ -100,11 +100,17 @@ def test_single_doc_index_is_visible_through_cached_serving_deps(tmp_path, servi
         fresh.write_bytes(b"the xylophone glacier permit was approved yesterday")
         result = _run_flow(cfg, "email-attachments/note@00vis@.txt")
         assert result["status"] == "indexed", result
+        # "00vis" is a producer-minted token the registry never issued, so the
+        # deposit is adjudicated a fresh identity instead (#0390); the
+        # visibility contract holds for whatever ID the flow assigned.
+        fresh_ns = result["doc_id"]
+        assert fresh_ns.startswith("documents::")
+        assert fresh_ns != "documents::00vis"
 
         # 4. Documented contract: the doc must be visible to the serving reads
         #    immediately — through the SAME cached-deps path the tools use.
         store, _embed, _config_out = mcp_server._get_deps()
-        assert "documents::00vis" in store.list_doc_ids(), (
+        assert fresh_ns in store.list_doc_ids(), (
             "single-doc indexed document invisible to the serving store handle: "
             "_get_deps served a stale cached LanceDB handle (index_metadata.json "
             "was never touched by index_document_flow)"
@@ -112,4 +118,4 @@ def test_single_doc_index_is_visible_through_cached_serving_deps(tmp_path, servi
 
         payload = mcp_server._file_search_impl("xylophone glacier permit", top_k=5)
         assert not payload.get("error"), payload
-        assert any(r["doc_id"] == "documents::00vis" for r in payload["results"]), payload["results"]
+        assert any(r["doc_id"] == fresh_ns for r in payload["results"]), payload["results"]

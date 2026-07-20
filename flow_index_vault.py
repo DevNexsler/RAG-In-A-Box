@@ -465,31 +465,39 @@ def scan_filesystem_records(
             # --- Persistent doc_id assignment ---
             existing_id = extract_id_from_filename(fname)
             if existing_id and doc_id_store:
+                # A path that already has a registered identity was adjudicated
+                # on an earlier sweep: deposit-owned (no-rename) and
+                # rename-failed files keep their stale token in the filename
+                # forever, and resolve by path below. Re-logging the same
+                # collision every sweep would bury the audit log.
+                path_adjudicated = doc_id_store.lookup_id(rel_str) is not None
                 # Check for retired ID: was this ID previously deleted?
                 # Copy-pasted files may carry a stale @XXXXX@ from a deleted doc.
                 if doc_id_store.is_retired(existing_id):
-                    retired = doc_id_store.retired_info(existing_id)
-                    last_path = retired["last_path"] if retired else "unknown"
-                    logger.warning(
-                        "Retired ID %s (was %s) found on %s — assigning fresh ID",
-                        existing_id, last_path, rel_str,
-                    )
-                    doc_id_store.log_event(
-                        DocIDStore.COLLISION, existing_id, rel_str,
-                        detail=f"retired ID, previously used by {last_path}",
-                    )
+                    if not path_adjudicated:
+                        retired = doc_id_store.retired_info(existing_id)
+                        last_path = retired["last_path"] if retired else "unknown"
+                        logger.warning(
+                            "Retired ID %s (was %s) found on %s — assigning fresh ID",
+                            existing_id, last_path, rel_str,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.COLLISION, existing_id, rel_str,
+                            detail=f"retired ID, previously used by {last_path}",
+                        )
                     existing_id = None  # fall through to "no ID" path below
                 # Check for collision: another file already claimed this ID
                 elif existing_id in seen_ids:
                     # Collision! Re-assign a fresh ID to this file
-                    logger.warning(
-                        "ID collision: %s already used by %s — re-assigning %s",
-                        existing_id, seen_ids[existing_id], rel_str,
-                    )
-                    doc_id_store.log_event(
-                        DocIDStore.COLLISION, existing_id, rel_str,
-                        detail=f"already claimed by {seen_ids[existing_id]}",
-                    )
+                    if not path_adjudicated:
+                        logger.warning(
+                            "ID collision: %s already used by %s — re-assigning %s",
+                            existing_id, seen_ids[existing_id], rel_str,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.COLLISION, existing_id, rel_str,
+                            detail=f"already claimed by {seen_ids[existing_id]}",
+                        )
                     existing_id = None  # fall through to "no ID" path below
                 else:
                     stored_path = doc_id_store.lookup_path(existing_id)
@@ -498,14 +506,15 @@ def scan_filesystem_records(
                         # copied in from elsewhere) — not an identity claim.
                         # Adopting it would also plant a collision in the
                         # counter's future ID space.
-                        logger.warning(
-                            "Unissued ID %s on %s — assigning fresh ID",
-                            existing_id, rel_str,
-                        )
-                        doc_id_store.log_event(
-                            DocIDStore.COLLISION, existing_id, rel_str,
-                            detail="token never issued by this registry",
-                        )
+                        if not path_adjudicated:
+                            logger.warning(
+                                "Unissued ID %s on %s — assigning fresh ID",
+                                existing_id, rel_str,
+                            )
+                            doc_id_store.log_event(
+                                DocIDStore.COLLISION, existing_id, rel_str,
+                                detail="token never issued by this registry",
+                            )
                         existing_id = None  # fall through to "no ID" path below
                     elif (
                         stored_path is not None
@@ -516,14 +525,15 @@ def scan_filesystem_records(
                         # this is a copy or a forged claim, not a move — the
                         # registered owner keeps the ID regardless of which
                         # file the walk visits first.
-                        logger.warning(
-                            "ID %s belongs to %s which still exists — re-assigning %s",
-                            existing_id, stored_path, rel_str,
-                        )
-                        doc_id_store.log_event(
-                            DocIDStore.COLLISION, existing_id, rel_str,
-                            detail=f"still owned by {stored_path}",
-                        )
+                        if not path_adjudicated:
+                            logger.warning(
+                                "ID %s belongs to %s which still exists — re-assigning %s",
+                                existing_id, stored_path, rel_str,
+                            )
+                            doc_id_store.log_event(
+                                DocIDStore.COLLISION, existing_id, rel_str,
+                                detail=f"still owned by {stored_path}",
+                            )
                         existing_id = None  # fall through to "no ID" path below
                     else:
                         doc_id = existing_id
