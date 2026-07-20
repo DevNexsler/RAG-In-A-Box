@@ -304,6 +304,21 @@ class DocIDStore:
             ).fetchone()
             return row[0] if row else None
 
+    def stored_file_identity(self, doc_id: str) -> tuple[int, bytes] | None:
+        """Return the (size_bytes, content_hash) recorded for a doc_id.
+
+        None when the row is missing or predates the dedupe pass (no content
+        identity recorded) — callers cannot verify content for those rows.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT size_bytes, content_hash FROM doc_registry WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return int(row[0]), row[1]
+
     def lookup_id(self, rel_path: str) -> str | None:
         """Return the doc_id for a rel_path, or None if not found."""
         with self._lock:

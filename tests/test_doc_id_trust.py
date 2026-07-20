@@ -184,3 +184,62 @@ def test_adjudicated_deposit_token_logs_collision_only_once(tmp_path):
     assert second[deposit_rel] == assigned  # identity is stable...
     events = registry.audit_log(doc_id=owner_id, event=DocIDStore.COLLISION)
     assert len(events) == 1  # ...and re-adjudicated silently
+
+
+def _record_owner_content_identity(registry, vault_root, owner_id, owner_rel):
+    """Simulate the dedupe pass recording the owner's exact content identity."""
+    from core.dedupe import compute_file_identity
+
+    ident = compute_file_identity(vault_root / owner_rel)
+    registry.claim_canonical_by_exact_hash(
+        owner_id, ident.size_bytes, ident.content_hash, hash_algo="blake3"
+    )
+
+
+def test_vanished_owner_token_on_different_content_is_not_a_move(tmp_path):
+    """Deleting the owner must not let a producer copy inherit its identity.
+
+    The ticket's headline case: the registered holder of a token disappears,
+    then a producer file carrying the same token appears elsewhere. The bytes
+    don't match the registry's recorded content identity, so it is a
+    collision, not a move.
+    """
+    registry, owner_id, owner_rel = _vault_with_owner(tmp_path)
+    _record_owner_content_identity(registry, tmp_path, owner_id, owner_rel)
+
+    (tmp_path / owner_rel).unlink()
+    (tmp_path / "notes" / f"impostor@{owner_id}@.md").write_text(
+        "unrelated producer bytes"
+    )
+
+    records = scan_filesystem_records(
+        tmp_path, ["**/*.md"], [], doc_id_store=registry
+    )
+
+    assert len(records) == 1
+    assert records[0]["doc_id"] != owner_id
+    # The vanished owner's row is untouched (left for the reap, not re-pointed).
+    assert registry.lookup_path(owner_id) == owner_rel
+    events = registry.audit_log(doc_id=owner_id, event=DocIDStore.COLLISION)
+    assert events, "rejected move-claim must log a collision event"
+
+
+def test_moved_file_with_matching_content_hash_keeps_id(tmp_path):
+    """A genuine move — same bytes, old path gone — still carries the ID."""
+    registry, owner_id, owner_rel = _vault_with_owner(tmp_path)
+    _record_owner_content_identity(registry, tmp_path, owner_id, owner_rel)
+
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    owner_name = owner_rel.split("/")[-1]
+    (tmp_path / owner_rel).rename(archive / owner_name)
+
+    records = scan_filesystem_records(
+        tmp_path, ["**/*.md"], [], doc_id_store=registry
+    )
+
+    assert len(records) == 1
+    assert records[0]["doc_id"] == owner_id
+    assert registry.lookup_path(owner_id) == f"archive/{owner_name}"
+    moves = registry.audit_log(doc_id=owner_id, event=DocIDStore.MOVED)
+    assert moves, "a genuine move is still recorded as moved"
