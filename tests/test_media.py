@@ -42,6 +42,38 @@ def test_build_media_provider_uses_whisper_then_fallbacks(monkeypatch):
     assert primary.video_model == "qwen/qwen3.5-397b-a17b"
 
 
+def test_build_media_provider_litellm_primary(monkeypatch):
+    """provider: litellm builds a LiteLLM-primary media provider (video+audio)
+    with OpenRouter demoted to a per-modality fallback."""
+    from providers.media import _LiteLLMMediaProvider, build_media_provider
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-litellm-test")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    provider = build_media_provider(
+        {
+            "media": {
+                "enabled": True,
+                "provider": "litellm",
+                "endpoint": "http://litellm.local:4000/v1",
+                "video_model": "video",
+                "audio_model": "transcribe",
+                "openrouter_fallback": {"video_model": "qwen/qwen3.5-397b-a17b"},
+            }
+        }
+    )
+    assert isinstance(provider._primary, _LiteLLMMediaProvider)
+    # OpenRouter stays reachable as the fallback for both modalities.
+    assert provider._video_fb is not None
+    assert provider._audio_fb is not None
+
+
+def test_build_media_provider_rejects_unknown_provider():
+    from providers.media import build_media_provider
+
+    with pytest.raises(ValueError, match="Unknown media provider"):
+        build_media_provider({"media": {"enabled": True, "provider": "bogus"}})
+
+
 @pytest.mark.parametrize(
     "config_path",
     ["config.yaml.example", "config.vps.yaml.example", "config.local.yaml.example"],
