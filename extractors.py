@@ -14,6 +14,7 @@ Supported formats:
 - Plain text (.txt): UTF-8 reader with error replacement.
 """
 
+import json
 import logging
 import re
 import threading
@@ -532,6 +533,29 @@ def extract_image(
 # Audio/video
 # ---------------------------------------------------------------------------
 
+def _is_nonmedia_stub(file_path: str | Path) -> bool:
+    """True if the media file is actually a small JSON envelope standing in for
+    the real bytes — an attachment-retrieval failure placeholder.
+
+    When a temporary download link expires, the retrieval layer can persist an
+    error body (e.g. Zoho Cliq's ``{"code": "attachment_access_time_expired"}``)
+    in place of the video/audio. Real audio/video is binary and never a small
+    JSON object, so this cheap pre-check lets us skip the file permanently
+    instead of paying a media-model call on it every indexing run.
+    """
+    path = Path(file_path)
+    try:
+        if path.stat().st_size > 4096:
+            return False
+        raw = path.read_bytes()
+    except OSError:
+        return False
+    try:
+        return isinstance(json.loads(raw), dict)
+    except (ValueError, UnicodeDecodeError):
+        return False
+
+
 def _media_frontmatter(file_path: str | Path, media_type: str) -> dict:
     path = Path(file_path)
     fm = {
@@ -553,6 +577,13 @@ def extract_audio(
     fm = _media_frontmatter(file_path, "audio")
     if media_provider is None:
         return ExtractionResult.from_text("", frontmatter=fm)
+    if _is_nonmedia_stub(file_path):
+        logger.warning(
+            "Audio file is a non-media stub (attachment retrieval failed?), "
+            "skipping without provider call: %s", file_path,
+        )
+        note_skip("media_retrieval_stub")
+        return ExtractionResult.from_text("", frontmatter=fm)
     try:
         transcript = media_provider.transcribe_audio(file_path)
     except Exception as e:
@@ -569,6 +600,13 @@ def extract_video(
     """Extract searchable text from a video file."""
     fm = _media_frontmatter(file_path, "video")
     if media_provider is None:
+        return ExtractionResult.from_text("", frontmatter=fm)
+    if _is_nonmedia_stub(file_path):
+        logger.warning(
+            "Video file is a non-media stub (attachment retrieval failed?), "
+            "skipping without provider call: %s", file_path,
+        )
+        note_skip("media_retrieval_stub")
         return ExtractionResult.from_text("", frontmatter=fm)
     try:
         notes = media_provider.analyze_video(file_path)

@@ -482,6 +482,70 @@ def test_extract_video_provider_failure_permanent_notes_degradation():
     assert degs[0].transient is False  # ValueError is not transient
 
 
+def test_extract_video_retrieval_stub_skips_without_provider_call(tmp_path):
+    # A retrieval placeholder (a small JSON error envelope written in place of
+    # the real video bytes, e.g. Zoho Cliq's attachment_access_time_expired) is
+    # a permanent skip and must NOT reach the paid media provider — otherwise it
+    # is re-downloaded/re-analyzed every indexing run forever (the #Maintenance
+    # "no electric" video incident: video_extract_failed x9 and climbing).
+    from extractors import (
+        begin_degradation_capture,
+        collect_degradations,
+        collect_skips,
+        extract_video,
+    )
+
+    stub = tmp_path / "clip.mp4"
+    stub.write_text('{"code":"attachment_access_time_expired"}')
+
+    class _Boom:
+        def analyze_video(self, file_path):
+            raise AssertionError("provider must not be called for a non-media stub")
+
+    begin_degradation_capture()
+    result = extract_video(stub, media_provider=_Boom())
+    assert result.full_text == ""
+    assert "media_retrieval_stub" in collect_skips()  # skip -> excluded from diff
+    assert collect_degradations() == []  # not a retry-forever degradation
+
+
+def test_extract_audio_retrieval_stub_skips_without_provider_call(tmp_path):
+    from extractors import (
+        begin_degradation_capture,
+        collect_skips,
+        extract_audio,
+    )
+
+    stub = tmp_path / "voicemail.m4a"
+    stub.write_text('{"error":"link expired"}')
+
+    class _Boom:
+        def transcribe_audio(self, file_path):
+            raise AssertionError("provider must not be called for a non-media stub")
+
+    begin_degradation_capture()
+    result = extract_audio(stub, media_provider=_Boom())
+    assert result.full_text == ""
+    assert "media_retrieval_stub" in collect_skips()
+
+
+def test_extract_video_real_bytes_not_treated_as_stub(tmp_path):
+    # Binary media that is not JSON must still reach the provider as normal.
+    from extractors import begin_degradation_capture, collect_skips, extract_video
+
+    real = tmp_path / "clip.mp4"
+    real.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 128)  # mp4-ish binary
+
+    class _OK:
+        def analyze_video(self, file_path):
+            return "a person waves at the camera"
+
+    begin_degradation_capture()
+    result = extract_video(real, media_provider=_OK())
+    assert result.full_text == "a person waves at the camera"
+    assert collect_skips() == []
+
+
 def test_extract_video_empty_analysis_notes_nothing():
     # Confirmed-blank analysis (wrapper returns "") is clean — no note.
     from extractors import begin_degradation_capture, collect_degradations, extract_video

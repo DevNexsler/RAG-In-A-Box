@@ -1427,6 +1427,16 @@ def _process_doc_task(
             doc_meta["enr_importance"] = "0.5"
             doc_meta["enr_importance_source"] = "default"
 
+        # --- Make the gathered conversation context searchable ---
+        # The same-channel before/after envelope was built for the enrichment
+        # prompt (context_text) but was otherwise discarded. Fold it into the
+        # body here — after title/enrichment are computed, before chunking — so
+        # it is chunked, embedded and FTS-indexed alongside the attachment's own
+        # content. An attachment is then findable by its surrounding
+        # conversation, not only by its own describe/caption text.
+        if context_text:
+            full_text = f"{full_text}\n\n[Conversation context]\n{context_text}"
+
         # --- Chunk and build nodes ---
         # Three paths:
         #   1. Multi-page PDF  → page-aware chunks, context header per page

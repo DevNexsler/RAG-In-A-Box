@@ -616,6 +616,98 @@ def test_process_doc_task_passes_context_to_enrichment(monkeypatch):
     assert captured["metadata"]["context_nearest_before_message_id"] == "m1"
 
 
+def test_process_doc_task_embeds_conversation_context_into_search_text(monkeypatch):
+    """Same-channel before/after context is folded into the embedded/FTS chunk
+    text, not just the enrichment prompt, so an attachment is findable by its
+    surrounding conversation (not only by its own describe/caption text)."""
+    from communication_context import CommunicationMessage, ContextEnvelope
+    from doc_enrichment import empty_enrichment
+    from extractors import ExtractionResult
+    from flow_index_vault import process_doc_task
+    from sources.base import SourceRecord
+
+    captured = {}
+
+    class FakeSource:
+        name = "documents"
+
+        def extract(self, record):
+            return ExtractionResult.from_text("image description", frontmatter={})
+
+    class FakeProvider:
+        def get_context_envelope(self, item):
+            return ContextEnvelope(
+                primary_item=item,
+                same_channel_before=[
+                    CommunicationMessage(
+                        message_id="m1",
+                        source_message_id="src-m1",
+                        sender="Rafael",
+                        sent_at="2026-07-20T12:21:57Z",
+                        text="16 N Main Phillipsburg NJ 08865",
+                    )
+                ],
+                same_channel_after=[],
+            )
+
+    class FakeStore:
+        def upsert_nodes(self, nodes):
+            captured["node_texts"] = [n.text for n in nodes]
+
+    class FakeEmbed:
+        def embed_texts(self, texts):
+            captured["embedded"] = list(texts)
+            return [[0.1] * 768 for _ in texts]
+
+    monkeypatch.setattr(
+        "flow_index_vault.enrich_document", lambda *a, **k: dict(empty_enrichment())
+    )
+    monkeypatch.setattr("flow_index_vault.get_run_logger", lambda: MagicMock())
+    _RUNTIME.clear()
+    _RUNTIME.update(
+        {
+            "store": FakeStore(),
+            "embed_provider": FakeEmbed(),
+            "splitter": _FakeSplitter(),
+            "config": {},
+            "sources_by_name": {"documents": FakeSource()},
+            "source_records_by_ns_doc_id": {
+                "documents::photo": SourceRecord(
+                    doc_id="photo",
+                    source_type="img",
+                    natural_key="photo.jpg",
+                    mtime=1.0,
+                    size=10,
+                    metadata={
+                        "source": "zoho_cliq",
+                        "channel_id": "chan",
+                        "sent_at": "2026-07-20T12:22:01Z",
+                        "message_id": "m2",
+                    },
+                )
+            },
+            "communication_context_provider": FakeProvider(),
+            "llm_generator": object(),
+        }
+    )
+
+    process_doc_task.fn(
+        {
+            "doc_id": "documents::photo",
+            "rel_path": "photo.jpg",
+            "mtime": 1.0,
+            "size": 10,
+            "source_type": "img",
+            "source_name": "documents",
+        }
+    )
+
+    # The neighbor message text must be in the embedded chunk AND the stored node
+    # text — i.e. genuinely searchable, not just fed to the enrichment LLM.
+    assert any("16 N Main" in t for t in captured["embedded"])
+    assert any("16 N Main" in t for t in captured["node_texts"])
+
+
 def test_process_doc_task_includes_attachment_message_body_in_enrichment(monkeypatch):
     """Same-message attachment captions become primary enrichment text."""
     from extractors import ExtractionResult
