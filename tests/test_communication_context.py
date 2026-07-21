@@ -1032,3 +1032,66 @@ def test_repair_sidecar_context_is_idempotent(tmp_path: Path):
         generated_at="2026-01-01T10:02:00Z",
     )
     assert sidecar.read_text() == first_write
+
+
+def test_context_envelope_from_sidecar_payload_reconstructs_messages():
+    from communication_context import (
+        CommunicationItem,
+        context_envelope_from_sidecar_payload,
+    )
+
+    payload = {
+        "context": {
+            "same_channel_before": [
+                {"text": "Sending the basement video", "source_message_id": "m1"}
+            ],
+            "same_channel_after": [
+                {
+                    "text": "This is 163 Washington Unit 2",
+                    "source_message_id": "m2",
+                    "sender": "Gunther",
+                }
+            ],
+        }
+    }
+    env = context_envelope_from_sidecar_payload(payload, CommunicationItem(doc_id="d"))
+    assert [m.text for m in env.same_channel_before] == ["Sending the basement video"]
+    assert env.same_channel_after[0].text == "This is 163 Washington Unit 2"
+    assert env.same_channel_after[0].source_message_id == "m2"
+    assert env.nearest_nonempty_after.text == "This is 163 Washington Unit 2"
+
+
+def test_context_envelope_from_sidecar_payload_no_context_block():
+    from communication_context import (
+        CommunicationItem,
+        context_envelope_from_sidecar_payload,
+    )
+
+    env = context_envelope_from_sidecar_payload({"media": {}}, CommunicationItem(doc_id="d"))
+    assert env.same_channel_before == []
+    assert env.same_channel_after == []
+
+
+def test_sidecar_context_provider_reads_stored_block(tmp_path):
+    import json
+
+    from communication_context import CommunicationItem, SidecarContextProvider
+
+    sc = tmp_path / "s.json"
+    sc.write_text(
+        json.dumps(
+            {"context": {"same_channel_after": [{"text": "This is 163 Washington Unit 2"}]}}
+        )
+    )
+    env = SidecarContextProvider().get_context_envelope(
+        CommunicationItem(doc_id="d", sidecar_path=str(sc))
+    )
+    assert env.same_channel_after[0].text == "This is 163 Washington Unit 2"
+
+
+def test_sidecar_context_provider_no_sidecar_is_empty():
+    from communication_context import CommunicationItem, SidecarContextProvider
+
+    env = SidecarContextProvider().get_context_envelope(CommunicationItem(doc_id="d"))
+    assert env.same_channel_before == []
+    assert env.same_channel_after == []

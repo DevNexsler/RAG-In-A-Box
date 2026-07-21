@@ -62,6 +62,7 @@ from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
 from llama_index.core.node_parser import SentenceSplitter
 
 from communication_context import (
+    SidecarContextProvider,
     build_context_provider_from_records,
     communication_item_from_record,
     envelope_metadata,
@@ -2798,6 +2799,11 @@ def _build_single_doc_runtime(
             "config": config,
             "sources_by_name": {src.name: src},
             "source_records_by_ns_doc_id": {record["doc_id"]: source_record},
+            # Targeted path can't afford the full-corpus scan the sweep uses to
+            # build context, so reuse the doc's OWN sidecar's already-computed
+            # same-channel context. Makes per-attachment (real-time) indexing
+            # embed neighbor context immediately, not only at the next sweep.
+            "communication_context_provider": SidecarContextProvider(),
         }
     )
 

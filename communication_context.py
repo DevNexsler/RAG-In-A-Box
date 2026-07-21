@@ -454,6 +454,63 @@ def repair_sidecar_context(
     return True
 
 
+def _message_from_sidecar_entry(entry: Any) -> CommunicationMessage:
+    if not isinstance(entry, dict):
+        return CommunicationMessage()
+    return CommunicationMessage(
+        message_id=_text(entry.get("message_id")),
+        source_message_id=_text(entry.get("source_message_id")),
+        sender=_text(entry.get("sender")),
+        sent_at=_text(entry.get("sent_at")),
+        text=_text(entry.get("text")),
+        origin_source=_text(entry.get("origin_source")),
+        channel_id=_text(entry.get("channel_id")),
+        thread_id=_text(entry.get("thread_id")),
+    )
+
+
+def context_envelope_from_sidecar_payload(
+    payload: Any, item: CommunicationItem
+) -> ContextEnvelope:
+    """Reconstruct a ContextEnvelope from an attachment sidecar's stored
+    `context` block (written earlier by repair_sidecar_context on a full sweep).
+
+    Lets the targeted single-document index path reuse already-computed
+    same-channel context without re-scanning the whole message corpus (which is
+    why that path could not build context before)."""
+    context = payload.get("context") if isinstance(payload, dict) else None
+    if not isinstance(context, dict):
+        return ContextEnvelope(primary_item=item)
+    before = [_message_from_sidecar_entry(m) for m in (context.get("same_channel_before") or [])]
+    after = [_message_from_sidecar_entry(m) for m in (context.get("same_channel_after") or [])]
+    return ContextEnvelope(
+        primary_item=item,
+        same_channel_before=before,
+        same_channel_after=after,
+        nearest_nonempty_before=_nearest_nonempty(reversed(before)),
+        nearest_nonempty_after=_nearest_nonempty(after),
+    )
+
+
+class SidecarContextProvider:
+    """Context provider that reads a doc's OWN sidecar's stored context block.
+
+    Cheap and per-doc — for the targeted single-document index path, which
+    cannot afford the full-corpus scan the sweep's SourceWindowContextProvider
+    performs. Returns an empty envelope when the item has no sidecar or no
+    stored context, so non-communication docs are unaffected."""
+
+    def get_context_envelope(self, item: CommunicationItem) -> ContextEnvelope:
+        path = getattr(item, "sidecar_path", "") or ""
+        if not path:
+            return ContextEnvelope(primary_item=item)
+        try:
+            payload = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError):
+            return ContextEnvelope(primary_item=item)
+        return context_envelope_from_sidecar_payload(payload, item)
+
+
 def _sidecar_context_payload(
     envelope: ContextEnvelope,
     *,
