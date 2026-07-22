@@ -913,12 +913,19 @@ def _load_skip_ledger(index_root: Path) -> dict:
 
 def _save_skip_ledger(index_root: Path, ledger: dict) -> bool:
     """Persist the ledger; False when the write failed (disk full, read-only)."""
+    path = _skip_ledger_path(index_root)
+    tmp_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
     try:
-        _skip_ledger_path(index_root).write_text(
-            json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8"
-        )
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(ledger, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
         return True
     except OSError as exc:
+        tmp_path.unlink(missing_ok=True)
         logging.getLogger(__name__).warning("Failed to save skip ledger: %s", exc)
         return False
 
@@ -996,6 +1003,13 @@ def _apply_skip_ledger(
             docs[doc_id] = {**docs[doc_id], "skipped_at": now}
         if _save_skip_ledger(index_root, ledger):
             restamped = len(due)
+        else:
+            # Claim persistence is the admission boundary. If the renewed
+            # leases are not durable, fail closed for those due retries so a
+            # disk-full/read-only run cannot hand out the same herd again.
+            due_ids = set(due)
+            kept = [r for r in kept if str(r.get("doc_id", "")) not in due_ids]
+            excluded += len(due)
     stats = {
         "entries": len(docs),
         "excluded": excluded,

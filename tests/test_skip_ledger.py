@@ -194,15 +194,17 @@ def test_changed_doc_is_readmitted_without_claiming_a_retry(tmp_path):
     assert _load_skip_ledger(tmp_path)["docs"]["d::1"]["skipped_at"] == t0
 
 
-def test_failed_ledger_write_reports_fewer_restamps_than_due(tmp_path, monkeypatch):
-    # restamped < due is the signal that protection was NOT renewed (#58 disk
-    # full) — it must not be reported as a successful claim.
+def test_failed_ledger_write_keeps_unclaimed_due_retry_excluded(tmp_path, monkeypatch):
+    # A due retry cannot enter the work queue unless its renewed lease is
+    # durable. Otherwise disk-full/read-only runs re-admit it every 15 minutes.
     t0 = 1000.0
     _save_skip_ledger(tmp_path, {"docs": {"d::1": _entry("h1", skipped_at=t0)}})
     monkeypatch.setattr(fiv, "_save_skip_ledger", lambda *a, **kw: False)
-    _, stats = _apply_skip_ledger(
+    kept, stats = _apply_skip_ledger(
         tmp_path, [_rec("d::1", change_hash="h1")], now=t0 + 2 * _SKIP_RETRY_SECONDS
     )
+    assert kept == []
+    assert stats["excluded"] == 1
     assert stats["due"] == 1 and stats["restamped"] == 0
 
 
@@ -260,6 +262,22 @@ def test_skip_ledger_roundtrip(tmp_path):
     ledger = {"docs": {"d::1": _entry("h1", skipped_at=1000.0, reasons=["duplicate"])}}
     _save_skip_ledger(tmp_path, ledger)
     assert _load_skip_ledger(tmp_path) == ledger
+
+
+def test_skip_ledger_atomic_save_failure_preserves_previous_ledger(
+    tmp_path, monkeypatch
+):
+    previous = {"docs": {"d::old": _entry("old", skipped_at=1000.0)}}
+    replacement = {"docs": {"d::new": _entry("new", skipped_at=2000.0)}}
+    assert _save_skip_ledger(tmp_path, previous)
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(fiv.os, "replace", fail_replace)
+    assert not _save_skip_ledger(tmp_path, replacement)
+    assert _load_skip_ledger(tmp_path) == previous
+    assert not list(tmp_path.glob(".skip_docs.json.*.tmp"))
 
 
 def test_load_missing_returns_empty(tmp_path):
