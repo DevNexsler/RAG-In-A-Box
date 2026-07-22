@@ -1433,12 +1433,18 @@ def _process_doc_task(
             doc_meta["enr_importance"] = "0.5"
             doc_meta["enr_importance_source"] = "default"
 
-        # NOTE: the conversation context is deliberately NOT appended to
-        # full_text. Appending it buried a ~100-char address inside a multi-KB
-        # describe, so the chunk embedding was dominated by the visual
-        # description and a query for the address ranked the attachment below
-        # the source messages. It is emitted as its own short chunk after the
-        # content chunks instead (see "conversation-context chunk" below).
+        # --- Make the gathered conversation context searchable ---
+        # Appended to the body (not emitted as a separate chunk) ON PURPOSE.
+        # Real queries for an attachment are hybrid — "163 Washington video
+        # walkthrough" needs the neighbour address AND the visual-describe terms
+        # to match the SAME chunk. Splitting context into its own chunk was
+        # measured and made retrieval strictly worse: the video dropped from #5
+        # to absent for that exact query, because the describe chunk matched
+        # "video walkthrough" but not the address while the context chunk
+        # matched the address but not "walkthrough", so neither outranked the
+        # source messages. Keep them together.
+        if context_text:
+            full_text = f"{full_text}\n\n[Conversation context]\n{context_text}"
 
         # --- Chunk and build nodes ---
         # Three paths:
@@ -1547,29 +1553,6 @@ def _process_doc_task(
                 )
                 node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
                 nodes.append(node)
-
-        # --- conversation-context chunk ---
-        # Emitted as its OWN short chunk rather than appended to the content
-        # above: a ~100-char neighbour address buried in a multi-KB visual
-        # describe barely moved that chunk's embedding, so a query for the
-        # address ranked the attachment below the source messages. A short,
-        # context-only chunk matches such a query directly.
-        if context_text:
-            ctx_body = f"Conversation context for {title}:\n{context_text}"
-            ctx_loc = "ctx:0"
-            with _tracer.start_as_current_span("embed", attributes={"chunk_count": 1}):
-                ctx_vector = embed_provider.embed_texts([ctx_body])[0]
-            ctx_snippet = (ctx_body[:200] + "...") if len(ctx_body) > 200 else ctx_body
-            ctx_node = TextNode(
-                text=ctx_body,
-                id_=f"{doc_id}::{ctx_loc}",
-                embedding=ctx_vector,
-                metadata={**doc_meta, "loc": ctx_loc, "snippet": ctx_snippet},
-            )
-            ctx_node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                node_id=doc_id
-            )
-            nodes.append(ctx_node)
 
         # --- Persist into store ---
         # The scan/diff proves which documents are absent. Insert those
