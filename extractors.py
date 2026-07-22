@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 from core.resilience import is_transient
-from providers.media.base import MediaProvider
+from providers.media.base import MediaPolicyError, MediaProvider
 from providers.ocr.base import OCRProvider
 
 logger = logging.getLogger(__name__)
@@ -640,6 +640,14 @@ def extract_audio(
         return ExtractionResult.from_text("", frontmatter=fm)
     try:
         transcript = media_provider.transcribe_audio(file_path)
+    except MediaPolicyError as e:
+        # Deterministic policy rejection (e.g. oversize) — an intentional skip,
+        # not a backend failure: the skip ledger stops the re-extract-every-run
+        # loop, and the wording must not match the provider-failure scanner's
+        # "extraction failed" trigger (#0382).
+        logger.warning("Audio skipped by media policy for %s: %s", file_path, e)
+        note_skip(e.skip_reason)
+        transcript = ""
     except Exception as e:
         logger.warning("Audio extraction failed for %s: %s", file_path, e)
         note_degradation("audio_extract_failed", transient=is_transient(e))
@@ -664,10 +672,18 @@ def extract_video(
         return ExtractionResult.from_text("", frontmatter=fm)
     try:
         notes = media_provider.analyze_video(file_path)
+    except MediaPolicyError as e:
+        # Deterministic policy rejection (e.g. oversize) — an intentional skip,
+        # not a backend failure: the skip ledger stops the re-extract-every-run
+        # loop, and the wording must not match the provider-failure scanner's
+        # "extraction failed" trigger (#0382).
+        logger.warning("Video skipped by media policy for %s: %s", file_path, e)
+        note_skip(e.skip_reason)
+        notes = ""
     except Exception as e:
         logger.warning("Video extraction failed for %s: %s", file_path, e)
-        # transient (outage) -> retries; permanent (oversized/codec, non-transient)
-        # -> caps at the degraded-ledger max then stops.
+        # transient (outage) -> retries; permanent (backend codec/rejection,
+        # non-transient) -> caps at the degraded-ledger max then stops.
         note_degradation("video_extract_failed", transient=is_transient(e))
         notes = ""
     return ExtractionResult.from_text(notes, frontmatter=fm)

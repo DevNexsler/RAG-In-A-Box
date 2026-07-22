@@ -73,7 +73,7 @@ from attachment_context_refresh import (
     context_text_from_sidecar,
     refresh_document_context,
 )
-from core.config import load_config
+from core.config import filesystem_source_roots, load_config
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
@@ -952,6 +952,102 @@ def _merge_skip_ledger(
     for doc_id, info in skip_now.items():
         docs[doc_id] = {**info, "skipped_at": now}
     return {"docs": docs}
+
+
+def _reap_vanished_registry_rows(
+    doc_id_store: DocIDStore,
+    scanned_ids: set[str],
+    stored_ids: set[str],
+    filesystem_roots: dict[str, Path],
+    *,
+    source_scope: str | None,
+    max_delete_ratio: float,
+    min_docs_for_ratio: int,
+    logger: logging.Logger,
+) -> tuple[set[str], dict[str, tuple[int, int]]]:
+    """Delete registry rows whose backing source object no longer exists.
+
+    The store diff only reaps docs that made it into the Lance table
+    (to_delete = stored - scanned). A doc that was never indexed —
+    skip-ledgered, degraded-capped, duplicate, or deleted before its first
+    successful run — has no store row, so when its backing object disappears
+    its registry row survives forever and deep health counts it as an
+    indexable gap (#0382).
+
+    A row is reaped when its namespaced doc_id is neither scanned nor stored,
+    UNLESS its source has a filesystem root and the backing file still exists
+    (e.g. zero-byte files and communication sidecars the scan intentionally
+    skips — presence means "intentionally excluded", which deep health
+    classifies; only absence is lifecycle's job). A filesystem source whose
+    root is unavailable (unmounted?) is left entirely alone: absence can't be
+    proven there.
+
+    Deletion goes row by row through DocIDStore.delete() with each row's
+    exact stored key — legacy bare + namespaced dual rows both die — and
+    tombstones the ids in retired_ids, so a revived file carrying a stale
+    @id@ gets a fresh identity.
+
+    Mirrors the store diff's per-source mass-delete guard: a source whose
+    orphan count exceeds max_delete_ratio of its registry rows (with at least
+    min_docs_for_ratio rows) is skipped — a partial scan must not purge
+    registry history.
+
+    Returns (reaped namespaced ids, {source: (orphan_count, row_count)} for
+    guarded sources).
+    """
+    rows_by_source: dict[str, list[dict]] = {}
+    for row in doc_id_store.list_rows():
+        source = row["namespaced_doc_id"].split("::", 1)[0]
+        if source_scope is not None and source != source_scope:
+            continue
+        rows_by_source.setdefault(source, []).append(row)
+
+    reaped: set[str] = set()
+    blocked: dict[str, tuple[int, int]] = {}
+    for source, rows in sorted(rows_by_source.items()):
+        root = filesystem_roots.get(source)
+        if root is not None and not root.is_dir():
+            logger.warning(
+                "Skipping registry reap for source '%s' — root %s unavailable",
+                source, root,
+            )
+            continue
+        source_stored_ids = {
+            doc_id
+            for doc_id in stored_ids
+            if str(doc_id).split("::", 1)[0] == source
+        }
+        stored_missing_count = len(source_stored_ids - scanned_ids)
+        store_delete_blocked = (
+            len(source_stored_ids) >= min_docs_for_ratio
+            and stored_missing_count > len(source_stored_ids) * max_delete_ratio
+        )
+        orphans = []
+        for row in rows:
+            ns_id = row["namespaced_doc_id"]
+            if ns_id in scanned_ids or ns_id in stored_ids:
+                continue
+            if root is not None and (root / row["rel_path"]).exists():
+                continue
+            orphans.append(row)
+        if not orphans:
+            continue
+        if store_delete_blocked or (
+            len(rows) >= min_docs_for_ratio
+            and len(orphans) > len(rows) * max_delete_ratio
+        ):
+            blocked[source] = (len(orphans), len(rows))
+            continue
+        for row in orphans:
+            try:
+                doc_id_store.delete(row["doc_id"])
+            except Exception as exc:
+                logger.warning(
+                    "Registry reap failed for %s: %s", row["doc_id"], exc
+                )
+                continue
+            reaped.add(row["namespaced_doc_id"])
+    return reaped, blocked
 
 
 _SIDECAR_ID_RE = re.compile(r"@[0-9A-Za-z]{5}@")
@@ -2513,6 +2609,37 @@ def index_vault_flow(
                 doc_id_store.delete(did)
             except Exception:
                 pass
+
+    # The loop above only reaps docs that were in the store. Rows for docs
+    # that vanished before ever being indexed (skip-ledgered, degraded-capped,
+    # duplicates, deleted DB objects) would otherwise haunt the registry — and
+    # deep health — forever (#0382). Their ledger entries are cleared through
+    # the same clean-sets the merges below already consume.
+    reaped_ids, blocked_reaps = _reap_vanished_registry_rows(
+        doc_id_store,
+        {str(r["doc_id"]) for r in scanned},
+        set(stored_mtimes),
+        filesystem_source_roots(config),
+        source_scope=source_name,
+        max_delete_ratio=max_delete_ratio,
+        min_docs_for_ratio=min_docs_for_ratio,
+        logger=logger,
+    )
+    for src_name, (orphan_count, row_count) in sorted(blocked_reaps.items()):
+        logger.error(
+            "ABORTING registry reap of %d/%d rows for source '%s' — "
+            "scan likely partial (source unreachable?)",
+            orphan_count, row_count, src_name,
+        )
+        _RUNTIME.setdefault("_warnings", []).append(
+            f"mass_registry_reap_blocked:{src_name}:{orphan_count}/{row_count}"
+        )
+    if reaped_ids:
+        logger.info(
+            "Reaped %d registry rows whose source objects vanished", len(reaped_ids)
+        )
+        _RUNTIME.setdefault("degraded_clean", set()).update(reaped_ids)
+        _RUNTIME.setdefault("skip_clean", set()).update(reaped_ids)
 
     # Keep the native FTS index current after data changes. The Lance-native
     # index updates incrementally — ensure_fts_index() creates it if missing

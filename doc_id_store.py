@@ -414,6 +414,30 @@ class DocIDStore:
         with self._lock:
             cur = self._conn.execute("SELECT DISTINCT source_name FROM doc_registry")
             return {row[0] for row in cur.fetchall()}
+
+    def list_rows(self) -> list[dict]:
+        """Return every registry row with both its exact stored key and its
+        namespaced form.
+
+        Unlike all_mappings(), which collapses to {namespaced_id: rel_path},
+        this preserves the stored ``doc_id`` key — a document can hold both a
+        legacy bare row and a namespaced row, and callers that delete or
+        update specific rows must address each one precisely.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT doc_id, rel_path, source_name FROM doc_registry"
+            ).fetchall()
+        result: list[dict] = []
+        for doc_id, rel_path, source_name in rows:
+            sn = source_name or "documents"
+            result.append({
+                "doc_id": doc_id,
+                "namespaced_doc_id": doc_id if "::" in doc_id else f"{sn}::{doc_id}",
+                "source_name": sn,
+                "rel_path": rel_path,
+            })
+        return result
     @staticmethod
     def _registry_row_to_dict(row: tuple) -> dict:
         return {

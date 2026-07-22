@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core.config import load_config
+from core.config import filesystem_source_roots, load_config
 from core.artifacts import is_communication_sidecar
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
@@ -943,19 +943,29 @@ def _ledger_doc_ids(path: Path) -> tuple[set[str], str | None]:
         return set(), str(exc)
 
 
-def _filesystem_source_roots(config: dict) -> dict[str, Path]:
-    roots: dict[str, Path] = {}
-    for source in config.get("sources") or []:
-        if not isinstance(source, dict) or source.get("type") != "filesystem":
+def _group_backing_object_state(root: Path | None, rel_paths: set[str]) -> str:
+    """Classify an unindexed registry group by its backing filesystem object.
+
+    Returns "present" (an indexable object exists — a genuine gap), "empty"
+    (objects exist but all are zero-byte, which the scan intentionally skips),
+    or "deleted" (no backing object remains; the indexing run's registry reap
+    removes the rows). Sources without a filesystem root — and sources whose
+    root itself is unavailable (unmounted?) — return "present": absence can't
+    be proven there, so the gap must stay visible.
+    """
+    if root is None or not root.is_dir():
+        return "present"
+    sizes: list[int] = []
+    for rel_path in rel_paths:
+        try:
+            sizes.append((root / rel_path).stat().st_size)
+        except OSError:
             continue
-        name = str(source.get("name") or "documents")
-        root = source.get("root")
-        if root:
-            roots[name] = Path(str(root))
-    legacy_root = config.get("documents_root") or config.get("vault_root")
-    if legacy_root and "documents" not in roots:
-        roots["documents"] = Path(str(legacy_root))
-    return roots
+    if not sizes:
+        return "deleted"
+    if all(size == 0 for size in sizes):
+        return "empty"
+    return "present"
 
 
 def _registry_coverage(
@@ -965,11 +975,12 @@ def _registry_coverage(
     registry_stats: dict[str, dict],
     indexed_doc_ids: set[str],
 ) -> tuple[dict[str, dict[str, int]], str | None]:
-    """Classify content groups as indexed, intentionally skipped, retrying, or missing."""
+    """Classify content groups as indexed, intentionally skipped, retrying,
+    deleted, intentionally empty, or missing."""
     skip_ids, skip_error = _ledger_doc_ids(index_root / "skip_docs.json")
     degraded_ids, degraded_error = _ledger_doc_ids(index_root / "degraded_docs.json")
     no_text_ids, log_error = _not_extractable_doc_ids(index_root)
-    roots = _filesystem_source_roots(config)
+    roots = filesystem_source_roots(config)
     errors = [error for error in (skip_error, degraded_error, log_error) if error]
 
     coverage: dict[str, dict[str, int]] = {}
@@ -979,6 +990,8 @@ def _registry_coverage(
             "indexed_group_count": 0,
             "not_extractable_group_count": 0,
             "retry_pending_group_count": 0,
+            "deleted_object_group_count": 0,
+            "intentionally_empty_group_count": 0,
             "missing_group_count": 0,
         }
         root = roots.get(source_name)
@@ -997,14 +1010,27 @@ def _registry_coverage(
             if indexed:
                 counts["covered_group_count"] += 1
                 counts["indexed_group_count"] += 1
-            elif intentionally_skipped or sidecar:
-                counts["covered_group_count"] += 1
-                counts["not_extractable_group_count"] += 1
-            elif retry_pending:
-                counts["covered_group_count"] += 1
-                counts["retry_pending_group_count"] += 1
             else:
-                counts["missing_group_count"] += 1
+                # Registry history is not the same as currently indexable:
+                # physical state outranks stale skip/degraded ledgers. Probe
+                # before classifying intentional skips, retries, or gaps.
+                backing = _group_backing_object_state(
+                    root, group.get("rel_paths", set())
+                )
+                if backing == "deleted":
+                    counts["covered_group_count"] += 1
+                    counts["deleted_object_group_count"] += 1
+                elif backing == "empty":
+                    counts["covered_group_count"] += 1
+                    counts["intentionally_empty_group_count"] += 1
+                elif intentionally_skipped or sidecar:
+                    counts["covered_group_count"] += 1
+                    counts["not_extractable_group_count"] += 1
+                elif retry_pending:
+                    counts["covered_group_count"] += 1
+                    counts["retry_pending_group_count"] += 1
+                else:
+                    counts["missing_group_count"] += 1
         coverage[source_name] = counts
     return coverage, "; ".join(errors) or None
 
@@ -1242,6 +1268,12 @@ def _compute_deep_health(
         retry_pending_doc_count = int(
             source_coverage.get("retry_pending_group_count") or 0
         )
+        deleted_object_group_count = int(
+            source_coverage.get("deleted_object_group_count") or 0
+        )
+        intentionally_empty_group_count = int(
+            source_coverage.get("intentionally_empty_group_count") or 0
+        )
         index_content_group_count = int(
             source_coverage.get("indexed_group_count")
             if registry_content_group_count > 0
@@ -1256,7 +1288,12 @@ def _compute_deep_health(
             index_doc_count=index_content_group_count,
             indexer_running=indexer_running,
             last_run_at=last_run_at,
-            not_extractable_doc_count=not_extractable_doc_count + retry_pending_doc_count,
+            not_extractable_doc_count=(
+                not_extractable_doc_count
+                + retry_pending_doc_count
+                + deleted_object_group_count
+                + intentionally_empty_group_count
+            ),
         )
         if retry_pending_doc_count > 0 and status == "ok":
             status = "indexing" if indexer_running else "degraded"
@@ -1278,6 +1315,8 @@ def _compute_deep_health(
             "index_content_group_count": index_content_group_count,
             "not_extractable_doc_count": not_extractable_doc_count,
             "retry_pending_doc_count": retry_pending_doc_count,
+            "deleted_object_group_count": deleted_object_group_count,
+            "intentionally_empty_group_count": intentionally_empty_group_count,
             "unindexed_registry_doc_count": unindexed_registry_doc_count,
             "registry_latest_seen_at": _iso_or_none(registry_latest_seen_at),
             "index_latest_mtime": index_latest_mtime,
