@@ -69,6 +69,10 @@ from communication_context import (
     format_context_envelope_for_prompt,
     repair_sidecar_context,
 )
+from attachment_context_refresh import (
+    context_text_from_sidecar,
+    refresh_document_context,
+)
 from core.config import load_config
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
@@ -639,25 +643,59 @@ def _repair_communication_sidecars(
     return repaired
 
 
-def _include_repaired_sidecar_docs(
+def _refresh_repaired_sidecar_docs(
     scanned: list[dict],
-    to_add_or_update: list[dict],
+    source_records_by_ns_doc_id: dict[str, object],
     repaired_doc_ids: set[str],
-) -> list[dict]:
-    """Force repaired sidecar owners through processing even when media mtime is unchanged."""
-    if not repaired_doc_ids:
-        return to_add_or_update
-
-    existing_doc_ids = {str(record.get("doc_id", "")) for record in to_add_or_update}
-    records_by_doc_id = {str(record.get("doc_id", "")): record for record in scanned}
-    forced = list(to_add_or_update)
+    store: Any,
+    embed_provider: EmbedProvider,
+    *,
+    max_time_window_minutes: float = 15,
+    logger: logging.Logger | None = None,
+) -> tuple[int, int]:
+    """Re-embed repaired context without re-extracting attachment media."""
+    logger = logger or logging.getLogger(__name__)
+    records_by_doc_id = {
+        str(record.get("doc_id", "")): record for record in scanned
+    }
+    changed = 0
+    failed = 0
     for doc_id in sorted(repaired_doc_ids):
-        if doc_id in existing_doc_ids:
+        doc = records_by_doc_id.get(doc_id)
+        source_record = source_records_by_ns_doc_id.get(doc_id)
+        if doc is None or source_record is None:
             continue
-        record = records_by_doc_id.get(doc_id)
-        if record is not None:
-            forced.append(record)
-    return forced
+        metadata = getattr(source_record, "metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        item = communication_item_from_record(doc, metadata)
+        if item is None or not item.sidecar_path:
+            continue
+        try:
+            context_text = context_text_from_sidecar(
+                Path(item.sidecar_path),
+                doc_id=doc_id,
+                max_time_window_minutes=max_time_window_minutes,
+            )
+            if not context_text:
+                continue
+            if refresh_document_context(
+                store,
+                embed_provider,
+                doc_id,
+                context_text,
+            ):
+                changed += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning(
+                "Attachment context refresh failed for '%s': %s",
+                doc_id,
+                exc,
+            )
+            _RUNTIME.setdefault("_warnings", []).append(
+                f"attachment_context_refresh_failed:{doc_id}:{exc}"
+            )
+    return changed, failed
 
 
 _DEGRADED_MAX_ATTEMPTS = 5
@@ -2307,11 +2345,6 @@ def index_vault_flow(
     to_add_or_update, to_delete = diff_index_task(
         scanned, stored_mtimes, stored_change_hashes
     )
-    to_add_or_update = _include_repaired_sidecar_docs(
-        scanned,
-        to_add_or_update,
-        repaired_sidecar_doc_ids,
-    )
     degraded_ledger = _load_degraded_ledger(index_root)
     before_degraded = len(to_add_or_update)
     to_add_or_update = _include_degraded_docs(scanned, to_add_or_update, degraded_ledger)
@@ -2326,6 +2359,14 @@ def index_vault_flow(
     to_add_or_update, skipped_count = _exclude_skipped_docs(to_add_or_update, skip_ledger)
     if skipped_count:
         logger.info("Excluded %d unchanged skip-ledger docs (no reprocessing)", skipped_count)
+    full_processing_doc_ids = {
+        str(record.get("doc_id", "")) for record in to_add_or_update
+    }
+    context_refresh_doc_ids = (
+        repaired_sidecar_doc_ids
+        & set(stored_mtimes)
+        - full_processing_doc_ids
+    )
     stored_doc_count = len(stored_mtimes)
     changed_doc_count = len(to_add_or_update) + len(to_delete)
     memory_observer.sample("phase_finish", phase="scan_diff")
@@ -2396,6 +2437,7 @@ def index_vault_flow(
         docs_to_process = scanned
         docs_to_delete = []
         storage_insert_doc_ids = {str(doc["doc_id"]) for doc in docs_to_process}
+        context_refresh_doc_ids = set()
 
     _RUNTIME["storage_insert_doc_ids"] = storage_insert_doc_ids
 
@@ -2414,6 +2456,28 @@ def index_vault_flow(
         finally:
             _write_heartbeat(index_root)
             memory_observer.sample("phase_finish", phase="pre_index_maintenance")
+
+    context_refresh_changed, context_refresh_failed = (
+        _refresh_repaired_sidecar_docs(
+            scanned,
+            source_records_by_ns_doc_id,
+            context_refresh_doc_ids,
+            store,
+            embed_provider,
+            max_time_window_minutes=config.get("communication_context", {}).get(
+                "max_time_window_minutes", 15
+            ),
+            logger=logger,
+        )
+        if context_refresh_doc_ids
+        else (0, 0)
+    )
+    if context_refresh_changed or context_refresh_failed:
+        logger.info(
+            "Attachment context-only refresh changed=%d failed=%d",
+            context_refresh_changed,
+            context_refresh_failed,
+        )
 
     concurrency = int(enrichment_cfg.get("concurrency", 1) or 1)
     if concurrency > 1:
@@ -2455,7 +2519,9 @@ def index_vault_flow(
     # and otherwise merges new rows via optimize(); no full rebuild and no
     # rebuild window where keyword search degrades.
     # Self-heal: if the index is unusable, fall back to a full rebuild.
-    should_update_fts = bool(docs_to_process or docs_to_delete)
+    should_update_fts = bool(
+        docs_to_process or docs_to_delete or context_refresh_changed
+    )
     needs_full_rebuild = False
     if not should_update_fts and not store.fts_available():
         logger.info("FTS index unavailable after no-op diff — rebuilding FTS index")
@@ -2513,7 +2579,11 @@ def index_vault_flow(
     _write_heartbeat(index_root)  # FTS/promote done — still progressing, not frozen
 
     run_seconds = time.perf_counter() - t0
-    index_stats_task(len(to_add_or_update), len(to_delete), run_seconds)
+    index_stats_task(
+        len(to_add_or_update) + context_refresh_changed,
+        len(to_delete),
+        run_seconds,
+    )
 
     # Read final counts — auto-recover if table is corrupt
     try:
@@ -2812,7 +2882,11 @@ def _build_single_doc_runtime(
             # build context, so reuse the doc's OWN sidecar's already-computed
             # same-channel context. Makes per-attachment (real-time) indexing
             # embed neighbor context immediately, not only at the next sweep.
-            "communication_context_provider": SidecarContextProvider(),
+            "communication_context_provider": SidecarContextProvider(
+                max_time_window_minutes=config.get("communication_context", {}).get(
+                    "max_time_window_minutes", 15
+                )
+            ),
         }
     )
 

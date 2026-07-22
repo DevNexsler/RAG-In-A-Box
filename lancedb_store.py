@@ -17,6 +17,7 @@ from typing import Any
 
 import pyarrow as pa
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
+from llama_index.core.vector_stores.utils import node_to_metadata_dict
 from llama_index.vector_stores.lancedb import LanceDBVectorStore
 from llama_index.vector_stores.lancedb.base import TableNotFoundError
 
@@ -770,6 +771,63 @@ class LanceDBStore:
             if not self._exclusive_writer_depth:
                 self._checkout_latest()
             self._write_nodes_unlocked(nodes, operation="upsert")
+
+    def replace_chunk_text_and_vector(
+        self,
+        doc_id: str,
+        loc: str,
+        expected_text: str,
+        new_text: str,
+        vector: list[float],
+    ) -> bool:
+        """Atomically replace one chunk after verifying caller read current text."""
+        chunk_uid = f"{doc_id}::{loc}"
+        with self._serialize_document_writes({doc_id}):
+            if not self._exclusive_writer_depth:
+                self._checkout_latest()
+            rows = (
+                self._vs.table.search(None)
+                .where(
+                    f"id = '{self._sql_escape(chunk_uid)}'",
+                    prefilter=True,
+                )
+                .select(["id", "doc_id", "text", "metadata"])
+                .limit(1)
+                .to_list()
+            )
+            if not rows or (rows[0].get("text") or "") != expected_text:
+                return False
+
+            metadata = rows[0].get("metadata") or {}
+            metadata = _strip_llama_managed_keys(metadata)
+            node = TextNode(
+                text=new_text,
+                id_=chunk_uid,
+                embedding=vector,
+                metadata=metadata,
+            )
+            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                node_id=doc_id
+            )
+            refreshed_metadata = node_to_metadata_dict(
+                node,
+                remove_text=False,
+                flat_metadata=self._vs.flat_metadata,
+            )
+            result = self._vs.table.update(
+                where=f"id = '{self._sql_escape(chunk_uid)}'",
+                values={
+                    "text": new_text,
+                    "vector": vector,
+                    "metadata": refreshed_metadata,
+                },
+            )
+            if result.rows_updated != 1:
+                raise RuntimeError(
+                    f"Expected one updated chunk for {chunk_uid}; got {result.rows_updated}"
+                )
+            self._vs._fts_index_ready = False
+            return True
 
     def insert_nodes(
         self, nodes: list[TextNode], *, known_absent: bool = False

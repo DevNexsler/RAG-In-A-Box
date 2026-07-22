@@ -892,26 +892,50 @@ def test_repair_communication_sidecars_writes_context_and_returns_doc_ids(tmp_pa
     assert updated["context"]["same_channel_before"][0]["text"] == "before text"
 
 
-def test_include_repaired_sidecar_docs_forces_reindex_without_duplicates():
+def test_refresh_repaired_sidecar_docs_uses_embedding_only_path(tmp_path, monkeypatch):
     import flow_index_vault as fiv
+    from sources.base import SourceRecord
 
-    assert hasattr(fiv, "_include_repaired_sidecar_docs")
+    sidecar = tmp_path / "photo.json"
+    sidecar.write_text("{}")
+    scanned = [{"doc_id": "documents::photo", "source_type": "img"}]
+    records = {
+        "documents::photo": SourceRecord(
+            doc_id="photo",
+            source_type="img",
+            natural_key="photo.jpg",
+            mtime=1.0,
+            size=1,
+            metadata={"sidecar_path": str(sidecar), "source": "chat"},
+        )
+    }
+    store = MagicMock()
+    embed = MagicMock()
+    context = MagicMock(return_value="BEFORE MESSAGES\n[BEFORE] 482 #6")
+    refresh = MagicMock(return_value=True)
+    monkeypatch.setattr(fiv, "context_text_from_sidecar", context, raising=False)
+    monkeypatch.setattr(fiv, "refresh_document_context", refresh, raising=False)
 
-    scanned = [
-        {"doc_id": "documents::photo", "mtime": 1.0},
-        {"doc_id": "documents::note", "mtime": 1.0},
-    ]
-
-    forced = fiv._include_repaired_sidecar_docs(
+    changed, failed = fiv._refresh_repaired_sidecar_docs(
         scanned,
-        [{"doc_id": "documents::note", "mtime": 2.0}],
-        {"documents::photo", "documents::note"},
+        records,
+        {"documents::photo"},
+        store,
+        embed,
     )
 
-    assert [record["doc_id"] for record in forced] == [
-        "documents::note",
+    assert (changed, failed) == (1, 0)
+    context.assert_called_once_with(
+        sidecar,
+        doc_id="documents::photo",
+        max_time_window_minutes=15,
+    )
+    refresh.assert_called_once_with(
+        store,
+        embed,
         "documents::photo",
-    ]
+        "BEFORE MESSAGES\n[BEFORE] 482 #6",
+    )
 
 
 @pytest.mark.parametrize(

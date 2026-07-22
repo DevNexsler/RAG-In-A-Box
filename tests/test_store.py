@@ -1,5 +1,7 @@
 """Tests for LanceDBStore (uses a temp directory, no mocks needed)."""
 
+import json
+
 import multiprocessing
 import subprocess
 import sys
@@ -77,6 +79,42 @@ def test_upsert_replaces():
 
         doc_ids = store.list_doc_ids()
         assert doc_ids == ["a.md"]
+
+
+def test_replace_chunk_text_and_vector_is_atomic_and_refreshes_node_metadata():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        old_text = "photo\n\n[Conversation context]\nBEFORE: old"
+        new_text = "photo\n\n[Conversation context]\nBEFORE: 482 #6"
+        store.upsert_nodes([_make_node("photo.jpg", "img:c:0", old_text, [0.1] * 768)])
+
+        changed = store.replace_chunk_text_and_vector(
+            "photo.jpg", "img:c:0", old_text, new_text, [0.2] * 768
+        )
+
+        assert changed is True
+        hit = store.get_chunk("photo.jpg", "img:c:0")
+        assert hit is not None
+        assert hit.text == new_text
+        assert store.get_vector("photo.jpg::img:c:0") == pytest.approx([0.2] * 768)
+        raw = store._vs.table.search(None).where("id = 'photo.jpg::img:c:0'").limit(1).to_list()[0]
+        assert json.loads(raw["metadata"]["_node_content"])["text"] == new_text
+        store.ensure_fts_index(compact_data=False)
+        assert store.keyword_search("482", top_k=5)[0].doc_id == "photo.jpg"
+        assert store.vector_search([0.2] * 768, top_k=1)[0].doc_id == "photo.jpg"
+
+
+def test_replace_chunk_text_and_vector_rejects_stale_expected_text():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("photo.jpg", "img:c:0", "current", [0.1] * 768)])
+
+        changed = store.replace_chunk_text_and_vector(
+            "photo.jpg", "img:c:0", "stale", "replacement", [0.2] * 768
+        )
+
+        assert changed is False
+        assert store.get_chunk("photo.jpg", "img:c:0").text == "current"
 
 
 def test_insert_nodes_commits_once_without_noop_delete():

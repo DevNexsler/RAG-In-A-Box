@@ -327,7 +327,46 @@ def test_provider_prunes_farther_context_candidates_by_time_distance():
     envelope = provider.get_context_envelope(target)
 
     assert [m.message_id for m in envelope.same_channel_before] == ["before"]
+    assert [m.message_id for m in envelope.same_channel_after] == ["after"]
+
+
+def test_provider_rejects_nearest_messages_outside_absolute_time_window():
+    target = CommunicationItem(
+        doc_id="photo",
+        origin_source="zoho_cliq",
+        channel_id="renovations",
+        sent_at="2026-05-08T19:00:00Z",
+    )
+    messages = [
+        CommunicationMessage(
+            message_id="before-too-far",
+            origin_source="zoho_cliq",
+            channel_id="renovations",
+            sent_at="2026-05-08T18:44:59Z",
+            text="Old property",
+        ),
+        CommunicationMessage(
+            message_id="after-too-far",
+            origin_source="zoho_cliq",
+            channel_id="renovations",
+            sent_at="2026-05-08T19:15:01Z",
+            text="Different property",
+        ),
+    ]
+
+    provider = SourceWindowContextProvider.from_messages(
+        messages,
+        message_channels={m.message_id: "renovations" for m in messages},
+        message_sources={m.message_id: "zoho_cliq" for m in messages},
+        max_time_window_minutes=15,
+    )
+
+    envelope = provider.get_context_envelope(target)
+
+    assert envelope.same_channel_before == []
     assert envelope.same_channel_after == []
+    assert envelope.nearest_nonempty_before is None
+    assert envelope.nearest_nonempty_after is None
 
 
 def test_provider_keeps_balanced_before_and_after_candidates():
@@ -1061,6 +1100,54 @@ def test_context_envelope_from_sidecar_payload_reconstructs_messages():
     assert env.nearest_nonempty_after.text == "This is 163 Washington Unit 2"
 
 
+def test_context_envelope_from_sidecar_payload_preserves_explicit_nearest_messages():
+    from communication_context import (
+        CommunicationItem,
+        context_envelope_from_sidecar_payload,
+    )
+
+    payload = {
+        "context": {
+            "same_channel_before": [{"text": "Window before", "message_id": "b-window"}],
+            "same_channel_after": [],
+            "nearest_nonempty_before": {
+                "text": "Guaranteed before",
+                "message_id": "b-nearest",
+            },
+            "nearest_nonempty_after": {
+                "text": "Guaranteed after",
+                "message_id": "a-nearest",
+            },
+        }
+    }
+
+    env = context_envelope_from_sidecar_payload(payload, CommunicationItem(doc_id="d"))
+
+    assert env.nearest_nonempty_before.message_id == "b-nearest"
+    assert env.nearest_nonempty_after.message_id == "a-nearest"
+
+
+def test_context_envelope_from_sidecar_payload_rejects_stale_window_messages():
+    from communication_context import context_envelope_from_sidecar_payload
+
+    item = CommunicationItem(doc_id="d", sent_at="2026-05-08T19:00:00Z")
+    payload = {
+        "context": {
+            "same_channel_before": [
+                {"sent_at": "2026-05-08T18:44:59Z", "text": "Old property"}
+            ],
+            "same_channel_after": [
+                {"sent_at": "2026-05-08T19:15:01Z", "text": "Other property"}
+            ],
+        }
+    }
+
+    env = context_envelope_from_sidecar_payload(payload, item)
+
+    assert env.same_channel_before == []
+    assert env.same_channel_after == []
+
+
 def test_context_envelope_from_sidecar_payload_no_context_block():
     from communication_context import (
         CommunicationItem,
@@ -1095,3 +1182,37 @@ def test_sidecar_context_provider_no_sidecar_is_empty():
     env = SidecarContextProvider().get_context_envelope(CommunicationItem(doc_id="d"))
     assert env.same_channel_before == []
     assert env.same_channel_after == []
+
+
+def test_sidecar_context_provider_honors_custom_absolute_time_window(tmp_path):
+    from communication_context import CommunicationItem, SidecarContextProvider
+
+    sidecar = tmp_path / "s.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "context": {
+                    "same_channel_after": [
+                        {
+                            "sent_at": "2026-01-01T10:20:00Z",
+                            "text": "Within custom window",
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    item = CommunicationItem(
+        doc_id="d",
+        sent_at="2026-01-01T10:00:00Z",
+        sidecar_path=str(sidecar),
+    )
+
+    assert SidecarContextProvider().get_context_envelope(item).same_channel_after == []
+    assert (
+        SidecarContextProvider(max_time_window_minutes=30)
+        .get_context_envelope(item)
+        .same_channel_after[0]
+        .text
+        == "Within custom window"
+    )

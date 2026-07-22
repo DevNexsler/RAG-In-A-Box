@@ -57,6 +57,7 @@ class SourceWindowContextProvider:
         *,
         window_before: int = 5,
         window_after: int = 5,
+        max_time_window_minutes: float = 15,
         max_relative_gap: float = 3.0,
         max_extra_gap_seconds: int = 60,
     ) -> None:
@@ -66,6 +67,9 @@ class SourceWindowContextProvider:
         }
         self._window_before = window_before
         self._window_after = window_after
+        self._max_time_window_seconds = max(
+            0.0, float(max_time_window_minutes or 0)
+        ) * 60.0
         self._max_relative_gap = max(1.0, float(max_relative_gap or 1.0))
         self._max_extra_gap_seconds = max(0, int(max_extra_gap_seconds or 0))
 
@@ -79,6 +83,7 @@ class SourceWindowContextProvider:
         message_threads: dict[str, str] | None = None,
         window_before: int = 5,
         window_after: int = 5,
+        max_time_window_minutes: float = 15,
         max_relative_gap: float = 3.0,
         max_extra_gap_seconds: int = 60,
     ) -> SourceWindowContextProvider:
@@ -121,6 +126,7 @@ class SourceWindowContextProvider:
             messages_by_scope,
             window_before=window_before,
             window_after=window_after,
+            max_time_window_minutes=max_time_window_minutes,
             max_relative_gap=max_relative_gap,
             max_extra_gap_seconds=max_extra_gap_seconds,
         )
@@ -139,6 +145,14 @@ class SourceWindowContextProvider:
             for message in messages
             if _message_sort_key(message) > item_key and not _is_context_target(message, item)
         ]
+        before = _messages_within_time_window(
+            item, before, self._max_time_window_seconds
+        )
+        after = _messages_within_time_window(
+            item, after, self._max_time_window_seconds
+        )
+        nearest_before = _nearest_nonempty(reversed(before))
+        nearest_after = _nearest_nonempty(after)
         before_window = before[-self._window_before :] if self._window_before > 0 else []
         after_window = after[: self._window_after] if self._window_after > 0 else []
         before_window, after_window = _prune_by_time_distance(
@@ -148,13 +162,17 @@ class SourceWindowContextProvider:
             max_relative_gap=self._max_relative_gap,
             max_extra_gap_seconds=self._max_extra_gap_seconds,
         )
+        if self._window_before > 0:
+            before_window = _include_context_message(before_window, nearest_before)
+        if self._window_after > 0:
+            after_window = _include_context_message(after_window, nearest_after)
 
         return ContextEnvelope(
             primary_item=item,
             same_channel_before=before_window,
             same_channel_after=after_window,
-            nearest_nonempty_before=_nearest_nonempty(reversed(before)),
-            nearest_nonempty_after=_nearest_nonempty(after),
+            nearest_nonempty_before=nearest_before,
+            nearest_nonempty_after=nearest_after,
         )
 
 
@@ -371,6 +389,9 @@ def build_context_provider_from_records(
         message_threads=message_threads,
         window_before=_configured_window(config, "window_before", 5),
         window_after=_configured_window(config, "window_after", 5),
+        max_time_window_minutes=_configured_float(
+            config, "max_time_window_minutes", 15.0
+        ),
         max_relative_gap=_configured_float(config, "max_relative_gap", 3.0),
         max_extra_gap_seconds=_configured_window(
             config, "max_extra_gap_seconds", 60
@@ -469,8 +490,18 @@ def _message_from_sidecar_entry(entry: Any) -> CommunicationMessage:
     )
 
 
+def _sidecar_nearest_message(entry: Any) -> CommunicationMessage | None:
+    if not isinstance(entry, dict):
+        return None
+    message = _message_from_sidecar_entry(entry)
+    return message if _text(message.text) else None
+
+
 def context_envelope_from_sidecar_payload(
-    payload: Any, item: CommunicationItem
+    payload: Any,
+    item: CommunicationItem,
+    *,
+    max_time_window_minutes: float = 15,
 ) -> ContextEnvelope:
     """Reconstruct a ContextEnvelope from an attachment sidecar's stored
     `context` block (written earlier by repair_sidecar_context on a full sweep).
@@ -483,12 +514,21 @@ def context_envelope_from_sidecar_payload(
         return ContextEnvelope(primary_item=item)
     before = [_message_from_sidecar_entry(m) for m in (context.get("same_channel_before") or [])]
     after = [_message_from_sidecar_entry(m) for m in (context.get("same_channel_after") or [])]
+    max_seconds = max(0.0, float(max_time_window_minutes or 0)) * 60.0
+    before = _messages_within_time_window(item, before, max_seconds)
+    after = _messages_within_time_window(item, after, max_seconds)
+    explicit_before = _sidecar_nearest_message(context.get("nearest_nonempty_before"))
+    explicit_after = _sidecar_nearest_message(context.get("nearest_nonempty_after"))
+    explicit_before = _message_within_time_window(item, explicit_before, max_seconds)
+    explicit_after = _message_within_time_window(item, explicit_after, max_seconds)
+    before = _include_context_message(before, explicit_before)
+    after = _include_context_message(after, explicit_after)
     return ContextEnvelope(
         primary_item=item,
         same_channel_before=before,
         same_channel_after=after,
-        nearest_nonempty_before=_nearest_nonempty(reversed(before)),
-        nearest_nonempty_after=_nearest_nonempty(after),
+        nearest_nonempty_before=explicit_before or _nearest_nonempty(reversed(before)),
+        nearest_nonempty_after=explicit_after or _nearest_nonempty(after),
     )
 
 
@@ -500,6 +540,9 @@ class SidecarContextProvider:
     performs. Returns an empty envelope when the item has no sidecar or no
     stored context, so non-communication docs are unaffected."""
 
+    def __init__(self, *, max_time_window_minutes: float = 15) -> None:
+        self._max_time_window_minutes = max_time_window_minutes
+
     def get_context_envelope(self, item: CommunicationItem) -> ContextEnvelope:
         path = getattr(item, "sidecar_path", "") or ""
         if not path:
@@ -508,7 +551,11 @@ class SidecarContextProvider:
             payload = json.loads(Path(path).read_text())
         except (OSError, json.JSONDecodeError):
             return ContextEnvelope(primary_item=item)
-        return context_envelope_from_sidecar_payload(payload, item)
+        return context_envelope_from_sidecar_payload(
+            payload,
+            item,
+            max_time_window_minutes=self._max_time_window_minutes,
+        )
 
 
 def _sidecar_context_payload(
@@ -675,6 +722,43 @@ def _prune_by_time_distance(
         [message for message in before if id(message) in keep],
         [message for message in after if id(message) in keep],
     )
+
+
+def _messages_within_time_window(
+    item: CommunicationItem,
+    messages: list[CommunicationMessage],
+    max_seconds: float,
+) -> list[CommunicationMessage]:
+    return [
+        message
+        for message in messages
+        if _message_within_time_window(item, message, max_seconds) is not None
+    ]
+
+
+def _message_within_time_window(
+    item: CommunicationItem,
+    message: CommunicationMessage | None,
+    max_seconds: float,
+) -> CommunicationMessage | None:
+    if message is None:
+        return None
+    item_time = _parse_timestamp(item.sent_at)
+    if item_time is None:
+        return message
+    distance = _distance_seconds(item_time, message)
+    if distance is None or distance <= max_seconds:
+        return message
+    return None
+
+
+def _include_context_message(
+    messages: list[CommunicationMessage],
+    required: CommunicationMessage | None,
+) -> list[CommunicationMessage]:
+    if required is None or required in messages:
+        return messages
+    return sorted([*messages, required], key=_message_sort_key)
 
 
 def _distance_seconds(
