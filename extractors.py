@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 from core.resilience import is_transient
-from providers.media.base import MediaProvider
+from providers.media.base import MediaPolicyError, MediaProvider
 from providers.ocr.base import OCRProvider
 
 logger = logging.getLogger(__name__)
@@ -640,6 +640,10 @@ def extract_audio(
         return ExtractionResult.from_text("", frontmatter=fm)
     try:
         transcript = media_provider.transcribe_audio(file_path)
+    except MediaPolicyError as e:
+        logger.warning("Audio not extractable (%s): %s", e.skip_reason, e)
+        note_skip(e.skip_reason)
+        transcript = ""
     except Exception as e:
         logger.warning("Audio extraction failed for %s: %s", file_path, e)
         note_degradation("audio_extract_failed", transient=is_transient(e))
@@ -664,10 +668,19 @@ def extract_video(
         return ExtractionResult.from_text("", frontmatter=fm)
     try:
         notes = media_provider.analyze_video(file_path)
+    except MediaPolicyError as e:
+        # The file itself is out of policy (oversized, unsupported container).
+        # Deterministic: no later run can change the outcome, so this is a
+        # skip. As a degradation it never reached LanceDB nor the skip ledger,
+        # so the plain diff re-admitted it every run and the attempts cap was
+        # vacuous (#0481).
+        logger.warning("Video not extractable (%s): %s", e.skip_reason, e)
+        note_skip(e.skip_reason)
+        notes = ""
     except Exception as e:
         logger.warning("Video extraction failed for %s: %s", file_path, e)
-        # transient (outage) -> retries; permanent (oversized/codec, non-transient)
-        # -> caps at the degraded-ledger max then stops.
+        # transient (outage) -> retries; anything else rides the degraded
+        # ledger and stops at _DEGRADED_MAX_ATTEMPTS.
         note_degradation("video_extract_failed", transient=is_transient(e))
         notes = ""
     return ExtractionResult.from_text(notes, frontmatter=fm)

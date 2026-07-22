@@ -11,8 +11,11 @@ from pathlib import Path
 import httpx
 
 from core.resilience import TransientError
+from providers.media.base import MediaFileTooLargeError
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["MediaFileTooLargeError", "OpenRouterMediaProvider"]
 
 _AUDIO_TRANSCRIBE_PROMPT = (
     "Transcribe this audio faithfully for document search. If multiple speakers "
@@ -64,10 +67,6 @@ _VIDEO_MIME_BY_EXT = {
     "webm": "video/webm",
     "avi": "video/x-msvideo",
 }
-
-
-class MediaFileTooLargeError(ValueError):
-    """Raised when a local media file exceeds configured upload size."""
 
 
 class OpenRouterMediaProvider:

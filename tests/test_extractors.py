@@ -469,17 +469,71 @@ def test_extract_video_provider_failure_transient_notes_degradation():
 
 
 def test_extract_video_provider_failure_permanent_notes_degradation():
-    # A genuinely permanent failure (oversized/codec) is non-transient — it
-    # rides the degraded ledger and caps after the max attempts.
+    # An unclassified backend failure (bad response shape, codec the model
+    # choked on) is non-transient — it rides the degraded ledger and caps
+    # after the max attempts.
     from extractors import begin_degradation_capture, collect_degradations, extract_video
 
     begin_degradation_capture()
     extract_video(
-        "/fake/clip.mp4", media_provider=_FakeMedia(exc=ValueError("oversized"))
+        "/fake/clip.mp4", media_provider=_FakeMedia(exc=ValueError("bad shape"))
     )
     degs = collect_degradations()
     assert [d.reason for d in degs] == ["video_extract_failed"]
     assert degs[0].transient is False  # ValueError is not transient
+
+
+def _oversize_provider(max_file_size_mb=0.001):
+    """The real LiteLLM media provider with a tiny ceiling, so the production
+    size guard — not a stand-in exception — decides the outcome."""
+    from providers.media import _LiteLLMMediaProvider
+
+    def _must_not_run(file_path):
+        raise AssertionError("provider must not be called for an oversized file")
+
+    return _LiteLLMMediaProvider(
+        _must_not_run, _must_not_run, max_file_size_mb=max_file_size_mb
+    )
+
+
+def test_extract_video_oversized_is_skip_not_degradation(tmp_path):
+    # #0481: a file over media.max_file_size_mb is a property of the FILE, not
+    # of the backend — no retry can shrink it. Classifying it as a degradation
+    # left it out of both LanceDB and the skip ledger, so the plain diff
+    # re-admitted it every run and `attempts` ran to 113 against a cap of 5.
+    from extractors import (
+        begin_degradation_capture,
+        collect_degradations,
+        collect_skips,
+        extract_video,
+    )
+
+    clip = tmp_path / "walkthrough.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 4096)
+
+    begin_degradation_capture()
+    result = extract_video(clip, media_provider=_oversize_provider())
+    assert result.full_text == ""
+    assert collect_skips() == ["media_file_too_large"]
+    assert collect_degradations() == []  # not a retry-forever degradation
+
+
+def test_extract_audio_oversized_is_skip_not_degradation(tmp_path):
+    from extractors import (
+        begin_degradation_capture,
+        collect_degradations,
+        collect_skips,
+        extract_audio,
+    )
+
+    voicemail = tmp_path / "voicemail.m4a"
+    voicemail.write_bytes(b"\x00" * 4096)
+
+    begin_degradation_capture()
+    result = extract_audio(voicemail, media_provider=_oversize_provider())
+    assert result.full_text == ""
+    assert collect_skips() == ["media_file_too_large"]
+    assert collect_degradations() == []
 
 
 def test_extract_video_retrieval_stub_skips_without_provider_call(tmp_path):

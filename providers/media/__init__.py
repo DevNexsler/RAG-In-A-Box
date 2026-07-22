@@ -3,9 +3,19 @@
 import os
 from pathlib import Path
 
-from providers.media.base import MediaProvider
+from providers.media.base import (
+    MediaFileTooLargeError,
+    MediaPolicyError,
+    MediaProvider,
+)
 
-__all__ = ["MediaProvider", "build_media_provider", "DEFAULT_VIDEO_MODEL"]
+__all__ = [
+    "MediaFileTooLargeError",
+    "MediaPolicyError",
+    "MediaProvider",
+    "build_media_provider",
+    "DEFAULT_VIDEO_MODEL",
+]
 
 DEFAULT_VIDEO_MODEL = "qwen/qwen3.5-397b-a17b"
 
@@ -46,8 +56,6 @@ class _LiteLLMMediaProvider:
         self._max_bytes = int(max_file_size_mb * 1024 * 1024)
 
     def _check_size(self, file_path) -> None:
-        from providers.media.openrouter_media import MediaFileTooLargeError
-
         size = Path(file_path).stat().st_size
         if self._max_bytes >= 0 and size > self._max_bytes:
             raise MediaFileTooLargeError(

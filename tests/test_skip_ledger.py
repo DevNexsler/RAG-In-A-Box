@@ -117,6 +117,54 @@ def test_no_text_doc_not_reprocessed_on_second_run(tmp_path):
     assert [r["doc_id"] for r in kept] == ["d::1"] and n == 0
 
 
+def test_oversized_video_not_reprocessed_on_second_diff(tmp_path):
+    # #0481 repro, chained over a persisted ledger: extraction of a file above
+    # media.max_file_size_mb fails deterministically, so the doc never reaches
+    # LanceDB and the plain diff sees it as "new" forever. Production ran five
+    # 160-430MB videos to attempts=113 against a cap of 5. Run 1 must record a
+    # skip; run 2 must not re-admit the doc.
+    from extractors import extract_video
+    from providers.media import _LiteLLMMediaProvider
+
+    clip = tmp_path / "walkthrough.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 4096)
+    rec = _rec("documents::000Qh", change_hash="h1")
+    t0 = 1000.0
+
+    def _must_not_run(file_path):
+        raise AssertionError("provider must not be called for an oversized file")
+
+    provider = _LiteLLMMediaProvider(_must_not_run, _must_not_run, max_file_size_mb=0.001)
+
+    # run 1: nothing in the ledger yet -> the doc is processed and fails
+    kept, _ = _exclude_skipped_docs([rec], _load_skip_ledger(tmp_path), now=t0)
+    assert kept == [rec]
+    begin_degradation_capture()
+    extract_video(clip, media_provider=provider)
+    skips = collect_skips()
+    assert skips == ["media_file_too_large"], (
+        "an oversized file is a deterministic property of the file — it must "
+        f"become a skip, not a degradation (got skips={skips}, "
+        f"degradations={collect_degradations()})"
+    )
+    _save_skip_ledger(tmp_path, _merge_skip_ledger(
+        _load_skip_ledger(tmp_path),
+        {rec["doc_id"]: {"reasons": sorted(set(skips)), "change_key": _change_key(rec)}},
+        set(),
+        now=t0,
+    ))
+
+    # run 2 (15 min later): the file cannot have shrunk -> no re-extraction
+    kept, n = _exclude_skipped_docs([rec], _load_skip_ledger(tmp_path), now=t0 + 900)
+    assert kept == [] and n == 1
+
+    # replaced with a smaller file -> re-evaluated immediately
+    kept, _ = _exclude_skipped_docs(
+        [_rec("documents::000Qh", change_hash="h2")], _load_skip_ledger(tmp_path), now=t0 + 900
+    )
+    assert [r["doc_id"] for r in kept] == ["documents::000Qh"]
+
+
 # --- merge ---
 
 def test_merge_adds_new_skips():

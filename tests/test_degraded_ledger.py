@@ -18,9 +18,11 @@ from extractors import (
 )
 from flow_index_vault import (
     _DEGRADED_MAX_ATTEMPTS,
+    _change_key,
     _include_degraded_docs,
     _load_degraded_ledger,
     _merge_degraded_ledger,
+    _promote_exhausted_degraded,
     _save_degraded_ledger,
 )
 
@@ -115,6 +117,67 @@ def test_include_degraded_ignores_docs_no_longer_scanned():
     ledger = {"docs": {"documents::gone": {"reasons": ["x"], "attempts": 1}}}
     out = _include_degraded_docs(_scanned("documents::other"), [], ledger)
     assert out == []
+
+
+# --- the attempts cap must be terminal on BOTH admission paths (#0481) ---
+
+def test_exhausted_entry_is_promoted_to_the_skip_ledger():
+    # The cap only ever gated the self-heal re-queue. A doc that fails before
+    # it can be stored has no index row, so the ordinary diff re-admits it as
+    # "new" every run and the cap never bites (production: attempts=113).
+    # Exhausting the cap must hand the doc to the skip ledger, which is what
+    # actually keeps it out of the diff.
+    ledger = {"version": 2, "docs": {
+        "documents::dead": {"reasons": ["video_extract_failed"], "attempts": _DEGRADED_MAX_ATTEMPTS},
+    }}
+    remaining, promoted = _promote_exhausted_degraded(ledger, _scanned("documents::dead"))
+    assert remaining["docs"] == {}, "an exhausted entry must not linger and keep counting"
+    assert promoted["documents::dead"]["change_key"] == _change_key(_scanned("documents::dead")[0])
+    assert "degraded_max_attempts" in promoted["documents::dead"]["reasons"]
+    assert "video_extract_failed" in promoted["documents::dead"]["reasons"]
+
+
+def test_promoted_doc_is_excluded_from_the_ordinary_diff():
+    # End state of the promotion: the doc the plain diff would re-admit as
+    # "new" is dropped by _exclude_skipped_docs on the next run.
+    from flow_index_vault import _exclude_skipped_docs, _merge_skip_ledger
+
+    rec = {"doc_id": "documents::dead", "mtime": 1.0}
+    ledger = {"version": 2, "docs": {
+        "documents::dead": {"reasons": ["video_extract_failed"], "attempts": _DEGRADED_MAX_ATTEMPTS},
+    }}
+    _, promoted = _promote_exhausted_degraded(ledger, [rec])
+    skip_ledger = _merge_skip_ledger({"docs": {}}, promoted, set(), now=1000.0)
+    kept, n = _exclude_skipped_docs([rec], skip_ledger, now=1000.0 + 900)
+    assert kept == [] and n == 1
+
+
+def test_promotion_reopens_when_the_file_changes():
+    # Terminal, not permanent: the promoted entry carries the change key, so a
+    # replaced file is re-evaluated immediately (same guarantee the skip
+    # ledger already gives duplicates and contentless docs).
+    from flow_index_vault import _exclude_skipped_docs, _merge_skip_ledger
+
+    ledger = {"version": 2, "docs": {
+        "documents::dead": {"reasons": ["video_extract_failed"], "attempts": _DEGRADED_MAX_ATTEMPTS},
+    }}
+    _, promoted = _promote_exhausted_degraded(
+        ledger, [{"doc_id": "documents::dead", "mtime": 1.0}]
+    )
+    skip_ledger = _merge_skip_ledger({"docs": {}}, promoted, set(), now=1000.0)
+    replaced = [{"doc_id": "documents::dead", "mtime": 2.0}]
+    kept, n = _exclude_skipped_docs(replaced, skip_ledger, now=1000.0 + 900)
+    assert [r["doc_id"] for r in kept] == ["documents::dead"] and n == 0
+
+
+def test_promotion_leaves_retryable_and_unscanned_entries_alone():
+    ledger = {"version": 2, "docs": {
+        "documents::retry": {"reasons": ["ocr_describe_failed"], "attempts": _DEGRADED_MAX_ATTEMPTS - 1},
+        "documents::gone": {"reasons": ["x"], "attempts": _DEGRADED_MAX_ATTEMPTS},
+    }}
+    remaining, promoted = _promote_exhausted_degraded(ledger, _scanned("documents::retry"))
+    assert promoted == {}  # nothing exhausted-and-scanned
+    assert set(remaining["docs"]) == {"documents::retry", "documents::gone"}
 
 
 # --- merge logic ---

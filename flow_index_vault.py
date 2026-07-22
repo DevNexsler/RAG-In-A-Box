@@ -792,6 +792,50 @@ def _include_degraded_docs(
     return forced
 
 
+# Skip reason stamped on a doc that used up its degraded-ledger attempts.
+_EXHAUSTED_SKIP_REASON = "degraded_max_attempts"
+
+
+def _promote_exhausted_degraded(
+    ledger: dict,
+    scanned: list[dict],
+) -> tuple[dict, dict[str, dict]]:
+    """Hand degraded entries that used up _DEGRADED_MAX_ATTEMPTS to the skip
+    ledger, and drop them from the degraded one.
+
+    The cap only ever gated the self-heal re-queue in _include_degraded_docs.
+    A doc whose extraction fails never reaches the table, so the ordinary diff
+    re-admits it as "new" on the very next run, `attempts` is charged again,
+    and the cap never bites — five oversized videos reached 113 attempts in
+    production (#0481). The skip ledger is this codebase's existing home for
+    "decided: do not index": it excludes the doc from the diff while its
+    change key holds, re-opens it the moment the file changes, and still
+    re-attempts once per _SKIP_RETRY_SECONDS. Handing the exhausted entry over
+    makes the cap terminal on *both* admission paths without abandoning any
+    doc permanently, and gives an operator a visible reason instead of a
+    runaway counter.
+
+    Returns the ledger without the promoted entries, plus the skip-ledger
+    additions. A doc that is no longer scanned has no change key to record, so
+    it is left alone."""
+    docs = ledger.get("docs", {})
+    if not docs:
+        return ledger, {}
+    records_by_doc_id = {str(r.get("doc_id", "")): r for r in scanned}
+    remaining: dict[str, dict] = {}
+    promoted: dict[str, dict] = {}
+    for doc_id, entry in docs.items():
+        record = records_by_doc_id.get(doc_id)
+        if record is None or int(entry.get("attempts", 0)) < _DEGRADED_MAX_ATTEMPTS:
+            remaining[doc_id] = entry
+            continue
+        promoted[doc_id] = {
+            "reasons": sorted({*entry.get("reasons", []), _EXHAUSTED_SKIP_REASON}),
+            "change_key": _change_key(record),
+        }
+    return {"version": _DEGRADED_LEDGER_VERSION, "docs": remaining}, promoted
+
+
 def _merge_degraded_ledger(
     ledger: dict,
     degraded_now: dict[str, list],
@@ -1302,6 +1346,11 @@ def _process_doc_task(
                 # timeout, backend down) — leave it to the degraded lane, which
                 # retries with capped attempts instead of the daily skip window.
                 logger.debug(f"No text extracted (degraded, will retry): {doc_id}")
+            elif collect_skips():
+                # Extraction already decided why this doc yields nothing
+                # (oversized media, retrieval stub). Keep that specific reason
+                # in the ledger rather than burying it under the generic one.
+                logger.debug(f"No text extracted (skipped): {doc_id}")
             else:
                 # Genuinely contentless (empty transcript row, blank mail body,
                 # sidecar JSON with no text). Record a skip so the diff stops
@@ -2540,19 +2589,31 @@ def index_vault_flow(
 
     degraded_now = _RUNTIME.get("degraded_now", {})
     clean_now = _RUNTIME.get("degraded_clean", set())
-    if degraded_now or clean_now:
-        updated_ledger = _merge_degraded_ledger(
-            _load_degraded_ledger(index_root), degraded_now, clean_now
-        )
-        _save_degraded_ledger(index_root, updated_ledger)
-        if degraded_now:
-            logger.warning(
-                "%d docs indexed with degradations (will self-heal next run): %s",
-                len(degraded_now), sorted(degraded_now)[:10],
-            )
-
     skip_now = _RUNTIME.get("skip_now", {})
     skip_clean = _RUNTIME.get("skip_clean", set())
+
+    updated_ledger = _merge_degraded_ledger(
+        _load_degraded_ledger(index_root), degraded_now, clean_now
+    )
+    # The attempts cap is only terminal if it also stops the ordinary diff —
+    # otherwise a doc that fails before it can be stored bypasses it forever.
+    updated_ledger, exhausted_skips = _promote_exhausted_degraded(updated_ledger, scanned)
+    if degraded_now or clean_now or exhausted_skips:
+        _save_degraded_ledger(index_root, updated_ledger)
+    if degraded_now:
+        logger.warning(
+            "%d docs indexed with degradations (will self-heal next run): %s",
+            len(degraded_now), sorted(degraded_now)[:10],
+        )
+    if exhausted_skips:
+        # _merge_skip_ledger applies skip_clean before skip_now, so a doc that
+        # degraded again this run is still recorded as skipped.
+        skip_now.update(exhausted_skips)
+        logger.warning(
+            "%d docs exhausted %d degraded attempts — moved to the skip ledger: %s",
+            len(exhausted_skips), _DEGRADED_MAX_ATTEMPTS, sorted(exhausted_skips)[:10],
+        )
+
     if skip_now or skip_clean:
         updated_skip = _merge_skip_ledger(
             _load_skip_ledger(index_root), skip_now, skip_clean
