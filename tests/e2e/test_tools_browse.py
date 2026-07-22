@@ -18,10 +18,6 @@ from tests.e2e.conftest import (
 pytestmark = pytest.mark.anyio
 
 SWEEP_TIMEOUT_S = 120
-# If indexer_running never flips to True within this window after "started",
-# assume the sweep finished between polls instead of waiting out the full
-# timeout — the final idle check still guards correctness.
-RUNNING_OBSERVE_GRACE_S = 20
 
 
 async def test_list_documents_pagination(indexed_corpus, mcp_session):
@@ -154,45 +150,77 @@ async def test_index_update_scoped_sweep(indexed_corpus, mcp_session):
         text=True,
     )
 
-    started = await mcp_session.call_tool_json(
-        "file_index_update", {"source_name": "sor"})
-    assert started.get("status") == "started", started
-    assert started.get("source_name") == "sor"
-    assert started.get("pid")
+    try:
+        started = await mcp_session.call_tool_json(
+            "file_index_update", {"source_name": "sor"})
+        assert started.get("status") == "started", started
+        assert started.get("source_name") == "sor"
+        assert started.get("pid")
+        run_id = started.get("run_id")
+        assert run_id, started
 
-    # Wait for the background subprocess to actually finish (indexer_running
-    # goes true → false), not just for doc_count — the corpus already
-    # satisfies min_docs, and a still-running sweep must not leak into the
-    # next test.
-    saw_running = False
-    start = time.monotonic()
-    while time.monotonic() - start < SWEEP_TIMEOUT_S:
-        status = await mcp_session.call_tool_json("file_status", {})
-        running = bool(status.get("indexer_running"))
-        saw_running = saw_running or running
-        elapsed = time.monotonic() - start
-        if not running and (saw_running or elapsed > RUNNING_OBSERVE_GRACE_S):
-            break
-        await anyio.sleep(2)
+        # Follow this exact run to a successful terminal state. Corpus count
+        # and idle state can both already be true before the child starts, and
+        # remain true after a failed child, so neither proves sweep success.
+        last_status = {}
+        start = time.monotonic()
+        while time.monotonic() - start < SWEEP_TIMEOUT_S:
+            last_status = await mcp_session.call_tool_json("file_status", {})
+            attempt = (last_status.get("index_run") or {}).get("last_attempt") or {}
+            if (
+                attempt.get("run_id") == run_id
+                and attempt.get("status") not in {"starting", "running", "terminating"}
+            ):
+                assert attempt.get("status") == "succeeded", last_status
+                break
+            await anyio.sleep(2)
+        else:
+            raise AssertionError(
+                f"scoped sweep {run_id} did not finish: {last_status}"
+            )
 
-    status = await wait_for_index(mcp_session, min_docs=EXPECTED_CORPUS_DOCS)
-    assert status["doc_count"] >= EXPECTED_CORPUS_DOCS
-    assert not status.get("indexer_running")
+        status = await wait_for_index(mcp_session, min_docs=EXPECTED_CORPUS_DOCS)
+        assert status["doc_count"] >= EXPECTED_CORPUS_DOCS
+        assert not status.get("indexer_running")
 
-    log = subprocess.run(
-        [
-            "docker",
-            "compose",
-            "-f",
-            str(COMPOSE_FILE),
-            "exec",
-            "-T",
-            "doc-organizer-staging",
-            "cat",
-            "/data/index/indexer.log",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    assert retained_warning in log
+        log = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(COMPOSE_FILE),
+                "exec",
+                "-T",
+                "doc-organizer-staging",
+                "cat",
+                "/data/index/indexer.log",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert retained_warning in log
+    finally:
+        # Remove only this test's marker. Preserve all real sweep output, even
+        # when an assertion above fails and the session-scoped volume survives.
+        subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(COMPOSE_FILE),
+                "exec",
+                "-T",
+                "doc-organizer-staging",
+                "sh",
+                "-c",
+                'log=/data/index/indexer.log; tmp="$log.test-cleanup"; '
+                'awk -v needle="$1" \'$0 != needle\' "$log" > "$tmp"; '
+                'cat "$tmp" > "$log"; rm -f "$tmp"',
+                "sh",
+                retained_warning,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
