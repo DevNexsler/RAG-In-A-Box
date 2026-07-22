@@ -814,17 +814,32 @@ class LanceDBStore:
                 remove_text=False,
                 flat_metadata=self._vs.flat_metadata,
             )
-            result = self._vs.table.update(
-                where=f"id = '{self._sql_escape(chunk_uid)}'",
-                values={
-                    "text": new_text,
-                    "vector": vector,
-                    "metadata": refreshed_metadata,
-                },
+            replacement = pa.Table.from_pylist(
+                [
+                    {
+                        "id": chunk_uid,
+                        "doc_id": rows[0].get("doc_id") or doc_id,
+                        "text": new_text,
+                        "vector": vector,
+                        "metadata": refreshed_metadata,
+                    }
+                ],
+                schema=self._vs.table.schema,
             )
-            if result.rows_updated != 1:
+            result = (
+                self._vs.table.merge_insert("id")
+                .when_matched_update_all(
+                    where=(
+                        "target.text = "
+                        f"'{self._sql_escape(expected_text)}'"
+                    )
+                )
+                .execute(replacement)
+            )
+            if result.num_updated_rows != 1:
                 raise RuntimeError(
-                    f"Expected one updated chunk for {chunk_uid}; got {result.rows_updated}"
+                    "Expected one updated chunk for "
+                    f"{chunk_uid}; got {result.num_updated_rows}"
                 )
             self._vs._fts_index_ready = False
             return True
