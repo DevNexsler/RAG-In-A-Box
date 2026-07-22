@@ -140,6 +140,21 @@ def test_reap_mass_orphan_guard_blocks_partial_scan(registry):
     assert registry.count() == 20
 
 
+def test_reap_honors_mass_delete_signal_from_stored_rows(registry):
+    # Partial scan misses 95 stored rows and 5 never-indexed rows. Looking only
+    # at the 5 reap candidates makes this appear safely below 50%, even though
+    # the store deletion guard has correctly identified a source-wide outage.
+    for i in range(100):
+        registry.register(f"comm::msg-{i}", f"cesar/msg-{i}", source_name="comm")
+    stored = {f"comm::msg-{i}" for i in range(95)}
+
+    reaped, blocked = _reap(registry, scanned=set(), stored=stored)
+
+    assert reaped == set()
+    assert blocked == {"comm": (5, 100)}
+    assert registry.count() == 100
+
+
 def test_reap_small_sources_bypass_ratio_guard(registry):
     # Mirrors the store guard's min_docs_for_ratio: tiny sources reap freely.
     registry.register("probe::doc-1", "probe/1", source_name="probe")

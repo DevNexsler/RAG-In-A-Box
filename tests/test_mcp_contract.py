@@ -1442,6 +1442,30 @@ def test_registry_coverage_classifies_deleted_and_empty_groups(tmp_path):
     assert counts["covered_group_count"] == 2
 
 
+def test_registry_coverage_backing_state_overrides_stale_ledgers(tmp_path):
+    config, stats = _coverage_fixture(tmp_path)
+    (tmp_path / "skip_docs.json").write_text(
+        '{"docs":{"documents::00003":{"reasons":["no_text"]}}}'
+    )
+    (tmp_path / "degraded_docs.json").write_text(
+        '{"docs":{"documents::00002":{"reasons":["extract_failed"]}}}'
+    )
+
+    coverage, error = mcp_server._registry_coverage(
+        index_root=tmp_path,
+        config=config,
+        registry_stats=stats,
+        indexed_doc_ids=set(),
+    )
+
+    assert error is None
+    counts = coverage["documents"]
+    assert counts["deleted_object_group_count"] == 1
+    assert counts["intentionally_empty_group_count"] == 1
+    assert counts["not_extractable_group_count"] == 0
+    assert counts["retry_pending_group_count"] == 0
+
+
 def test_registry_coverage_unavailable_root_does_not_classify_as_deleted(tmp_path):
     """If the source root itself is gone (unmounted NAS), absence proves
     nothing — groups must stay missing so the outage remains visible."""

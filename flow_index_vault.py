@@ -1012,6 +1012,16 @@ def _reap_vanished_registry_rows(
                 source, root,
             )
             continue
+        source_stored_ids = {
+            doc_id
+            for doc_id in stored_ids
+            if str(doc_id).split("::", 1)[0] == source
+        }
+        stored_missing_count = len(source_stored_ids - scanned_ids)
+        store_delete_blocked = (
+            len(source_stored_ids) >= min_docs_for_ratio
+            and stored_missing_count > len(source_stored_ids) * max_delete_ratio
+        )
         orphans = []
         for row in rows:
             ns_id = row["namespaced_doc_id"]
@@ -1022,7 +1032,10 @@ def _reap_vanished_registry_rows(
             orphans.append(row)
         if not orphans:
             continue
-        if len(rows) >= min_docs_for_ratio and len(orphans) > len(rows) * max_delete_ratio:
+        if store_delete_blocked or (
+            len(rows) >= min_docs_for_ratio
+            and len(orphans) > len(rows) * max_delete_ratio
+        ):
             blocked[source] = (len(orphans), len(rows))
             continue
         for row in orphans:

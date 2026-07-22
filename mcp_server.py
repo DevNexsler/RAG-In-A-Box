@@ -1010,15 +1010,10 @@ def _registry_coverage(
             if indexed:
                 counts["covered_group_count"] += 1
                 counts["indexed_group_count"] += 1
-            elif intentionally_skipped or sidecar:
-                counts["covered_group_count"] += 1
-                counts["not_extractable_group_count"] += 1
-            elif retry_pending:
-                counts["covered_group_count"] += 1
-                counts["retry_pending_group_count"] += 1
             else:
                 # Registry history is not the same as currently indexable:
-                # probe the backing object before calling this a gap (#0382).
+                # physical state outranks stale skip/degraded ledgers. Probe
+                # before classifying intentional skips, retries, or gaps.
                 backing = _group_backing_object_state(
                     root, group.get("rel_paths", set())
                 )
@@ -1028,6 +1023,12 @@ def _registry_coverage(
                 elif backing == "empty":
                     counts["covered_group_count"] += 1
                     counts["intentionally_empty_group_count"] += 1
+                elif intentionally_skipped or sidecar:
+                    counts["covered_group_count"] += 1
+                    counts["not_extractable_group_count"] += 1
+                elif retry_pending:
+                    counts["covered_group_count"] += 1
+                    counts["retry_pending_group_count"] += 1
                 else:
                     counts["missing_group_count"] += 1
         coverage[source_name] = counts
