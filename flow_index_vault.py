@@ -32,6 +32,7 @@ than as task arguments.  This avoids Prefect 3's input-serialisation warnings
 while keeping the flow easy to read.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -879,6 +880,23 @@ def _change_key(record: dict) -> str:
     return str(record.get("change_hash") or "") or f"mtime:{record.get('mtime', 0.0)}"
 
 
+def _skip_retry_due_at(doc_id: str, skipped_at: float) -> float:
+    """When a skip entry becomes due for its next bounded retry.
+
+    The window is _SKIP_RETRY_SECONDS plus a per-doc offset spread over the
+    same span, so entries stamped together do not come due together. Skips are
+    merged in batches at the end of a run, so their stamps share a second by
+    construction (#0480: 1081 entries on one second, 1056 on another) — a flat
+    window turns that into a synchronized retry herd that re-admits the whole
+    ledger to a single run. The offset is derived from the doc id so it is
+    stable across processes and restarts; hash() is salted per interpreter and
+    random jitter would re-roll the herd every run.
+    """
+    digest = hashlib.blake2b(doc_id.encode("utf-8"), digest_size=8).digest()
+    offset = int.from_bytes(digest, "big") % _SKIP_RETRY_SECONDS
+    return skipped_at + _SKIP_RETRY_SECONDS + offset
+
+
 def _skip_ledger_path(index_root: Path) -> Path:
     return Path(index_root) / "skip_docs.json"
 
@@ -893,13 +911,16 @@ def _load_skip_ledger(index_root: Path) -> dict:
     return {"docs": {}}
 
 
-def _save_skip_ledger(index_root: Path, ledger: dict) -> None:
+def _save_skip_ledger(index_root: Path, ledger: dict) -> bool:
+    """Persist the ledger; False when the write failed (disk full, read-only)."""
     try:
         _skip_ledger_path(index_root).write_text(
             json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8"
         )
+        return True
     except OSError as exc:
         logging.getLogger(__name__).warning("Failed to save skip ledger: %s", exc)
+        return False
 
 
 def _exclude_skipped_docs(
@@ -911,8 +932,8 @@ def _exclude_skipped_docs(
     already decided 'do not index' and the file is unchanged. A doc whose key
     differs (file modified) is kept, so the skip decision is re-evaluated.
 
-    Exclusion is bounded: an entry older than _SKIP_RETRY_SECONDS is due for
-    one re-attempt (kept), so a skipped doc is never permanently abandoned.
+    Exclusion is bounded: an entry past its _skip_retry_due_at is due for one
+    re-attempt (kept), so a skipped doc is never permanently abandoned.
     Legacy entries with no skipped_at stamp are due immediately and get
     stamped by their next merge."""
     docs = ledger.get("docs", {})
@@ -922,16 +943,66 @@ def _exclude_skipped_docs(
         now = time.time()
     kept, skipped = [], 0
     for r in to_add_or_update:
-        entry = docs.get(str(r.get("doc_id", "")))
+        doc_id = str(r.get("doc_id", ""))
+        entry = docs.get(doc_id)
         if (
             entry is not None
             and entry.get("change_key") == _change_key(r)
-            and now - float(entry.get("skipped_at") or 0.0) < _SKIP_RETRY_SECONDS
+            and now < _skip_retry_due_at(doc_id, float(entry.get("skipped_at") or 0.0))
         ):
             skipped += 1
         else:
             kept.append(r)
     return kept, skipped
+
+
+def _apply_skip_ledger(
+    index_root: Path,
+    to_add_or_update: list[dict],
+    now: float | None = None,
+) -> tuple[list[dict], dict]:
+    """Exclude unchanged skip-ledger docs, and claim the retries handed out.
+
+    The retry lease is renewed when the retry is *handed out*, not when it is
+    completed. Restamping only on re-skip (_merge_skip_ledger, at the end of
+    the run) makes the protection conditional on the run surviving its queue —
+    exactly the condition that fails when the queue is already too long. Runs
+    killed mid-queue (#0472) then restamp nothing, so every due entry is handed
+    straight back to the next run 15 minutes later and the 24h cadence
+    degenerates into 'every run, forever' (#0480).
+
+    So the due entries are restamped and persisted here, before any work: a
+    killed run keeps the protection of everything it re-admitted. A doc that is
+    re-skipped anyway gets a fresh stamp from the end-of-run merge; one that
+    finally indexes cleanly is dropped from the ledger there.
+    """
+    ledger = _load_skip_ledger(index_root)
+    docs = ledger.get("docs", {})
+    if now is None:
+        now = time.time()
+    kept, excluded = _exclude_skipped_docs(to_add_or_update, ledger, now=now)
+    # A kept doc that still matches its ledger entry is only kept because the
+    # entry came due — that is the retry we are handing out this run. (A doc
+    # whose key moved is a changed file, not a retry: leave its stamp alone.)
+    due = []
+    for r in kept:
+        doc_id = str(r.get("doc_id", ""))
+        entry = docs.get(doc_id)
+        if entry is not None and entry.get("change_key") == _change_key(r):
+            due.append(doc_id)
+    restamped = 0
+    if due:
+        for doc_id in due:
+            docs[doc_id] = {**docs[doc_id], "skipped_at": now}
+        if _save_skip_ledger(index_root, ledger):
+            restamped = len(due)
+    stats = {
+        "entries": len(docs),
+        "excluded": excluded,
+        "due": len(due),
+        "restamped": restamped,
+    }
+    return kept, stats
 
 
 def _merge_skip_ledger(
@@ -2354,11 +2425,19 @@ def index_vault_flow(
             len(to_add_or_update) - before_degraded,
         )
     # Drop docs already decided 'do not index' (duplicate/oversized/corrupt)
-    # whose file is unchanged — stops the reprocess-every-run loop.
-    skip_ledger = _load_skip_ledger(index_root)
-    to_add_or_update, skipped_count = _exclude_skipped_docs(to_add_or_update, skip_ledger)
-    if skipped_count:
-        logger.info("Excluded %d unchanged skip-ledger docs (no reprocessing)", skipped_count)
+    # whose file is unchanged — stops the reprocess-every-run loop — and claim
+    # the bounded retries this run hands out.
+    to_add_or_update, skip_stats = _apply_skip_ledger(index_root, to_add_or_update)
+    if skip_stats["entries"]:
+        # due/restamped make the protection observable: a healthy run excludes
+        # nearly the whole ledger and only a thin slice comes due (#0480).
+        logger.info(
+            "Skip ledger: %d entries, %d excluded, %d due this run, %d retries restamped",
+            skip_stats["entries"],
+            skip_stats["excluded"],
+            skip_stats["due"],
+            skip_stats["restamped"],
+        )
     full_processing_doc_ids = {
         str(record.get("doc_id", "")) for record in to_add_or_update
     }

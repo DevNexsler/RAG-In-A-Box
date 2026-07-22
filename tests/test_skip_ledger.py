@@ -20,11 +20,13 @@ from extractors import (
 )
 from flow_index_vault import (
     _SKIP_RETRY_SECONDS,
+    _apply_skip_ledger,
     _change_key,
     _exclude_skipped_docs,
     _load_skip_ledger,
     _merge_skip_ledger,
     _save_skip_ledger,
+    _skip_retry_due_at,
 )
 
 
@@ -73,10 +75,10 @@ def test_mtime_fallback_change_key():
 # --- bounded retry ---
 
 def test_entry_past_retry_window_is_due():
-    # unchanged doc, but the entry aged past _SKIP_RETRY_SECONDS -> re-attempt
+    # unchanged doc, but the entry aged past its retry window -> re-attempt
     ledger = {"docs": {"d::1": _entry("h1", skipped_at=1000.0)}}
     kept, n = _exclude_skipped_docs(
-        [_rec("d::1", change_hash="h1")], ledger, now=1000.0 + _SKIP_RETRY_SECONDS + 1
+        [_rec("d::1", change_hash="h1")], ledger, now=_skip_retry_due_at("d::1", 1000.0) + 1
     )
     assert [r["doc_id"] for r in kept] == ["d::1"] and n == 0
 
@@ -112,9 +114,104 @@ def test_no_text_doc_not_reprocessed_on_second_run(tmp_path):
 
     # next day: due for one bounded retry
     kept, n = _exclude_skipped_docs(
-        [rec], _load_skip_ledger(tmp_path), now=t0 + _SKIP_RETRY_SECONDS + 1
+        [rec], _load_skip_ledger(tmp_path), now=_skip_retry_due_at("d::1", t0) + 1
     )
     assert [r["doc_id"] for r in kept] == ["d::1"] and n == 0
+
+
+# --- expiry herd (#0480) ---
+
+def test_batch_stamped_entries_do_not_come_due_as_a_herd():
+    # Skips are written in batches at the end of a run — prod had 1081 entries
+    # sharing one second. With a flat window they all come due in the same run,
+    # which hands the whole ledger back to the queue at once.
+    recs = [_rec(f"d::{i}", change_hash="h") for i in range(200)]
+    ledger = {"docs": {r["doc_id"]: _entry("h", skipped_at=1000.0) for r in recs}}
+    kept, n = _exclude_skipped_docs(recs, ledger, now=1000.0 + _SKIP_RETRY_SECONDS + 1)
+    assert n > 0.9 * len(recs), "the whole batch came due in one run"
+    assert len(kept) < 0.1 * len(recs)
+
+
+def test_retry_offset_is_stable_and_within_one_window():
+    # Stable across processes (no hash()/random) so a restart does not re-roll
+    # the spread, and bounded so no doc waits longer than 2 windows.
+    first = _skip_retry_due_at("d::1", 1000.0)
+    assert first == _skip_retry_due_at("d::1", 1000.0)
+    assert 1000.0 + _SKIP_RETRY_SECONDS <= first < 1000.0 + 2 * _SKIP_RETRY_SECONDS
+    assert first != _skip_retry_due_at("d::2", 1000.0)
+    # the offset is per-doc, not per-stamp: it moves with skipped_at
+    assert _skip_retry_due_at("d::1", 2000.0) == first + 1000.0
+
+
+# --- retry claimed on hand-out (#0480) ---
+
+def test_killed_runs_keep_the_protection_they_handed_out(tmp_path):
+    # Every run here is SIGKILLed mid-queue (#0472), so _merge_skip_ledger
+    # never runs. Pre-fix the ledger renewed only on re-skip, so once the batch
+    # came due every 15-minute run re-admitted all of it, forever.
+    recs = [_rec(f"d::{i}", change_hash="h") for i in range(200)]
+    t0 = 1000.0
+    _save_skip_ledger(
+        tmp_path,
+        {"docs": {r["doc_id"]: _entry("h", skipped_at=t0) for r in recs}},
+    )
+
+    readmitted = []
+    for run in range(1, 193):  # 48h of 15-minute runs, none of them finishing
+        kept, stats = _apply_skip_ledger(tmp_path, recs, now=t0 + run * 900)
+        assert stats["restamped"] == stats["due"]
+        assert stats["excluded"] == len(recs) - len(kept)
+        readmitted.append(len(kept))
+
+    assert max(readmitted) < 0.1 * len(recs), "a herd was re-admitted in one run"
+    # each doc gets its retry, and only one per window
+    assert 0 < sum(readmitted) <= len(recs)
+
+
+def test_due_retry_is_restamped_before_the_work_runs(tmp_path):
+    rec = _rec("d::1", change_hash="h1")
+    t0 = 1000.0
+    _save_skip_ledger(tmp_path, {"docs": {"d::1": _entry("h1", skipped_at=t0)}})
+    due_at = _skip_retry_due_at("d::1", t0)
+
+    kept, stats = _apply_skip_ledger(tmp_path, [rec], now=due_at + 1)
+    assert kept == [rec]
+    assert stats == {"entries": 1, "excluded": 0, "due": 1, "restamped": 1}
+    assert _load_skip_ledger(tmp_path)["docs"]["d::1"]["skipped_at"] == due_at + 1
+    # ... so the next run excludes it again instead of re-admitting it
+    kept, stats = _apply_skip_ledger(tmp_path, [rec], now=due_at + 901)
+    assert kept == [] and stats["excluded"] == 1 and stats["due"] == 0
+
+
+def test_changed_doc_is_readmitted_without_claiming_a_retry(tmp_path):
+    # A modified file is not a bounded retry — it must be re-evaluated on every
+    # run until it indexes or is skipped again, so its stamp is left alone.
+    t0 = 1000.0
+    _save_skip_ledger(tmp_path, {"docs": {"d::1": _entry("h1", skipped_at=t0)}})
+    kept, stats = _apply_skip_ledger(tmp_path, [_rec("d::1", change_hash="h2")], now=t0 + 900)
+    assert [r["doc_id"] for r in kept] == ["d::1"]
+    assert stats["due"] == 0 and stats["restamped"] == 0
+    assert _load_skip_ledger(tmp_path)["docs"]["d::1"]["skipped_at"] == t0
+
+
+def test_failed_ledger_write_reports_fewer_restamps_than_due(tmp_path, monkeypatch):
+    # restamped < due is the signal that protection was NOT renewed (#58 disk
+    # full) — it must not be reported as a successful claim.
+    t0 = 1000.0
+    _save_skip_ledger(tmp_path, {"docs": {"d::1": _entry("h1", skipped_at=t0)}})
+    monkeypatch.setattr(fiv, "_save_skip_ledger", lambda *a, **kw: False)
+    _, stats = _apply_skip_ledger(
+        tmp_path, [_rec("d::1", change_hash="h1")], now=t0 + 2 * _SKIP_RETRY_SECONDS
+    )
+    assert stats["due"] == 1 and stats["restamped"] == 0
+
+
+def test_apply_skip_ledger_on_empty_ledger_is_a_no_op(tmp_path):
+    recs = [_rec("d::1", change_hash="h1")]
+    kept, stats = _apply_skip_ledger(tmp_path, recs, now=1000.0)
+    assert kept == recs
+    assert stats == {"entries": 0, "excluded": 0, "due": 0, "restamped": 0}
+    assert not (tmp_path / "skip_docs.json").exists()
 
 
 # --- merge ---
