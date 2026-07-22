@@ -83,6 +83,7 @@ def candidates_from_rows(
     source_types: set[str],
     limit: int,
     doc_ids: set[str] | None = None,
+    after_doc_id: str | None = None,
 ) -> list[Candidate]:
     """Normalize raw Lance rows into deterministic document candidates."""
     by_doc_id: dict[str, Candidate] = {}
@@ -95,6 +96,8 @@ def candidates_from_rows(
         if not doc_id or source_type not in source_types or not sidecar_path:
             continue
         if doc_ids is not None and doc_id not in doc_ids:
+            continue
+        if after_doc_id is not None and doc_id <= after_doc_id:
             continue
         by_doc_id.setdefault(
             doc_id,
@@ -133,6 +136,10 @@ def main() -> int:
         dest="source_types",
     )
     parser.add_argument("--doc-id", action="append", dest="doc_ids")
+    parser.add_argument(
+        "--after-doc-id",
+        help="select only document IDs lexically after this cursor",
+    )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     if args.limit < 0:
@@ -161,6 +168,7 @@ def main() -> int:
                 rows,
                 source_types=source_types,
                 doc_ids=selected_ids,
+                after_doc_id=args.after_doc_id,
                 limit=args.limit,
             )
             store = open_store_with_recovery(index_root, table_name)
@@ -242,7 +250,11 @@ def main() -> int:
                     _emit(doc_id=candidate.doc_id, status="failed", error=str(exc))
             if args.apply and counts["changed"]:
                 store.ensure_fts_index(compact_data=False)
-            _emit(mode="apply" if args.apply else "dry_run", summary=counts)
+            _emit(
+                mode="apply" if args.apply else "dry_run",
+                after_doc_id=args.after_doc_id,
+                summary=counts,
+            )
             return 1 if counts["failed"] else 0
     except IndexWriteLockBusy as exc:
         _emit(status="writer_busy", error=str(exc))

@@ -66,6 +66,31 @@ def test_candidates_from_rows_honors_explicit_document_ids():
     assert [c.doc_id for c in candidates] == ["documents::b"]
 
 
+def test_candidates_from_rows_starts_after_cursor_before_limiting():
+    rows = [
+        {
+            "doc_id": f"documents::{suffix}",
+            "metadata": {
+                "source_type": "img",
+                "sidecar_path": f"/data/{suffix}.json",
+            },
+        }
+        for suffix in ("d", "a", "c", "b")
+    ]
+
+    candidates = candidates_from_rows(
+        rows,
+        source_types={"img"},
+        after_doc_id="documents::b",
+        limit=2,
+    )
+
+    assert [candidate.doc_id for candidate in candidates] == [
+        "documents::c",
+        "documents::d",
+    ]
+
+
 def test_context_provider_from_rows_rebuilds_symmetric_message_window():
     rows = [
         {
