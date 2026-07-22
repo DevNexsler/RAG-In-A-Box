@@ -230,6 +230,13 @@ def main() -> int:
                         loc=plan.loc,
                         context_chars=len(context_text),
                     )
+                except FileNotFoundError as exc:
+                    counts["missing"] += 1
+                    _emit(
+                        doc_id=candidate.doc_id,
+                        status="sidecar_missing",
+                        error=str(exc),
+                    )
                 except Exception as exc:
                     counts["failed"] += 1
                     _emit(doc_id=candidate.doc_id, status="failed", error=str(exc))
