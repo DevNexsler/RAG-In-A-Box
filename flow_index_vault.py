@@ -2717,9 +2717,11 @@ def index_vault_flow(
                 for reason in info.get("reasons", [])
             )
             logger.info(
-                "%d docs added to skip ledger (excluded while unchanged, retry in %dh): %s",
+                "%d docs added to skip ledger (excluded while unchanged, "
+                "retry in %d-%dh): %s",
                 len(skip_now),
                 _SKIP_RETRY_SECONDS // 3600,
+                2 * _SKIP_RETRY_SECONDS // 3600,
                 dict(reason_counts),
             )
 
