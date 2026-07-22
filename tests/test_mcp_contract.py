@@ -1602,6 +1602,7 @@ def test_deep_health_uses_hash_group_and_ledger_coverage(
         "hash-b", 17, digest, hash_algo="blake3"
     )
     registry.close()
+    (docs_root / "skipped.txt").write_text("present but intentionally skipped")
     (tmp_path / "skip_docs.json").write_text(
         json.dumps(
             {
@@ -1690,6 +1691,7 @@ def test_deep_health_reports_retry_pending_source_as_degraded(tmp_path):
     registry = DocIDStore(tmp_path / "doc_registry.db")
     registry.register("retrying", "retrying.jpg.vl.json", source_name="documents")
     registry.close()
+    (docs_root / "retrying.jpg.vl.json").write_text("retry-pending sidecar")
     (tmp_path / "degraded_docs.json").write_text(
         json.dumps(
             {
