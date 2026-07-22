@@ -1,4 +1,7 @@
+import json
+
 from communication_context import CommunicationItem
+import scripts.backfill_attachment_context as backfill
 from scripts.backfill_attachment_context import (
     candidates_from_rows,
     context_provider_from_rows,
@@ -133,3 +136,21 @@ def test_context_provider_from_rows_rebuilds_symmetric_message_window():
     assert [message.text for message in envelope.same_channel_after] == [
         "163 Washington"
     ]
+
+
+def test_refresh_serving_cache_marker_preserves_metadata_and_changes_signature(tmp_path):
+    metadata_path = tmp_path / "index_metadata.json"
+    metadata_path.write_text(
+        json.dumps({"failed_count": 2, "warning_count": 3, "doc_count": 10})
+    )
+    original_signature = (metadata_path.stat().st_mtime_ns, metadata_path.stat().st_size)
+
+    backfill.refresh_serving_cache_marker(tmp_path, changed_count=25)
+
+    refreshed = json.loads(metadata_path.read_text())
+    assert refreshed["failed_count"] == 2
+    assert refreshed["warning_count"] == 3
+    assert refreshed["doc_count"] == 10
+    assert refreshed["attachment_context_refreshed_count"] == 25
+    assert refreshed["last_attachment_context_refresh_at"]
+    assert (metadata_path.stat().st_mtime_ns, metadata_path.stat().st_size) != original_signature

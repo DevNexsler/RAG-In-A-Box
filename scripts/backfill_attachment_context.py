@@ -8,7 +8,9 @@ doc-organizer container or another environment with same config and mounts.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
+import os
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -121,6 +123,35 @@ def _load_rows(index_root: Path, table_name: str) -> list[dict[str, Any]]:
 
 def _emit(**payload: Any) -> None:
     print(json.dumps(payload, sort_keys=True, default=str), flush=True)
+
+
+def refresh_serving_cache_marker(
+    index_root: Path,
+    *,
+    changed_count: int,
+) -> bool:
+    """Signal serving processes to reopen LanceDB after a successful refresh."""
+    if changed_count <= 0:
+        return False
+
+    path = Path(index_root) / "index_metadata.json"
+    metadata: dict[str, Any] = {}
+    try:
+        existing = json.loads(path.read_text())
+        if isinstance(existing, dict):
+            metadata = existing
+    except (OSError, ValueError):
+        metadata = {}
+
+    metadata["last_attachment_context_refresh_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+    metadata["attachment_context_refreshed_count"] = changed_count
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = Path(f"{path}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(metadata, indent=2))
+    tmp_path.replace(path)
+    return True
 
 
 def main() -> int:
@@ -250,6 +281,10 @@ def main() -> int:
                     _emit(doc_id=candidate.doc_id, status="failed", error=str(exc))
             if args.apply and counts["changed"]:
                 store.ensure_fts_index(compact_data=False)
+                refresh_serving_cache_marker(
+                    index_root,
+                    changed_count=counts["changed"],
+                )
             _emit(
                 mode="apply" if args.apply else "dry_run",
                 after_doc_id=args.after_doc_id,
