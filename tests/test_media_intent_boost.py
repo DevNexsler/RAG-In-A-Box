@@ -96,3 +96,40 @@ def test_quota_zero_slots_disables():
     hits = [_hit("m1", 0.9, "pg_message")]
     pool = hits + [_hit("v1", 0.5, "video")]
     assert _ensure_media_intent_slots(hits, pool, "video", min_slots=0) == hits
+
+
+# --- media-intent types helper ----------------------------------------------
+
+
+def test_media_intent_types_detects_each_medium():
+    from search_hybrid import _media_intent_types
+    assert _media_intent_types("163 Washington video walkthrough") == {"video"}
+    assert _media_intent_types("send me the photo") == {"img"}
+    assert _media_intent_types("the audio recording") == {"audio"}
+    assert _media_intent_types("rent adjustment") == set()
+    assert _media_intent_types("") == set()
+
+
+def test_media_intent_types_can_ask_for_two_media():
+    from search_hybrid import _media_intent_types
+    assert _media_intent_types("pics and video from the walkthrough") == {"img", "video"}
+
+
+def test_media_intent_types_is_case_and_punctuation_insensitive():
+    from search_hybrid import _media_intent_types
+    assert _media_intent_types("Any VIDEO?") == {"video"}
+    assert _media_intent_types("screenshots, please") == {"img"}
+
+
+def test_quota_rescales_injected_scores_onto_the_result_scale():
+    """Recall-pass hits carry raw scores (~18) vs fused (~1); re-sorting by score
+    must not float a tail-injected hit to the top."""
+    hits = [_hit(f"m{i}", 1.0 - i * 0.05, "pg_message") for i in range(10)]
+    pool = hits + [_hit("v1", 18.8, "video"), _hit("v2", 12.7, "video")]
+    out = _ensure_media_intent_slots(hits, pool, "video walkthrough", min_slots=2)
+    injected = [h for h in out if h.doc_id in ("v1", "v2")]
+    assert len(injected) == 2
+    floor = min(h.score for h in out if h.doc_id.startswith("m"))
+    assert all(h.score < floor for h in injected), "injected must sit below kept hits"
+    assert injected[0].score > injected[1].score, "relative order preserved"
+    assert sorted(out, key=lambda h: -h.score)[0].doc_id == "m0", "score sort still sane"

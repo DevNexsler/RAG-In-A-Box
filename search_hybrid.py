@@ -503,6 +503,17 @@ _MEDIA_INTENT_TERMS: dict[str, str] = {
 }
 
 
+def _media_intent_types(query: str) -> set[str]:
+    """source_types a query explicitly asks for ("video walkthrough" -> {"video"})."""
+    if not query:
+        return set()
+    return {
+        _MEDIA_INTENT_TERMS[token]
+        for token in re.findall(r"[a-z]+", query.lower())
+        if token in _MEDIA_INTENT_TERMS
+    }
+
+
 def _apply_media_intent_boost(
     hits: list[SearchHit], query: str, weight: float = 0.35
 ) -> list[SearchHit]:
@@ -522,11 +533,7 @@ def _apply_media_intent_boost(
     """
     if not hits or not query or weight <= 0:
         return hits
-    wanted = {
-        _MEDIA_INTENT_TERMS[token]
-        for token in re.findall(r"[a-z]+", query.lower())
-        if token in _MEDIA_INTENT_TERMS
-    }
+    wanted = _media_intent_types(query)
     if not wanted:
         return hits
     for hit in hits:
@@ -557,11 +564,7 @@ def _ensure_media_intent_slots(
     """
     if not hits or not query or min_slots <= 0:
         return hits
-    wanted = {
-        _MEDIA_INTENT_TERMS[token]
-        for token in re.findall(r"[a-z]+", query.lower())
-        if token in _MEDIA_INTENT_TERMS
-    }
+    wanted = _media_intent_types(query)
     if not wanted:
         return hits
     present = [h for h in hits if (h.source_type or "") in wanted]
@@ -588,6 +591,16 @@ def _ensure_media_intent_slots(
             dropped.add(idx)
             room -= 1
     keep = [hit for idx, hit in enumerate(hits) if idx not in dropped]
+    # Rescale injected scores onto the result set's scale. Recall-pass hits carry
+    # raw vector/keyword scores (measured: 18.8 next to a fused 1.0), so anything
+    # that re-sorts by score would rank a tail-injected hit first. Map them just
+    # below the weakest kept hit, preserving their order relative to each other.
+    if keep:
+        floor = min(hit.score for hit in keep)
+        top = max((hit.score for hit in extras), default=0.0)
+        if top > 0:
+            for extra in extras:
+                extra.score = floor * 0.99 * (extra.score / top)
     return keep + extras
 
 
@@ -790,7 +803,7 @@ def hybrid_search(
         }
 
         # 0. Build WHERE clause for pre-filtering (applied inside LanceDB before scoring)
-        where = store._build_where_clause(
+        _where_kwargs = dict(
             doc_id_prefix=doc_id_prefix,
             source_type=source_type,
             source_name=source_name,
@@ -802,6 +815,7 @@ def hybrid_search(
             metadata_filters=metadata_filters,
             filter_ast=filter_ast,
         )
+        where = store._build_where_clause(**_where_kwargs)
 
         # 1. Embed query. If this fails, keep FTS/BM25 available instead of aborting.
         query_vector: list[float] | None = None
@@ -904,6 +918,53 @@ def hybrid_search(
         timing_ms["fusion"] = round((time.perf_counter() - stage_started) * 1000, 3)
         candidate_counts["fused"] = len(fused)
 
+        # 6a. Media-intent RECALL. The source_type filter is pushed down into
+        #     retrieval, so filtering changes what is fetched, not just what is
+        #     kept: unfiltered, the top-50 vector + top-50 keyword rows can be
+        #     entirely messages and no video/audio is retrieved at all. Measured
+        #     on prod — three attachments that rank #1 *within their own medium*
+        #     (1.127 / 1.166 / 0.871) were absent from the unfiltered candidate
+        #     set entirely, so the quota below had nothing to inject.
+        #
+        #     When the query names a medium and nothing of that type was
+        #     retrieved, run one targeted retrieval per missing type and add the
+        #     results to the pool. Never runs when the caller already filtered by
+        #     source_type, nor when that medium is already represented.
+        media_recall: list[SearchHit] = []
+        _wanted_types = _media_intent_types(query) if media_intent_slots > 0 else set()
+        if _wanted_types and not source_type:
+            _missing = {
+                st for st in _wanted_types
+                if not any((h.source_type or "") == st for h in fused)
+            }
+            for _st in sorted(_missing):
+                try:
+                    _kw = dict(_where_kwargs)
+                    _kw["source_type"] = _st
+                    _media_where = store._build_where_clause(**_kw)
+                    _limit = max(media_intent_slots * 3, 5)
+                    if query_vector is not None:
+                        media_recall.extend(
+                            store.vector_search(query_vector, _limit, _media_where)
+                        )
+                    media_recall.extend(
+                        store.keyword_search(query, _limit, _media_where)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Media-intent recall for source_type=%s failed: %s", _st, exc
+                    )
+            if media_recall:
+                _seen_keys = {(h.doc_id, h.loc) for h in fused}
+                _deduped: list[SearchHit] = []
+                for _hit in sorted(media_recall, key=lambda h: -h.score):
+                    _key = (_hit.doc_id, _hit.loc)
+                    if _key not in _seen_keys:
+                        _seen_keys.add(_key)
+                        _deduped.append(_hit)
+                media_recall = _deduped
+                diagnostics["media_intent_recall"] = len(media_recall)
+
         # 6b. Media-intent boost — applied BEFORE the re-rank pool is truncated.
         #     The re-ranker only sees fused[:final_top_k*6], so an attachment
         #     that starts below that cut is discarded before any later boost can
@@ -918,7 +979,7 @@ def hybrid_search(
         # Measured on prod: for "163 Washington video walkthrough" the right
         # video sits below fused rank 60, so a snapshot taken any later contains
         # no video at all and the quota silently has nothing to inject.
-        media_intent_pool = list(fused)
+        media_intent_pool = list(fused) + media_recall
 
         # 7. Optional cross-encoder re-rank (on top N candidates for efficiency)
         #    On failure: cosine similarity fallback instead of giving up entirely.
