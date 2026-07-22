@@ -1599,6 +1599,8 @@ def _file_search_impl(
             importance_field=importance_cfg.get("field", "enr_importance"),
             importance_weight=importance_cfg.get("weight", 0.3),
             min_score_threshold=search_cfg.get("min_score_threshold", 0.0),
+            media_intent_weight=search_cfg.get("media_intent_weight", 0.35),
+            media_intent_slots=search_cfg.get("media_intent_slots", 2),
         )
     except ValueError as exc:
         return _error(

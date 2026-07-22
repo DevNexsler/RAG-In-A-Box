@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -492,6 +493,104 @@ def _apply_recency_boost(
 # MMR diversity
 # ---------------------------------------------------------------------------
 
+_MEDIA_INTENT_TERMS: dict[str, str] = {
+    "video": "video", "videos": "video", "walkthrough": "video",
+    "clip": "video", "clips": "video", "footage": "video",
+    "photo": "img", "photos": "img", "pic": "img", "pics": "img",
+    "picture": "img", "pictures": "img", "image": "img", "images": "img",
+    "screenshot": "img", "screenshots": "img",
+    "audio": "audio", "voicemail": "audio", "recording": "audio",
+}
+
+
+def _apply_media_intent_boost(
+    hits: list[SearchHit], query: str, weight: float = 0.35
+) -> list[SearchHit]:
+    """Lift attachments when the query explicitly names the medium it wants.
+
+    An attachment carries its neighbour-conversation context (e.g. the address
+    from the next message) inside a multi-KB visual describe, so that address is
+    a tiny fraction of the chunk. A query like "163 Washington video walkthrough"
+    is therefore dominated by the *message* containing that address — it matches
+    at ~1.0 because it literally is that text — and every top slot goes to
+    messages. Measured on prod: the video sat in the candidate pool at rank 22
+    (a sibling at rank 5) yet never survived the final top-10 cut.
+
+    When the query names a medium, that medium is the thing being asked for, so
+    boost it enough to survive selection. Queries that name no medium are
+    returned untouched, so ordinary search is unaffected.
+    """
+    if not hits or not query or weight <= 0:
+        return hits
+    wanted = {
+        _MEDIA_INTENT_TERMS[token]
+        for token in re.findall(r"[a-z]+", query.lower())
+        if token in _MEDIA_INTENT_TERMS
+    }
+    if not wanted:
+        return hits
+    for hit in hits:
+        if (hit.source_type or "") in wanted:
+            hit.score *= 1.0 + weight
+    hits.sort(key=lambda h: h.score, reverse=True)
+    return hits
+
+
+def _ensure_media_intent_slots(
+    hits: list[SearchHit],
+    pool: list[SearchHit],
+    query: str,
+    min_slots: int = 2,
+) -> list[SearchHit]:
+    """Guarantee a query that names a medium returns some of that medium.
+
+    Score boosting cannot win this contest: an attachment carries its
+    conversation context (e.g. the property address) inside a multi-KB visual
+    describe, while the messages quoting that same address ARE that text and
+    re-rank at ~1.0. Measured on prod: filtered to videos the right clip ranks
+    #1 at 1.205, but in a mixed pool every one of the ten slots goes to
+    messages, so the attachment is never returned.
+
+    When the query explicitly asks for a video/photo/recording, reserve a couple
+    of slots for the best-scoring candidates of that type. Queries that name no
+    medium are untouched.
+    """
+    if not hits or not query or min_slots <= 0:
+        return hits
+    wanted = {
+        _MEDIA_INTENT_TERMS[token]
+        for token in re.findall(r"[a-z]+", query.lower())
+        if token in _MEDIA_INTENT_TERMS
+    }
+    if not wanted:
+        return hits
+    present = [h for h in hits if (h.source_type or "") in wanted]
+    if len(present) >= min_slots:
+        return hits
+    seen = {(h.doc_id, h.loc) for h in hits}
+    extras: list[SearchHit] = []
+    for hit in pool:  # pool is score-ordered
+        if len(present) + len(extras) >= min_slots:
+            break
+        if (hit.source_type or "") in wanted and (hit.doc_id, hit.loc) not in seen:
+            extras.append(hit)
+            seen.add((hit.doc_id, hit.loc))
+    if not extras:
+        return hits
+    # Make room by dropping the weakest NON-matching hits (walking up from the
+    # tail) so hits that already satisfy the quota are never evicted.
+    room = len(extras)
+    dropped: set[int] = set()
+    for idx in range(len(hits) - 1, -1, -1):
+        if room <= 0:
+            break
+        if (hits[idx].source_type or "") not in wanted:
+            dropped.add(idx)
+            room -= 1
+    keep = [hit for idx, hit in enumerate(hits) if idx not in dropped]
+    return keep + extras
+
+
 def _apply_mmr_diversity(
     hits: list[SearchHit],
     store: "LanceDBStore",
@@ -627,6 +726,8 @@ def hybrid_search(
     importance_field: str = "enr_importance",
     importance_weight: float = 0.3,
     min_score_threshold: float = 0.0,
+    media_intent_weight: float = 0.35,
+    media_intent_slots: int = 2,
 ) -> SearchResult:
     """Run vector + keyword search in parallel, fuse with RRF, optionally re-rank.
 
@@ -803,6 +904,22 @@ def hybrid_search(
         timing_ms["fusion"] = round((time.perf_counter() - stage_started) * 1000, 3)
         candidate_counts["fused"] = len(fused)
 
+        # 6b. Media-intent boost — applied BEFORE the re-rank pool is truncated.
+        #     The re-ranker only sees fused[:final_top_k*6], so an attachment
+        #     that starts below that cut is discarded before any later boost can
+        #     help it. Measured: for a busy address ("163 Washington") dozens of
+        #     messages outrank the video in fusion, so it never entered the pool
+        #     and a post-rerank boost was a no-op.
+        fused = _apply_media_intent_boost(fused, query, weight=media_intent_weight)
+
+        # Snapshot the FULL fused candidate set for the media-intent quota
+        # (step 11b). Everything downstream narrows: the re-rank pool is
+        # fused[:top_k*6], MMR keeps ~top_k*2, then the score threshold prunes.
+        # Measured on prod: for "163 Washington video walkthrough" the right
+        # video sits below fused rank 60, so a snapshot taken any later contains
+        # no video at all and the quota silently has nothing to inject.
+        media_intent_pool = list(fused)
+
         # 7. Optional cross-encoder re-rank (on top N candidates for efficiency)
         #    On failure: cosine similarity fallback instead of giving up entirely.
         if reranker is not None:
@@ -818,6 +935,13 @@ def hybrid_search(
                     stage_started = time.perf_counter()
                     fused = _cosine_fallback_rerank(query_vector, rerank_pool, store)
                     timing_ms["rerank"] = round((time.perf_counter() - stage_started) * 1000, 3)
+
+        # 7b. Media-intent boost — applied AFTER the re-ranker so it survives
+        #     into the final cut. The re-ranker scores textual relevance and
+        #     consistently prefers the message that quotes an attachment's
+        #     context over the attachment itself, which is exactly the failure
+        #     this corrects.
+        fused = _apply_media_intent_boost(fused, query, weight=media_intent_weight)
 
         # 8. MMR diversity (remove near-duplicate chunks)
         stage_started = time.perf_counter()
@@ -849,6 +973,13 @@ def hybrid_search(
 
         # 11. Final top_k
         hits = fused[:final_top_k]
+
+        # 11b. Media-intent quota — a query that names a medium must return some
+        #      of that medium even when messages sweep every slot on score.
+        if media_intent_slots > 0:
+            hits = _ensure_media_intent_slots(
+                hits, media_intent_pool, query, min_slots=media_intent_slots
+            )
         candidate_counts["returned"] = len(hits)
         timing_ms["total"] = round((time.perf_counter() - search_started) * 1000, 3)
         return SearchResult(hits=hits, diagnostics=diagnostics)
