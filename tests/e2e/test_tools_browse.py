@@ -150,6 +150,7 @@ async def test_index_update_scoped_sweep(indexed_corpus, mcp_session):
         text=True,
     )
 
+    run_terminal = False
     try:
         started = await mcp_session.call_tool_json(
             "file_index_update", {"source_name": "sor"})
@@ -171,6 +172,7 @@ async def test_index_update_scoped_sweep(indexed_corpus, mcp_session):
                 attempt.get("run_id") == run_id
                 and attempt.get("status") not in {"starting", "running", "terminating"}
             ):
+                run_terminal = True
                 assert attempt.get("status") == "succeeded", last_status
                 break
             await anyio.sleep(2)
@@ -202,25 +204,27 @@ async def test_index_update_scoped_sweep(indexed_corpus, mcp_session):
         assert retained_warning in log
     finally:
         # Remove only this test's marker. Preserve all real sweep output, even
-        # when an assertion above fails and the session-scoped volume survives.
-        subprocess.run(
-            [
-                "docker",
-                "compose",
-                "-f",
-                str(COMPOSE_FILE),
-                "exec",
-                "-T",
-                "doc-organizer-staging",
-                "sh",
-                "-c",
-                'log=/data/index/indexer.log; tmp="$log.test-cleanup"; '
-                'awk -v needle="$1" \'$0 != needle\' "$log" > "$tmp"; '
-                'cat "$tmp" > "$log"; rm -f "$tmp"',
-                "sh",
-                retained_warning,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        # when a post-run assertion fails. Never rewrite the log while the
+        # child may still append; hermetic volume teardown handles that case.
+        if run_terminal:
+            subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    str(COMPOSE_FILE),
+                    "exec",
+                    "-T",
+                    "doc-organizer-staging",
+                    "sh",
+                    "-c",
+                    'log=/data/index/indexer.log; tmp="$log.test-cleanup"; '
+                    'awk -v needle="$1" \'$0 != needle\' "$log" > "$tmp"; '
+                    'cat "$tmp" > "$log"; rm -f "$tmp"',
+                    "sh",
+                    retained_warning,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
