@@ -13,6 +13,7 @@ import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -21,6 +22,12 @@ from attachment_context_refresh import (
     context_text_from_sidecar,
     plan_document_context,
     refresh_document_context,
+)
+from communication_context import (
+    build_context_provider_from_records,
+    communication_item_from_sidecar,
+    format_context_envelope_for_prompt,
+    repair_sidecar_context,
 )
 from core.config import load_config
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
@@ -33,6 +40,41 @@ class Candidate:
     doc_id: str
     source_type: str
     sidecar_path: Path
+
+
+def context_provider_from_rows(
+    rows: list[dict[str, Any]],
+    communication_config: dict[str, Any],
+):
+    """Rebuild nearby-message provider from indexed communication rows."""
+    records: list[dict[str, Any]] = []
+    source_records: dict[str, Any] = {}
+    for row in rows:
+        metadata = row.get("metadata")
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        if str(metadata.get("source_type") or "") != "pg_message":
+            continue
+        doc_id = str(row.get("doc_id") or metadata.get("doc_id") or "")
+        if not doc_id or doc_id in source_records:
+            continue
+        metadata["_text"] = str(
+            metadata.get("message_body")
+            or metadata.get("snippet")
+            or ""
+        )
+        records.append(
+            {
+                "doc_id": doc_id,
+                "source_name": str(metadata.get("source_name") or ""),
+                "source_type": "pg_message",
+            }
+        )
+        source_records[doc_id] = SimpleNamespace(metadata=metadata)
+    return build_context_provider_from_records(
+        records,
+        source_records,
+        communication_config,
+    )
 
 
 def candidates_from_rows(
@@ -110,6 +152,11 @@ def main() -> int:
     try:
         with session:
             rows = _load_rows(index_root, table_name)
+            communication_config = config.get("communication_context", {})
+            context_provider = context_provider_from_rows(
+                rows,
+                communication_config,
+            )
             candidates = candidates_from_rows(
                 rows,
                 source_types=source_types,
@@ -118,7 +165,7 @@ def main() -> int:
             )
             store = open_store_with_recovery(index_root, table_name)
             embed_provider = build_embed_provider(config) if args.apply else None
-            max_time_window_minutes = config.get("communication_context", {}).get(
+            max_time_window_minutes = communication_config.get(
                 "max_time_window_minutes", 15
             )
             counts = {
@@ -131,11 +178,20 @@ def main() -> int:
             }
             for candidate in candidates:
                 try:
-                    context_text = context_text_from_sidecar(
-                        candidate.sidecar_path,
-                        doc_id=candidate.doc_id,
-                        max_time_window_minutes=max_time_window_minutes,
-                    )
+                    envelope = None
+                    if context_provider is not None:
+                        item = communication_item_from_sidecar(
+                            Path(candidate.doc_id),
+                            candidate.sidecar_path,
+                        )
+                        envelope = context_provider.get_context_envelope(item)
+                        context_text = format_context_envelope_for_prompt(envelope)
+                    else:
+                        context_text = context_text_from_sidecar(
+                            candidate.sidecar_path,
+                            doc_id=candidate.doc_id,
+                            max_time_window_minutes=max_time_window_minutes,
+                        )
                     if not context_text:
                         counts["no_context"] += 1
                         _emit(doc_id=candidate.doc_id, status="no_context")
@@ -148,6 +204,8 @@ def main() -> int:
                         _emit(doc_id=candidate.doc_id, status="missing")
                         continue
                     if not plan.needs_refresh:
+                        if args.apply and envelope is not None:
+                            repair_sidecar_context(candidate.sidecar_path, envelope)
                         counts["unchanged"] += 1
                         _emit(doc_id=candidate.doc_id, status="unchanged", loc=plan.loc)
                         continue
@@ -163,6 +221,8 @@ def main() -> int:
                             counts["failed"] += 1
                             _emit(doc_id=candidate.doc_id, status=status, loc=plan.loc)
                             continue
+                        if envelope is not None:
+                            repair_sidecar_context(candidate.sidecar_path, envelope)
                     counts["changed"] += 1
                     _emit(
                         doc_id=candidate.doc_id,
