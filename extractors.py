@@ -533,6 +533,60 @@ def extract_image(
 # Audio/video
 # ---------------------------------------------------------------------------
 
+def _collapse_repeated_units(seq: list, max_consecutive: int) -> list:
+    """Collapse consecutive runs of a repeating unit (unit length 1..30)."""
+    out: list = []
+    i = 0
+    n = len(seq)
+    while i < n:
+        collapsed = False
+        for size in range(1, 31):
+            if i + size * 2 > n:
+                break
+            unit = seq[i : i + size]
+            reps = 1
+            j = i + size
+            while j + size <= n and seq[j : j + size] == unit:
+                reps += 1
+                j += size
+            if reps > max_consecutive:
+                out.extend(unit * max_consecutive)
+                i = j
+                collapsed = True
+                break
+        if not collapsed:
+            out.append(seq[i])
+            i += 1
+    return out
+
+
+def collapse_runaway_repetition(text: str, *, max_consecutive: int = 3) -> str:
+    """Collapse runaway repetition from decode loops and layout padding.
+
+    Four real patterns found polluting the index: OCR token loops
+    ("OO\\nOO\\nOO..."), PDF/vision sentence loops (one sentence repeated
+    hundreds of times), marketing-email invisible padding ("&#847; &zwnj;"
+    repeated), and empty spreadsheet rows ("|  |  |  |"). None is content: they
+    bloat chunks, waste embedding spend, and match searches spuriously.
+
+    Text with normal lexical diversity is returned untouched via a cheap fast
+    path, so this costs nothing for healthy documents.
+    """
+    if not text or len(text) < 500:
+        return text
+    words = text.split()
+    if not words or len(set(words)) / len(words) >= 0.35:
+        return text
+    lines = _collapse_repeated_units(text.split("\n"), max_consecutive)
+    out: list[str] = []
+    for line in lines:
+        tokens = line.split(" ")
+        if len(tokens) > 12:
+            tokens = _collapse_repeated_units(tokens, max_consecutive)
+        out.append(" ".join(tokens))
+    return "\n".join(out)
+
+
 def _is_nonmedia_stub(file_path: str | Path) -> bool:
     """True if the media file is actually a small JSON envelope standing in for
     the real bytes — an attachment-retrieval failure placeholder.

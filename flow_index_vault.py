@@ -78,6 +78,7 @@ from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
     Degradation,
     begin_degradation_capture,
+    collapse_runaway_repetition,
     collect_degradations,
     collect_skips,
     note_skip,
@@ -1290,6 +1291,10 @@ def _process_doc_task(
             getattr(source_record, "metadata", {}) if source_record is not None else {}
         )
         full_text = _with_communication_caption(result.full_text, source_metadata)
+        # Strip decode-loop / padding repetition before it reaches chunking:
+        # OCR "OO OO OO" loops, PDF sentence loops, marketing-mail invisible
+        # padding, empty spreadsheet rows. Healthy text is untouched.
+        full_text = collapse_runaway_repetition(full_text)
 
         if not full_text.strip():
             if collect_degradations():
@@ -1428,15 +1433,12 @@ def _process_doc_task(
             doc_meta["enr_importance"] = "0.5"
             doc_meta["enr_importance_source"] = "default"
 
-        # --- Make the gathered conversation context searchable ---
-        # The same-channel before/after envelope was built for the enrichment
-        # prompt (context_text) but was otherwise discarded. Fold it into the
-        # body here — after title/enrichment are computed, before chunking — so
-        # it is chunked, embedded and FTS-indexed alongside the attachment's own
-        # content. An attachment is then findable by its surrounding
-        # conversation, not only by its own describe/caption text.
-        if context_text:
-            full_text = f"{full_text}\n\n[Conversation context]\n{context_text}"
+        # NOTE: the conversation context is deliberately NOT appended to
+        # full_text. Appending it buried a ~100-char address inside a multi-KB
+        # describe, so the chunk embedding was dominated by the visual
+        # description and a query for the address ranked the attachment below
+        # the source messages. It is emitted as its own short chunk after the
+        # content chunks instead (see "conversation-context chunk" below).
 
         # --- Chunk and build nodes ---
         # Three paths:
@@ -1454,6 +1456,7 @@ def _process_doc_task(
                 page_body = page_text.text
                 if page_text.page == 0:
                     page_body = _with_communication_caption(page_body, source_metadata)
+                page_body = collapse_runaway_repetition(page_body)
                 raw_chunks = _split_section(
                     page_body, splitter, semantic_splitter, semantic_threshold
                 )
@@ -1544,6 +1547,29 @@ def _process_doc_task(
                 )
                 node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
                 nodes.append(node)
+
+        # --- conversation-context chunk ---
+        # Emitted as its OWN short chunk rather than appended to the content
+        # above: a ~100-char neighbour address buried in a multi-KB visual
+        # describe barely moved that chunk's embedding, so a query for the
+        # address ranked the attachment below the source messages. A short,
+        # context-only chunk matches such a query directly.
+        if context_text:
+            ctx_body = f"Conversation context for {title}:\n{context_text}"
+            ctx_loc = "ctx:0"
+            with _tracer.start_as_current_span("embed", attributes={"chunk_count": 1}):
+                ctx_vector = embed_provider.embed_texts([ctx_body])[0]
+            ctx_snippet = (ctx_body[:200] + "...") if len(ctx_body) > 200 else ctx_body
+            ctx_node = TextNode(
+                text=ctx_body,
+                id_=f"{doc_id}::{ctx_loc}",
+                embedding=ctx_vector,
+                metadata={**doc_meta, "loc": ctx_loc, "snippet": ctx_snippet},
+            )
+            ctx_node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                node_id=doc_id
+            )
+            nodes.append(ctx_node)
 
         # --- Persist into store ---
         # The scan/diff proves which documents are absent. Insert those

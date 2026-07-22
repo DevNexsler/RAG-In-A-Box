@@ -653,10 +653,13 @@ def test_process_doc_task_embeds_conversation_context_into_search_text(monkeypat
     class FakeStore:
         def upsert_nodes(self, nodes):
             captured["node_texts"] = [n.text for n in nodes]
+            captured["nodes"] = [
+                ((n.metadata or {}).get("loc", ""), n.text) for n in nodes
+            ]
 
     class FakeEmbed:
         def embed_texts(self, texts):
-            captured["embedded"] = list(texts)
+            captured.setdefault("embedded", []).extend(texts)
             return [[0.1] * 768 for _ in texts]
 
     monkeypatch.setattr(
@@ -702,10 +705,22 @@ def test_process_doc_task_embeds_conversation_context_into_search_text(monkeypat
         }
     )
 
-    # The neighbor message text must be in the embedded chunk AND the stored node
-    # text — i.e. genuinely searchable, not just fed to the enrichment LLM.
+    # The neighbor message text must be embedded and stored — i.e. genuinely
+    # searchable, not just fed to the enrichment LLM.
     assert any("16 N Main" in t for t in captured["embedded"])
     assert any("16 N Main" in t for t in captured["node_texts"])
+
+    # ...and it must live in its OWN short chunk, not be buried in the content
+    # chunk. Appending it to the describe diluted the embedding so badly that a
+    # query for the address ranked the attachment below the source messages.
+    ctx_nodes = [(loc, txt) for loc, txt in captured["nodes"] if loc == "ctx:0"]
+    assert len(ctx_nodes) == 1, "expected exactly one conversation-context chunk"
+    assert "16 N Main" in ctx_nodes[0][1]
+    content_nodes = [txt for loc, txt in captured["nodes"] if loc != "ctx:0"]
+    assert content_nodes, "content chunks should still exist"
+    assert not any("16 N Main" in t for t in content_nodes), (
+        "context must NOT be appended to the content chunk (that caused the dilution)"
+    )
 
 
 def test_process_doc_task_includes_attachment_message_body_in_enrichment(monkeypatch):
