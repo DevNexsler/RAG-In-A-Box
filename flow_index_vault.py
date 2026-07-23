@@ -1770,15 +1770,12 @@ def _process_doc_task(
             doc_meta["enr_importance_source"] = "default"
 
         # --- Make the gathered conversation context searchable ---
-        # Appended to the body (not emitted as a separate chunk) ON PURPOSE.
-        # Real queries for an attachment are hybrid — "163 Washington video
-        # walkthrough" needs the neighbour address AND the visual-describe terms
-        # to match the SAME chunk. Splitting context into its own chunk was
-        # measured and made retrieval strictly worse: the video dropped from #5
-        # to absent for that exact query, because the describe chunk matched
-        # "video walkthrough" but not the address while the context chunk
-        # matched the address but not "walkthrough", so neither outranked the
-        # source messages. Keep them together.
+        # Keep context in the content chunk for hybrid queries that combine
+        # media details with nearby-message terms. Also emit one short context
+        # chunk below when media/document text exists: production retrieval
+        # showed long vision descriptions can dilute an exact nearby-message
+        # query even though that message is present at the end of the embedding.
+        content_text_available = bool(full_text.strip())
         if context_text:
             context_block = f"[Conversation context]\n{context_text}"
             full_text = (
@@ -1894,6 +1891,39 @@ def _process_doc_task(
                 )
                 node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
                 nodes.append(node)
+
+        if context_text and content_text_available:
+            attachment_label = {
+                "img": "Image",
+                "audio": "Audio",
+                "video": "Video",
+                "pdf": "PDF",
+            }.get(source_type, "Document")
+            context_body = (
+                f"{attachment_label} attachment. "
+                "Conversation messages before and after this attachment.\n\n"
+                f"[Conversation context]\n{context_text}"
+            )
+            with _tracer.start_as_current_span(
+                "embed", attributes={"chunk_count": 1}
+            ):
+                with _measure_index_memory("embed", doc_id):
+                    context_vector = embed_provider.embed_texts([context_body])[0]
+            context_loc = "context:c:0"
+            context_node = TextNode(
+                text=context_body,
+                id_=f"{doc_id}::{context_loc}",
+                embedding=context_vector,
+                metadata={
+                    **doc_meta,
+                    "loc": context_loc,
+                    "snippet": context_text[:200],
+                },
+            )
+            context_node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                node_id=doc_id
+            )
+            nodes.append(context_node)
 
         # --- Persist into store ---
         # The scan/diff proves which documents are absent. Insert those

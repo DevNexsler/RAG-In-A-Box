@@ -617,9 +617,12 @@ def test_process_doc_task_passes_context_to_enrichment(monkeypatch):
 
 
 def test_process_doc_task_embeds_conversation_context_into_search_text(monkeypatch):
-    """Same-channel before/after context is folded into the embedded/FTS chunk
-    text, not just the enrichment prompt, so an attachment is findable by its
-    surrounding conversation (not only by its own describe/caption text)."""
+    """Attachment context gets its own short searchable chunk.
+
+    Context remains in the media-content chunk for hybrid queries, while the
+    short context chunk prevents long descriptions from diluting exact nearby
+    message searches.
+    """
     from communication_context import CommunicationMessage, ContextEnvelope
     from doc_enrichment import empty_enrichment
     from extractors import ExtractionResult
@@ -710,15 +713,12 @@ def test_process_doc_task_embeds_conversation_context_into_search_text(monkeypat
     assert any("16 N Main" in t for t in captured["embedded"])
     assert any("16 N Main" in t for t in captured["node_texts"])
 
-    # It must flow through the NORMAL content chunking (appended to the body),
-    # never as a separate context-only chunk. Measured on prod: splitting them
-    # made retrieval strictly worse for the hybrid queries people actually type
-    # ("163 Washington video walkthrough") — the video fell from rank #5 to
-    # absent, because the describe chunk matched "walkthrough" but not the
-    # address and the context chunk matched the address but not "walkthrough".
-    assert not any(loc == "ctx:0" for loc, _ in captured["nodes"]), (
-        "context must not be emitted as a separate chunk"
-    )
+    context_nodes = [
+        text for loc, text in captured["nodes"] if loc == "context:c:0"
+    ]
+    assert len(context_nodes) == 1
+    assert "Image attachment" in context_nodes[0]
+    assert "16 N Main Phillipsburg NJ 08865" in context_nodes[0]
 
 
 def test_process_doc_task_indexes_context_when_media_policy_skips_body(monkeypatch):
