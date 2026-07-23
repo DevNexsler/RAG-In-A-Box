@@ -436,6 +436,63 @@ def test_index_document_flow_skip_outcome_lands_in_skip_ledger(tmp_path):
     assert "pdf_unreadable" in entry["reasons"]
 
 
+def test_index_document_flow_skip_outcome_clears_stale_degraded_entry(tmp_path):
+    """Targeted skip classification must occupy only the skip retry lane."""
+    import json
+
+    root, f = _make_attachment(
+        tmp_path, "email-attachments/broken@00bak@.pdf", data=b"not a real pdf"
+    )
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True)
+    (index_root / "degraded_docs.json").write_text(json.dumps(
+        {
+            "docs": {
+                "documents::00bak": {
+                    "reasons": ["video_extract_failed"],
+                    "attempts": 113,
+                }
+            }
+        }
+    ))
+
+    result, _ = _run_single_doc(tmp_path, root, f, None)
+
+    assert result["status"] == "indexed"
+    assert "documents::00bak" in _ledger(tmp_path, "skip_docs.json")["docs"]
+    assert "documents::00bak" not in _ledger(
+        tmp_path, "degraded_docs.json"
+    )["docs"]
+
+
+def test_index_document_flow_degraded_outcome_clears_stale_skip_entry(tmp_path):
+    """Targeted transient classification must occupy only the degraded lane."""
+    import json
+
+    from providers.ocr.fallback import FallbackOCRProvider
+
+    root, f = _make_png(tmp_path, "quo-attachments/photo@00bal@.png")
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True)
+    (index_root / "skip_docs.json").write_text(json.dumps(
+        {
+            "docs": {
+                "documents::00bal": {
+                    "reasons": ["media_policy_oversized"],
+                    "change_key": "old",
+                }
+            }
+        }
+    ))
+
+    wrapped = FallbackOCRProvider(_EmptyDescribeOCR(), describe_fallback=None)
+    result, _ = _run_single_doc(tmp_path, root, f, wrapped)
+
+    assert result["status"] == "indexed"
+    assert "documents::00bal" in _ledger(tmp_path, "degraded_docs.json")["docs"]
+    assert "documents::00bal" not in _ledger(tmp_path, "skip_docs.json")["docs"]
+
+
 def test_index_document_flow_missing_file_returns_error(tmp_path):
     root, _ = _make_attachment(tmp_path, "email-attachments/real.pdf")
     cfg = _fs_config(root, tmp_path / "index")

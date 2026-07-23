@@ -3207,11 +3207,21 @@ def _record_single_doc_outcome(index_root: Path, doc: dict) -> None:
             set(),
         )
         _save_skip_ledger(index_root, skip_ledger)
+        degraded = _load_degraded_ledger(index_root)
+        if doc_id in degraded.get("docs", {}):
+            _save_degraded_ledger(
+                index_root, _merge_degraded_ledger(degraded, {}, {doc_id})
+            )
     elif reasons:
         degraded = _merge_degraded_ledger(
             _load_degraded_ledger(index_root), {doc_id: reasons}, set()
         )
         _save_degraded_ledger(index_root, degraded)
+        skip_ledger = _load_skip_ledger(index_root)
+        if doc_id in skip_ledger.get("docs", {}):
+            _save_skip_ledger(
+                index_root, _merge_skip_ledger(skip_ledger, {}, {doc_id})
+            )
     else:
         # Indexed cleanly — drop any stale entry, rewriting only ledger files
         # that actually held one (the common clean path stays write-free).
