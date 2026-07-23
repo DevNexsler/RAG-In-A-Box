@@ -27,8 +27,11 @@ Enhancements inspired by memory-lancedb-pro (win4r/memory-lancedb-pro):
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import math
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -758,9 +761,13 @@ def hybrid_search(
 
     Returns a SearchResult (list-compatible) with a diagnostics dict.
     """
-    with _tracer.start_as_current_span(
-        "search.hybrid", attributes={"top_k": final_top_k}
-    ):
+    span_attributes = {"top_k": final_top_k}
+    fingerprint_key = os.environ.get("E2E_QUERY_FINGERPRINT_KEY")
+    if fingerprint_key:
+        span_attributes["query_fingerprint"] = hmac.new(
+            fingerprint_key.encode("utf-8"), query.encode("utf-8"), hashlib.sha256
+        ).hexdigest()[:16]
+    with _tracer.start_as_current_span("search.hybrid", attributes=span_attributes):
         search_started = time.perf_counter()
         timing_ms = {
             "total": 0.0,

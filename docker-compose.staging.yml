@@ -28,6 +28,7 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-sim}
       DEEPINFRA_API_KEY: sim
       API_KEY: staging-test-key
+      E2E_QUERY_FINGERPRINT_KEY: ${E2E_QUERY_FINGERPRINT_KEY:-}
       COMM_DATA_STORE_DSN: postgresql://comm:comm@comm-postgres:5432/comm
       SOR_DSN: postgresql://comm:comm@comm-postgres:5432/comm
     volumes:

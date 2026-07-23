@@ -232,10 +232,26 @@ def test_compose_tiers_propagate_explicit_provider_env(
             assert env["STAGING_CONFIG"] == "./config.staging.yaml"
             assert env["E2E_REAL"] == "0"
 
+    staging_fingerprint_keys = {
+        env["E2E_QUERY_FINGERPRINT_KEY"]
+        for cmd, env in staging_calls
+        if cmd[:2] == ["docker", "compose"] or "pytest" in cmd
+    }
+    assert len(staging_fingerprint_keys) == 1
+    assert len(next(iter(staging_fingerprint_keys))) == 64
+
     for cmd, env in calls:
         if cmd[:2] == ["docker", "compose"] or "pytest" in cmd:
             assert env["STAGING_CONFIG"] == "./config.staging.realmedia.yaml"
             assert env["E2E_REAL"] == "1"
+
+    real_fingerprint_keys = {
+        env["E2E_QUERY_FINGERPRINT_KEY"]
+        for cmd, env in calls
+        if cmd[:2] == ["docker", "compose"] or "pytest" in cmd
+    }
+    assert len(real_fingerprint_keys) == 1
+    assert staging_fingerprint_keys != real_fingerprint_keys
 
 
 def test_staging_gate_runs_attachment_audit_after_trace_collection(tmp_path, monkeypatch):
@@ -252,6 +268,38 @@ def test_staging_gate_runs_attachment_audit_after_trace_collection(tmp_path, mon
     staging = next(tier for tier in gate.TIERS if tier.name == "staging-e2e")
     assert gate.run_compose_tier(staging, tmp_path / "run") is True
     assert events == ["traces", "tools", "attachment"]
+
+
+def test_compose_tier_clears_prior_trace_and_audit_artifacts_before_start(tmp_path, monkeypatch):
+    compose_file = tmp_path / "compose.yml"
+    compose_file.write_text("services: {}\n")
+    monkeypatch.setattr(gate, "COMPOSE_FILE", compose_file)
+    run_dir = tmp_path / "run"
+    traces = run_dir / "traces"
+    traces.mkdir(parents=True)
+    stale_paths = [
+        traces / "stale.jsonl",
+        run_dir / "attachment-path-evidence.json",
+        run_dir / "attachment-path-audit.json",
+        run_dir / "tool-coverage.json",
+    ]
+    for path in stale_paths:
+        path.write_text("stale")
+
+    def capture_run(cmd, **kwargs):
+        if "up" in cmd:
+            assert not traces.exists()
+            assert all(not path.exists() for path in stale_paths[1:])
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(gate.subprocess, "run", capture_run)
+    monkeypatch.setattr(gate, "run_tier", lambda *args, **kwargs: True)
+    monkeypatch.setattr(gate, "collect_staging_traces", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gate, "check_tool_coverage", lambda *args, **kwargs: True)
+    monkeypatch.setattr(gate, "check_attachment_path", lambda *args, **kwargs: True)
+
+    staging = next(tier for tier in gate.TIERS if tier.name == "staging-e2e")
+    assert gate.run_compose_tier(staging, run_dir) is True
 
 
 def test_run_tier_passes_attachment_evidence_path_to_host_pytest(tmp_path, monkeypatch):

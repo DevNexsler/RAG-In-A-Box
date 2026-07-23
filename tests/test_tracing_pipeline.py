@@ -13,6 +13,8 @@
 # Ordering note: tests/test_tracing.py sorts before this file, so its
 # "disabled is a no-op" test still runs before any provider exists here.
 
+import hashlib
+import hmac
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -119,9 +121,10 @@ def _index_note(tmp_path):
     return store, embed
 
 
-def test_pipeline_stages_emit_spans(tmp_path, span_dir):
+def test_pipeline_stages_emit_spans(tmp_path, span_dir, monkeypatch):
     from search_hybrid import hybrid_search
 
+    monkeypatch.delenv("E2E_QUERY_FINGERPRINT_KEY", raising=False)
     store, embed = _index_note(tmp_path)
     result = hybrid_search(store, embed, "machine learning embedding", final_top_k=5)
     assert len(result) > 0  # pipeline actually worked; spans were additive
@@ -147,6 +150,7 @@ def test_pipeline_stages_emit_spans(tmp_path, span_dir):
     search_span = by_name.get("search.hybrid")
     assert search_span is not None, f"no search.hybrid span; got {sorted(by_name)}"
     assert search_span["attributes"]["top_k"] == 5
+    assert "query_fingerprint" not in search_span["attributes"]
     # The search ran outside process_doc, so it must be its own trace.
     assert search_span["trace_id"] != parent["trace_id"]
 
@@ -246,7 +250,7 @@ def test_attachment_context_is_embedded_and_traced(tmp_path, span_dir):
     }
 
 
-def test_media_recall_survives_rerank_cutoff_and_emits_audit_spans(span_dir):
+def test_media_recall_survives_rerank_cutoff_and_emits_audit_spans(span_dir, monkeypatch):
     from core.storage import SearchHit
     from search_hybrid import Reranker, hybrid_search
 
@@ -273,10 +277,13 @@ def test_media_recall_survives_rerank_cutoff_and_emits_audit_spans(span_dir):
         def keyword_search(self, _query, top_k, where):
             return self.vector_search(None, top_k, where)
 
+    fingerprint_key = "per-run-secret"
+    monkeypatch.setenv("E2E_QUERY_FINGERPRINT_KEY", fingerprint_key)
+    query = "show quarterly zephyr property video"
     result = hybrid_search(
         Store(),
         Embed(),
-        "show quarterly zephyr property video",
+        query,
         vector_top_k=70,
         keyword_top_k=70,
         final_top_k=10,
@@ -289,6 +296,9 @@ def test_media_recall_survives_rerank_cutoff_and_emits_audit_spans(span_dir):
     shutdown_tracing()
     spans = _read_spans(span_dir)
     search_span = next(s for s in spans if s["name"] == "search.hybrid")
+    assert search_span["attributes"]["query_fingerprint"] == hmac.new(
+        fingerprint_key.encode(), query.encode(), hashlib.sha256
+    ).hexdigest()[:16]
     recall = next(s for s in spans if s["name"] == "search.media_recall")
     quota = next(s for s in spans if s["name"] == "search.media_quota")
     for child in (recall, quota):
@@ -296,6 +306,7 @@ def test_media_recall_survives_rerank_cutoff_and_emits_audit_spans(span_dir):
         assert child["parent_span_id"] == search_span["span_id"]
     assert recall["attributes"]["missing_types"] == "video"
     assert recall["attributes"]["recalled_count"] == 1
+    assert quota["attributes"]["injected_count"] == 1
     assert quota["attributes"]["returned_media_count"] == 1
 
 

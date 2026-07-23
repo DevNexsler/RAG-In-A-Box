@@ -7,6 +7,8 @@ import argparse
 import dataclasses
 import json
 import os
+import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -153,10 +155,23 @@ def run_compose_tier(tier, run_dir):
     if not COMPOSE_FILE.exists():
         print(f"FAIL {tier.name}: {COMPOSE_FILE} not found", flush=True)
         return False
+    run_dir = Path(run_dir)
+    traces_path = run_dir / "traces"
+    if traces_path.is_symlink() or traces_path.is_file():
+        traces_path.unlink()
+    else:
+        shutil.rmtree(traces_path, ignore_errors=True)
+    for artifact_name in (
+        "attachment-path-evidence.json",
+        "attachment-path-audit.json",
+        "tool-coverage.json",
+    ):
+        (run_dir / artifact_name).unlink(missing_ok=True)
     # Per-tier compose env (e.g. STAGING_CONFIG for the real-API e2e stage).
     # Applied to up/down/cp alike so the whole lifecycle targets one rendering.
     env = {**os.environ, **dict(tier.compose_env)}
     env["E2E_ATTACHMENT_EVIDENCE_FILE"] = str(Path(run_dir).resolve() / "attachment-path-evidence.json")
+    env["E2E_QUERY_FINGERPRINT_KEY"] = secrets.token_hex(32)
     up = ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "--build", "--wait"]
     down = ["docker", "compose", "-f", str(COMPOSE_FILE), "down", "-v"]
     ok = False
@@ -167,7 +182,8 @@ def run_compose_tier(tier, run_dir):
             tier,
             run_dir,
             extra_env={
-                "E2E_ATTACHMENT_EVIDENCE_FILE": env["E2E_ATTACHMENT_EVIDENCE_FILE"]
+                "E2E_ATTACHMENT_EVIDENCE_FILE": env["E2E_ATTACHMENT_EVIDENCE_FILE"],
+                "E2E_QUERY_FINGERPRINT_KEY": env["E2E_QUERY_FINGERPRINT_KEY"],
             },
         )
         collect_staging_traces(run_dir, env=env)

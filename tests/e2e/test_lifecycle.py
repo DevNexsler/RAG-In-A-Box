@@ -12,6 +12,8 @@ transcription output is non-deterministic, so the media assertion relaxes from
 "searchable by the sim marker" to "the media docs went through the pipeline and
 are indexed". OCR stays on the sim in that mode, so its marker assertion holds.
 """
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -71,10 +73,16 @@ async def test_audio_and_video_pipelines_searchable(indexed_corpus, mcp_session)
 async def test_video_sidecar_context_is_embedded_retrievable_and_audited(
     indexed_corpus, mcp_session
 ):
+    before_query = "quarterly zephyr report"
+    after_query = "marmalade budget"
+    media_query = "video"
+    fingerprint_key = os.environ["E2E_QUERY_FINGERPRINT_KEY"].encode()
     before_results = _hits(await mcp_session.call_tool_json(
-        "file_search", {"query": "quarterly zephyr report video", "top_k": 10}))
+        "file_search", {"query": before_query, "top_k": 10}))
     after_results = _hits(await mcp_session.call_tool_json(
-        "file_search", {"query": "marmalade budget video", "top_k": 10}))
+        "file_search", {"query": after_query, "top_k": 10}))
+    media_results = _hits(await mcp_session.call_tool_json(
+        "file_search", {"query": media_query, "top_k": 10}))
     before_video = next((
         hit for hit in before_results
         if "clip" in hit.get("rel_path", "") and hit.get("rel_path", "").endswith(".mp4")
@@ -83,9 +91,14 @@ async def test_video_sidecar_context_is_embedded_retrievable_and_audited(
         hit for hit in after_results
         if "clip" in hit.get("rel_path", "") and hit.get("rel_path", "").endswith(".mp4")
     ), None)
+    media_video = next((
+        hit for hit in media_results
+        if "clip" in hit.get("rel_path", "") and hit.get("rel_path", "").endswith(".mp4")
+    ), None)
     assert before_video, f"video absent for before-context query: {_rel_paths(before_results)}"
     assert after_video, f"video absent for after-context query: {_rel_paths(after_results)}"
-    assert before_video["doc_id"] == after_video["doc_id"]
+    assert media_video, f"video absent for media-intent query: {_rel_paths(media_results)}"
+    assert before_video["doc_id"] == after_video["doc_id"] == media_video["doc_id"]
 
     chunks = await mcp_session.call_tool_json(
         "file_get_doc_chunks", {"doc_id": before_video["doc_id"]})
@@ -97,11 +110,24 @@ async def test_video_sidecar_context_is_embedded_retrievable_and_audited(
 
     listing = await mcp_session.call_tool_json("file_list_documents", {"limit": 100})
     indexed_paths = [doc.get("rel_path", "") for doc in listing.get("documents", [])]
-    sidecar_not_indexed = not any(path.endswith("clip.json") for path in indexed_paths)
+    sidecar_not_indexed = not any(
+        "clip" in path and path.endswith(".json") for path in indexed_paths
+    )
     assert sidecar_not_indexed, indexed_paths
 
     evidence = {
         "target_doc_id": before_video["doc_id"],
+        "search_query_fingerprints": {
+            "before_context": hmac.new(
+                fingerprint_key, before_query.encode(), hashlib.sha256
+            ).hexdigest()[:16],
+            "after_context": hmac.new(
+                fingerprint_key, after_query.encode(), hashlib.sha256
+            ).hexdigest()[:16],
+            "media": hmac.new(
+                fingerprint_key, media_query.encode(), hashlib.sha256
+            ).hexdigest()[:16],
+        },
         "checks": {
             "sidecar_detected": before_embedded and after_embedded,
             "sidecar_not_indexed": sidecar_not_indexed,
@@ -109,6 +135,7 @@ async def test_video_sidecar_context_is_embedded_retrievable_and_audited(
             "after_embedded": after_embedded,
             "before_query_retrieved": before_video is not None,
             "after_query_retrieved": after_video is not None,
+            "media_query_retrieved": media_video is not None,
         },
     }
     evidence_path = Path(os.environ.get(
