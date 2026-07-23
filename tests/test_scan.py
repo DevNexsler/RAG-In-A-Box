@@ -721,6 +721,109 @@ def test_process_doc_task_embeds_conversation_context_into_search_text(monkeypat
     )
 
 
+def test_process_doc_task_indexes_context_when_media_policy_skips_body(monkeypatch):
+    """Oversized media remains searchable through same-channel before/after text."""
+    from communication_context import CommunicationMessage, ContextEnvelope
+    from doc_enrichment import empty_enrichment
+    from extractors import (
+        ExtractionResult,
+        begin_degradation_capture,
+        collect_skips,
+        note_skip,
+    )
+    from flow_index_vault import process_doc_task
+    from sources.base import SourceRecord
+
+    captured = {}
+
+    class FakeSource:
+        name = "documents"
+
+        def extract(self, record):
+            note_skip("media_policy_rejected")
+            return ExtractionResult.from_text("", frontmatter={"media_type": "video"})
+
+    class FakeProvider:
+        def get_context_envelope(self, item):
+            return ContextEnvelope(
+                primary_item=item,
+                same_channel_before=[
+                    CommunicationMessage(
+                        message_id="before",
+                        source_message_id="src-before",
+                        sender="Rafael",
+                        sent_at="2026-07-20T12:21:57Z",
+                        text="16 N Main Phillipsburg NJ 08865",
+                    )
+                ],
+                same_channel_after=[
+                    CommunicationMessage(
+                        message_id="after",
+                        source_message_id="src-after",
+                        sender="Rafael",
+                        sent_at="2026-07-20T12:23:11Z",
+                        text="I turned the flash on because there is no electric",
+                    )
+                ],
+            )
+
+    class FakeStore:
+        def upsert_nodes(self, nodes):
+            captured["node_texts"] = [node.text for node in nodes]
+
+    class FakeEmbed:
+        def embed_texts(self, texts):
+            captured["embedded"] = list(texts)
+            return [[0.1] * 768 for _ in texts]
+
+    monkeypatch.setattr(
+        "flow_index_vault.enrich_document", lambda *a, **k: dict(empty_enrichment())
+    )
+    monkeypatch.setattr("flow_index_vault.get_run_logger", lambda: MagicMock())
+    _RUNTIME.clear()
+    _RUNTIME.update(
+        {
+            "store": FakeStore(),
+            "embed_provider": FakeEmbed(),
+            "splitter": _FakeSplitter(),
+            "config": {},
+            "sources_by_name": {"documents": FakeSource()},
+            "source_records_by_ns_doc_id": {
+                "documents::video": SourceRecord(
+                    doc_id="video",
+                    source_type="video",
+                    natural_key="walkthrough.mp4",
+                    mtime=1.0,
+                    size=131_850_259,
+                    metadata={
+                        "source": "zoho_cliq",
+                        "channel_id": "tenant-showings",
+                        "sent_at": "2026-07-20T12:22:01Z",
+                        "message_id": "video-message",
+                    },
+                )
+            },
+            "communication_context_provider": FakeProvider(),
+        }
+    )
+
+    begin_degradation_capture()
+    process_doc_task.fn(
+        {
+            "doc_id": "documents::video",
+            "rel_path": "walkthrough.mp4",
+            "mtime": 1.0,
+            "size": 131_850_259,
+            "source_type": "video",
+            "source_name": "documents",
+        }
+    )
+
+    assert any("16 N Main" in text for text in captured["embedded"])
+    assert any("no electric" in text for text in captured["node_texts"])
+    assert collect_skips() == ["media_policy_rejected"]
+
+
 def test_process_doc_task_includes_attachment_message_body_in_enrichment(monkeypatch):
     """Same-message attachment captions become primary enrichment text."""
     from extractors import ExtractionResult

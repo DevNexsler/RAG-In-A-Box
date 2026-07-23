@@ -7,6 +7,7 @@ and respecting the deposit-owned (no_rename) ID-alias convention.
 
 import sqlite3
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -101,6 +102,44 @@ def test_resolve_single_record_finds_alias_injected_file_from_clean_path(tmp_pat
     assert rec is not None
     assert rec["rel_path"] == "email-attachments/laura/report@001Hk@.pdf"
     assert rec["doc_id"] == "documents::001Hk"
+
+
+def test_resolve_single_record_reassigns_persistent_id_collision(tmp_path):
+    """A targeted scan must not overwrite an ID owned by another live file."""
+    root, target = _make_attachment(
+        tmp_path, "email-attachments/rafael/video@00abc@.txt", data=b"video"
+    )
+    canonical = root / "archive" / "report@00abc@.txt"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(b"report")
+    store = DocIDStore(tmp_path / "reg.db")
+    store.register("00abc", "archive/report@00abc@.txt")
+    cfg = _fs_config(root, tmp_path / "index")
+    cfg["sources"][0]["scan"]["no_rename"] = []
+
+    rec = fiv.resolve_single_record(cfg, "documents", str(target), store)
+
+    assert rec["doc_id"] != "documents::00abc"
+    assert store.lookup_path("00abc") == "archive/report@00abc@.txt"
+    assert canonical.exists()
+    assert not target.exists()
+    assert Path(rec["abs_path"]).exists()
+    assert f"@{rec['doc_id'].split('::', 1)[1]}@" in rec["rel_path"]
+
+
+def test_resolve_single_record_preserves_id_for_real_move(tmp_path):
+    """A missing old registry path means the aliased file moved, not collided."""
+    root, moved = _make_attachment(tmp_path, "archive/report@00abc@.txt", data=b"report")
+    store = DocIDStore(tmp_path / "reg.db")
+    store.register("00abc", "notes/report@00abc@.txt")
+    cfg = _fs_config(root, tmp_path / "index")
+
+    rec = fiv.resolve_single_record(cfg, "documents", str(moved), store)
+
+    assert rec["doc_id"] == "documents::00abc"
+    assert rec["rel_path"] == "archive/report@00abc@.txt"
+    assert store.lookup_path("00abc") == "archive/report@00abc@.txt"
+    assert moved.exists()
 
 
 def test_resolve_single_record_missing_file_returns_none(tmp_path):

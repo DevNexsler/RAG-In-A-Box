@@ -488,12 +488,30 @@ def scan_filesystem_records(
                     )
                     existing_id = None  # fall through to "no ID" path below
                 else:
-                    doc_id = existing_id
-                    seen_ids[doc_id] = rel_str
-                    # Register/update mapping in SQLite
-                    stored_path = doc_id_store.lookup_path(doc_id)
-                    if stored_path != rel_str:
-                        doc_id_store.register(doc_id, rel_str)
+                    stored_path = doc_id_store.lookup_path(existing_id)
+                    if (
+                        stored_path
+                        and stored_path != rel_str
+                        and (root / stored_path).is_file()
+                    ):
+                        # Targeted scans see only one file, so seen_ids cannot
+                        # detect an alias already owned by another live path.
+                        # Preserve that owner and assign this file a fresh ID.
+                        logger.warning(
+                            "ID collision: %s already registered to %s — re-assigning %s",
+                            existing_id, stored_path, rel_str,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.COLLISION, existing_id, rel_str,
+                            detail=f"already registered to live path {stored_path}",
+                        )
+                        existing_id = None
+                    else:
+                        doc_id = existing_id
+                        seen_ids[doc_id] = rel_str
+                        # A missing old path means this is a real move.
+                        if stored_path != rel_str:
+                            doc_id_store.register(doc_id, rel_str)
 
             if existing_id is None and doc_id_store and any(
                 rel_str.startswith(p) for p in norm_prefixes
@@ -1515,21 +1533,6 @@ def _process_doc_task(
         # padding, empty spreadsheet rows. Healthy text is untouched.
         full_text = collapse_runaway_repetition(full_text)
 
-        if not full_text.strip():
-            if collect_degradations():
-                # Emptiness caused by a transient extraction failure (OCR/vision
-                # timeout, backend down) — leave it to the degraded lane, which
-                # retries with capped attempts instead of the daily skip window.
-                logger.debug(f"No text extracted (degraded, will retry): {doc_id}")
-            else:
-                # Genuinely contentless (empty transcript row, blank mail body,
-                # sidecar JSON with no text). Record a skip so the diff stops
-                # re-processing it every run; the ledger re-attempts it after
-                # _SKIP_RETRY_SECONDS or as soon as the doc changes.
-                note_skip("no_text_extracted")
-                logger.debug(f"No text extracted: {doc_id}")
-            return
-
         context_text = ""
         context_meta: dict[str, str] = {}
         communication_context_provider = _RUNTIME.get("communication_context_provider")
@@ -1551,6 +1554,21 @@ def _process_doc_task(
                     _RUNTIME.setdefault("_warnings", []).append(
                         f"communication_context_failed:{doc_id}:{exc}"
                     )
+
+        if not full_text.strip() and not context_text:
+            if collect_degradations():
+                # Emptiness caused by a transient extraction failure (OCR/vision
+                # timeout, backend down) — leave it to the degraded lane, which
+                # retries with capped attempts instead of the daily skip window.
+                logger.debug(f"No text extracted (degraded, will retry): {doc_id}")
+            else:
+                # Genuinely contentless (empty transcript row, blank mail body,
+                # sidecar JSON with no text). Record a skip so the diff stops
+                # re-processing it every run; the ledger re-attempts it after
+                # _SKIP_RETRY_SECONDS or as soon as the doc changes.
+                note_skip("no_text_extracted")
+                logger.debug(f"No text extracted: {doc_id}")
+            return
 
         # --- Extract document-level metadata ---
         fm = result.frontmatter  # from Markdown frontmatter; empty dict for PDF/images
@@ -1670,7 +1688,12 @@ def _process_doc_task(
         # matched the address but not "walkthrough", so neither outranked the
         # source messages. Keep them together.
         if context_text:
-            full_text = f"{full_text}\n\n[Conversation context]\n{context_text}"
+            context_block = f"[Conversation context]\n{context_text}"
+            full_text = (
+                f"{full_text}\n\n{context_block}"
+                if full_text.strip()
+                else context_block
+            )
 
         # --- Chunk and build nodes ---
         # Three paths:
