@@ -764,6 +764,70 @@ class LanceDBStore:
 
     # --- StorageInterface methods ---
 
+    def list_communication_context_rows(
+        self,
+        *,
+        origin_source: str,
+        channel_id: str,
+        limit: int = 10_000,
+    ) -> list[dict]:
+        """Load lightweight indexed message metadata for one source channel."""
+        origin_source = str(origin_source or "").strip()
+        channel_id = str(channel_id or "").strip()
+        if not origin_source or not channel_id:
+            return []
+
+        def _op():
+            available = self._metadata_subfields()
+            required = {"source_type", "source", "source_channel_id"}
+            if not required.issubset(available):
+                return []
+            fields = (
+                "source_type",
+                "source_name",
+                "source",
+                "source_message_id",
+                "source_channel_id",
+                "channel_id",
+                "thread_id",
+                "sender",
+                "sent_at",
+                "snippet",
+                "message_body",
+            )
+            selected = [field for field in fields if field in available]
+            projection = {"doc_id": "doc_id"}
+            projection.update(
+                {field: f"metadata.{field}" for field in selected}
+            )
+            where = (
+                "metadata.source_type = 'pg_message' "
+                f"AND metadata.source = '{self._sql_escape(origin_source)}' "
+                "AND metadata.source_channel_id = "
+                f"'{self._sql_escape(channel_id)}'"
+            )
+            rows = (
+                self._vs.table.search(None)
+                .where(where, prefilter=True)
+                .select(projection)
+                .limit(max(1, int(limit)))
+                .to_list()
+            )
+            return [
+                {
+                    "doc_id": str(row.get("doc_id") or ""),
+                    "metadata": {
+                        field: row.get(field)
+                        for field in selected
+                        if row.get(field) not in (None, "")
+                    },
+                }
+                for row in rows
+                if row.get("doc_id")
+            ]
+
+        return self._run_read_with_recovery(_op, [])
+
     def upsert_nodes(self, nodes: list[TextNode]) -> None:
         """Replace each document while excluding peer writers."""
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}

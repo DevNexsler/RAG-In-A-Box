@@ -3056,6 +3056,81 @@ def resolve_single_record(
     }
 
 
+def _targeted_communication_context_provider(
+    store,
+    source_record,
+    communication_config: dict,
+):
+    """Build bounded same-channel context from already-indexed messages."""
+    fallback = SidecarContextProvider(
+        max_time_window_minutes=communication_config.get(
+            "max_time_window_minutes", 15
+        )
+    )
+    if communication_config.get("enabled") is False:
+        return fallback, False
+
+    metadata = getattr(source_record, "metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    origin_source = str(
+        metadata.get("origin_source") or metadata.get("source") or ""
+    ).strip()
+    channel_id = str(
+        metadata.get("source_channel_id") or metadata.get("channel_id") or ""
+    ).strip()
+    if not origin_source or not channel_id or not metadata.get("sidecar_path"):
+        return fallback, False
+
+    try:
+        rows = store.list_communication_context_rows(
+            origin_source=origin_source,
+            channel_id=channel_id,
+        )
+    except Exception as exc:
+        _get_logger().warning(
+            "Targeted communication context lookup failed for %s/%s: %s",
+            origin_source,
+            channel_id,
+            exc,
+        )
+        return fallback, False
+    if not rows:
+        return fallback, False
+
+    from types import SimpleNamespace
+
+    records: list[dict[str, str]] = []
+    source_records: dict[str, object] = {}
+    for row in rows:
+        row_metadata = row.get("metadata")
+        row_metadata = (
+            dict(row_metadata) if isinstance(row_metadata, dict) else {}
+        )
+        doc_id = str(row.get("doc_id") or "")
+        if not doc_id or doc_id in source_records:
+            continue
+        row_metadata["_text"] = str(
+            row_metadata.get("message_body")
+            or row_metadata.get("snippet")
+            or ""
+        )
+        records.append(
+            {
+                "doc_id": doc_id,
+                "source_name": str(row_metadata.get("source_name") or ""),
+                "source_type": "pg_message",
+            }
+        )
+        source_records[doc_id] = SimpleNamespace(metadata=row_metadata)
+
+    provider = build_context_provider_from_records(
+        records,
+        source_records,
+        communication_config,
+    )
+    return (provider, True) if provider is not None else (fallback, False)
+
+
 def _build_single_doc_runtime(
     config: dict, store, doc_id_store: DocIDStore, source_name: str, record: dict
 ) -> None:
@@ -3101,6 +3176,14 @@ def _build_single_doc_runtime(
         size=record["size"],
         metadata=metadata,
     )
+    communication_config = config.get("communication_context", {})
+    communication_context_provider, repair_context = (
+        _targeted_communication_context_provider(
+            store,
+            source_record,
+            communication_config,
+        )
+    )
 
     llm_generator = None
     if config.get("enrichment", {}).get("enabled"):
@@ -3130,17 +3213,16 @@ def _build_single_doc_runtime(
             "config": config,
             "sources_by_name": {src.name: src},
             "source_records_by_ns_doc_id": {record["doc_id"]: source_record},
-            # Targeted path can't afford the full-corpus scan the sweep uses to
-            # build context, so reuse the doc's OWN sidecar's already-computed
-            # same-channel context. Makes per-attachment (real-time) indexing
-            # embed neighbor context immediately, not only at the next sweep.
-            "communication_context_provider": SidecarContextProvider(
-                max_time_window_minutes=config.get("communication_context", {}).get(
-                    "max_time_window_minutes", 15
-                )
-            ),
+            "communication_context_provider": communication_context_provider,
         }
     )
+    if repair_context:
+        _repair_communication_sidecars(
+            [record],
+            {record["doc_id"]: source_record},
+            communication_context_provider,
+            logger=_get_logger(),
+        )
 
 
 def _update_index_metadata_after_single_doc(index_root: str | Path, store) -> None:

@@ -53,6 +53,70 @@ def _enter_document_lock(index_root, started, acquired):
         acquired.set()
 
 
+def test_list_communication_context_rows_filters_source_and_channel():
+    store = LanceDBStore.__new__(LanceDBStore)
+    query = MagicMock()
+    query.where.return_value = query
+    query.select.return_value = query
+    query.limit.return_value = query
+    query.to_list.return_value = [
+        {
+            "doc_id": "comm_messages::1",
+            "source_type": "pg_message",
+            "source": "zoho_cliq",
+            "source_message_id": "message-1",
+            "source_channel_id": "maintenance",
+            "sender": "Cesar",
+            "sent_at": "2026-06-18T19:11:48Z",
+            "snippet": "Maybe tomorrow",
+        }
+    ]
+    store._vs = MagicMock()
+    store._vs.table.search.return_value = query
+    store._run_read_with_recovery = lambda operation, default: operation()
+    store._metadata_subfields = MagicMock(
+        return_value={
+            "source_type",
+            "source",
+            "source_message_id",
+            "source_channel_id",
+            "sender",
+            "sent_at",
+            "snippet",
+        }
+    )
+
+    rows = store.list_communication_context_rows(
+        origin_source="zoho_cliq",
+        channel_id="maintenance",
+    )
+
+    assert rows == [
+        {
+            "doc_id": "comm_messages::1",
+            "metadata": {
+                "source_type": "pg_message",
+                "source": "zoho_cliq",
+                "source_message_id": "message-1",
+                "source_channel_id": "maintenance",
+                "sender": "Cesar",
+                "sent_at": "2026-06-18T19:11:48Z",
+                "snippet": "Maybe tomorrow",
+            },
+        }
+    ]
+    query.where.assert_called_once_with(
+        "metadata.source_type = 'pg_message' "
+        "AND metadata.source = 'zoho_cliq' "
+        "AND metadata.source_channel_id = 'maintenance'",
+        prefilter=True,
+    )
+    projection = query.select.call_args.args[0]
+    assert projection["doc_id"] == "doc_id"
+    assert projection["source_type"] == "metadata.source_type"
+    assert projection["source_channel_id"] == "metadata.source_channel_id"
+
+
 def test_upsert_and_list():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")

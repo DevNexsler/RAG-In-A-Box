@@ -5,6 +5,7 @@ path/doc_id, reusing the same scan/doc_id/diff/extract path, idempotently,
 and respecting the deposit-owned (no_rename) ID-alias convention.
 """
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -203,6 +204,91 @@ def test_index_document_flow_indexes_new_file(tmp_path):
     called_doc = proc.fn.call_args[0][0]
     assert called_doc["doc_id"] == "documents::00xyz"
     assert called_doc["source_name"] == "documents"
+
+
+def test_index_document_flow_repairs_new_sidecar_context_from_indexed_messages(tmp_path):
+    root, video = _make_attachment(
+        tmp_path,
+        "email-attachments/cesar/2026-06/msg1__mm0@00vid@.mp4",
+        data=b"\x00\x00\x00\x18ftypmp42video",
+    )
+    sidecar = video.with_name("msg1__mm0.json")
+    sidecar.write_text(
+        """
+        {
+          "schema_version": 2,
+          "source": "zoho_cliq",
+          "message": {
+            "message_id": "1",
+            "source_message_id": "attachment-1",
+            "sent_at": "2026-06-18T19:08:42Z",
+            "from": {"name": "Cesar"}
+          },
+          "channel": {"source_channel_id": "maintenance"},
+          "media": {"media_index": 0, "media_type": "video/mp4"}
+        }
+        """
+    )
+    cfg = _fs_config(root, tmp_path / "index")
+    cfg["sources"][0]["scan"]["include"].append("**/*.mp4")
+    cfg["communication_context"] = {
+        "enabled": True,
+        "window_before": 5,
+        "window_after": 5,
+        "max_time_window_minutes": 15,
+    }
+    store = MagicMock()
+    store.list_doc_mtimes.return_value = {}
+    store.list_doc_change_hashes.return_value = {}
+    store.list_communication_context_rows.return_value = [
+        {
+            "doc_id": "comm_messages::zoho_cliq/before",
+            "metadata": {
+                "source_type": "pg_message",
+                "source": "zoho_cliq",
+                "source_message_id": "before",
+                "source_channel_id": "maintenance",
+                "sender": "Joycelyn",
+                "sent_at": "2026-06-18T19:07:07Z",
+                "snippet": "Were you able to complete Bullmans?",
+            },
+        },
+        {
+            "doc_id": "comm_messages::zoho_cliq/after",
+            "metadata": {
+                "source_type": "pg_message",
+                "source": "zoho_cliq",
+                "source_message_id": "after",
+                "source_channel_id": "maintenance",
+                "sender": "Cesar",
+                "sent_at": "2026-06-18T19:11:48Z",
+                "snippet": "Maybe tomorrow",
+            },
+        },
+    ]
+
+    with patch("flow_index_vault.load_config", return_value=cfg), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=store), \
+         patch("flow_index_vault.build_embed_provider", return_value=MagicMock()), \
+         patch("flow_index_vault.build_ocr_provider", return_value=None), \
+         patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("flow_index_vault.process_doc_task"):
+        result = fiv.index_document_flow(
+            target=str(video), source_name="documents", force=True
+        )
+
+    assert result["status"] == "indexed"
+    store.list_communication_context_rows.assert_called_once_with(
+        origin_source="zoho_cliq",
+        channel_id="maintenance",
+    )
+    context = json.loads(sidecar.read_text())["context"]
+    assert [m["text"] for m in context["same_channel_before"]] == [
+        "Were you able to complete Bullmans?"
+    ]
+    assert [m["text"] for m in context["same_channel_after"]] == [
+        "Maybe tomorrow"
+    ]
 
 
 def test_index_document_flow_force_reindexes_unchanged(tmp_path):
