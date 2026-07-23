@@ -129,6 +129,30 @@ def _render_coverage(run_dir: Path):
     return lines, failed
 
 
+def _render_attachment_audit(run_dir: Path):
+    lines = ["## Attachment path audit", ""]
+    path = run_dir / "attachment-path-audit.json"
+    if not path.exists():
+        lines.append("check not run (staging-e2e tier was not reached)")
+        return lines, False
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        lines.append("attachment-path-audit.json not available (unreadable)")
+        return lines, True
+    failed = not bool(data.get("passed"))
+    lines.append("pass" if not failed else "FAIL")
+    failed_checks = data.get("failed_checks") or []
+    if failed_checks:
+        lines.append("- failed: " + ", ".join(str(item) for item in failed_checks))
+    checkpoints = data.get("checkpoints") or {}
+    if checkpoints:
+        lines += ["", "| checkpoint | spans |", "|---|---|"]
+        for name in sorted(checkpoints):
+            lines.append(f"| {name} | {checkpoints[name]} |")
+    return lines, failed
+
+
 def _load_spans(traces_dir: Path):
     spans = []
     if not traces_dir.is_dir():
@@ -232,14 +256,15 @@ def build_report(run_dir: Path) -> str:
     result = _load_result(run_dir)
     tier_lines, tiers_failed, junit_found = _render_tiers(run_dir, result)
     coverage_lines, coverage_failed = _render_coverage(run_dir)
+    attachment_lines, attachment_failed = _render_attachment_audit(run_dir)
     overall = (result or {}).get("overall")
     if overall in ("pass", "fail"):
         # The runner's own verdict wins: it sees tiers with no junit artifact
         # (static) and skipped/not_run states that artifact inference cannot.
         # Artifact-derived failures still veto a "pass" (defense in depth).
         status = "FAIL" if (overall == "fail" or tiers_failed
-                            or coverage_failed) else "PASS"
-    elif tiers_failed or coverage_failed:
+                            or coverage_failed or attachment_failed) else "PASS"
+    elif tiers_failed or coverage_failed or attachment_failed:
         status = "FAIL"
     elif junit_found == 0:
         # zero junit artifacts: the run died before producing any tier
@@ -248,7 +273,8 @@ def build_report(run_dir: Path) -> str:
     else:
         status = "PASS"
     sections = [[f"# Gate run {run_dir.name} — {status}"], tier_lines,
-                coverage_lines, _render_timelines(run_dir), _render_spend(run_dir)]
+                coverage_lines, attachment_lines, _render_timelines(run_dir),
+                _render_spend(run_dir)]
     return "\n\n".join("\n".join(s) for s in sections) + "\n"
 
 

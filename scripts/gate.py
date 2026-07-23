@@ -101,8 +101,12 @@ def _run(cmd, run_dir, tier_name, env=None):
         return False
 
 
-def run_tier(tier, run_dir):
-    env = {**os.environ, **dict(tier.pytest_env)} if tier.pytest_env else None
+def run_tier(tier, run_dir, extra_env=None):
+    env = (
+        {**os.environ, **dict(tier.pytest_env), **(extra_env or {})}
+        if tier.pytest_env or extra_env
+        else None
+    )
     ok = _run(tier.cmd, run_dir, tier.name, env=env)
     if tier.name == "static":
         ok = ok and _run(STATIC_SECOND_CMD, run_dir, tier.name)
@@ -135,23 +139,42 @@ def check_tool_coverage(run_dir):
         return False
 
 
+def check_attachment_path(run_dir):
+    cmd = [sys.executable, "scripts/attachment_path_audit.py", "--run-dir", str(run_dir)]
+    print(f"  $ {' '.join(cmd)}", flush=True)
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except FileNotFoundError:
+        print("FAIL staging-e2e: attachment-path audit could not run", flush=True)
+        return False
+
+
 def run_compose_tier(tier, run_dir):
     if not COMPOSE_FILE.exists():
         print(f"FAIL {tier.name}: {COMPOSE_FILE} not found", flush=True)
         return False
     # Per-tier compose env (e.g. STAGING_CONFIG for the real-API e2e stage).
     # Applied to up/down/cp alike so the whole lifecycle targets one rendering.
-    env = {**os.environ, **dict(tier.compose_env)} if tier.compose_env else None
+    env = {**os.environ, **dict(tier.compose_env)}
+    env["E2E_ATTACHMENT_EVIDENCE_FILE"] = str(Path(run_dir).resolve() / "attachment-path-evidence.json")
     up = ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "--build", "--wait"]
     down = ["docker", "compose", "-f", str(COMPOSE_FILE), "down", "-v"]
     ok = False
     try:
         # up runs INSIDE the try: a partially-started stack must still get `down -v`
         subprocess.run(up, check=True, env=env)
-        ok = run_tier(tier, run_dir)
+        ok = run_tier(
+            tier,
+            run_dir,
+            extra_env={
+                "E2E_ATTACHMENT_EVIDENCE_FILE": env["E2E_ATTACHMENT_EVIDENCE_FILE"]
+            },
+        )
         collect_staging_traces(run_dir, env=env)
         if ok:
             ok = check_tool_coverage(run_dir)
+        if ok:
+            ok = check_attachment_path(run_dir)
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"FAIL {tier.name}: compose up failed: {exc}", flush=True)
     finally:

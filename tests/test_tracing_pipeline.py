@@ -151,6 +151,154 @@ def test_pipeline_stages_emit_spans(tmp_path, span_dir):
     assert search_span["trace_id"] != parent["trace_id"]
 
 
+def test_attachment_context_is_embedded_and_traced(tmp_path, span_dir):
+    import flow_index_vault as fiv
+    from communication_context import CommunicationMessage, SourceWindowContextProvider
+    from extractors import ExtractionResult
+    from lancedb_store import LanceDBStore
+    from llama_index.core.node_parser import SentenceSplitter
+    from sources.base import SourceRecord
+
+    class StaticSource:
+        def extract(self, _record):
+            return ExtractionResult.from_text("simulated video walkthrough")
+
+    store = LanceDBStore(str(tmp_path / "index"), "attachment_chunks")
+    embed = MockEmbedProvider()
+    record = SourceRecord(
+        doc_id="clip.mp4",
+        source_type="video",
+        natural_key="clip.mp4",
+        mtime=1.0,
+        size=123,
+        metadata={
+            "source": "quo",
+            "source_message_id": "attachment-1",
+            "source_channel_id": "ops",
+            "sent_at": "2026-06-01T10:00:30Z",
+        },
+    )
+    provider = SourceWindowContextProvider.from_messages(
+        [
+            CommunicationMessage(
+                source_message_id="msg-001",
+                sender="Alice",
+                sent_at="2026-06-01T10:00:00Z",
+                text="quarterly zephyr report before marker",
+                origin_source="quo",
+                channel_id="ops",
+            ),
+            CommunicationMessage(
+                source_message_id="msg-002",
+                sender="Bob",
+                sent_at="2026-06-01T10:01:00Z",
+                text="marmalade budget after marker",
+                origin_source="quo",
+                channel_id="ops",
+            ),
+        ],
+        message_channels={"msg-001": "ops", "msg-002": "ops"},
+    )
+    doc = {
+        "doc_id": "documents::clip",
+        "rel_path": "clip.mp4",
+        "mtime": 1.0,
+        "size": 123,
+        "ext": "mp4",
+        "source_type": "video",
+        "source_name": "documents",
+    }
+    fiv._RUNTIME.clear()
+    fiv._RUNTIME.update(
+        {
+            "store": store,
+            "embed_provider": embed,
+            "splitter": SentenceSplitter(chunk_size=300, chunk_overlap=50),
+            "semantic_splitter": None,
+            "semantic_threshold": 0,
+            "config": {},
+            "sources_by_name": {"documents": StaticSource()},
+            "source_records_by_ns_doc_id": {doc["doc_id"]: record},
+            "communication_context_provider": provider,
+        }
+    )
+    try:
+        fiv.process_doc_task.fn(doc)
+        chunks = store.get_doc_chunks(doc["doc_id"])
+    finally:
+        fiv._RUNTIME.clear()
+
+    assert chunks
+    stored = "\n".join(chunk.text for chunk in chunks)
+    assert "quarterly zephyr report before marker" in stored
+    assert "marmalade budget after marker" in stored
+
+    shutdown_tracing()
+    spans = _read_spans(span_dir)
+    parent = next(s for s in spans if s["name"] == "process_doc")
+    context_span = next(s for s in spans if s["name"] == "attachment.context.resolve")
+    assert context_span["trace_id"] == parent["trace_id"]
+    assert context_span["parent_span_id"] == parent["span_id"]
+    assert context_span["attributes"] == {
+        "before_count": 1,
+        "after_count": 1,
+        "has_context": True,
+    }
+
+
+def test_media_recall_survives_rerank_cutoff_and_emits_audit_spans(span_dir):
+    from core.storage import SearchHit
+    from search_hybrid import Reranker, hybrid_search
+
+    class Embed:
+        def embed_query(self, _query):
+            return [1.0, 0.0]
+
+    class KeepOrderReranker(Reranker):
+        def rerank(self, _query, hits):
+            return hits
+
+    class Store:
+        def _build_where_clause(self, **kwargs):
+            return kwargs.get("source_type") or ""
+
+        def vector_search(self, _vector, top_k, where):
+            if where == "video":
+                return [SearchHit("target-video", "video:c:0", "", "", 9.0, "video")]
+            return [
+                SearchHit(f"message-{i:03d}", "c:0", "", "", 100.0 - i, "pg_message")
+                for i in range(min(top_k, 70))
+            ]
+
+        def keyword_search(self, _query, top_k, where):
+            return self.vector_search(None, top_k, where)
+
+    result = hybrid_search(
+        Store(),
+        Embed(),
+        "show quarterly zephyr property video",
+        vector_top_k=70,
+        keyword_top_k=70,
+        final_top_k=10,
+        reranker=KeepOrderReranker(),
+        media_intent_slots=1,
+    )
+    assert "target-video" in [hit.doc_id for hit in result]
+    assert result.diagnostics["media_intent_recall"] == 1
+
+    shutdown_tracing()
+    spans = _read_spans(span_dir)
+    search_span = next(s for s in spans if s["name"] == "search.hybrid")
+    recall = next(s for s in spans if s["name"] == "search.media_recall")
+    quota = next(s for s in spans if s["name"] == "search.media_quota")
+    for child in (recall, quota):
+        assert child["trace_id"] == search_span["trace_id"]
+        assert child["parent_span_id"] == search_span["span_id"]
+    assert recall["attributes"]["missing_types"] == "video"
+    assert recall["attributes"]["recalled_count"] == 1
+    assert quota["attributes"]["returned_media_count"] == 1
+
+
 def test_scan_vault_task_emits_scan_span(tmp_path, span_dir):
     import flow_index_vault as fiv
 

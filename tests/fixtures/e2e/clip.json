@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "source": "quo",
+  "message": {
+    "source_message_id": "attachment-001",
+    "sender": "Field Agent",
+    "sent_at": "2026-06-01T10:00:30Z"
+  },
+  "channel": {
+    "source_channel_id": "ops"
+  },
+  "media": {
+    "media_index": 0,
+    "media_type": "video",
+    "original_filename": "clip.mp4"
+  }
+}

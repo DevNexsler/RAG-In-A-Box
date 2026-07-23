@@ -32,7 +32,8 @@ sources:
     tables:
       - source_type: pg_message
         query: |
-          SELECT source, source_message_id, channel_name, sender, direction,
+          SELECT source, source_message_id, channel_name,
+                 channel_name AS source_channel_id, sender, direction,
                  sent_at, updated_at, body AS _text
           FROM messages
           WHERE body IS NOT NULL AND body <> ''
@@ -40,7 +41,7 @@ sources:
         text_column: _text
         text_normalizer: zoho_cliq_mentions
         mtime_column: updated_at
-        metadata_columns: [source, source_message_id, channel_name, sender, sent_at, direction]
+        metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, sent_at, direction]
 
 pdf:
   strategy: "text_then_ocr"

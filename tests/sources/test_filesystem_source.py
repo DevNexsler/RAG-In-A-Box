@@ -181,6 +181,17 @@ def test_scan_adds_communication_sidecar_metadata_to_attachment(tmp_path):
     assert record.metadata["sidecar_path"].endswith("__msg15729__mm0@000QL@.json")
 
 
+def test_injected_media_id_still_finds_plain_preexisting_sidecar(tmp_path):
+    from sources.filesystem import _find_communication_sidecar
+
+    media = tmp_path / "clip@000QB@.mp4"
+    sidecar = tmp_path / "clip.json"
+    media.write_bytes(b"video")
+    sidecar.write_text('{"source":"quo","message":{},"channel":{},"media":{}}')
+
+    assert _find_communication_sidecar(media) == sidecar
+
+
 def test_scan_does_not_mutate_flow_runtime(tmp_path, monkeypatch):
     """FilesystemSource.scan should not depend on flow_index_vault._RUNTIME."""
     from doc_id_store import DocIDStore

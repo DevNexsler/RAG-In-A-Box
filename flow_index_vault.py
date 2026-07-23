@@ -1535,15 +1535,22 @@ def _process_doc_task(
         communication_context_provider = _RUNTIME.get("communication_context_provider")
         comm_item = communication_item_from_record(doc, source_metadata, full_text)
         if comm_item is not None and communication_context_provider is not None:
-            try:
-                envelope = communication_context_provider.get_context_envelope(comm_item)
-                context_text = format_context_envelope_for_prompt(envelope)
-                context_meta = envelope_metadata(envelope)
-            except Exception as exc:
-                logger.warning("Communication context failed for '%s': %s", doc_id, exc)
-                _RUNTIME.setdefault("_warnings", []).append(
-                    f"communication_context_failed:{doc_id}:{exc}"
-                )
+            with _tracer.start_as_current_span("attachment.context.resolve") as context_span:
+                try:
+                    envelope = communication_context_provider.get_context_envelope(comm_item)
+                    context_text = format_context_envelope_for_prompt(envelope)
+                    context_meta = envelope_metadata(envelope)
+                    context_span.set_attribute("before_count", len(envelope.same_channel_before))
+                    context_span.set_attribute("after_count", len(envelope.same_channel_after))
+                    context_span.set_attribute("has_context", bool(context_text))
+                except Exception as exc:
+                    context_span.set_attribute("before_count", 0)
+                    context_span.set_attribute("after_count", 0)
+                    context_span.set_attribute("has_context", False)
+                    logger.warning("Communication context failed for '%s': %s", doc_id, exc)
+                    _RUNTIME.setdefault("_warnings", []).append(
+                        f"communication_context_failed:{doc_id}:{exc}"
+                    )
 
         # --- Extract document-level metadata ---
         fm = result.frontmatter  # from Markdown frontmatter; empty dict for PDF/images

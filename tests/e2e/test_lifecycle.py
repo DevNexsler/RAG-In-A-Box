@@ -12,7 +12,9 @@ transcription output is non-deterministic, so the media assertion relaxes from
 "searchable by the sim marker" to "the media docs went through the pipeline and
 are indexed". OCR stays on the sim in that mode, so its marker assertion holds.
 """
+import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -64,6 +66,56 @@ async def test_audio_and_video_pipelines_searchable(indexed_corpus, mcp_session)
     paths = _rel_paths(results)
     assert any(p.endswith(".wav") for p in paths), f"clip.wav transcript missing: {paths}"
     assert any(p.endswith(".mp4") for p in paths), f"clip.mp4 transcript missing: {paths}"
+
+
+async def test_video_sidecar_context_is_embedded_retrievable_and_audited(
+    indexed_corpus, mcp_session
+):
+    before_results = _hits(await mcp_session.call_tool_json(
+        "file_search", {"query": "quarterly zephyr report video", "top_k": 10}))
+    after_results = _hits(await mcp_session.call_tool_json(
+        "file_search", {"query": "marmalade budget video", "top_k": 10}))
+    before_video = next((
+        hit for hit in before_results
+        if "clip" in hit.get("rel_path", "") and hit.get("rel_path", "").endswith(".mp4")
+    ), None)
+    after_video = next((
+        hit for hit in after_results
+        if "clip" in hit.get("rel_path", "") and hit.get("rel_path", "").endswith(".mp4")
+    ), None)
+    assert before_video, f"video absent for before-context query: {_rel_paths(before_results)}"
+    assert after_video, f"video absent for after-context query: {_rel_paths(after_results)}"
+    assert before_video["doc_id"] == after_video["doc_id"]
+
+    chunks = await mcp_session.call_tool_json(
+        "file_get_doc_chunks", {"doc_id": before_video["doc_id"]})
+    stored = "\n".join(chunk.get("text", "") for chunk in chunks)
+    before_embedded = "quarterly zephyr report" in stored.lower()
+    after_embedded = "marmalade budget" in stored.lower()
+    assert before_embedded, stored[:2000]
+    assert after_embedded, stored[:2000]
+
+    listing = await mcp_session.call_tool_json("file_list_documents", {"limit": 100})
+    indexed_paths = [doc.get("rel_path", "") for doc in listing.get("documents", [])]
+    sidecar_not_indexed = not any(path.endswith("clip.json") for path in indexed_paths)
+    assert sidecar_not_indexed, indexed_paths
+
+    evidence = {
+        "target_doc_id": before_video["doc_id"],
+        "checks": {
+            "sidecar_detected": before_embedded and after_embedded,
+            "sidecar_not_indexed": sidecar_not_indexed,
+            "before_embedded": before_embedded,
+            "after_embedded": after_embedded,
+            "before_query_retrieved": before_video is not None,
+            "after_query_retrieved": after_video is not None,
+        },
+    }
+    evidence_path = Path(os.environ.get(
+        "E2E_ATTACHMENT_EVIDENCE_FILE", ".evals/e2e-attachment-path-evidence.json"
+    ))
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
 
 
 async def test_chunk_roundtrip(indexed_corpus, mcp_session):

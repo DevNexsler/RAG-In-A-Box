@@ -236,3 +236,37 @@ def test_compose_tiers_propagate_explicit_provider_env(
         if cmd[:2] == ["docker", "compose"] or "pytest" in cmd:
             assert env["STAGING_CONFIG"] == "./config.staging.realmedia.yaml"
             assert env["E2E_REAL"] == "1"
+
+
+def test_staging_gate_runs_attachment_audit_after_trace_collection(tmp_path, monkeypatch):
+    compose_file = tmp_path / "compose.yml"
+    compose_file.write_text("services: {}\n")
+    monkeypatch.setattr(gate, "COMPOSE_FILE", compose_file)
+    monkeypatch.setattr(gate.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
+    monkeypatch.setattr(gate, "run_tier", lambda *args, **kwargs: True)
+    events = []
+    monkeypatch.setattr(gate, "collect_staging_traces", lambda *args, **kwargs: events.append("traces"))
+    monkeypatch.setattr(gate, "check_tool_coverage", lambda *args, **kwargs: events.append("tools") or True)
+    monkeypatch.setattr(gate, "check_attachment_path", lambda *args, **kwargs: events.append("attachment") or True)
+
+    staging = next(tier for tier in gate.TIERS if tier.name == "staging-e2e")
+    assert gate.run_compose_tier(staging, tmp_path / "run") is True
+    assert events == ["traces", "tools", "attachment"]
+
+
+def test_run_tier_passes_attachment_evidence_path_to_host_pytest(tmp_path, monkeypatch):
+    captured = {}
+
+    def capture(_cmd, _run_dir, _tier_name, env=None):
+        captured.update(env or {})
+        return True
+
+    monkeypatch.setattr(gate, "_run", capture)
+    staging = next(tier for tier in gate.TIERS if tier.name == "staging-e2e")
+    assert gate.run_tier(
+        staging,
+        tmp_path,
+        extra_env={"E2E_ATTACHMENT_EVIDENCE_FILE": "/tmp/evidence.json"},
+    ) is True
+    assert captured["E2E_ATTACHMENT_EVIDENCE_FILE"] == "/tmp/evidence.json"
+    assert captured["E2E_REAL"] == "0"

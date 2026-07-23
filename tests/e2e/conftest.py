@@ -142,9 +142,10 @@ async def _build_corpus() -> dict:
             assert resp.status_code == 201, f"upload {name}: {resp.status_code} {resp.text}"
             uploaded[name] = resp.json()["doc_id"]
 
-    for name in ("clip.wav", "clip.mp4"):
+    for name in ("clip.wav", "clip.mp4", "clip.json"):
         _compose_cp_into_documents(FIXTURES / name)
-        uploaded[name] = name
+        if name != "clip.json":
+            uploaded[name] = name
 
     async with open_mcp_session("indexed_corpus") as session:
         started = await session.call_tool_json("file_index_update", {})

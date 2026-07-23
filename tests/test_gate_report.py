@@ -133,6 +133,20 @@ def test_coverage_not_run_when_json_absent(tmp_path):
     assert "check not run" in md
 
 
+def test_attachment_path_audit_is_rendered_and_can_fail_report(tmp_path):
+    run_dir = make_run(tmp_path)
+    (run_dir / "attachment-path-audit.json").write_text(json.dumps({
+        "passed": False,
+        "failed_checks": ["span:attachment.context.resolve"],
+        "checkpoints": {"extract": 1, "attachment.context.resolve": 0},
+    }))
+    md = build_report(run_dir)
+    assert "## Attachment path audit" in md
+    assert "span:attachment.context.resolve" in md
+    assert "| attachment.context.resolve | 0 |" in md
+    assert md.splitlines()[0].endswith("— FAIL")
+
+
 # --- document timelines ---------------------------------------------------------
 
 def test_doc_timelines_stages_order_and_error_flag(tmp_path):

@@ -132,5 +132,8 @@ def _find_communication_sidecar(media_path: Path) -> Path | None:
         return None
 
     prefix = match.group("prefix")
+    plain = media_path.parent / f"{prefix}.json"
+    if plain.exists():
+        return plain
     candidates = sorted(media_path.parent.glob(f"{glob_escape(prefix)}@*.json"))
     return candidates[0] if candidates else None

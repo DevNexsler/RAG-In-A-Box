@@ -937,33 +937,41 @@ def hybrid_search(
                 st for st in _wanted_types
                 if not any((h.source_type or "") == st for h in fused)
             }
-            for _st in sorted(_missing):
-                try:
-                    _kw = dict(_where_kwargs)
-                    _kw["source_type"] = _st
-                    _media_where = store._build_where_clause(**_kw)
-                    _limit = max(media_intent_slots * 3, 5)
-                    if query_vector is not None:
+            with _tracer.start_as_current_span(
+                "search.media_recall",
+                attributes={
+                    "wanted_types": ",".join(sorted(_wanted_types)),
+                    "missing_types": ",".join(sorted(_missing)),
+                },
+            ) as recall_span:
+                for _st in sorted(_missing):
+                    try:
+                        _kw = dict(_where_kwargs)
+                        _kw["source_type"] = _st
+                        _media_where = store._build_where_clause(**_kw)
+                        _limit = max(media_intent_slots * 3, 5)
+                        if query_vector is not None:
+                            media_recall.extend(
+                                store.vector_search(query_vector, _limit, _media_where)
+                            )
                         media_recall.extend(
-                            store.vector_search(query_vector, _limit, _media_where)
+                            store.keyword_search(query, _limit, _media_where)
                         )
-                    media_recall.extend(
-                        store.keyword_search(query, _limit, _media_where)
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Media-intent recall for source_type=%s failed: %s", _st, exc
-                    )
-            if media_recall:
-                _seen_keys = {(h.doc_id, h.loc) for h in fused}
-                _deduped: list[SearchHit] = []
-                for _hit in sorted(media_recall, key=lambda h: -h.score):
-                    _key = (_hit.doc_id, _hit.loc)
-                    if _key not in _seen_keys:
-                        _seen_keys.add(_key)
-                        _deduped.append(_hit)
-                media_recall = _deduped
-                diagnostics["media_intent_recall"] = len(media_recall)
+                    except Exception as exc:
+                        logger.warning(
+                            "Media-intent recall for source_type=%s failed: %s", _st, exc
+                        )
+                if media_recall:
+                    _seen_keys = {(h.doc_id, h.loc) for h in fused}
+                    _deduped: list[SearchHit] = []
+                    for _hit in sorted(media_recall, key=lambda h: -h.score):
+                        _key = (_hit.doc_id, _hit.loc)
+                        if _key not in _seen_keys:
+                            _seen_keys.add(_key)
+                            _deduped.append(_hit)
+                    media_recall = _deduped
+                    diagnostics["media_intent_recall"] = len(media_recall)
+                recall_span.set_attribute("recalled_count", len(media_recall))
 
         # 6b. Media-intent boost — applied BEFORE the re-rank pool is truncated.
         #     The re-ranker only sees fused[:final_top_k*6], so an attachment
@@ -1037,10 +1045,23 @@ def hybrid_search(
 
         # 11b. Media-intent quota — a query that names a medium must return some
         #      of that medium even when messages sweep every slot on score.
-        if media_intent_slots > 0:
-            hits = _ensure_media_intent_slots(
-                hits, media_intent_pool, query, min_slots=media_intent_slots
-            )
+        if media_intent_slots > 0 and _wanted_types:
+            before_keys = {(hit.doc_id, hit.loc) for hit in hits}
+            with _tracer.start_as_current_span(
+                "search.media_quota",
+                attributes={"wanted_types": ",".join(sorted(_wanted_types))},
+            ) as quota_span:
+                hits = _ensure_media_intent_slots(
+                    hits, media_intent_pool, query, min_slots=media_intent_slots
+                )
+                quota_span.set_attribute(
+                    "injected_count",
+                    sum((hit.doc_id, hit.loc) not in before_keys for hit in hits),
+                )
+                quota_span.set_attribute(
+                    "returned_media_count",
+                    sum((hit.source_type or "") in _wanted_types for hit in hits),
+                )
         candidate_counts["returned"] = len(hits)
         timing_ms["total"] = round((time.perf_counter() - search_started) * 1000, 3)
         return SearchResult(hits=hits, diagnostics=diagnostics)
