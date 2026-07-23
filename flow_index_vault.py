@@ -1215,6 +1215,97 @@ def _annotate_canonical_sidecar(
         logger.warning("Canonical sidecar annotation failed: %s", exc)
 
 
+def _index_duplicate_delivery_context(
+    doc: dict,
+    canonical_doc_id: str,
+) -> bool:
+    """Index one context-only alias for duplicate media without re-extraction."""
+    doc_id = str(doc["doc_id"])
+    source_records = _RUNTIME.get("source_records_by_ns_doc_id", {})
+    source_record = source_records.get(doc_id)
+    source_metadata = (
+        getattr(source_record, "metadata", {}) if source_record is not None else {}
+    )
+    source_metadata = source_metadata if isinstance(source_metadata, dict) else {}
+    provider = _RUNTIME.get("communication_context_provider")
+    item = communication_item_from_record(doc, source_metadata)
+    if item is None or provider is None:
+        return False
+
+    logger = _get_logger()
+    with _tracer.start_as_current_span(
+        "attachment.context.duplicate_alias",
+        attributes={"doc_id": doc_id, "canonical_doc_id": canonical_doc_id},
+    ) as span:
+        try:
+            envelope = provider.get_context_envelope(item)
+            context_text = format_context_envelope_for_prompt(envelope)
+            context_meta = envelope_metadata(envelope)
+        except Exception as exc:
+            span.set_attribute("has_context", False)
+            logger.warning(
+                "Duplicate delivery context failed for '%s': %s",
+                doc_id,
+                exc,
+            )
+            _RUNTIME.setdefault("_warnings", []).append(
+                f"duplicate_delivery_context_failed:{doc_id}:{exc}"
+            )
+            return False
+        span.set_attribute("before_count", len(envelope.same_channel_before))
+        span.set_attribute("after_count", len(envelope.same_channel_after))
+        span.set_attribute("has_context", bool(context_text))
+        if not context_text:
+            return False
+
+    source_type = canonical_source_type(doc.get("source_type") or doc.get("ext", ""))
+    rel_path = str(doc.get("rel_path") or doc_id)
+    body = (
+        f"{source_type.capitalize()} attachment delivery. "
+        f"Canonical media attachment: {canonical_doc_id}\n\n"
+        f"[Conversation context]\n{context_text}"
+    )
+    metadata = {
+        "doc_id": doc_id,
+        "rel_path": rel_path,
+        "source_type": source_type,
+        "source_name": str(doc.get("source_name") or "documents"),
+        "mtime": float(doc.get("mtime") or 0.0),
+        "size": int(doc.get("size") or 0),
+        "title": doc_id,
+        "folder": derive_folder(rel_path),
+        "status": "active",
+        "description": f"Context-only alias for {canonical_doc_id}",
+        "loc": "context:c:0",
+        "snippet": context_text[:200],
+    }
+    for key in _COMMUNICATION_METADATA_KEYS:
+        value = source_metadata.get(key)
+        if value:
+            metadata[key] = str(value)
+    metadata.update(context_meta)
+
+    embed_provider: EmbedProvider = _RUNTIME["embed_provider"]
+    store: LanceDBStore = _RUNTIME["store"]
+    with _tracer.start_as_current_span("embed", attributes={"chunk_count": 1}):
+        with _measure_index_memory("embed", doc_id):
+            vector = embed_provider.embed_texts([body])[0]
+    node = TextNode(
+        text=body,
+        id_=f"{doc_id}::context:c:0",
+        embedding=vector,
+        metadata=metadata,
+    )
+    node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
+    store.upsert_nodes([node])
+    logger.info(
+        "Indexed duplicate delivery context alias %s -> %s",
+        doc_id,
+        canonical_doc_id,
+    )
+    return True
+
+
 # No timeout_seconds here: Prefect cannot interrupt tasks running in worker
 # threads (its own warning says so), so a timeout was a false safety net that
 # logged one warning per task (~1350/run). Freeze detection is owned by the
@@ -1475,6 +1566,7 @@ def _process_doc_task(
                         store.delete_by_doc_ids([doc_id])
                     except Exception as exc:
                         logger.warning("Failed to drop stale duplicate chunks for %s: %s", doc_id, exc)
+                    _index_duplicate_delivery_context(doc, canonical_ns)
                     if dedupe_cfg.get("update_canonical_metadata", True):
                         try:
                             refs = registry.duplicate_refs_for_canonical(winner["doc_id"])

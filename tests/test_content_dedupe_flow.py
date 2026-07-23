@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Barrier, Event
+from types import SimpleNamespace
 
 import pytest
 import blake3
@@ -561,6 +562,90 @@ def test_canonical_sidecar_gets_duplicate_delivery_note(runtime):
     assert len(deliveries) == 1
     assert deliveries[0]["rel_path"] == "email-attachments/nigel/msgB__mm0.md"
     assert deliveries[0]["message"]["source_message_id"] == "<b@x>"
+
+
+def test_duplicate_video_delivery_indexes_context_alias_without_media_extraction(runtime):
+    from communication_context import (
+        SidecarContextProvider,
+        communication_metadata_from_sidecar,
+    )
+
+    docs_root, store, registry = runtime
+    body = "identical media bytes"
+    canonical = _make_doc(docs_root, "f/canonical.md", body, "00001")
+    duplicate = _make_doc(
+        docs_root,
+        "email-attachments/cesar/msgB__mm0.mp4",
+        body,
+        "00002",
+    )
+    duplicate["ext"] = "mp4"
+    duplicate["source_type"] = "video"
+    sidecar = docs_root / "email-attachments/cesar/msgB__mm0.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "source": "zoho_cliq",
+                "message": {
+                    "source_message_id": "attachment",
+                    "sent_at": "2026-06-18T19:08:42Z",
+                    "from": {"name": "Cesar"},
+                },
+                "channel": {"source_channel_id": "maintenance"},
+                "media": {"media_index": 0, "media_type": "video/mp4"},
+                "context": {
+                    "same_channel_before": [
+                        {
+                            "source_message_id": "before",
+                            "sent_at": "2026-06-18T19:07:07Z",
+                            "text": "Were you able to complete Bullmans?",
+                            "origin_source": "zoho_cliq",
+                            "channel_id": "maintenance",
+                        }
+                    ],
+                    "same_channel_after": [
+                        {
+                            "source_message_id": "after",
+                            "sent_at": "2026-06-18T19:11:48Z",
+                            "text": "Maybe tomorrow",
+                            "origin_source": "zoho_cliq",
+                            "channel_id": "maintenance",
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    _register(registry, canonical)
+    _register(registry, duplicate)
+    fiv.process_doc_task.fn(canonical)
+
+    metadata = communication_metadata_from_sidecar(
+        Path(duplicate["abs_path"]),
+        sidecar,
+    )
+    fiv._RUNTIME["source_records_by_ns_doc_id"] = {
+        duplicate["doc_id"]: SimpleNamespace(metadata=metadata)
+    }
+    fiv._RUNTIME["communication_context_provider"] = SidecarContextProvider()
+
+    with patch(
+        "flow_index_vault.extract_text",
+        side_effect=AssertionError("duplicate media must not be extracted"),
+    ):
+        fiv.process_doc_task.fn(duplicate)
+
+    alias_chunks = store.get_doc_chunks(duplicate["doc_id"])
+    assert len(alias_chunks) == 1
+    assert alias_chunks[0].source_type == "video"
+    assert "Were you able to complete Bullmans?" in alias_chunks[0].text
+    assert "Maybe tomorrow" in alias_chunks[0].text
+    assert canonical["doc_id"] in alias_chunks[0].text
+    assert set(store.list_doc_ids()) == {
+        canonical["doc_id"],
+        duplicate["doc_id"],
+    }
 
 
 def test_different_content_both_index(runtime):
