@@ -334,6 +334,25 @@ def _health_probe(config: dict) -> tuple[dict, int]:
     return payload, status_code
 
 
+def _provider_health_probe(config: dict) -> tuple[dict, int]:
+    """Payload and status for unauthenticated provider-failure health probes."""
+    index_root = Path(config["index_root"])
+    provider_failures = _recent_provider_failures(index_root)
+    payload = {
+        "status": provider_failures.get("status", "unknown"),
+        "provider_failures": provider_failures,
+    }
+    status_code = 200 if payload["status"] == "ok" else 503
+    return payload, status_code
+
+
+def _is_unauthenticated_probe_path(path: str | None) -> bool:
+    """Allow docker/operator health probes without Bearer auth."""
+    if not path:
+        return False
+    return path == "/health" or path.startswith("/health/")
+
+
 def _hit_to_dict(h: SearchHit, include_text: bool = False) -> dict:
     """Convert a SearchHit to a response dict."""
     d: dict = {
@@ -3540,9 +3559,23 @@ if HAS_MCP and FastMCP is not None:
                         # Never let a health-check bug cause a false outage.
                         return JSONResponse({"status": "ok", "health_check_error": str(exc)})
 
-                # Compose: /health → probe, /api/* → REST API, everything else → MCP
+                async def _health_providers(request):
+                    try:
+                        payload, status_code = _provider_health_probe(config)
+                        return JSONResponse(payload, status_code=status_code)
+                    except Exception as exc:
+                        return JSONResponse(
+                            {
+                                "status": "unknown",
+                                "provider_health_check_error": str(exc),
+                            },
+                            status_code=503,
+                        )
+
+                # Compose: /health* → probes, /api/* → REST API, everything else → MCP
                 app = Starlette(routes=[
                     Route("/health", _health, methods=["GET"]),
+                    Route("/health/providers", _health_providers, methods=["GET"]),
                     Mount("/api", app=api_app),
                     Mount("/", app=mcp_app),
                 ], lifespan=lifespan)
@@ -3559,7 +3592,7 @@ if HAS_MCP and FastMCP is not None:
                             if scope["type"] in ("http", "websocket"):
                                 # Liveness probe is unauthenticated (docker-health
                                 # sends no Bearer token).
-                                if scope.get("path") == "/health":
+                                if _is_unauthenticated_probe_path(scope.get("path")):
                                     await self.app(scope, receive, send)
                                     return
                                 auth_value = b""

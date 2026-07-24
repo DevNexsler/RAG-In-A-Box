@@ -2400,6 +2400,14 @@ def test_file_status_ignores_non_indexer_pid_file(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_probe_path_helper_accepts_health_and_subpaths():
+    assert mcp_server._is_unauthenticated_probe_path("/health") is True
+    assert mcp_server._is_unauthenticated_probe_path("/health/providers") is True
+    assert mcp_server._is_unauthenticated_probe_path("/health/providers/deep") is True
+    assert mcp_server._is_unauthenticated_probe_path("/api/health") is False
+    assert mcp_server._is_unauthenticated_probe_path("/healthz") is False
+
+
 def test_health_probe_ok_when_idle_and_no_warnings(tmp_path):
     """Idle indexer with no recorded FTS failures probes healthy — and always
     carries index-filesystem telemetry (#0232)."""
@@ -2433,6 +2441,43 @@ def test_health_probe_disk_high_water_503s(tmp_path):
     assert payload["status"] == "disk_full"
     assert payload["disk_used_percent"] == 93.0
     assert payload["disk_free_bytes"] == _disk_usage(93).free
+
+
+def test_provider_health_probe_ok(tmp_path):
+    failures = {
+        "status": "ok",
+        "lookback_seconds": 86400,
+        "total_count": 0,
+        "by_key": {},
+    }
+    with patch("mcp_server._recent_provider_failures", return_value=failures):
+        payload, status_code = mcp_server._provider_health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["provider_failures"] == failures
+
+
+def test_provider_health_probe_503s_on_degraded_status(tmp_path):
+    failures = {
+        "status": "critical",
+        "lookback_seconds": 86400,
+        "total_count": 3,
+        "by_key": {
+            "openrouter_embeddings": {
+                "provider": "openrouter",
+                "operation": "embeddings",
+                "severity": "critical",
+                "count": 3,
+            }
+        },
+    }
+    with patch("mcp_server._recent_provider_failures", return_value=failures):
+        payload, status_code = mcp_server._provider_health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "critical"
+    assert payload["provider_failures"] == failures
 
 
 def test_health_probe_disk_threshold_env_override_and_invalid_fallback(tmp_path):
