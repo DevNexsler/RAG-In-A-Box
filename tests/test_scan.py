@@ -3,6 +3,7 @@
 import os
 import inspect
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1725,6 +1726,114 @@ def test_large_degraded_requeue_does_not_trigger_shadow_rebuild(tmp_path):
     # No shadow table constructed, no promote — degraded heal stayed in place
     shadow_ctor.assert_not_called()
     active_store.promote_table.assert_not_called()
+
+
+def _run_flow_over_unchanged_vault(tmp_path, index_root, stored):
+    """Run index_vault_flow over a vault whose files are all unchanged, and
+    return the doc ids handed to _process_docs."""
+    from sources.base import SourceRecord
+    from flow_index_vault import index_vault_flow
+
+    active_store = MagicMock()
+    active_store.list_doc_ids.return_value = list(stored.keys())
+    active_store.list_doc_mtimes.return_value = stored
+    active_store.count_chunks.return_value = len(stored)
+    active_store.fts_available.return_value = True
+
+    fake_registry = MagicMock()
+    fake_registry.count.return_value = 1
+    fake_taxonomy = MagicMock()
+    fake_taxonomy.count.return_value = 0
+
+    class _FakeSource:
+        name = "documents"
+
+        def scan(self):
+            return iter([
+                SourceRecord(
+                    doc_id=doc_id.split("::", 1)[1], natural_key=f"{doc_id}.png",
+                    source_type="img", mtime=mtime, size=4,
+                    metadata={"abs_path": str(tmp_path / "img.png"), "ext": "png"},
+                )
+                for doc_id, mtime in stored.items()
+            ])
+
+        def set_ocr_provider(self, provider):
+            return None
+
+        def close(self):
+            return None
+
+    config = {
+        "index_root": str(index_root),
+        "sources": [{"type": "filesystem", "name": "documents", "root": str(tmp_path)}],
+        "chunking": {"max_chars": 1800, "overlap": 200, "semantic": {"enabled": False}},
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+
+    processed: list[list[str]] = []
+
+    def _capture(docs, *_args, **_kwargs):
+        processed.append([d["doc_id"] for d in docs])
+        return []
+
+    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+        with patch("flow_index_vault.load_config", return_value=config):
+            with patch("flow_index_vault.open_store_with_recovery", return_value=active_store):
+                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                            with patch("sources.build_source", return_value=_FakeSource()):
+                                with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                    with patch("flow_index_vault._process_docs", _capture):
+                                        with patch("flow_index_vault.delete_docs_task"):
+                                            with patch("flow_index_vault.index_stats_task"):
+                                                with patch("flow_index_vault.write_index_metadata_task"):
+                                                    index_vault_flow.fn("dummy.yaml")
+    return processed[0] if processed else []
+
+
+def test_flow_requeues_a_due_degraded_doc_and_claims_the_retry(tmp_path):
+    """The flow admits a degraded doc whose backoff has come due, and defers it
+    at handout — so a run killed mid-queue can't hand it back next run (#0583).
+    """
+    from flow_index_vault import _load_degraded_ledger, _save_degraded_ledger
+
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True, exist_ok=True)
+    stored = {"documents::img-1": 1.0}
+    _save_degraded_ledger(index_root, {"version": 3, "docs": {"documents::img-1": {
+        "reasons": ["ocr_describe_failed"], "attempts": 0, "failures": 1,
+        "last_attempt": 0.0, "retry_after": 1.0, "change_key": "mtime:1.0",
+    }}})
+
+    assert _run_flow_over_unchanged_vault(tmp_path, index_root, stored) == [
+        "documents::img-1"
+    ]
+    entry = _load_degraded_ledger(index_root)["docs"]["documents::img-1"]
+    assert entry["retry_after"] > time.time()
+
+
+def test_flow_does_not_requeue_a_parked_degraded_doc(tmp_path):
+    """#0583: the same 57 docs were re-queued every run at ~908s each. A doc
+    still inside its cross-run backoff must not be processed at all."""
+    from flow_index_vault import _DEGRADED_RETRY_BASE_SECONDS, _save_degraded_ledger
+
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True, exist_ok=True)
+    stored = {"documents::img-1": 1.0}
+    _save_degraded_ledger(index_root, {"version": 3, "docs": {"documents::img-1": {
+        "reasons": ["ocr_describe_failed"], "attempts": 0, "failures": 1,
+        "last_attempt": time.time(),
+        "retry_after": time.time() + _DEGRADED_RETRY_BASE_SECONDS,
+        "change_key": "mtime:1.0",
+    }}})
+
+    assert _run_flow_over_unchanged_vault(tmp_path, index_root, stored) == []
 
 
 def test_index_flow_syncs_folder_taxonomy_from_sources(tmp_path):

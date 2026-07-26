@@ -65,6 +65,56 @@ def test_exhaustion_reraises_original():
         call_with_retry(fn, attempts=2, backoff=(0,), sleep=lambda *_: None)
 
 
+def test_budget_stops_the_ladder_after_one_hung_call():
+    """#0583: 3 attempts x a 300s ReadTimeout cost ~908s per image, ~90% of a 4h
+    indexing run across 57 images. A call that burned its whole timeout has
+    already proven the upstream is hung — the budget stops the ladder there."""
+    calls = {"n": 0}
+    clock = {"t": 0.0}
+
+    def fn():
+        calls["n"] += 1
+        clock["t"] += 300.0            # each attempt consumes its full timeout
+        raise httpx.ReadTimeout("timed out")
+
+    with pytest.raises(httpx.ReadTimeout):
+        call_with_retry(fn, attempts=3, backoff=(5.0,), label="vision",
+                        budget_seconds=300.0, sleep=lambda *_: None,
+                        monotonic=lambda: clock["t"])
+    assert calls["n"] == 1
+
+
+def test_budget_still_allows_fast_transient_retries():
+    """A blip that fails in milliseconds (connection refused, 5xx) is not
+    evidence of a hung upstream and still gets every attempt."""
+    calls = {"n": 0}
+    clock = {"t": 0.0}
+
+    def fn():
+        calls["n"] += 1
+        clock["t"] += 0.01
+        if calls["n"] < 3:
+            raise httpx.ConnectError("blip")
+        return "ok"
+
+    out = call_with_retry(fn, attempts=3, backoff=(0,), budget_seconds=300.0,
+                          sleep=lambda *_: None, monotonic=lambda: clock["t"])
+    assert out == "ok"
+    assert calls["n"] == 3
+
+
+def test_no_budget_by_default_keeps_the_full_ladder():
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        raise httpx.ReadTimeout("timed out")
+
+    with pytest.raises(httpx.ReadTimeout):
+        call_with_retry(fn, attempts=3, backoff=(0,), sleep=lambda *_: None)
+    assert calls["n"] == 3
+
+
 def test_transient_error_forces_retry():
     """A failure surfaced in an HTTP-200 body (raised as TransientError) is retried."""
     calls = {"n": 0}

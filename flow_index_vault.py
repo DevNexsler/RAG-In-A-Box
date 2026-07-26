@@ -744,13 +744,46 @@ def _write_heartbeat(index_root) -> None:
 _SCAN_HEARTBEAT_EVERY = 500
 
 
+def _atomic_write_json(path: Path, payload: dict, *, label: str) -> bool:
+    """Write `payload` to `path` atomically; False when the write failed (disk
+    full, read-only). Readers of a ledger never see a partial file — a torn
+    ledger parses as empty, which silently discards every entry in it."""
+    tmp_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        return True
+    except OSError as exc:
+        tmp_path.unlink(missing_ok=True)
+        logging.getLogger(__name__).warning("Failed to save %s: %s", label, exc)
+        return False
+
+
 def _degraded_ledger_path(index_root: Path) -> Path:
     return Path(index_root) / "degraded_docs.json"
 
 
 # v2: `attempts` only counts doc-specific failures; all-transient runs
 # (provider down) accumulate in the observability-only `transient_attempts`.
-_DEGRADED_LEDGER_VERSION = 2
+# v3: every entry carries cross-run retry state (`failures`, `retry_after`,
+# `change_key`), so a re-heal is scheduled rather than handed out every run.
+_DEGRADED_LEDGER_VERSION = 3
+
+# Cross-run backoff for a doc that keeps degrading. Under v2 a transient
+# failure was free — correct in that it must never abandon a doc (#0251), but
+# it also meant no backoff, so a *deterministic* transient failure (a vision
+# describe that times out on the same image every time) was re-attempted once
+# per run forever: 57 such docs x ~908s ate ~90% of every 4h run while fresh
+# content starved (#0583). The interval doubles per consecutive failure from a
+# base wider than the run cadence, and caps — it never becomes "never", so a
+# provider outage still heals on recovery, just not by burning a whole run.
+_DEGRADED_RETRY_BASE_SECONDS = 6 * 60 * 60
+_DEGRADED_RETRY_MAX_SECONDS = 7 * 24 * 60 * 60
 
 # Failure-reason prefixes produced by the OCR/vision describe pipeline
 # (ocr_describe_failed, ocr_page_failed:N, ocr_describe_empty_backfill,
@@ -765,9 +798,68 @@ def _ledger_version(ledger: dict) -> int:
         return 1
 
 
-def _migrate_degraded_ledger(ledger: dict) -> tuple[dict, int]:
-    """v1 -> v2: reopen capped entries whose failures are all OCR/vision-shaped.
+def _doc_spread_offset(doc_id: str, span: float) -> float:
+    """A stable per-doc offset in [0, span), used to de-synchronize ledger
+    retries. Ledger entries are merged in one batch at the end of a run, so
+    their stamps share a second by construction; a flat interval turns that
+    into a retry herd that re-admits the whole ledger to a single later run
+    (#0480). The offset comes from the doc id so it is stable across processes
+    and restarts — hash() is salted per interpreter and random jitter would
+    re-roll the herd every run."""
+    if span <= 0:
+        return 0.0
+    digest = hashlib.blake2b(doc_id.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % span
 
+
+def _degraded_failures(entry: dict) -> int:
+    """Consecutive failed heal attempts for a degraded doc, of any class.
+
+    Both doc-specific (`attempts`) and provider-side (`transient_attempts`)
+    failures count: backoff answers "is re-attempting this working?", which is
+    a different question from the `attempts` cap's "is this doc broken?". Only
+    the latter may abandon a doc (#0251)."""
+    if "failures" in entry:
+        try:
+            return int(entry["failures"])
+        except (TypeError, ValueError):
+            pass
+    return int(entry.get("attempts", 0)) + int(entry.get("transient_attempts", 0))
+
+
+def _degraded_retry_after(doc_id: str, failures: int, now: float) -> float:
+    """When a doc that has failed `failures` times in a row is due again."""
+    interval = min(
+        _DEGRADED_RETRY_BASE_SECONDS * 2 ** max(0, failures - 1),
+        _DEGRADED_RETRY_MAX_SECONDS,
+    )
+    return now + interval + _doc_spread_offset(doc_id, interval)
+
+
+def _degraded_state(entry: dict, now: float, change_key: str | None = None) -> str:
+    """Classify a degraded-ledger entry: 'capped' | 'parked' | 'due'.
+
+    - 'capped': doc-specific failures exhausted the attempts cap — abandoned
+      until the file changes.
+    - 'parked': still in cross-run backoff; nothing to do this run.
+    - 'due': re-heal it now.
+
+    `change_key` (when given) is the doc's current change key: a doc whose
+    content moved is due immediately regardless of schedule or cap — the
+    failure was about the old bytes."""
+    if change_key is not None and entry.get("change_key") not in (None, change_key):
+        return "due"
+    if int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS:
+        return "capped"
+    if now < float(entry.get("retry_after") or 0.0):
+        return "parked"
+    return "due"
+
+
+def _migrate_degraded_ledger(ledger: dict, now: float | None = None) -> tuple[dict, int]:
+    """Bring an older ledger up to _DEGRADED_LEDGER_VERSION.
+
+    v1 -> v2: reopen capped entries whose failures are all OCR/vision-shaped.
     Under v1 every degraded run charged `attempts`, so a vision-provider outage
     (connection refused — not a doc problem) burned docs to the cap in ~75min
     and abandoned them forever (#0251: 66 of 68 ocr_describe_failed docs).
@@ -775,20 +867,41 @@ def _migrate_degraded_ledger(ledger: dict) -> tuple[dict, int]:
     transiently while the provider is still down (attempts stay 0), and heals
     on the first run after recovery; a doc that genuinely breaks OCR re-caps
     under v2's stricter counting. v2 caps are all doc-specific and are NOT
-    reopened. Absorbs scripts/reopen_capped_ocr_docs.py into the flow."""
+    reopened. Absorbs scripts/reopen_capped_ocr_docs.py into the flow.
+
+    v2 -> v3: turn each entry's recorded failure history into a retry schedule.
+    A v2 entry already counted its consecutive failures (attempts +
+    transient_attempts) but had nowhere to record *when* to try again, so the
+    whole ledger came due every run. Scheduling from that history parks a
+    long-failing doc on the first v3 run instead of granting it one more
+    full-cost pass. The stamp is measured from now (the real last-attempt time
+    was never recorded), so the first interval can run up to one period long.
+    """
     reopened = 0
     if _ledger_version(ledger) >= _DEGRADED_LEDGER_VERSION:
         return ledger, reopened
+    if now is None:
+        now = time.time()
     docs = ledger.get("docs", {})
-    for entry in docs.values():
+    for doc_id, entry in docs.items():
         reasons = entry.get("reasons", [])
         if (
-            int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
+            _ledger_version(ledger) < 2
+            and int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
             and reasons
             and all(str(r).startswith(_OCR_VISION_REASON_PREFIXES) for r in reasons)
         ):
+            # Reopened: the recorded history was the outage's, not the doc's, so
+            # it earns no backoff either — this doc gets its retry now.
             entry["attempts"] = 0
+            entry["failures"] = 0
+            entry["retry_after"] = 0.0
             reopened += 1
+        entry.setdefault("failures", _degraded_failures(entry))
+        entry.setdefault(
+            "retry_after",
+            _degraded_retry_after(doc_id, int(entry["failures"]), now),
+        )
     return {"version": _DEGRADED_LEDGER_VERSION, "docs": docs}, reopened
 
 
@@ -812,55 +925,119 @@ def _load_degraded_ledger(index_root: Path) -> dict:
     return payload
 
 
-def _save_degraded_ledger(index_root: Path, ledger: dict) -> None:
-    try:
-        _degraded_ledger_path(index_root).write_text(
-            json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8"
-        )
-    except OSError as exc:
-        logging.getLogger(__name__).warning("Failed to save degraded ledger: %s", exc)
+def _save_degraded_ledger(index_root: Path, ledger: dict) -> bool:
+    """Persist the ledger atomically; False when the write failed (disk full,
+    read-only). A torn ledger reads back as empty, which would drop every
+    doc's retry schedule and re-admit the whole set to the next run."""
+    return _atomic_write_json(
+        _degraded_ledger_path(index_root), ledger, label="degraded ledger"
+    )
 
 
 def _include_degraded_docs(
     scanned: list[dict],
     to_add_or_update: list[dict],
     ledger: dict,
+    now: float | None = None,
 ) -> list[dict]:
-    """Re-queue docs that previously indexed with transient degradations
-    (OCR/vision timeouts, enrichment failures) even though their mtime is
-    unchanged. Entries past _DEGRADED_MAX_ATTEMPTS are left alone — those
-    are persistent (e.g. corrupt source files), not transient."""
+    """Re-queue docs that previously indexed with degradations (OCR/vision
+    timeouts, enrichment failures) even though their mtime is unchanged — but
+    only the ones actually *due* (see _degraded_state). Re-queueing the whole
+    degraded set every run is what let 57 deterministically failing images eat
+    ~90% of every run (#0583); entries past _DEGRADED_MAX_ATTEMPTS are
+    abandoned as persistently broken (e.g. corrupt source files)."""
     docs = ledger.get("docs", {})
     if not docs:
         return to_add_or_update
-    retry_ids = {
-        doc_id
-        for doc_id, entry in docs.items()
-        if int(entry.get("attempts", 0)) < _DEGRADED_MAX_ATTEMPTS
-    }
-    if not retry_ids:
-        return to_add_or_update
+    if now is None:
+        now = time.time()
     existing = {str(r.get("doc_id", "")) for r in to_add_or_update}
     by_id = {str(r.get("doc_id", "")): r for r in scanned}
     forced = list(to_add_or_update)
-    for doc_id in sorted(retry_ids):
-        if doc_id not in existing and doc_id in by_id:
-            forced.append(by_id[doc_id])
+    for doc_id, entry in sorted(docs.items()):
+        record = by_id.get(doc_id)
+        if doc_id in existing or record is None:
+            continue
+        if _degraded_state(entry, now, _change_key(record)) == "due":
+            forced.append(record)
     return forced
+
+
+def _apply_degraded_ledger(
+    index_root: Path,
+    scanned: list[dict],
+    to_add_or_update: list[dict],
+    now: float | None = None,
+) -> tuple[list[dict], dict]:
+    """Admit the degraded docs due for a re-heal, and claim those retries.
+
+    The schedule is re-stamped when the retry is *handed out*, not when it is
+    completed, for the same reason as the skip ledger (#0480): restamping only
+    in the end-of-run merge makes the protection conditional on the run
+    surviving its queue, so a run killed mid-queue hands the same herd straight
+    back to the next one. A doc that degrades again gets its real stamp from
+    the end-of-run merge; one that heals is dropped from the ledger there."""
+    ledger = _load_degraded_ledger(index_root)
+    docs = ledger.get("docs", {})
+    if now is None:
+        now = time.time()
+    queued = _include_degraded_docs(scanned, to_add_or_update, ledger, now=now)
+    admitted = {str(r.get("doc_id", "")) for r in queued} - {
+        str(r.get("doc_id", "")) for r in to_add_or_update
+    }
+    for doc_id in admitted:
+        entry = docs[doc_id]
+        # Defer by the interval this doc would earn if the re-heal fails again;
+        # the merge corrects it either way.
+        docs[doc_id] = {
+            **entry,
+            "retry_after": _degraded_retry_after(
+                doc_id, _degraded_failures(entry) + 1, now
+            ),
+        }
+    claimed = len(admitted)
+    if admitted and not _save_degraded_ledger(index_root, ledger):
+        # Claim persistence is the admission boundary: if the deferrals are not
+        # durable, fail closed so a disk-full/read-only run cannot hand out the
+        # same herd again next run.
+        queued = [r for r in queued if str(r.get("doc_id", "")) not in admitted]
+        claimed = 0
+    parked = sum(
+        1 for doc_id, e in docs.items()
+        if _degraded_state(e, now) == "parked" and doc_id not in admitted
+    )
+    stats = {
+        "entries": len(docs),
+        "requeued": claimed,
+        "parked": parked,
+        "capped": sum(
+            1 for e in docs.values() if _degraded_state(e, now) == "capped"
+        ),
+    }
+    return queued, stats
 
 
 def _merge_degraded_ledger(
     ledger: dict,
     degraded_now: dict[str, list],
     clean_now: set[str],
+    change_keys: dict[str, str] | None = None,
+    now: float | None = None,
 ) -> dict:
     """Fold one run's outcomes into the ledger: clean docs drop out, degraded
     docs accumulate attempts — but only doc-specific failures charge the cap.
     A run degraded solely by transient (provider-down) failures keeps
     `attempts` untouched and counts in the observability-only
     `transient_attempts`, so a provider outage of any length can never
-    abandon a doc (#0251); it retries every run and heals on recovery.
-    Bare-string reasons (legacy callers) count as doc-specific."""
+    abandon a doc (#0251); it heals on the first run after recovery.
+    Bare-string reasons (legacy callers) count as doc-specific.
+
+    Every degraded doc also records the failure count that drives its cross-run
+    backoff, the resulting `retry_after`, and the change key of the bytes that
+    failed — so a doc whose content moves is re-evaluated immediately instead
+    of waiting out a schedule earned by the old content."""
+    if now is None:
+        now = time.time()
     docs = dict(ledger.get("docs", {}))
     for doc_id in clean_now:
         docs.pop(doc_id, None)
@@ -869,10 +1046,17 @@ def _merge_degraded_ledger(
             d if isinstance(d, Degradation) else Degradation(str(d)) for d in noted
         ]
         prev = docs.get(doc_id, {})
+        failures = _degraded_failures(prev) + 1
         entry = {
             "reasons": sorted({d.reason for d in degradations}),
             "attempts": int(prev.get("attempts", 0)),
+            "failures": failures,
+            "last_attempt": now,
+            "retry_after": _degraded_retry_after(doc_id, failures, now),
         }
+        change_key = (change_keys or {}).get(doc_id, prev.get("change_key"))
+        if change_key is not None:
+            entry["change_key"] = change_key
         transient_attempts = int(prev.get("transient_attempts", 0))
         if degradations and all(d.transient for d in degradations):
             transient_attempts += 1
@@ -882,6 +1066,33 @@ def _merge_degraded_ledger(
             entry["transient_attempts"] = transient_attempts
         docs[doc_id] = entry
     return {"version": _DEGRADED_LEDGER_VERSION, "docs": docs}
+
+
+def _degraded_delta(
+    previous: dict,
+    updated: dict,
+    degraded_now: dict[str, list],
+    clean_now: set[str],
+    now: float | None = None,
+) -> dict:
+    """Compare a run's degraded outcomes against the ledger it started from.
+
+    A static "N docs indexed with degradations" count cannot distinguish a set
+    that is healing from one that is not: #0583 asserted "will self-heal next
+    run" six times for a byte-identical list of 55 docs, and finding that out
+    took diffing log lines by hand."""
+    if now is None:
+        now = time.time()
+    before = previous.get("docs", {})
+    after = updated.get("docs", {})
+    return {
+        "healed": len([d for d in clean_now if d in before]),
+        "still_degraded": len([d for d in degraded_now if d in before]),
+        "newly_degraded": len([d for d in degraded_now if d not in before]),
+        "entries": len(after),
+        "parked": len([e for e in after.values() if _degraded_state(e, now) == "parked"]),
+        "capped": len([e for e in after.values() if _degraded_state(e, now) == "capped"]),
+    }
 
 
 # --- Skip ledger: docs intentionally NOT indexed (duplicate, oversized,
@@ -902,17 +1113,14 @@ def _skip_retry_due_at(doc_id: str, skipped_at: float) -> float:
     """When a skip entry becomes due for its next bounded retry.
 
     The window is _SKIP_RETRY_SECONDS plus a per-doc offset spread over the
-    same span, so entries stamped together do not come due together. Skips are
-    merged in batches at the end of a run, so their stamps share a second by
-    construction (#0480: 1081 entries on one second, 1056 on another) — a flat
-    window turns that into a synchronized retry herd that re-admits the whole
-    ledger to a single run. The offset is derived from the doc id so it is
-    stable across processes and restarts; hash() is salted per interpreter and
-    random jitter would re-roll the herd every run.
+    same span (see _doc_spread_offset), so entries stamped together do not come
+    due together (#0480: 1081 entries on one second, 1056 on another).
     """
-    digest = hashlib.blake2b(doc_id.encode("utf-8"), digest_size=8).digest()
-    offset = int.from_bytes(digest, "big") % _SKIP_RETRY_SECONDS
-    return skipped_at + _SKIP_RETRY_SECONDS + offset
+    return (
+        skipped_at
+        + _SKIP_RETRY_SECONDS
+        + _doc_spread_offset(doc_id, _SKIP_RETRY_SECONDS)
+    )
 
 
 def _skip_ledger_path(index_root: Path) -> Path:
@@ -931,21 +1139,9 @@ def _load_skip_ledger(index_root: Path) -> dict:
 
 def _save_skip_ledger(index_root: Path, ledger: dict) -> bool:
     """Persist the ledger; False when the write failed (disk full, read-only)."""
-    path = _skip_ledger_path(index_root)
-    tmp_path = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    return _atomic_write_json(
+        _skip_ledger_path(index_root), ledger, label="skip ledger"
     )
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(ledger, handle, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-        return True
-    except OSError as exc:
-        tmp_path.unlink(missing_ok=True)
-        logging.getLogger(__name__).warning("Failed to save skip ledger: %s", exc)
-        return False
 
 
 def _exclude_skipped_docs(
@@ -2678,13 +2874,19 @@ def index_vault_flow(
     to_add_or_update, to_delete = diff_index_task(
         scanned, stored_mtimes, stored_change_hashes
     )
-    degraded_ledger = _load_degraded_ledger(index_root)
-    before_degraded = len(to_add_or_update)
-    to_add_or_update = _include_degraded_docs(scanned, to_add_or_update, degraded_ledger)
-    if len(to_add_or_update) > before_degraded:
+    # Re-queue the degraded docs whose cross-run backoff has come due, and
+    # claim those retries before any work (see _apply_degraded_ledger).
+    to_add_or_update, degraded_stats = _apply_degraded_ledger(
+        index_root, scanned, to_add_or_update
+    )
+    if degraded_stats["entries"]:
         logger.info(
-            "Re-queued %d degraded docs for self-heal",
-            len(to_add_or_update) - before_degraded,
+            "Degraded ledger: %d entries, %d re-queued for self-heal this run, "
+            "%d parked in backoff, %d capped",
+            degraded_stats["entries"],
+            degraded_stats["requeued"],
+            degraded_stats["parked"],
+            degraded_stats["capped"],
         )
     # Drop docs already decided 'do not index' (duplicate/oversized/corrupt)
     # whose file is unchanged — stops the reprocess-every-run loop — and claim
@@ -2983,15 +3185,44 @@ def index_vault_flow(
     degraded_now = _RUNTIME.get("degraded_now", {})
     clean_now = _RUNTIME.get("degraded_clean", set())
     if degraded_now or clean_now:
+        previous_ledger = _load_degraded_ledger(index_root)
         updated_ledger = _merge_degraded_ledger(
-            _load_degraded_ledger(index_root), degraded_now, clean_now
+            previous_ledger,
+            degraded_now,
+            clean_now,
+            change_keys={
+                str(r.get("doc_id", "")): _change_key(r)
+                for r in scanned
+                if str(r.get("doc_id", "")) in degraded_now
+            },
         )
         _save_degraded_ledger(index_root, updated_ledger)
+        delta = _degraded_delta(
+            previous_ledger, updated_ledger, degraded_now, clean_now
+        )
         if degraded_now:
+            # The delta, not a bare count: a set that heals nothing across runs
+            # is the failure mode (#0583) and a static count hides it.
             logger.warning(
-                "%d docs indexed with degradations (will self-heal next run): %s",
-                len(degraded_now), sorted(degraded_now)[:10],
+                "%d docs indexed with degradations — healed %d, still degraded "
+                "%d, newly degraded %d; ledger holds %d (%d parked in backoff, "
+                "%d capped). Next re-heal for a still-failing doc in >=%dh: %s",
+                len(degraded_now),
+                delta["healed"],
+                delta["still_degraded"],
+                delta["newly_degraded"],
+                delta["entries"],
+                delta["parked"],
+                delta["capped"],
+                _DEGRADED_RETRY_BASE_SECONDS // 3600,
+                sorted(degraded_now)[:10],
             )
+            if delta["still_degraded"] and not delta["healed"]:
+                logger.warning(
+                    "Degraded set is not converging: %d docs degraded again this "
+                    "run and none healed — the failure is not clearing on retry",
+                    delta["still_degraded"],
+                )
 
     skip_now = _RUNTIME.get("skip_now", {})
     skip_clean = _RUNTIME.get("skip_clean", set())
@@ -3418,7 +3649,10 @@ def _record_single_doc_outcome(index_root: Path, doc: dict) -> None:
             )
     elif reasons:
         degraded = _merge_degraded_ledger(
-            _load_degraded_ledger(index_root), {doc_id: reasons}, set()
+            _load_degraded_ledger(index_root),
+            {doc_id: reasons},
+            set(),
+            change_keys={doc_id: _change_key(doc)},
         )
         _save_degraded_ledger(index_root, degraded)
         skip_ledger = _load_skip_ledger(index_root)

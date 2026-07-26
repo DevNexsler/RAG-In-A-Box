@@ -59,7 +59,8 @@ class LiteLLMFallback:
     def __init__(self, endpoint: str, model: str, prompt: str, encoder: Encoder,
                  *, api_key: str | None = None, timeout: float = 300.0,
                  attempts: int = DEFAULT_ATTEMPTS,
-                 backoff: tuple[float, ...] = DEFAULT_BACKOFF):
+                 backoff: tuple[float, ...] = DEFAULT_BACKOFF,
+                 budget_seconds: float | None = None):
         self.base_url = endpoint.rstrip("/")
         self.model = model
         self.prompt = prompt
@@ -67,6 +68,12 @@ class LiteLLMFallback:
         self.timeout = timeout
         self.attempts = attempts
         self.backoff = backoff
+        # One call's worth of patience for the whole retry ladder. A request that
+        # burned its entire `timeout` has already proven the upstream is hung;
+        # spending `attempts` x timeout on it (3 x 300s = ~908s per image, ~90% of a
+        # 4h indexing run across 57 images — #0583) buys nothing. Blips that fail
+        # fast (connection refused, 5xx) are unaffected and still get every attempt.
+        self.budget_seconds = timeout if budget_seconds is None else budget_seconds
         self.api_key = (api_key or os.environ.get("LITELLM_API_KEY", "")
                         or os.environ.get("LITELLM_MASTER_KEY", ""))
 
@@ -90,7 +97,8 @@ class LiteLLMFallback:
         # unreachable endpoint propagates as a transient error to resolve_with_fallback.
         try:
             return call_with_retry(_once, attempts=self.attempts, backoff=self.backoff,
-                                   label=f"litellm-fallback {self.model}")
+                                   label=f"litellm-fallback {self.model}",
+                                   budget_seconds=self.budget_seconds)
         except Exception as exc:
             if is_transient(exc):
                 raise

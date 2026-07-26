@@ -7,8 +7,10 @@ blip (a 504, a connection reset, a rate limit, a model still cold-loading) faile
 differently depending on which provider you hit. This is the single place that:
 
   1. classifies a failure as TRANSIENT (upstream slow/unavailable/rate-limited —
-     worth retrying) vs PERMANENT (bad input / auth / not-found — don't retry), and
-  2. backs off and retries the transient ones.
+     worth retrying) vs PERMANENT (bad input / auth / not-found — don't retry),
+  2. backs off and retries the transient ones, and
+  3. bounds what the whole ladder may spend (`budget_seconds`), so a hung upstream
+     costs one per-call timeout rather than `attempts` of them.
 
 On exhaustion the original exception is re-raised UNCHANGED, so the caller's existing
 degrade path still fires (note_degradation/failed_enrichment -> the degraded ledger ->
@@ -77,6 +79,8 @@ def call_with_retry(
     label: str = "external call",
     classify: Callable[[BaseException], bool] = is_transient,
     sleep: Callable[[float], None] = time.sleep,
+    budget_seconds: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> T:
     """Call `fn()`; retry on TRANSIENT failures with backoff, raise PERMANENT ones
     immediately. After `attempts` transient failures, re-raise the last exception so
@@ -84,14 +88,32 @@ def call_with_retry(
 
     `backoff[i]` is the delay before attempt i+1 (the last value repeats). A caller can
     override `classify` (e.g. to honor a Retry-After) or inject `sleep` (tests).
+
+    `budget_seconds` caps the WALL CLOCK the whole ladder may spend: a retry is only
+    started while less than that has elapsed. Without it, `attempts` independent
+    per-call timeouts multiply — a hung upstream costs attempts x timeout (3 x 300s =
+    ~908s per image in #0583) even though the first exhausted timeout is already
+    proof it is hung. It bounds retries, not an in-flight call, so the worst case is
+    one attempt started just under the budget. Fast transients (connection refused,
+    5xx in milliseconds) still get every attempt.
     """
     last: BaseException | None = None
+    started = monotonic()
     for i in range(max(1, attempts)):
         try:
             return fn()
         except Exception as exc:  # noqa: BLE001 — classify, then retry or re-raise
             last = exc
             if not classify(exc) or i >= attempts - 1:
+                raise
+            elapsed = monotonic() - started
+            if budget_seconds is not None and elapsed >= budget_seconds:
+                logger.warning(
+                    "%s: attempt %d/%d failed transiently (%s: %s) — retry budget "
+                    "spent (%.0fs of %.0fs), not retrying",
+                    label, i + 1, attempts, type(exc).__name__, str(exc)[:160],
+                    elapsed, budget_seconds,
+                )
                 raise
             delay = backoff[min(i, len(backoff) - 1)] if backoff else 0.0
             logger.warning(
