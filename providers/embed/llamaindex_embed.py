@@ -4,14 +4,21 @@ import os
 from typing import Any
 
 from providers.embed.base import EmbedProvider
+from providers.embed.limits import bound_inputs, resolve_max_input_tokens
 
 
 class LlamaIndexEmbedProvider(EmbedProvider):
     """Wrap any LlamaIndex BaseEmbedding. Default: GoogleGenAIEmbedding (Gemini)."""
 
-    def __init__(self, provider: str = "gemini", model: str = "gemini-embedding-001") -> None:
+    def __init__(
+        self,
+        provider: str = "gemini",
+        model: str = "gemini-embedding-001",
+        max_input_tokens: int | None = None,
+    ) -> None:
         self.provider = provider
         self.model = model
+        self.max_input_tokens = max_input_tokens or resolve_max_input_tokens(model)
         self._embed_model = self._build_model()
 
     def _build_model(self) -> Any:
@@ -55,8 +62,14 @@ class LlamaIndexEmbedProvider(EmbedProvider):
         """Embed a list of texts (for indexing). Uses LlamaIndex batch embedding."""
         if not texts:
             return []
-        return [self._embed_model.get_text_embedding(t) for t in texts]
+        bounded = bound_inputs(
+            texts, self.max_input_tokens, label=f"{self.provider}-embed[{self.model}]",
+        )
+        return [self._embed_model.get_text_embedding(t) for t in bounded]
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a single query (for search). Uses LlamaIndex query embedding."""
-        return self._embed_model.get_query_embedding(query)
+        (bounded,) = bound_inputs(
+            [query], self.max_input_tokens, label=f"{self.provider}-embed[{self.model}]",
+        )
+        return self._embed_model.get_query_embedding(bounded)
