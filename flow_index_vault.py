@@ -773,6 +773,8 @@ def _degraded_ledger_path(index_root: Path) -> Path:
 # v3: every entry carries cross-run retry state (`failures`, `retry_after`,
 # `change_key`), so a re-heal is scheduled rather than handed out every run.
 _DEGRADED_LEDGER_VERSION = 3
+_DEGRADED_UNKNOWN_CHANGE_KEY = "<legacy-unkeyed>"
+_DEGRADED_LEGACY_UNKEYED = "_legacy_unkeyed"
 
 # Cross-run backoff for a doc that keeps degrading. Under v2 a transient
 # failure was free — correct in that it must never abandon a doc (#0251), but
@@ -898,10 +900,13 @@ def _migrate_degraded_ledger(ledger: dict, now: float | None = None) -> tuple[di
             entry["retry_after"] = 0.0
             reopened += 1
         entry.setdefault("failures", _degraded_failures(entry))
+        entry.setdefault("last_attempt", now)
         entry.setdefault(
             "retry_after",
             _degraded_retry_after(doc_id, int(entry["failures"]), now),
         )
+        if "change_key" not in entry:
+            entry[_DEGRADED_LEGACY_UNKEYED] = True
     return {"version": _DEGRADED_LEDGER_VERSION, "docs": docs}, reopened
 
 
@@ -981,6 +986,23 @@ def _apply_degraded_ledger(
     docs = ledger.get("docs", {})
     if now is None:
         now = time.time()
+    by_id = {str(r.get("doc_id", "")): r for r in scanned}
+    diff_queued = {
+        str(r.get("doc_id", "")) for r in to_add_or_update
+    }
+    dirty = False
+    for doc_id, entry in docs.items():
+        record = by_id.get(doc_id)
+        if record is not None and entry.get("change_key") is None:
+            if doc_id not in diff_queued:
+                entry["change_key"] = _change_key(record)
+                entry.pop(_DEGRADED_LEGACY_UNKEYED, None)
+                dirty = True
+            elif entry.pop(_DEGRADED_LEGACY_UNKEYED, False):
+                # This migrated doc changed before v3 could record which bytes
+                # failed. Sentinel makes the outcome merge reset old history.
+                entry["change_key"] = _DEGRADED_UNKNOWN_CHANGE_KEY
+                dirty = True
     queued = _include_degraded_docs(scanned, to_add_or_update, ledger, now=now)
     admitted = {str(r.get("doc_id", "")) for r in queued} - {
         str(r.get("doc_id", "")) for r in to_add_or_update
@@ -991,12 +1013,14 @@ def _apply_degraded_ledger(
         # the merge corrects it either way.
         docs[doc_id] = {
             **entry,
+            "last_attempt": now,
             "retry_after": _degraded_retry_after(
                 doc_id, _degraded_failures(entry) + 1, now
             ),
         }
+        dirty = True
     claimed = len(admitted)
-    if admitted and not _save_degraded_ledger(index_root, ledger):
+    if dirty and not _save_degraded_ledger(index_root, ledger):
         # Claim persistence is the admission boundary: if the deferrals are not
         # durable, fail closed so a disk-full/read-only run cannot hand out the
         # same herd again next run.
@@ -1046,6 +1070,14 @@ def _merge_degraded_ledger(
             d if isinstance(d, Degradation) else Degradation(str(d)) for d in noted
         ]
         prev = docs.get(doc_id, {})
+        change_key = (change_keys or {}).get(doc_id, prev.get("change_key"))
+        if (
+            change_key is not None
+            and prev.get("change_key") not in (None, change_key)
+        ):
+            # Failure history belongs to the bytes that produced it. Changed
+            # content gets a fresh schedule and attempts budget.
+            prev = {}
         failures = _degraded_failures(prev) + 1
         entry = {
             "reasons": sorted({d.reason for d in degradations}),
@@ -1054,7 +1086,6 @@ def _merge_degraded_ledger(
             "last_attempt": now,
             "retry_after": _degraded_retry_after(doc_id, failures, now),
         }
-        change_key = (change_keys or {}).get(doc_id, prev.get("change_key"))
         if change_key is not None:
             entry["change_key"] = change_key
         transient_attempts = int(prev.get("transient_attempts", 0))
@@ -1085,10 +1116,15 @@ def _degraded_delta(
         now = time.time()
     before = previous.get("docs", {})
     after = updated.get("docs", {})
+    before_ids = set(before)
+    after_ids = set(after)
     return {
-        "healed": len([d for d in clean_now if d in before]),
-        "still_degraded": len([d for d in degraded_now if d in before]),
-        "newly_degraded": len([d for d in degraded_now if d not in before]),
+        "healed": len(before_ids - after_ids),
+        "still_degraded": len(before_ids & after_ids),
+        "newly_degraded": len(after_ids - before_ids),
+        "retried_still_degraded": len(
+            set(degraded_now) & before_ids & after_ids
+        ),
         "entries": len(after),
         "parked": len([e for e in after.values() if _degraded_state(e, now) == "parked"]),
         "capped": len([e for e in after.values() if _degraded_state(e, now) == "capped"]),
@@ -2874,6 +2910,7 @@ def index_vault_flow(
     to_add_or_update, to_delete = diff_index_task(
         scanned, stored_mtimes, stored_change_hashes
     )
+    degraded_ledger_before = _load_degraded_ledger(index_root)
     # Re-queue the degraded docs whose cross-run backoff has come due, and
     # claim those retries before any work (see _apply_degraded_ledger).
     to_add_or_update, degraded_stats = _apply_degraded_ledger(
@@ -3184,10 +3221,10 @@ def index_vault_flow(
 
     degraded_now = _RUNTIME.get("degraded_now", {})
     clean_now = _RUNTIME.get("degraded_clean", set())
+    updated_ledger = _load_degraded_ledger(index_root)
     if degraded_now or clean_now:
-        previous_ledger = _load_degraded_ledger(index_root)
         updated_ledger = _merge_degraded_ledger(
-            previous_ledger,
+            updated_ledger,
             degraded_now,
             clean_now,
             change_keys={
@@ -3197,32 +3234,31 @@ def index_vault_flow(
             },
         )
         _save_degraded_ledger(index_root, updated_ledger)
-        delta = _degraded_delta(
-            previous_ledger, updated_ledger, degraded_now, clean_now
+    delta = _degraded_delta(
+        degraded_ledger_before, updated_ledger, degraded_now, clean_now
+    )
+    if degraded_ledger_before.get("docs") or updated_ledger.get("docs"):
+        # Emit on parked-only runs too. A static degraded count—or silence while
+        # every entry is parked—hides whether the set converges across runs.
+        logger.warning(
+            "Degraded run summary — healed %d, still degraded %d, newly "
+            "degraded %d; ledger holds %d (%d parked in backoff, %d capped). "
+            "Retried and still degraded this run: %d. Sample: %s",
+            delta["healed"],
+            delta["still_degraded"],
+            delta["newly_degraded"],
+            delta["entries"],
+            delta["parked"],
+            delta["capped"],
+            delta["retried_still_degraded"],
+            sorted(updated_ledger.get("docs", {}))[:10],
         )
-        if degraded_now:
-            # The delta, not a bare count: a set that heals nothing across runs
-            # is the failure mode (#0583) and a static count hides it.
+        if delta["retried_still_degraded"] and not delta["healed"]:
             logger.warning(
-                "%d docs indexed with degradations — healed %d, still degraded "
-                "%d, newly degraded %d; ledger holds %d (%d parked in backoff, "
-                "%d capped). Next re-heal for a still-failing doc in >=%dh: %s",
-                len(degraded_now),
-                delta["healed"],
-                delta["still_degraded"],
-                delta["newly_degraded"],
-                delta["entries"],
-                delta["parked"],
-                delta["capped"],
-                _DEGRADED_RETRY_BASE_SECONDS // 3600,
-                sorted(degraded_now)[:10],
+                "Degraded set is not converging: %d docs degraded again this "
+                "run and none healed — the failure is not clearing on retry",
+                delta["retried_still_degraded"],
             )
-            if delta["still_degraded"] and not delta["healed"]:
-                logger.warning(
-                    "Degraded set is not converging: %d docs degraded again this "
-                    "run and none healed — the failure is not clearing on retry",
-                    delta["still_degraded"],
-                )
 
     skip_now = _RUNTIME.get("skip_now", {})
     skip_clean = _RUNTIME.get("skip_clean", set())

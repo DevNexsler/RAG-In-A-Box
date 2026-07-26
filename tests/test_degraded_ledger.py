@@ -405,6 +405,7 @@ def test_migration_parks_v2_docs_with_a_failure_history(tmp_path):
     }}))
     entry = _load_degraded_ledger(tmp_path)["docs"]["documents::hung"]
     assert entry["failures"] == 6
+    assert entry["last_attempt"] > 0
     assert _degraded_state(entry, time.time()) == "parked"
 
 
@@ -435,6 +436,63 @@ def test_changed_content_is_due_regardless_of_schedule_or_cap():
     assert _degraded_state(parked, 1000.0, "mtime:2.0") == "due"
     capped = _entry(attempts=_DEGRADED_MAX_ATTEMPTS, change_key="mtime:1.0")
     assert _degraded_state(capped, 1e12, "mtime:2.0") == "due"
+
+
+def test_changed_content_starts_fresh_failure_history():
+    from extractors import Degradation
+
+    previous = _entry(
+        attempts=_DEGRADED_MAX_ATTEMPTS,
+        failures=8,
+        transient_attempts=3,
+        change_key="mtime:1.0",
+    )
+    merged = _merge_degraded_ledger(
+        {"docs": {"a": previous}},
+        {"a": [Degradation("ocr_describe_failed", transient=True)]},
+        set(),
+        change_keys={"a": "mtime:2.0"},
+        now=2000.0,
+    )
+    entry = merged["docs"]["a"]
+
+    assert entry["change_key"] == "mtime:2.0"
+    assert entry["attempts"] == 0
+    assert entry["transient_attempts"] == 1
+    assert entry["failures"] == 1
+    assert _degraded_state(entry, 2000.0, "mtime:2.0") == "parked"
+
+
+def test_changed_content_resets_migrated_failure_history(tmp_path):
+    from PIL import Image
+
+    img_path = tmp_path / "photo.png"
+    Image.new("RGB", (8, 8), "white").save(img_path)
+    doc_id = "documents::legacy"
+    (tmp_path / "degraded_docs.json").write_text(json.dumps({
+        "version": 2,
+        "docs": {
+            doc_id: {
+                "reasons": ["ocr_describe_failed"],
+                "attempts": _DEGRADED_MAX_ATTEMPTS,
+                "transient_attempts": 3,
+            },
+        },
+    }))
+    scanned = [{"doc_id": doc_id, "mtime": 2.0, "path": img_path}]
+    calls: list = []
+
+    _, ledger, _ = _simulate_run(
+        tmp_path, scanned, scanned, _hung_vision_provider(calls), 2000.0
+    )
+
+    entry = ledger["docs"][doc_id]
+    assert calls == [str(img_path)]
+    assert entry["change_key"] == "mtime:2.0"
+    assert entry["attempts"] == 0
+    assert entry["transient_attempts"] == 1
+    assert entry["failures"] == 1
+    assert _degraded_state(entry, 2000.0, "mtime:2.0") == "parked"
 
 
 def test_backoff_grows_with_consecutive_failures_and_caps():
@@ -498,6 +556,7 @@ def test_apply_requeues_due_docs_and_claims_the_retry(tmp_path):
     # the same doc back to the next run (#0480).
     persisted = _load_degraded_ledger(tmp_path)["docs"]["documents::a"]
     assert persisted["retry_after"] > due_at
+    assert persisted["last_attempt"] == due_at
     again, _ = _apply_degraded_ledger(tmp_path, scanned, [], now=due_at)
     assert again == []
 
@@ -512,6 +571,9 @@ def test_apply_reports_parked_entries_without_requeueing(tmp_path):
     queued, stats = _apply_degraded_ledger(tmp_path, scanned, [], now=1000.0)
     assert queued == []
     assert stats == {"entries": 2, "requeued": 0, "parked": 1, "capped": 1}
+    persisted = _load_degraded_ledger(tmp_path)["docs"]
+    assert persisted["documents::a"]["change_key"] == "mtime:1.0"
+    assert persisted["documents::dead"]["change_key"] == "mtime:1.0"
 
 
 def test_apply_fails_closed_when_the_claim_cannot_be_persisted(tmp_path, monkeypatch):
@@ -563,4 +625,13 @@ def test_delta_makes_a_non_converging_set_visible():
     delta = _degraded_delta(previous, updated, degraded_now, set(), now=0.0)
     assert delta["healed"] == 0
     assert delta["still_degraded"] == 55
+    assert delta["newly_degraded"] == 0
+
+
+def test_delta_counts_parked_docs_as_still_degraded():
+    previous = {"docs": {"a": _entry()}}
+    delta = _degraded_delta(previous, previous, {}, set(), now=0.0)
+
+    assert delta["healed"] == 0
+    assert delta["still_degraded"] == 1
     assert delta["newly_degraded"] == 0

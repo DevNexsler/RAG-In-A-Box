@@ -1728,7 +1728,9 @@ def test_large_degraded_requeue_does_not_trigger_shadow_rebuild(tmp_path):
     active_store.promote_table.assert_not_called()
 
 
-def _run_flow_over_unchanged_vault(tmp_path, index_root, stored):
+def _run_flow_over_unchanged_vault(
+    tmp_path, index_root, stored, *, return_logger=False
+):
     """Run index_vault_flow over a vault whose files are all unchanged, and
     return the doc ids handed to _process_docs."""
     from sources.base import SourceRecord
@@ -1781,7 +1783,8 @@ def _run_flow_over_unchanged_vault(tmp_path, index_root, stored):
         processed.append([d["doc_id"] for d in docs])
         return []
 
-    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+    run_logger = MagicMock()
+    with patch("flow_index_vault.get_run_logger", return_value=run_logger):
         with patch("flow_index_vault.load_config", return_value=config):
             with patch("flow_index_vault.open_store_with_recovery", return_value=active_store):
                 with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
@@ -1794,7 +1797,8 @@ def _run_flow_over_unchanged_vault(tmp_path, index_root, stored):
                                             with patch("flow_index_vault.index_stats_task"):
                                                 with patch("flow_index_vault.write_index_metadata_task"):
                                                     index_vault_flow.fn("dummy.yaml")
-    return processed[0] if processed else []
+    result = processed[0] if processed else []
+    return (result, run_logger) if return_logger else result
 
 
 def test_flow_requeues_a_due_degraded_doc_and_claims_the_retry(tmp_path):
@@ -1834,6 +1838,32 @@ def test_flow_does_not_requeue_a_parked_degraded_doc(tmp_path):
     }}})
 
     assert _run_flow_over_unchanged_vault(tmp_path, index_root, stored) == []
+
+
+def test_flow_reports_convergence_when_every_degraded_doc_is_parked(tmp_path):
+    from flow_index_vault import _DEGRADED_RETRY_BASE_SECONDS, _save_degraded_ledger
+
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True, exist_ok=True)
+    stored = {"documents::img-1": 1.0}
+    _save_degraded_ledger(index_root, {"version": 3, "docs": {"documents::img-1": {
+        "reasons": ["ocr_describe_failed"], "attempts": 0, "failures": 1,
+        "last_attempt": time.time(),
+        "retry_after": time.time() + _DEGRADED_RETRY_BASE_SECONDS,
+        "change_key": "mtime:1.0",
+    }}})
+
+    processed, run_logger = _run_flow_over_unchanged_vault(
+        tmp_path, index_root, stored, return_logger=True
+    )
+
+    assert processed == []
+    summaries = [
+        call for call in run_logger.warning.call_args_list
+        if call.args and str(call.args[0]).startswith("Degraded run summary")
+    ]
+    assert summaries
+    assert summaries[-1].args[1:4] == (0, 1, 0)
 
 
 def test_index_flow_syncs_folder_taxonomy_from_sources(tmp_path):

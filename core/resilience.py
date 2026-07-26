@@ -107,19 +107,32 @@ def call_with_retry(
             if not classify(exc) or i >= attempts - 1:
                 raise
             elapsed = monotonic() - started
-            if budget_seconds is not None and elapsed >= budget_seconds:
+            delay = backoff[min(i, len(backoff) - 1)] if backoff else 0.0
+            if (
+                budget_seconds is not None
+                and elapsed + delay >= budget_seconds
+            ):
                 logger.warning(
                     "%s: attempt %d/%d failed transiently (%s: %s) — retry budget "
-                    "spent (%.0fs of %.0fs), not retrying",
+                    "spent by backoff (%.0fs elapsed + %.0fs delay of %.0fs), "
+                    "not retrying",
                     label, i + 1, attempts, type(exc).__name__, str(exc)[:160],
-                    elapsed, budget_seconds,
+                    elapsed, delay, budget_seconds,
                 )
                 raise
-            delay = backoff[min(i, len(backoff) - 1)] if backoff else 0.0
             logger.warning(
                 "%s: attempt %d/%d failed transiently (%s: %s) — retrying in %.0fs",
                 label, i + 1, attempts, type(exc).__name__, str(exc)[:160], delay,
             )
             sleep(delay)
+            if (
+                budget_seconds is not None
+                and monotonic() - started >= budget_seconds
+            ):
+                logger.warning(
+                    "%s: retry budget expired during backoff, not retrying",
+                    label,
+                )
+                raise
     assert last is not None  # pragma: no cover — loop always runs >=1
     raise last

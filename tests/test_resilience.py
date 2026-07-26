@@ -103,6 +103,32 @@ def test_budget_still_allows_fast_transient_retries():
     assert calls["n"] == 3
 
 
+def test_budget_does_not_start_retry_after_backoff_crosses_deadline():
+    calls = {"n": 0}
+    clock = {"t": 0.0}
+
+    def fn():
+        calls["n"] += 1
+        clock["t"] += 5.0 if calls["n"] == 1 else 300.0
+        raise httpx.ReadTimeout("timed out")
+
+    def sleep(delay):
+        clock["t"] += delay
+
+    with pytest.raises(httpx.ReadTimeout):
+        call_with_retry(
+            fn,
+            attempts=3,
+            backoff=(6.0,),
+            budget_seconds=10.0,
+            sleep=sleep,
+            monotonic=lambda: clock["t"],
+        )
+
+    assert calls["n"] == 1
+    assert clock["t"] == 5.0
+
+
 def test_no_budget_by_default_keeps_the_full_ladder():
     calls = {"n": 0}
 
