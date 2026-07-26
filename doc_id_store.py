@@ -127,6 +127,7 @@ class DocIDStore:
     MOVED = "moved"                  # file moved, rel_path updated
     DELETED = "deleted"              # file removed from vault
     COLLISION = "collision"          # duplicate ID detected, re-assigned
+    RETOKENIZED = "retokenized"      # rejected claim replaced by a fresh ID
     RENAME_FAILED = "rename_failed"  # OS refused the rename
     MIGRATED = "migrated"            # legacy path-based ID migrated
 

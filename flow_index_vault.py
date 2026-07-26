@@ -415,6 +415,46 @@ def _file_matches_stored_identity(
         return False
 
 
+class _SweepLedger:
+    """Per-scan tally of contested filename tokens and how they were resolved.
+
+    A stream of `ID collision` warnings cannot distinguish a sweep that cleared
+    62 claims from one re-deciding the same 62 for the fourth time — which is
+    how 62 / 0 / 43 / 117 across four scans of one unchanged vault read as
+    progress (#0545). Every scan therefore states what it saw and what it
+    actually changed, and the invariant ``contested == retokenized + remaining``
+    holds: a claim is either cleared off the filename or still stamped on it.
+
+    ``remaining`` is the number that must fall to zero for the sweep to have
+    converged. It stays positive for deposit-owned paths, whose filenames an
+    external producer owns and the scan may never rewrite — real, standing
+    residue that must be visible rather than silently counted as resolved.
+    """
+
+    __slots__ = ("contested", "retokenized", "remaining")
+
+    def __init__(self) -> None:
+        self.contested = 0
+        self.retokenized = 0
+        self.remaining = 0
+
+    def cleared(self) -> None:
+        """A rejected claim whose file now carries its fresh ID on disk."""
+        self.contested += 1
+        self.retokenized += 1
+
+    def unresolved(self) -> None:
+        """A rejected claim whose stale token survives in the filename."""
+        self.contested += 1
+        self.remaining += 1
+
+    def log_summary(self, logger) -> None:
+        logger.info(
+            "Doc-ID sweep: %d contested / %d re-tokenized / %d remaining",
+            self.contested, self.retokenized, self.remaining,
+        )
+
+
 def scan_filesystem_records(
     vault_root: str | Path,
     include: list[str],
@@ -454,19 +494,27 @@ def scan_filesystem_records(
     adopt_unknown_ids = doc_id_store is not None and doc_id_store.count() == 0
 
     records = []
+    ledger = _SweepLedger()
     # Track IDs seen this scan to detect collisions (two files with same @XXXXX@)
     seen_ids: dict[str, str] = {}  # doc_id → rel_path of first file seen
 
     # os.walk with followlinks=True so symlinked directories (e.g. NAS mounts) are traversed.
     # Path.rglob does not follow symlinks in Python 3.13+.
     # Track visited real paths to guard against symlink cycles.
+    #
+    # Traversal is sorted, because walk order decides identity: it picks which
+    # file wins a contested token and the order fresh IDs are drawn from the
+    # counter. os.walk yields whatever the filesystem hands back, so two scans
+    # of an unchanged vault could adjudicate it differently and each blame the
+    # other's result (#0545). Sorting makes a rescan reproduce its predecessor.
     visited: set[str] = set()
-    for dirpath, _dirnames, filenames in os.walk(root, followlinks=True):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         real = os.path.realpath(dirpath)
         if real in visited:
             continue
         visited.add(real)
-        for fname in filenames:
+        dirnames.sort()
+        for fname in sorted(filenames):
             full_path = Path(dirpath) / fname
             rel_str = str(full_path.relative_to(root)).replace("\\", "/")
             if _matches_any(rel_str, exclude):
@@ -495,13 +543,16 @@ def scan_filesystem_records(
                 continue
 
             # --- Persistent doc_id assignment ---
-            existing_id = extract_id_from_filename(fname)
+            claimed_token = extract_id_from_filename(fname)
+            existing_id = claimed_token
+            # A path that already has a registered identity was adjudicated on
+            # an earlier sweep: deposit-owned (no-rename) and rename-failed
+            # files keep their stale token in the filename forever, and resolve
+            # by path below. Re-logging the same collision every sweep would
+            # bury the audit log — but the claim is still counted, so the
+            # ledger keeps reporting the standing residue.
+            path_adjudicated = False
             if existing_id and doc_id_store:
-                # A path that already has a registered identity was adjudicated
-                # on an earlier sweep: deposit-owned (no-rename) and
-                # rename-failed files keep their stale token in the filename
-                # forever, and resolve by path below. Re-logging the same
-                # collision every sweep would bury the audit log.
                 path_adjudicated = doc_id_store.lookup_id(rel_str) is not None
                 # Check for retired ID: was this ID previously deleted?
                 # Copy-pasted files may carry a stale @XXXXX@ from a deleted doc.
@@ -597,6 +648,11 @@ def scan_filesystem_records(
                         if stored_path != rel_str:
                             doc_id_store.register(doc_id, rel_str)
 
+            # The token was rejected above: the file claimed an identity it is
+            # not entitled to, and gets a fresh one below. Whether that fresh
+            # ID also reaches the filename decides cleared vs. unresolved.
+            claim_rejected = claimed_token is not None and existing_id is None
+
             if existing_id is None and doc_id_store and any(
                 rel_str.startswith(p) for p in norm_prefixes
             ):
@@ -607,6 +663,24 @@ def scan_filesystem_records(
                     doc_id = doc_id_store.next_id()
                     doc_id_store.register(doc_id, rel_str)
                 seen_ids[doc_id] = rel_str
+                if claim_rejected:
+                    # The producer owns this filename, so the contested token
+                    # stays on disk no matter how often the sweep runs. Say so
+                    # once, and keep counting it every scan.
+                    if not path_adjudicated:
+                        logger.warning(
+                            "Claim %s on deposit-owned %s cannot be cleared from "
+                            "the filename — identity is %s in the registry",
+                            claimed_token, rel_str, doc_id,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.RETOKENIZED, doc_id, rel_str,
+                            detail=(
+                                f"replaces contested claim {claimed_token}; "
+                                "filename is deposit-owned and unchanged"
+                            ),
+                        )
+                    ledger.unresolved()
             elif existing_id is None and doc_id_store:
                 # No ID in filename (or collision stripped it) — assign one and rename
                 doc_id = doc_id_store.next_id()
@@ -627,11 +701,27 @@ def scan_filesystem_records(
                     doc_id = rel_str
                     doc_id_store.register(doc_id, rel_str)
                     seen_ids[doc_id] = rel_str
+                    if claim_rejected:
+                        ledger.unresolved()
                 else:
                     full_path = new_full_path
                     rel_str = str(full_path.relative_to(root)).replace("\\", "/")
                     doc_id_store.register(doc_id, rel_str)
                     seen_ids[doc_id] = rel_str
+                    if claim_rejected:
+                        # Record which ID actually replaced the rejected claim.
+                        # The warnings above say only what the scan *will* do;
+                        # without this an operator cannot tell a resolved claim
+                        # from one re-decided every run (#0545).
+                        logger.warning(
+                            "Re-tokenized %s: rejected claim %s replaced by fresh ID %s",
+                            rel_str, claimed_token, doc_id,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.RETOKENIZED, doc_id, rel_str,
+                            detail=f"replaces contested claim {claimed_token}",
+                        )
+                        ledger.cleared()
             elif not doc_id_store:
                 # Fallback: no doc_id_store (shouldn't happen in normal flow)
                 doc_id = rel_str
@@ -647,6 +737,8 @@ def scan_filesystem_records(
                 "size": stat.st_size,
                 "ext": full_path.suffix.lower().lstrip(".") or "bin",
             })
+
+    ledger.log_summary(logger)
     return records
 
 
