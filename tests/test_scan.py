@@ -2073,3 +2073,19 @@ def test_write_index_metadata_counts_warnings_separately(tmp_path):
         "fts_rebuild_failed": 1,
     }
     assert meta["enrichment_failed_count"] == 2
+
+
+def test_write_index_metadata_reports_incomplete_doc_count(tmp_path):
+    """Docs indexed without their primary content must be visible in the run
+    summary, not only by tracing individual doc ids through the flow log."""
+    write_index_metadata_task.fn(
+        tmp_path,
+        doc_count=57,
+        chunk_count=57,
+        docs_indexed_incomplete=57,
+    )
+
+    import json
+
+    meta = json.loads((tmp_path / "index_metadata.json").read_text())
+    assert meta["docs_indexed_incomplete"] == 57

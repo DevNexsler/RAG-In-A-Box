@@ -18,6 +18,7 @@ from core.artifacts import is_communication_sidecar
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
 from core.tracing import get_tracer
+from extractors import CONTENT_COMPLETE
 from lancedb_store import LanceDBStore, open_store_with_recovery
 from index_run_supervisor import IndexRunSupervisor, index_log_paths
 from providers.embed import build_embed_provider
@@ -476,6 +477,11 @@ def _slim_hit_to_dict(h: SearchHit) -> dict:
         val = extra.get(meta_key)
         if val not in (None, ""):
             d[out_key] = str(val)
+    # Surface incomplete extraction so a hit is never read as a fully-extracted
+    # document (#0584). Omitted for the complete majority to keep slim slim.
+    content_status = str(extra.get("content_status") or "")
+    if content_status and content_status != CONTENT_COMPLETE:
+        d["content_status"] = content_status
     # Drop identity echoes: comm rows carry a title/rel_path that merely
     # repeats the message id already present in doc_id/source_id (~15%/hit).
     if d.get("rel_path") and h.doc_id.endswith(d["rel_path"]):

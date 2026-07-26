@@ -89,26 +89,62 @@ class PageText:
     was_ocr: bool = False
 
 
+# Provenance of a document's primary content, recorded on every indexed chunk
+# so a search consumer can tell "image described" from "image never read".
+CONTENT_COMPLETE = "complete"   # nothing failed
+CONTENT_PARTIAL = "partial"     # something failed, but content was still obtained
+CONTENT_MISSING = "missing"     # something failed and no content was obtained
+
+
 @dataclass
 class ExtractionResult:
     """Result of extracting text from a document."""
     pages: list[PageText] = field(default_factory=list)
     full_text: str = ""
     frontmatter: dict = field(default_factory=dict)
+    #: False when the extractor's content path yielded nothing, so any text in
+    #: ``full_text`` describes the *file* (EXIF, dimensions, page count) rather
+    #: than its contents. Extractors whose content path can fail set this; the
+    #: rest are content-only and leave the default.
+    primary_content: bool = True
+
+    def content_status(self, failures: list[str]) -> str:
+        """Classify what actually landed, given this document's extraction
+        failures (see ``collect_degradations``).
+
+        A degraded image that still carries its EXIF header is ``missing``, not
+        ``complete``: the header is not the photo. A PDF whose page 6 OCR failed
+        but whose other pages read fine is ``partial``.
+        """
+        if not failures:
+            return CONTENT_COMPLETE
+        return CONTENT_PARTIAL if self.primary_content else CONTENT_MISSING
 
     @staticmethod
     def from_pages(
-        pages: list[PageText], frontmatter: dict | None = None,
+        pages: list[PageText],
+        frontmatter: dict | None = None,
+        primary_content: bool = True,
     ) -> "ExtractionResult":
         full = "\n\n".join(p.text for p in pages if p.text.strip())
-        return ExtractionResult(pages=pages, full_text=full, frontmatter=frontmatter or {})
+        return ExtractionResult(
+            pages=pages,
+            full_text=full,
+            frontmatter=frontmatter or {},
+            primary_content=primary_content,
+        )
 
     @staticmethod
-    def from_text(text: str, frontmatter: dict | None = None) -> "ExtractionResult":
+    def from_text(
+        text: str,
+        frontmatter: dict | None = None,
+        primary_content: bool = True,
+    ) -> "ExtractionResult":
         return ExtractionResult(
             pages=[PageText(page=0, text=text)],
             full_text=text,
             frontmatter=frontmatter or {},
+            primary_content=primary_content,
         )
 
 
@@ -345,6 +381,10 @@ def extract_pdf(
 
     doc.close()
 
+    # Measured before the metadata header is folded in, so a PDF that yielded
+    # no page text is not made to look content-bearing by its own title block.
+    primary_content = any(p.text.strip() for p in pages)
+
     # Prepend metadata header to first page content so it gets embedded/searchable
     meta_header = _format_pdf_metadata_header(pdf_meta)
     if meta_header and pages:
@@ -354,7 +394,9 @@ def extract_pdf(
             was_ocr=pages[0].was_ocr,
         )
 
-    return ExtractionResult.from_pages(pages, frontmatter=pdf_meta)
+    return ExtractionResult.from_pages(
+        pages, frontmatter=pdf_meta, primary_content=primary_content
+    )
 
 
 def _ocr_count(pages: list[PageText]) -> int:
@@ -515,7 +557,7 @@ def extract_image(
 
     if ocr_provider is None:
         header = _format_image_metadata_header(meta)
-        return ExtractionResult.from_text(header, frontmatter=fm)
+        return ExtractionResult.from_text(header, frontmatter=fm, primary_content=False)
 
     try:
         vision_text = ocr_provider.describe(str(file_path))
@@ -526,7 +568,11 @@ def extract_image(
     header = _format_image_metadata_header(meta)
     parts = [p for p in [header, vision_text] if p.strip()]
     full_text = "\n\n".join(parts)
-    return ExtractionResult.from_text(full_text, frontmatter=fm)
+    # The EXIF header alone is not content: without vision text this document
+    # says nothing about what the image shows.
+    return ExtractionResult.from_text(
+        full_text, frontmatter=fm, primary_content=bool(vision_text.strip())
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +698,9 @@ def extract_audio(
         logger.warning("Audio extraction failed for %s: %s", file_path, e)
         note_degradation("audio_extract_failed", transient=is_transient(e))
         transcript = ""
-    return ExtractionResult.from_text(transcript, frontmatter=fm)
+    return ExtractionResult.from_text(
+        transcript, frontmatter=fm, primary_content=bool(transcript.strip())
+    )
 
 
 def extract_video(
@@ -686,7 +734,9 @@ def extract_video(
         # non-transient) -> caps at the degraded-ledger max then stops.
         note_degradation("video_extract_failed", transient=is_transient(e))
         notes = ""
-    return ExtractionResult.from_text(notes, frontmatter=fm)
+    return ExtractionResult.from_text(
+        notes, frontmatter=fm, primary_content=bool(notes.strip())
+    )
 
 
 # ---------------------------------------------------------------------------
