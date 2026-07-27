@@ -23,6 +23,8 @@ from typing import Callable, TypeVar
 
 import httpx
 
+from core.logging_setup import MAX_ERROR_CHARS, collapse
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -94,9 +96,18 @@ def call_with_retry(
             if not classify(exc) or i >= attempts - 1:
                 raise
             delay = backoff[min(i, len(backoff) - 1)] if backoff else 0.0
+            # #0546: a provider error's str() can contain a newline (litellm's
+            # RateLimitError ends with "\nFor more information check: <mdn url>").
+            # collapse() flattens it BEFORE truncating, so one retry warning is one
+            # physical line; dedup_key lets RepeatCollapseFilter fold a 429 storm
+            # into one line per window with a count instead of one line per attempt.
             logger.warning(
                 "%s: attempt %d/%d failed transiently (%s: %s) — retrying in %.0fs",
-                label, i + 1, attempts, type(exc).__name__, str(exc)[:160], delay,
+                label, i + 1, attempts, type(exc).__name__,
+                collapse(exc, MAX_ERROR_CHARS), delay,
+                extra={"dedup_key": (
+                    "core.resilience.retry", label, type(exc).__name__,
+                )},
             )
             sleep(delay)
     assert last is not None  # pragma: no cover — loop always runs >=1

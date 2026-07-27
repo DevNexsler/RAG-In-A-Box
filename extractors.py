@@ -627,7 +627,15 @@ def extract_audio(
     file_path: str | Path,
     media_provider: Optional[MediaProvider] = None,
 ) -> ExtractionResult:
-    """Extract searchable text from an audio file."""
+    """Extract searchable text from an audio file.
+
+    ffmpeg is deliberately NOT in the image (#0546): transcription is a cloud call
+    that uploads the file as-is, so nothing here decodes audio locally. The
+    ``Couldn't find ffmpeg or avconv`` RuntimeWarning comes from pydub, imported by
+    markitdown — whose own audio converter we never reach, because audio extensions
+    route here and markitdown only handles docx/pptx/html/epub/rtf/csv. The warning
+    is now a normal timestamped log record via logging.captureWarnings.
+    """
     fm = _media_frontmatter(file_path, "audio")
     if media_provider is None:
         return ExtractionResult.from_text("", frontmatter=fm)
