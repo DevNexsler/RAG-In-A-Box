@@ -519,7 +519,10 @@ def _build_store_and_embed(config_path: str = "config.yaml"):
 
 _cache: tuple | None = None
 _cache_index_signature: tuple[int, int] | None = None
-_cache_identity: int | None = None
+# The cache tuple ITSELF, not its id(): a freed tuple's address can be handed to
+# the next one, and then a swapped-in cache reads as unchanged. Holding the object
+# both keeps the comparison honest and keeps the address from being recycled.
+_cache_identity: tuple | None = None
 _DEEP_HEALTH_CACHE_TTL_SECONDS = 600
 _DEEP_HEALTH_SNAPSHOT = "index_health.json"
 _deep_health_cache: dict | None = None
@@ -588,16 +591,16 @@ def _get_deps(config_path: str = "config.yaml"):
     if _cache is None:
         _cache = _build_store_and_embed(config_path)
         _cache_index_signature = _index_metadata_signature(_cache[2])
-        _cache_identity = id(_cache)
+        _cache_identity = _cache
     else:
         current_signature = _index_metadata_signature(_cache[2])
-        if _cache_identity != id(_cache):
+        if _cache_identity is not _cache:
             _cache_index_signature = current_signature
-            _cache_identity = id(_cache)
+            _cache_identity = _cache
         elif current_signature != _cache_index_signature:
             _cache = _build_store_and_embed(config_path)
             _cache_index_signature = _index_metadata_signature(_cache[2])
-            _cache_identity = id(_cache)
+            _cache_identity = _cache
     return _cache[0], _cache[1], _cache[2]
 
 
