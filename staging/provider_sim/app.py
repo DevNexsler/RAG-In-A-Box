@@ -172,6 +172,17 @@ def _fault_response(fault: str) -> Response | None:
                 },
             }
         )
+    if fault == "hangup":
+        # Every other fault here is an ANSWER the provider gave. This one models
+        # the provider not being there at all — a container recreate mid-flight
+        # (#0619) — by cutting the connection after the headers, with no body.
+        # The client raises httpx.RemoteProtocolError, the connection-level
+        # failure shape production sees as [Errno 111] Connection refused.
+        async def _cut():
+            raise RuntimeError("simulated connection hangup")
+            yield b""  # unreachable; makes _cut an async generator
+
+        return StreamingResponse(_cut(), media_type="application/json")
     return None  # "timeout" delays, then falls through to normal handling
 
 
@@ -379,7 +390,7 @@ async def admin_reset() -> dict:
     return {"ok": True}
 
 
-_KNOWN_FAULTS = {"429", "timeout", "garbage", "reasoning_only"}
+_KNOWN_FAULTS = {"429", "timeout", "garbage", "reasoning_only", "hangup"}
 
 
 @app.post("/admin/fault")
