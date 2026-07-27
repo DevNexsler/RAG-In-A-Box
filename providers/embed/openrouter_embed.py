@@ -100,6 +100,7 @@ class OpenRouterEmbedProvider(EmbedProvider):
 
         return call_with_retry(
             _do, attempts=MAX_RETRIES, backoff=RETRY_BACKOFF, label="openrouter-embed",
+            circuit_key=self._base_url,
         )
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:

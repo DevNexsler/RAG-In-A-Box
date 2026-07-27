@@ -1426,6 +1426,36 @@ def _reset_invalid_dedupe_cohort(
     return affected
 
 
+def _note_provider_unavailable(doc_id: str) -> None:
+    """Record that this doc kept its previous entry because a provider was down,
+    so the run can report the outage instead of hiding it in per-doc WARNINGs."""
+    # Same lock as the ledgers: the flow processes documents concurrently.
+    # Absent outside a flow run (targeted single-doc indexing is single-threaded).
+    with _RUNTIME.get("degraded_lock") or nullcontext():
+        _RUNTIME.setdefault("provider_unavailable", set()).add(doc_id)
+
+
+def _keep_indexed_version_on_outage(doc_id: str, store: LanceDBStore, logger) -> bool:
+    """True when the pending write must be dropped in favor of the indexed row.
+
+    The rule is about transience, not about which provider failed: never replace
+    content with the ABSENCE of content because the provider was down. The doc
+    stays in the degraded ledger (transient-only degradations do not charge its
+    attempts cap), so the next run rewrites it from a healthy provider.
+    """
+    transient = [d for d in collect_degradations() if d.transient]
+    if not transient or not store.contains_doc_id(doc_id):
+        return False
+    _note_provider_unavailable(doc_id)
+    logger.warning(
+        "Provider unavailable (%s) — keeping the indexed version of %s "
+        "instead of overwriting it with a degraded one",
+        ", ".join(sorted({d.reason for d in transient})),
+        doc_id,
+    )
+    return True
+
+
 def _process_doc_task(
     doc: dict,
     *,
@@ -1750,6 +1780,16 @@ def _process_doc_task(
                 doc_meta.update(enrichment)
             else:
                 doc_meta.update(empty_enrichment())
+
+        # --- Provider-outage write guard ---
+        # A transient degradation means a provider was unreachable, not that the
+        # document changed: the text/enrichment it would have produced is missing
+        # for reasons that say nothing about this doc. Writing anyway replaces a
+        # good row with a poorer one (#0619). Keep what is indexed and let the
+        # degraded ledger re-process it; a doc that has never been indexed is
+        # still written, because a partial row beats no row.
+        if _keep_indexed_version_on_outage(doc_id, store, logger):
+            return
 
         # --- Importance: frontmatter overrides LLM, track source ---
         fm_importance = fm.get("importance")
@@ -2649,6 +2689,7 @@ def index_vault_flow(
     )
     _RUNTIME["communication_context_provider"] = communication_context_provider
     _RUNTIME["degraded_lock"] = threading.Lock()
+    _RUNTIME["provider_unavailable"] = set()
     _RUNTIME["degraded_now"] = {}
     _RUNTIME["degraded_clean"] = set()
     _RUNTIME["skip_now"] = {}
@@ -2992,6 +3033,19 @@ def index_vault_flow(
                 "%d docs indexed with degradations (will self-heal next run): %s",
                 len(degraded_now), sorted(degraded_now)[:10],
             )
+
+    # An outage inside a run must be visible in the run summary, not only by
+    # grepping per-doc WARNINGs — these docs were NOT re-indexed this run.
+    provider_unavailable = _RUNTIME.get("provider_unavailable", set())
+    if provider_unavailable:
+        logger.warning(
+            "provider_unavailable_docs=%d — kept their previous index entry "
+            "(provider unreachable, will self-heal next run): %s",
+            len(provider_unavailable), sorted(provider_unavailable)[:10],
+        )
+        _RUNTIME.setdefault("_warnings", []).append(
+            f"provider_unavailable_docs:{len(provider_unavailable)}"
+        )
 
     skip_now = _RUNTIME.get("skip_now", {})
     skip_clean = _RUNTIME.get("skip_clean", set())
