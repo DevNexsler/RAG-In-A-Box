@@ -18,9 +18,10 @@ from extractors import (
 )
 from flow_index_vault import (
     _DEGRADED_MAX_ATTEMPTS,
-    _include_degraded_docs,
+    _DEGRADED_MAX_UNRESOLVED_RUNS,
     _load_degraded_ledger,
     _merge_degraded_ledger,
+    _reconcile_degraded_docs,
     _save_degraded_ledger,
 )
 
@@ -86,10 +87,22 @@ def test_collector_is_thread_isolated():
         assert results[f"t{i}"] == [Degradation(f"t{i}")]
 
 
-# --- re-include logic ---
+# --- re-include / reconciliation logic ---
 
 def _scanned(*doc_ids):
     return [{"doc_id": d, "mtime": 1.0} for d in doc_ids]
+
+
+def _reconcile(scanned, queued, ledger, sources=("documents",), full_scan=True):
+    """Reconcile against a full scan of `sources` by default."""
+    return _reconcile_degraded_docs(
+        scanned, queued, ledger, scanned_sources=set(sources), full_scan=full_scan
+    )
+
+
+def _include_degraded_docs(scanned, queued, ledger, **kw):
+    """The re-queue half of reconciliation — what the old reader returned."""
+    return _reconcile(scanned, queued, ledger, **kw)[0]
 
 
 def test_include_degraded_requeues_ledger_docs():
@@ -115,6 +128,99 @@ def test_include_degraded_ignores_docs_no_longer_scanned():
     ledger = {"docs": {"documents::gone": {"reasons": ["x"], "attempts": 1}}}
     out = _include_degraded_docs(_scanned("documents::other"), [], ledger)
     assert out == []
+
+
+# --- total reconciliation (ticket #0618) ---
+
+def test_reconcile_partitions_every_entry_exactly_once():
+    # The ledger's size must equal the sum of the buckets — that identity is
+    # what stops an entry from vanishing into the gap between the ledger and
+    # the 'Re-queued N' count.
+    ledger = {"docs": {
+        "documents::queued": {"reasons": ["x"], "attempts": 1},
+        "documents::requeue": {"reasons": ["x"], "attempts": 1},
+        "documents::capped": {"reasons": ["x"], "attempts": _DEGRADED_MAX_ATTEMPTS},
+        "documents::gone": {"reasons": ["x"], "attempts": 1},
+        "comm_messages::other": {"reasons": ["x"], "attempts": 1},
+    }}
+    queued = [{"doc_id": "documents::queued", "mtime": 2.0}]
+    _, _, report = _reconcile(
+        _scanned("documents::queued", "documents::requeue"), queued, ledger,
+        sources=("documents",), full_scan=False,
+    )
+    assert report["already_queued"] == ["documents::queued"]
+    assert report["requeued"] == ["documents::requeue"]
+    assert report["capped"] == ["documents::capped"]
+    assert report["unresolved"] == ["documents::gone"]
+    assert report["source_not_scanned"] == ["comm_messages::other"]
+    assert report["total"] == 5
+    assert report["total"] == sum(
+        len(report[b]) for b in
+        ("already_queued", "requeued", "capped", "unresolved", "source_not_scanned")
+    )
+
+
+def test_reconcile_ages_entry_missing_from_its_own_scanned_source():
+    ledger = {"docs": {"documents::gone": {"reasons": ["x"], "attempts": 1}}}
+    _, ledger, report = _reconcile(_scanned("documents::other"), [], ledger)
+    assert report["unresolved"] == ["documents::gone"]
+    assert ledger["docs"]["documents::gone"]["unresolved_runs"] == 1
+    assert report["terminal"] == {}
+
+
+def test_reconcile_escalates_entry_stuck_unresolved_to_terminal():
+    # Ticket #0618: 16 comm_messages entries sat at attempts=1 for eight weeks
+    # because their source rows left the configured query. Ageing bounds that.
+    ledger = {"docs": {"comm_messages::dup": {"reasons": ["enrichment_failed"], "attempts": 1}}}
+    for _ in range(_DEGRADED_MAX_UNRESOLVED_RUNS):
+        _, ledger, report = _reconcile(
+            _scanned("comm_messages::real"), [], ledger, sources=("comm_messages",)
+        )
+    assert "comm_messages::dup" not in ledger["docs"], "must not linger in the retry ledger"
+    assert report["terminal"]["comm_messages::dup"]["unresolved_runs"] == (
+        _DEGRADED_MAX_UNRESOLVED_RUNS
+    )
+    assert report["terminal"]["comm_messages::dup"]["reasons"] == ["enrichment_failed"]
+
+
+def test_reconcile_resolving_entry_resets_the_unresolved_streak():
+    ledger = {"docs": {"documents::flaky": {
+        "reasons": ["x"], "attempts": 1, "unresolved_runs": _DEGRADED_MAX_UNRESOLVED_RUNS - 1,
+    }}}
+    _, ledger, report = _reconcile(_scanned("documents::flaky"), [], ledger)
+    assert report["requeued"] == ["documents::flaky"]
+    assert "unresolved_runs" not in ledger["docs"]["documents::flaky"]
+
+
+def test_reconcile_source_scoped_run_never_ages_another_source():
+    # A source-scoped index is no evidence about the sources it did not scan.
+    ledger = {"docs": {"documents::img1": {"reasons": ["x"], "attempts": 1}}}
+    for _ in range(_DEGRADED_MAX_UNRESOLVED_RUNS + 2):
+        _, ledger, report = _reconcile(
+            _scanned("comm_messages::m"), [], ledger,
+            sources=("comm_messages",), full_scan=False,
+        )
+    assert report["source_not_scanned"] == ["documents::img1"]
+    assert ledger["docs"]["documents::img1"] == {"reasons": ["x"], "attempts": 1}
+
+
+def test_reconcile_full_scan_ages_entry_from_a_removed_source():
+    # A namespace that is no longer configured at all can only be concluded
+    # dead by a full scan — and then it must age out, not accumulate forever.
+    ledger = {"docs": {"retired::doc": {"reasons": ["x"], "attempts": 1}}}
+    _, ledger, report = _reconcile(
+        _scanned("documents::img1"), [], ledger, sources=("documents",), full_scan=True
+    )
+    assert report["unresolved"] == ["retired::doc"]
+    assert ledger["docs"]["retired::doc"]["unresolved_runs"] == 1
+
+
+def test_reconcile_empty_ledger_is_a_noop():
+    queued = [{"doc_id": "documents::new", "mtime": 1.0}]
+    out, ledger, report = _reconcile(_scanned("documents::new"), queued, {"docs": {}})
+    assert out == queued
+    assert ledger == {"docs": {}}
+    assert report["total"] == 0
 
 
 # --- merge logic ---
