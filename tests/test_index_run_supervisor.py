@@ -180,6 +180,87 @@ def test_atomic_single_flight_launches_only_one_process(tmp_path):
     _wait_for(lambda: supervisor.snapshot().get("current") is None)
 
 
+def test_overlapping_start_logs_why_new_run_stood_down(tmp_path):
+    process = FakeProcess()
+    log_path = tmp_path / "indexer.log"
+    supervisor = _supervisor(
+        tmp_path,
+        process,
+        popen_factory=lambda *_args, **_kwargs: process,
+    )
+    first = supervisor.start(["python", "indexer"], log_path=log_path)
+
+    second = supervisor.start(["python", "indexer"], log_path=log_path)
+
+    assert second["status"] == "already_running"
+    assert second["run_id"] == first["run_id"]
+    assert (
+        f"Index run start stood down: active run {first['run_id']} "
+        f"status=running pid={process.pid}"
+    ) in log_path.read_text()
+    process.finish(0)
+    _wait_for(lambda: supervisor.snapshot().get("current") is None)
+
+
+def test_startup_reports_crash_left_predecessor_progress_to_index_log(tmp_path):
+    """Next supervisor must make a killed mid-queue predecessor visible."""
+    log_path = tmp_path / "indexer.log"
+    active = {
+        "run_id": "run-killed-mid-queue",
+        "status": "running",
+        "pid": 919191,
+        "pgid": 919191,
+        "process_starttime_ticks": 111,
+        "source_name": None,
+        "started_at": "2026-07-28T00:00:00+00:00",
+        "peak_rss_bytes": 1234,
+        "log_path": str(log_path),
+    }
+    (tmp_path / "index_run_state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "current": active,
+                "last_attempt": active,
+                "last_success": None,
+            }
+        )
+    )
+    (tmp_path / "indexer.heartbeat").write_text(
+        json.dumps(
+            {
+                "run_id": "run-killed-mid-queue",
+                "updated_at": "2026-07-28T00:05:00+00:00",
+                "phase": "process",
+                "queued": 10,
+                "processed": 3,
+                "skipped": 1,
+            }
+        )
+    )
+
+    from index_run_supervisor import IndexRunSupervisor
+
+    supervisor = IndexRunSupervisor(
+        tmp_path,
+        pid_alive=lambda _pid: False,
+        process_matches=lambda _pid: True,
+        monitor_interval=0.01,
+    )
+
+    terminal = supervisor.snapshot()["last_attempt"]
+    assert terminal["status"] == "lost"
+    assert terminal["queued"] == 10
+    assert terminal["processed"] == 3
+    assert terminal["skipped"] == 1
+    assert (
+        "ERROR index_run_supervisor: Previous index run "
+        "run-killed-mid-queue ended without completion"
+    ) in log_path.read_text()
+    assert "queued=10 processed=3 skipped=1" in log_path.read_text()
+    assert "reason=process_missing_on_reconcile" in log_path.read_text()
+
+
 def test_monitor_records_success_and_peak_rss_atomically(tmp_path):
     process = FakeProcess()
     samples = iter([10_000, 30_000, 20_000])
