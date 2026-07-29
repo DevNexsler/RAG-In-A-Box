@@ -717,7 +717,36 @@ def _refresh_repaired_sidecar_docs(
     return changed, failed
 
 
-_DEGRADED_MAX_ATTEMPTS = 5
+# Doc-specific failures charge `attempts`; a doc is abandoned once it reaches
+# this cap. Raised from 5 to 12 alongside exponential backoff (dpark 2026-07-28):
+# with retries now spaced out, more of them span a long time without hammering,
+# so a genuinely-flaky doc gets more chances before we give up.
+_DEGRADED_MAX_ATTEMPTS = 12
+
+# The v1 ledger cap was 5. The v1->v2 migration keys "was this capped under v1"
+# off this historical value, NOT the live cap above — otherwise raising the live
+# cap silently stops reopening the outage-burned v1 docs the migration exists to
+# rescue (#0251).
+_DEGRADED_V1_CAP = 5
+
+# Exponential backoff between re-queue attempts. Without this, every sweep
+# re-attempts every degraded doc immediately — during a gateway outage that
+# hammers the down provider on each run (transient failures retry forever by
+# design, #0251). The window doubles per total try (doc-specific + transient),
+# so a persistent outage backs off toward the cap instead of retrying hot.
+_DEGRADED_RETRY_BASE_SECONDS = 300  # 5 min after the first failure
+_DEGRADED_RETRY_CAP_SECONDS = 6 * 60 * 60  # never wait more than 6h
+
+
+def _degraded_backoff_seconds(entry: dict) -> float:
+    """Seconds to wait before re-queueing a degraded doc, by total tries.
+
+    Total tries = doc-specific attempts + transient attempts, so a long
+    provider outage (all transient) still widens the window even though it
+    never charges the abandonment cap.
+    """
+    tries = int(entry.get("attempts", 0)) + int(entry.get("transient_attempts", 0))
+    return min(_DEGRADED_RETRY_BASE_SECONDS * (2 ** tries), _DEGRADED_RETRY_CAP_SECONDS)
 
 
 def _heartbeat_path(index_root: Path) -> Path:
@@ -783,7 +812,7 @@ def _migrate_degraded_ledger(ledger: dict) -> tuple[dict, int]:
     for entry in docs.values():
         reasons = entry.get("reasons", [])
         if (
-            int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
+            int(entry.get("attempts", 0)) >= _DEGRADED_V1_CAP
             and reasons
             and all(str(r).startswith(_OCR_VISION_REASON_PREFIXES) for r in reasons)
         ):
@@ -825,18 +854,29 @@ def _include_degraded_docs(
     scanned: list[dict],
     to_add_or_update: list[dict],
     ledger: dict,
+    *,
+    now: float | None = None,
 ) -> list[dict]:
     """Re-queue docs that previously indexed with transient degradations
     (OCR/vision timeouts, enrichment failures) even though their mtime is
     unchanged. Entries past _DEGRADED_MAX_ATTEMPTS are left alone — those
-    are persistent (e.g. corrupt source files), not transient."""
+    are persistent (e.g. corrupt source files), not transient.
+
+    A doc is only re-admitted once its exponential backoff window has elapsed
+    since the last attempt, so a down provider is not re-hit every sweep.
+    Legacy entries with no ``last_attempt_at`` are treated as due immediately.
+    """
     docs = ledger.get("docs", {})
     if not docs:
         return to_add_or_update
+    if now is None:
+        now = time.time()
     retry_ids = {
         doc_id
         for doc_id, entry in docs.items()
         if int(entry.get("attempts", 0)) < _DEGRADED_MAX_ATTEMPTS
+        and (now - float(entry.get("last_attempt_at", 0.0)))
+        >= _degraded_backoff_seconds(entry)
     }
     if not retry_ids:
         return to_add_or_update
@@ -853,6 +893,8 @@ def _merge_degraded_ledger(
     ledger: dict,
     degraded_now: dict[str, list],
     clean_now: set[str],
+    *,
+    now: float | None = None,
 ) -> dict:
     """Fold one run's outcomes into the ledger: clean docs drop out, degraded
     docs accumulate attempts — but only doc-specific failures charge the cap.
@@ -861,6 +903,8 @@ def _merge_degraded_ledger(
     `transient_attempts`, so a provider outage of any length can never
     abandon a doc (#0251); it retries every run and heals on recovery.
     Bare-string reasons (legacy callers) count as doc-specific."""
+    if now is None:
+        now = time.time()
     docs = dict(ledger.get("docs", {}))
     for doc_id in clean_now:
         docs.pop(doc_id, None)
@@ -872,6 +916,8 @@ def _merge_degraded_ledger(
         entry = {
             "reasons": sorted({d.reason for d in degradations}),
             "attempts": int(prev.get("attempts", 0)),
+            # Stamp the try so _include_degraded_docs can space out re-queues.
+            "last_attempt_at": float(now),
         }
         transient_attempts = int(prev.get("transient_attempts", 0))
         if degradations and all(d.transient for d in degradations):

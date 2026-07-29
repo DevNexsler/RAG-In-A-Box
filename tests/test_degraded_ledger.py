@@ -18,6 +18,9 @@ from extractors import (
 )
 from flow_index_vault import (
     _DEGRADED_MAX_ATTEMPTS,
+    _DEGRADED_RETRY_BASE_SECONDS,
+    _DEGRADED_RETRY_CAP_SECONDS,
+    _degraded_backoff_seconds,
     _include_degraded_docs,
     _load_degraded_ledger,
     _merge_degraded_ledger,
@@ -132,8 +135,12 @@ def test_merge_degraded_docs_accumulate_attempts():
 
 
 def test_merge_new_degraded_doc_starts_at_one():
-    merged = _merge_degraded_ledger({"docs": {}}, {"b": ["enrichment_failed", "enrichment_failed"]}, set())
-    assert merged["docs"]["b"] == {"reasons": ["enrichment_failed"], "attempts": 1}
+    merged = _merge_degraded_ledger(
+        {"docs": {}}, {"b": ["enrichment_failed", "enrichment_failed"]}, set(), now=42.0
+    )
+    assert merged["docs"]["b"] == {
+        "reasons": ["enrichment_failed"], "attempts": 1, "last_attempt_at": 42.0
+    }
 
 
 def test_merge_all_transient_run_does_not_charge_attempts():
@@ -204,8 +211,67 @@ def test_provider_outage_never_caps_doc(tmp_path):
         "provider-down failures must not consume degraded-ledger attempts — "
         f"assert {attempts} == 0"
     )
-    requeued = _include_degraded_docs(_scanned(doc_id), [], ledger)
+    # Backoff (dpark 2026-07-28) means the doc is not re-queued on the very next
+    # sweep — it heals once its backoff window elapses. The #0251 invariant still
+    # holds: attempts is never charged, so it is never abandoned; it just retries
+    # on a widening schedule instead of hammering a down provider every run.
+    stamped = ledger["docs"][doc_id]["last_attempt_at"]
+    due = stamped + _DEGRADED_RETRY_CAP_SECONDS + 1
+    requeued = _include_degraded_docs(_scanned(doc_id), [], ledger, now=due)
     assert [r["doc_id"] for r in requeued] == [doc_id]
+
+
+# --- exponential backoff on retry (dpark 2026-07-28) ---
+
+
+def test_backoff_grows_exponentially_with_total_attempts():
+    base = _DEGRADED_RETRY_BASE_SECONDS
+    assert _degraded_backoff_seconds({"attempts": 0}) == base
+    assert _degraded_backoff_seconds({"attempts": 1}) == base * 2
+    assert _degraded_backoff_seconds({"attempts": 2}) == base * 4
+    # transient tries count too — a long outage widens the window.
+    assert _degraded_backoff_seconds({"attempts": 0, "transient_attempts": 3}) == base * 8
+
+
+def test_backoff_is_capped():
+    assert _degraded_backoff_seconds({"attempts": 40}) == _DEGRADED_RETRY_CAP_SECONDS
+
+
+def test_include_degraded_waits_for_backoff_window():
+    entry = {"reasons": ["ocr_describe_failed"], "attempts": 0,
+             "transient_attempts": 2, "last_attempt_at": 1000.0}
+    ledger = {"docs": {"documents::img1": dict(entry)}}
+    window = _degraded_backoff_seconds(entry)
+    # Not yet due -> not re-queued.
+    out = _include_degraded_docs(
+        _scanned("documents::img1"), [], ledger, now=1000.0 + window - 1
+    )
+    assert out == []
+    # Past the window -> re-queued.
+    out = _include_degraded_docs(
+        _scanned("documents::img1"), [], ledger, now=1000.0 + window + 1
+    )
+    assert [r["doc_id"] for r in out] == ["documents::img1"]
+
+
+def test_include_degraded_legacy_entry_without_timestamp_is_due():
+    # Entries stamped before this change lack last_attempt_at -> retry now,
+    # exactly as they did before backoff (no regression on first encounter).
+    ledger = {"docs": {"documents::img1": {"reasons": ["x"], "attempts": 1}}}
+    out = _include_degraded_docs(_scanned("documents::img1"), [], ledger, now=5000.0)
+    assert [r["doc_id"] for r in out] == ["documents::img1"]
+
+
+def test_merge_stamps_last_attempt_at():
+    merged = _merge_degraded_ledger(
+        {"docs": {}}, {"a": ["enrichment_failed"]}, set(), now=1234.0
+    )
+    assert merged["docs"]["a"]["last_attempt_at"] == 1234.0
+
+
+def test_retry_cap_was_raised():
+    # dpark asked to raise the doc-specific cap alongside backoff.
+    assert _DEGRADED_MAX_ATTEMPTS >= 12
 
 
 # --- persistence ---
