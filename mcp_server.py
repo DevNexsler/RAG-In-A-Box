@@ -2610,6 +2610,41 @@ def _file_index_update_impl(config_path: str = "config.yaml", source_name: str |
     }
 
 
+def is_indexer_running(config: dict) -> bool:
+    """True when a full-sweep indexer subprocess is active — used by the
+    scheduler to avoid launching a second overlapping sweep."""
+    summary = _get_index_run_supervisor(config).status_summary()
+    current = summary.get("current")
+    if isinstance(current, dict):
+        return current.get("status") in _ACTIVE_INDEX_RUN_STATUSES
+    running, _ = _resolve_indexer_pid(Path(config["index_root"]) / "indexer.pid")
+    return bool(running)
+
+
+def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
+    """Construct the in-process index scheduler, or None when disabled.
+
+    Off by default (config-gated) so hermetic test/e2e stacks are unaffected;
+    prod enables it via the ``scheduler`` config block. Drains the durable queue
+    on a short interval and spawns the guarded full sweep on a long one, reusing
+    the exact vetted mechanisms (_file_index_update_impl for the sweep,
+    drain_index_queue for the queue).
+    """
+    from core.index_scheduler import IndexScheduler
+    from flow_index_vault import drain_index_queue
+
+    sched_cfg = config.get("scheduler", {})
+    if not sched_cfg.get("enabled", False):
+        return None
+    return IndexScheduler(
+        drain_interval_s=float(sched_cfg.get("drain_interval_s", 60)),
+        sweep_interval_s=float(sched_cfg.get("sweep_interval_s", 3600)),
+        drain_fn=lambda: drain_index_queue(config_path),
+        sweep_fn=lambda: _file_index_update_impl(config_path),
+        sweep_running_fn=lambda: is_indexer_running(config),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Taxonomy tool implementations
 # ---------------------------------------------------------------------------

@@ -3598,6 +3598,50 @@ def _drain_index_requests(
     return results
 
 
+def drain_index_queue(config_path: str = "config.yaml", *, limit: int | None = None) -> dict:
+    """Drain pending targeted index requests WITHOUT enqueueing a new one.
+
+    The in-process scheduler calls this on a short interval so the durable queue
+    keeps moving even when no fresh request or sweep happens to take the write
+    lock (the original bug: a force-index sat 10+ minutes). Non-blocking on the
+    lock — if a writer already holds it, that holder is itself draining, so we
+    report busy and try again next tick. Cheap when idle: a one-row pending peek
+    avoids taking the lock at all when the queue is empty.
+    """
+    config = load_config(config_path)
+    index_root = Path(config["index_root"])
+    table_name = config.get("lancedb", {}).get("table", "chunks")
+    queue = IndexRequestQueue(index_root)
+    if not queue.pending(table_name, limit=1):
+        return {"status": "empty", "drained": 0}
+    queue_cfg = config.get("index_queue", {})
+    drain_limit = int(limit) if limit is not None else int(
+        queue_cfg.get("scheduled_drain_limit", 64)
+    )
+    try:
+        session = index_write_lock(index_root, table_name, blocking=False)
+        with session:
+            store = open_store_with_recovery(
+                index_root,
+                table_name,
+                logger_obj=_get_logger(),
+                auto_recover=True,
+            )
+            doc_id_store = DocIDStore(index_root / "doc_registry.db")
+            with store.exclusive_writer_session():
+                results = _drain_index_requests(
+                    config,
+                    queue,
+                    table_name,
+                    store,
+                    doc_id_store,
+                    limit=drain_limit,
+                )
+        return {"status": "drained", "drained": len(results)}
+    except IndexWriteLockBusy:
+        return {"status": "writer_busy", "drained": 0}
+
+
 def index_document_flow(
     config_path: str = "config.yaml",
     target: str = "",

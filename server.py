@@ -23,6 +23,7 @@ import os
 from core.config import load_config
 from core.tracing import setup_tracing
 from mcp_server import (
+    build_index_scheduler,
     initialize_index_supervisor,
     run_server,
     shutdown_index_supervisors,
@@ -46,9 +47,17 @@ def main() -> None:
     # subprocesses inherit PREFECT_API_URL and reuse it (never spawn their own).
     with PrefectServer():
         initialize_index_supervisor(config)
+        # In-process scheduler: drains the durable queue on a short interval and
+        # spawns the full sweep on a long one, so the self-heal actually runs
+        # (config-gated; None when disabled). Daemon thread — dies with process.
+        scheduler = build_index_scheduler(config)
+        if scheduler is not None:
+            scheduler.start_thread()
         try:
             run_server(transport="streamable-http", host=host, port=port)
         finally:
+            if scheduler is not None:
+                scheduler.stop()
             shutdown_index_supervisors()
 
 
