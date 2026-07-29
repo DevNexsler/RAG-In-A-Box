@@ -1731,6 +1731,89 @@ def test_deep_health_reports_retry_pending_source_as_degraded(tmp_path):
     assert result["overall"] == "degraded"
 
 
+@pytest.mark.parametrize(
+    ("http_status", "reason_phrase"),
+    [
+        (400, "Bad Request"),
+        (413, "Payload Too Large"),
+        (422, "Unprocessable Entity"),
+    ],
+)
+def test_deep_health_ignores_terminal_client_invalid_embedding_failure(
+    tmp_path, http_status, reason_phrase
+):
+    """Ticket #0705: a document-specific input-invalid rejection (400/413/422)
+    proves the provider answered — it must stay a per-document indexing
+    failure, not flip provider_status/overall to critical, even when it is
+    the newest embedding event in the log."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    from doc_id_store import DocIDStore
+
+    docs_root = tmp_path / "documents"
+    docs_root.mkdir()
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("oversized", "oversized.pdf", source_name="documents")
+    registry.close()
+    (docs_root / "oversized.pdf").write_text("oversized doc")
+    (tmp_path / "degraded_docs.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "docs": {
+                    "documents::oversized": {
+                        "reasons": ["embedding_failed"],
+                        "attempts": 3,
+                    }
+                },
+            }
+        )
+    )
+
+    def ts(seconds_ago: int) -> str:
+        stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        return stamp.strftime("%Y-%m-%d %H:%M:%S,000")
+
+    (tmp_path / "indexer.log").write_text(
+        "\n".join(
+            [
+                f"{ts(180)} INFO httpx: HTTP Request: POST "
+                'https://openrouter.ai/api/v1/embeddings "HTTP/1.1 200 OK"',
+                f"{ts(120)} INFO httpx: HTTP Request: POST "
+                f'https://openrouter.ai/api/v1/embeddings "HTTP/1.1 {http_status} {reason_phrase}"',
+                f"{ts(60)} ERROR prefect.flow_runs: Skipping documents::oversized "
+                f"after retries exhausted: Client error '{http_status} {reason_phrase}' "
+                "for url 'https://openrouter.ai/api/v1/embeddings'",
+            ]
+        )
+    )
+
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [
+                {"type": "filesystem", "name": "documents", "root": str(docs_root)}
+            ],
+        },
+        doc_ids=[],
+        chunk_count=0,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-07-15T00:00:00+00:00",
+    )
+
+    assert result["checks"]["provider_status"] == "ok"
+    assert result["checks"]["provider_failures"]["total_count"] == 0
+    assert result["overall"] == "degraded"
+    documents = result["sources"]["documents"]
+    assert documents["status"] == "degraded"
+    assert documents["reason"] == "retry_pending"
+    assert documents["retry_pending_doc_count"] == 1
+
+
 def test_file_status_deep_health_treats_no_text_docs_as_processed(tmp_path):
     """Docs that were scanned but produced no text should not look like index loss."""
     import json
@@ -1821,6 +1904,63 @@ def test_recent_provider_failures_classifies_openrouter_403_logs(tmp_path):
     assert result["by_key"]["openrouter_embeddings"]["last_seen_at"] == "2026-05-29T17:41:31+00:00"
     assert "Key limit exceeded" in result["by_key"]["openrouter_embeddings"]["sample"]
     assert result["by_key"]["openrouter_chat"]["operation"] == "chat"
+
+
+@pytest.mark.parametrize(
+    ("failure", "http_status"),
+    [
+        pytest.param(
+            "ERROR providers.embed.openrouter_embed: OpenRouter embedding API "
+            'error: 401 {"error":{"message":"No auth credentials found","code":401}}',
+            401,
+            id="auth-401",
+        ),
+        pytest.param(
+            "ERROR providers.embed.openrouter_embed: OpenRouter embedding API "
+            'error: 403 {"error":{"message":"Key limit exceeded (monthly limit)","code":403}}',
+            403,
+            id="auth-403",
+        ),
+        pytest.param(
+            "INFO httpx: HTTP Request: POST "
+            'https://openrouter.ai/api/v1/embeddings "HTTP/1.1 429 Too Many Requests"',
+            429,
+            id="rate-limit-429",
+        ),
+        pytest.param(
+            "INFO httpx: HTTP Request: POST "
+            'https://openrouter.ai/api/v1/embeddings "HTTP/1.1 500 Internal Server Error"',
+            500,
+            id="server-500",
+        ),
+        pytest.param(
+            "ERROR prefect.flow_runs: Skipping documents::000dZ after retries "
+            "exhausted: ConnectError: [Errno -3] Temporary failure in name "
+            "resolution for url 'https://openrouter.ai/api/v1/embeddings'",
+            None,
+            id="connection-failure",
+        ),
+    ],
+)
+def test_recent_provider_failures_keeps_availability_failures_visible(
+    tmp_path, failure, http_status
+):
+    """Auth, capacity, server, and transport failures remain provider-critical."""
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    (tmp_path / "indexer.log").write_text(
+        f"2026-07-29 11:59:00,000 {failure}\n"
+    )
+
+    result = mcp_server._recent_provider_failures(tmp_path, now=now)
+
+    assert result["status"] == "critical"
+    assert result["total_count"] == 1
+    failure_item = result["by_key"]["openrouter_embeddings"]
+    assert failure_item["http_status"] == http_status
+    assert failure_item["severity"] == "critical"
+    assert failure_item["recovered"] is False
 
 
 def test_health_reads_retained_index_run_archives(tmp_path):

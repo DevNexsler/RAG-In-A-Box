@@ -53,6 +53,9 @@ _DEFAULT_SEARCH_TOP_K = 8
 _RECENT_SORT_POOL = 50
 _PROVIDER_FAILURE_LOOKBACK_SECONDS = 24 * 60 * 60
 _PROVIDER_FAILURE_MAX_BYTES = 128 * 1024 * 1024
+# Input-invalid rejections: the provider answered and refused one request's
+# payload, so they never indicate provider unavailability (#0705).
+_CLIENT_INVALID_HTTP_STATUSES = frozenset({400, 413, 422})
 _COMPACT_EXCLUDED_METADATA_KEYS = {
     "_node_content",
     "_node_type",
@@ -1078,6 +1081,13 @@ def _provider_failure_kind(line: str) -> tuple[str, str, str] | None:
     if "ocr failed for page" in lower:
         return "ocr_vision_page", "ocr_vision", "page_ocr"
     status_code = _http_status_from_log_line(line)
+    # 400/413/422 mean one document's input was rejected — that stays visible
+    # through per-document accounting (degraded ledger / skip ledger, #0569),
+    # not the provider-availability ledger (#0705: two bad documents falsely
+    # marked openrouter_embeddings and deep health critical). Auth (401/403),
+    # rate limits (429), and 5xx still count against the provider.
+    if status_code in _CLIENT_INVALID_HTTP_STATUSES:
+        return None
     failure_marker = (
         status_code is not None and status_code >= 400
     ) or any(
