@@ -81,6 +81,7 @@ from core.artifacts import is_communication_sidecar
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
+    CONTENT_MISSING,
     Degradation,
     begin_degradation_capture,
     collapse_runaway_repetition,
@@ -1472,6 +1473,20 @@ def _reset_invalid_dedupe_cohort(
     return affected
 
 
+def _note_indexed_incomplete(doc_id: str) -> None:
+    """Record that a document was indexed without any of its primary content.
+
+    Until this existed the only per-run trace of a never-read attachment was the
+    aggregate degradation WARNING; anything reading outcome state saw a success.
+    """
+    lock = _RUNTIME.get("degraded_lock")
+    if lock is not None:
+        with lock:
+            _RUNTIME.setdefault("indexed_incomplete", set()).add(doc_id)
+    else:
+        _RUNTIME.setdefault("indexed_incomplete", set()).add(doc_id)
+
+
 def _process_doc_task(
     doc: dict,
     *,
@@ -1662,6 +1677,14 @@ def _process_doc_task(
                         ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
                     )
 
+        # Extraction provenance. The degradation capture is opened per document
+        # immediately before this task runs, and enrichment failures are noted
+        # later, so everything captured so far came from extraction — whichever
+        # extractor ran. Recording it here keeps "indexed but incomplete" a
+        # single path instead of a per-extractor special case.
+        content_failures = sorted({d.reason for d in collect_degradations()})
+        content_status = result.content_status(content_failures)
+
         source_metadata = (
             getattr(source_record, "metadata", {}) if source_record is not None else {}
         )
@@ -1744,6 +1767,10 @@ def _process_doc_task(
             "keywords": keywords,
             "custom_meta": custom_meta,
             "section": "",
+            # Consumer-visible extraction provenance: search can filter or
+            # deprioritise documents whose primary content never arrived.
+            "content_status": content_status,
+            "content_failure_reasons": ", ".join(content_failures),
         }
         # Promote extra frontmatter to real columns (skip collisions with reserved keys)
         for k, v in extra_fm.items():
@@ -1762,7 +1789,15 @@ def _process_doc_task(
         taxonomy_store = _RUNTIME.get("taxonomy_store")
         enrichment_cfg = _RUNTIME.get("config", {}).get("enrichment", {})
         with _measure_index_memory("enrichment", doc_id):
-            if llm_generator:
+            if content_status == CONTENT_MISSING:
+                # Enriching a document whose content extractor produced nothing
+                # describes the *file*, not the document: production emitted
+                # "topics=image, photo, MPO format" for maintenance photos that
+                # were never read. Generic filler presented as content topics is
+                # worse than no topics, and it changed on every pass. Skipping
+                # also drops a per-run LLM call for a doc we cannot enrich.
+                doc_meta.update(empty_enrichment())
+            elif llm_generator:
                 enrichment = enrich_document(
                     text=full_text,
                     title=title,
@@ -1982,6 +2017,10 @@ def _process_doc_task(
             store.upsert_nodes(nodes)
             write_mode = "Upserted"
         logger.info(f"{write_mode} {len(nodes)} chunks: {doc_id}")
+        if content_status == CONTENT_MISSING:
+            # Counted only once the write succeeded: this is a document that is
+            # now searchable without any of its own content.
+            _note_indexed_incomplete(doc_id)
 
         chunks = []
         for node in nodes:
@@ -2223,6 +2262,7 @@ def write_index_metadata_task(
     chunk_count: int | None,
     failed_docs: list[str] | None = None,
     warnings: list[str] | None = None,
+    docs_indexed_incomplete: int = 0,
 ) -> None:
     """Write index_metadata.json for file_status (last_run_at, counts, failures, warnings)."""
     import json
@@ -2234,6 +2274,10 @@ def write_index_metadata_task(
         "last_run_at": datetime.now(timezone.utc).isoformat(),
         "doc_count": doc_count,
         "chunk_count": chunk_count,
+        # Docs that landed in the index with none of their own content (an
+        # extractor failed) — a recall hole a consumer can watch without
+        # tracing individual doc ids.
+        "docs_indexed_incomplete": docs_indexed_incomplete,
     }
     if failed_docs:
         meta["failed_count"] = len(failed_docs)
@@ -3064,10 +3108,19 @@ def index_vault_flow(
                 dict(reason_counts),
             )
 
+    indexed_incomplete = _RUNTIME.get("indexed_incomplete") or set()
+    if indexed_incomplete:
+        logger.warning(
+            "%d docs indexed without their primary content "
+            "(searchable but content-free, not enriched): %s",
+            len(indexed_incomplete), sorted(indexed_incomplete)[:10],
+        )
+
     write_index_metadata_task(
         index_root, doc_count, chunk_count,
         failed_docs or None,
         _RUNTIME.get("_warnings") or None,
+        docs_indexed_incomplete=len(indexed_incomplete),
     )
     memory_observer.sample("phase_finish", phase="finalize")
     logger.info(f"index_vault_flow finished in {run_seconds:.1f}s")

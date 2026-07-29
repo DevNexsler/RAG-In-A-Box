@@ -119,6 +119,51 @@ async def test_degraded_enrichment_still_indexes(indexed_corpus, api, mcp_sessio
 
 @pytest.mark.skipif(
     E2E_REAL,
+    reason="vision is live in real mode; the sim's describe fault can't be injected",
+)
+async def test_image_with_failed_describe_is_indexed_as_incomplete(
+    indexed_corpus, api, mcp_session
+):
+    """#0584: an image whose vision describe never succeeds must land in the
+    index flagged as content-free, with no enrichment invented from its EXIF.
+
+    Production indexed these as plain successes: the only trace was a WARNING,
+    and the enricher turned the file's own metadata into `topics=image, photo,
+    MPO format` for maintenance photos nobody had ever looked at.
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    # Exhaust every describe retry so the extractor's content path truly fails.
+    await _arm_fault("/describe", "429", times=8)
+
+    salt = uuid.uuid4().hex
+    buf = BytesIO()
+    Image.new("RGB", (48, 32), color=(int(salt[:2], 16), 90, 140)).save(buf, "PNG")
+    name = f"undescribed-{salt[:8]}.png"
+    resp = await api.post("/api/upload", files={"file": (name, buf.getvalue())})
+    assert resp.status_code == 201, resp.text
+    result = await mcp_session.call_tool_json(
+        "file_index_document", {"target": name, "source_name": "documents"}
+    )
+    assert result.get("status") == "indexed", result
+
+    chunks = await mcp_session.call_tool_json(
+        "file_get_doc_chunks", {"doc_id": result["doc_id"]}
+    )
+    assert isinstance(chunks, list) and chunks, chunks
+    for chunk in chunks:
+        assert chunk["content_status"] == "missing", chunk
+        assert "ocr_describe_failed" in chunk["content_failure_reasons"], chunk
+        # No filler enrichment derived from the file's own metadata.
+        assert chunk["enr_topics"] == "", chunk
+        assert chunk["enr_doc_type"] == "", chunk
+        assert chunk["enr_summary"] == "", chunk
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
     reason="enrichment is live in real mode; simulator truncation cannot be armed",
 )
 async def test_reasoning_only_enrichment_retries_with_populated_facets(

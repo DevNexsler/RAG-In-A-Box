@@ -205,6 +205,31 @@ def test_slim_hit_document_keeps_title_and_path_omits_comm_fields():
         assert comm_key not in d
 
 
+def test_slim_hit_flags_incomplete_content_but_stays_quiet_when_complete():
+    """A hit whose primary content never arrived must say so in the default
+    return mode (#0584) — otherwise a never-described photo reads exactly like
+    a described one. Fully-extracted hits stay unannotated."""
+    def _hit(content_status: str) -> SearchHit:
+        return SearchHit(
+            doc_id="documents::002qT",
+            loc="c:0",
+            snippet="Dimensions: 3024x4032",
+            text="Dimensions: 3024x4032",
+            score=0.5,
+            source_type="img",
+            title="mm31178",
+            rel_path="quo-attachments/carlos/2026-07/mm31178@002qT@.jpg",
+            extra_metadata={
+                "content_status": content_status,
+                "content_failure_reasons": "ocr_describe_failed",
+            },
+        )
+
+    assert mcp_server._slim_hit_to_dict(_hit("missing"))["content_status"] == "missing"
+    assert mcp_server._slim_hit_to_dict(_hit("partial"))["content_status"] == "partial"
+    assert "content_status" not in mcp_server._slim_hit_to_dict(_hit("complete"))
+
+
 def test_file_search_impl_slim_is_default_return_mode():
     """_file_search_impl defaults to slim output."""
     fake_result = MagicMock()

@@ -150,6 +150,21 @@ class TestNormalizeEnrichment:
         result = _normalize_enrichment(raw)
         assert result["enr_key_facts"] == '["already serialized"]'
 
+    def test_labels_are_canonicalized_and_deduplicated(self):
+        """Label variants must collapse at the enrichment boundary (#0584).
+
+        Production emitted `img` on one pass and `image` on the next for the
+        same file, and repeated a label within one record
+        (`communication, communication`), so identical input produced different
+        stored labels and the taxonomy accumulated both spellings."""
+        raw = {
+            "doc_type": ["img", "image", "IMAGE", "photo", "Photo"],
+            "topics": ["settlement", "communication", "Communication"],
+        }
+        result = _normalize_enrichment(raw)
+        assert result["enr_doc_type"] == "image, photo"
+        assert result["enr_topics"] == "settlement, communication"
+
 
 def test_parse_enrichment_response_normalizes_valid_json():
     raw = '{"summary":"x","doc_type":["memo"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":[],"topics":["ops"],"keywords":["lease"],"key_facts":["rent due"],"suggested_tags":["housing"],"suggested_folder":"2-Housing","importance":0.7}'

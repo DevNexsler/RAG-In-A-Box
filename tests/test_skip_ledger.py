@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import flow_index_vault as fiv
 from extractors import (
     Degradation,
+    ExtractionResult,
     begin_degradation_capture,
     collect_degradations,
     collect_skips,
@@ -296,9 +297,10 @@ def test_change_key_falls_back_to_mtime():
 
 # --- process_doc_task: contentless docs must enter the ledger ---
 
-class _EmptyResult:
-    full_text = ""
-    frontmatter = {}
+def _EmptyResult():
+    """A real extraction result carrying no text — the production type, so it
+    also carries extraction provenance (#0584)."""
+    return ExtractionResult.from_text("")
 
 
 def _no_text_runtime(source, doc_id, record=None):
