@@ -1,4 +1,6 @@
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -208,6 +210,60 @@ def test_factory_builds_litellm_provider_directly(monkeypatch):
     assert provider.timeout == 41
     assert provider._extract_client.api_key == "environment-key"
     assert provider._describe_client.api_key == "environment-key"
+
+
+def test_factory_honors_shared_ocr_concurrency_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("LITELLM_API_KEY", "environment-key")
+    provider = build_ocr_provider({
+        "ocr": {
+            "enabled": True,
+            "provider": "litellm",
+            "endpoint": "http://lite/v1",
+            "extract_model": "ocr",
+            "describe_model": "vision",
+            "concurrency": 1,
+        }
+    })
+    image = tmp_path / "page.png"
+    image.write_bytes(b"image")
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release = threading.Event()
+    overlap = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+
+    def blocked_run(_path):
+        nonlocal active
+        with state_lock:
+            active += 1
+            if active == 1:
+                first_started.set()
+            else:
+                overlap.set()
+        release.wait(timeout=2)
+        with state_lock:
+            active -= 1
+        return "ok"
+
+    monkeypatch.setattr(provider._extract_client, "run", blocked_run)
+    monkeypatch.setattr(provider._describe_client, "run", blocked_run)
+
+    def describe():
+        second_started.set()
+        return provider.describe(image)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(provider.extract, image)
+        assert first_started.wait(timeout=1)
+        second = pool.submit(describe)
+        assert second_started.wait(timeout=1)
+        overlap_observed = overlap.wait(timeout=1)
+        release.set()
+        assert first.result(timeout=1) == "ok"
+        assert second.result(timeout=1) == "ok"
+
+    assert not overlap_observed
 
 
 @pytest.mark.parametrize("missing", ["endpoint", "extract_model", "describe_model"])

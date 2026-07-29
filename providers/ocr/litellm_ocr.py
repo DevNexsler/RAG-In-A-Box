@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -68,11 +69,16 @@ class LiteLLMOCR(OCRProvider):
         timeout: float = 300.0,
         *,
         api_key: str | None = None,
+        concurrency: int = 1,
     ) -> None:
+        if concurrency < 1:
+            raise ValueError("OCR concurrency must be at least 1")
         self.endpoint = endpoint.rstrip("/")
         self.extract_model = extract_model
         self.describe_model = describe_model
         self.timeout = timeout
+        self.concurrency = concurrency
+        self._gate = threading.BoundedSemaphore(concurrency)
         self._extract_client = LiteLLMFallback(
             self.endpoint,
             extract_model,
@@ -90,14 +96,17 @@ class LiteLLMOCR(OCRProvider):
             timeout=timeout,
         )
         logger.info(
-            "LiteLLMOCR: %s extract_model=%s describe_model=%s",
+            "LiteLLMOCR: %s extract_model=%s describe_model=%s concurrency=%d",
             self.endpoint,
             extract_model,
             describe_model,
+            concurrency,
         )
 
     def extract(self, file_path: str | Path, page: Optional[int] = None) -> str:
-        return self._extract_client.run(file_path)
+        with self._gate:
+            return self._extract_client.run(file_path)
 
     def describe(self, file_path: str | Path) -> str:
-        return self._describe_client.run(file_path)
+        with self._gate:
+            return self._describe_client.run(file_path)

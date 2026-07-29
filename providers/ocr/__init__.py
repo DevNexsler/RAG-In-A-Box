@@ -109,6 +109,7 @@ def build_ocr_provider(config: dict) -> OCRProvider | None:
             extract_model=ocr_cfg["extract_model"],
             describe_model=ocr_cfg["describe_model"],
             timeout=ocr_cfg.get("timeout", 300.0),
+            concurrency=int(ocr_cfg.get("concurrency", 1)),
         )
 
     default = _build_single_provider(ocr_cfg)
