@@ -78,21 +78,22 @@ def test_non_retryable_error_body_raises_immediately():
 
 
 def test_oversized_input_is_bounded_before_request():
-    """One oversized item must not make OpenRouter reject the whole batch."""
+    """Mixed inputs stay ordered and fit a tokenizer-independent byte budget."""
+    normal = "small context"
     oversized = "context " * 50_000
     posted_json = {}
 
     def fake_post(*args, **kwargs):
         posted_json.update(kwargs["json"])
-        return _FakeResponse(_ok_payload())
+        return _FakeResponse(_ok_payload(2))
 
     with patch("providers.embed.openrouter_embed.httpx.post", side_effect=fake_post):
-        _provider()._call_embeddings([oversized])
+        vectors = _provider()._call_embeddings([normal, oversized])
 
-    sent = posted_json["input"][0]
-    from llama_index.core.utils import get_tokenizer
-
-    assert len(get_tokenizer()(sent)) < 40_960
+    assert len(vectors) == 2
+    assert posted_json["input"][0] == normal
+    sent = posted_json["input"][1]
+    assert len(sent.encode("utf-8")) <= int(40_960 * 0.9)
     assert oversized.startswith(sent)
 
 
@@ -108,8 +109,6 @@ def test_token_dense_unicode_is_bounded_before_request():
     with patch("providers.embed.openrouter_embed.httpx.post", side_effect=fake_post):
         _provider()._call_embeddings([oversized])
 
-    from llama_index.core.utils import get_tokenizer
-
     sent = posted_json["input"][0]
-    assert len(get_tokenizer()(sent)) < 40_960
+    assert len(sent.encode("utf-8")) <= int(40_960 * 0.9)
     assert oversized.startswith(sent)

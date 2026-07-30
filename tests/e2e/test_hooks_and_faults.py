@@ -207,3 +207,9 @@ async def test_oversized_conversation_context_still_indexes(
     )
     assert chunks, result
     assert any(phrase in chunk.get("text", "") for chunk in chunks), chunks[:3]
+    context_chunks = [
+        chunk for chunk in chunks if chunk.get("loc") == "context:c:0"
+    ]
+    assert len(context_chunks) == 1, chunks
+    assert "[Conversation context]" in context_chunks[0].get("text", "")
+    assert "shipment manifest was revised again" in context_chunks[0].get("text", "")
