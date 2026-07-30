@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 # Match substrings so provider prefixes and model revisions share one limit.
 MODEL_INPUT_TOKENS = {
-    "qwen3-embedding": 40_960,
+    "qwen3-embedding": 32_768,
     "text-embedding-3": 8_191,
     "text-embedding-ada-002": 8_191,
     "nomic-embed-text": 8_192,

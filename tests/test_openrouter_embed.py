@@ -93,7 +93,7 @@ def test_oversized_input_is_bounded_before_request():
     assert len(vectors) == 2
     assert posted_json["input"][0] == normal
     sent = posted_json["input"][1]
-    assert len(sent.encode("utf-8")) <= int(40_960 * 0.9)
+    assert len(sent.encode("utf-8")) <= int(32_768 * 0.9)
     assert oversized.startswith(sent)
 
 
@@ -110,5 +110,5 @@ def test_token_dense_unicode_is_bounded_before_request():
         _provider()._call_embeddings([oversized])
 
     sent = posted_json["input"][0]
-    assert len(sent.encode("utf-8")) <= int(40_960 * 0.9)
+    assert len(sent.encode("utf-8")) <= int(32_768 * 0.9)
     assert oversized.startswith(sent)
