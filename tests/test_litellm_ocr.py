@@ -1,4 +1,6 @@
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -194,6 +196,7 @@ def test_factory_builds_litellm_provider_directly(monkeypatch):
             "extract_model": "ocr",
             "describe_model": "vision",
             "timeout": 41,
+            "concurrency": 3,
             "api_key": "yaml-key-must-be-ignored",
         }
     }
@@ -206,8 +209,85 @@ def test_factory_builds_litellm_provider_directly(monkeypatch):
     assert provider.extract_model == "ocr"
     assert provider.describe_model == "vision"
     assert provider.timeout == 41
+    assert provider.concurrency == 3
     assert provider._extract_client.api_key == "environment-key"
     assert provider._describe_client.api_key == "environment-key"
+
+
+def test_factory_enforces_shared_ocr_concurrency_limit():
+    provider = build_ocr_provider(
+        {
+            "ocr": {
+                "enabled": True,
+                "provider": "litellm",
+                "endpoint": "http://lite/v1",
+                "extract_model": "ocr",
+                "describe_model": "vision",
+                "concurrency": 1,
+            }
+        }
+    )
+    extract_started = threading.Event()
+    release_extract = threading.Event()
+    describe_started = threading.Event()
+    second_gate_entry = threading.Event()
+
+    class RecordingGate:
+        def __init__(self, gate):
+            self._gate = gate
+            self._entries = 0
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            with self._lock:
+                self._entries += 1
+                if self._entries == 2:
+                    second_gate_entry.set()
+            self._gate.acquire()
+
+        def __exit__(self, *_exc_info):
+            self._gate.release()
+
+    class BlockingExtractClient:
+        def run(self, _file_path):
+            extract_started.set()
+            assert release_extract.wait(timeout=2)
+            return "text"
+
+    class RecordingDescribeClient:
+        def run(self, _file_path):
+            describe_started.set()
+            return "description"
+
+    provider._extract_client = BlockingExtractClient()
+    provider._describe_client = RecordingDescribeClient()
+    provider._concurrency_gate = RecordingGate(provider._concurrency_gate)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        extract_future = executor.submit(provider.extract, "page.png")
+        assert extract_started.wait(timeout=1)
+        describe_future = executor.submit(provider.describe, "photo.png")
+        try:
+            assert second_gate_entry.wait(timeout=1)
+            assert not describe_started.is_set()
+        finally:
+            release_extract.set()
+
+        assert extract_future.result(timeout=1) == "text"
+        assert describe_future.result(timeout=1) == "description"
+        assert describe_started.is_set()
+
+
+@pytest.mark.parametrize("concurrency", [0, -1, True, 1.5, "2"])
+def test_litellm_ocr_requires_positive_integer_concurrency(concurrency):
+    with pytest.raises(ValueError, match="positive integer"):
+        LiteLLMOCR(
+            "http://lite/v1",
+            "ocr",
+            "vision",
+            api_key="unit-key",
+            concurrency=concurrency,
+        )
 
 
 @pytest.mark.parametrize("missing", ["endpoint", "extract_model", "describe_model"])
