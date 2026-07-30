@@ -17,6 +17,7 @@ import httpx
 
 from core.resilience import TransientError, call_with_retry
 from providers.embed.base import EmbedProvider
+from providers.embed.limits import bound_inputs, resolve_max_input_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,11 @@ class OpenRouterEmbedProvider(EmbedProvider):
     def _call_embeddings(self, texts: list[str]) -> list[list[float]]:
         """Call /v1/embeddings via the shared resilience layer (retries transient
         5xx/429/timeouts; permanent 4xx raise straight through)."""
+        texts = bound_inputs(
+            texts,
+            resolve_max_input_tokens(self.model),
+            label=f"openrouter-embed[{self.model}]",
+        )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

@@ -75,3 +75,41 @@ def test_non_retryable_error_body_raises_immediately():
             _provider()._call_embeddings(["hello"])
 
     assert len(calls) == 1
+
+
+def test_oversized_input_is_bounded_before_request():
+    """One oversized item must not make OpenRouter reject the whole batch."""
+    oversized = "context " * 50_000
+    posted_json = {}
+
+    def fake_post(*args, **kwargs):
+        posted_json.update(kwargs["json"])
+        return _FakeResponse(_ok_payload())
+
+    with patch("providers.embed.openrouter_embed.httpx.post", side_effect=fake_post):
+        _provider()._call_embeddings([oversized])
+
+    sent = posted_json["input"][0]
+    from llama_index.core.utils import get_tokenizer
+
+    assert len(get_tokenizer()(sent)) < 40_960
+    assert oversized.startswith(sent)
+
+
+def test_token_dense_unicode_is_bounded_before_request():
+    """Character count cannot stand in for model token count."""
+    oversized = "🜁" * 30_000
+    posted_json = {}
+
+    def fake_post(*args, **kwargs):
+        posted_json.update(kwargs["json"])
+        return _FakeResponse(_ok_payload())
+
+    with patch("providers.embed.openrouter_embed.httpx.post", side_effect=fake_post):
+        _provider()._call_embeddings([oversized])
+
+    from llama_index.core.utils import get_tokenizer
+
+    sent = posted_json["input"][0]
+    assert len(get_tokenizer()(sent)) < 40_960
+    assert oversized.startswith(sent)

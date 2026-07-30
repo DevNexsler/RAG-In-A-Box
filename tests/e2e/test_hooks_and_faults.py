@@ -8,14 +8,17 @@ Fault notes:
     indexed_corpus itself (the per-test /admin/reset wipes the live sink, so
     asserting on a later GET /hooks/received would race with reset ordering).
 """
+import json
 import os
+import tempfile
 import uuid
+from pathlib import Path
 
 import httpx
 import pytest
 
 from tests.e2e.client import get_hook_events, search_hits
-from tests.e2e.conftest import E2E_SIM_URL
+from tests.e2e.conftest import E2E_SIM_URL, _compose_cp_into_documents
 
 pytestmark = pytest.mark.anyio
 E2E_REAL = os.environ.get("E2E_REAL") == "1"
@@ -141,3 +144,66 @@ async def test_reasoning_only_enrichment_retries_with_populated_facets(
     )
     assert chunk["enr_summary"]
     assert chunk["enr_doc_type"]
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
+    reason="real embedding service cannot use simulator context limit",
+)
+async def test_oversized_conversation_context_still_indexes(
+    indexed_corpus,
+    mcp_session,
+):
+    """Oversized stored attachment context must survive provider input limits."""
+    stem = f"oversized-context-{uuid.uuid4().hex[:8]}"
+    phrase = "zephyr cantilever manifest"
+    channel = f"ops-{stem}"
+    sidecar = {
+        "schema_version": 1,
+        "source": "quo",
+        "message": {
+            "source_message_id": f"{stem}-msg",
+            "sender": "Field Agent",
+            "sent_at": "2026-06-01T10:00:30Z",
+        },
+        "channel": {"source_channel_id": channel},
+        "media": {
+            "media_index": 0,
+            "media_type": "document",
+            "original_filename": f"{stem}.md",
+        },
+        "context": {
+            "schema_version": 1,
+            "same_channel_before": [
+                {
+                    "source_message_id": f"{stem}-context",
+                    "sender": "Dispatch",
+                    "sent_at": "2026-06-01T09:59:30Z",
+                    "origin_source": "quo",
+                    "channel_id": channel,
+                    "text": "the shipment manifest was revised again. " * 8_000,
+                }
+            ],
+        },
+    }
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        document = Path(temp_dir) / f"{stem}.md"
+        document.write_text(f"# Manifest\n\nThe {phrase} is attached.\n")
+        sidecar_path = Path(temp_dir) / f"{stem}.json"
+        sidecar_path.write_text(json.dumps(sidecar))
+        _compose_cp_into_documents(sidecar_path)
+        _compose_cp_into_documents(document)
+
+    result = await mcp_session.call_tool_json(
+        "file_index_document",
+        {"target": document.name, "source_name": "documents"},
+    )
+    assert result.get("status") == "indexed", result
+
+    chunks = await mcp_session.call_tool_json(
+        "file_get_doc_chunks",
+        {"doc_id": result["doc_id"]},
+    )
+    assert chunks, result
+    assert any(phrase in chunk.get("text", "") for chunk in chunks), chunks[:3]

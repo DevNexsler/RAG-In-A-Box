@@ -29,6 +29,7 @@ app = FastAPI(title="provider-sim")
 
 SINK_EVENTS: list[Any] = []
 ARMED_FAULTS: list[dict[str, Any]] = []  # {route_prefix, fault, times, seconds}
+MAX_EMBED_INPUT_CHARS = 250_000
 
 # --------------------------------------------------------------------------
 # Deterministic helpers
@@ -217,11 +218,28 @@ async def health() -> dict:
 
 
 @app.post("/api/v1/embeddings")
-async def embeddings(request: Request) -> dict:
+async def embeddings(request: Request):
     body = await request.json()
     inputs = body.get("input", [])
     if isinstance(inputs, str):
         inputs = [inputs]
+    oversized = next(
+        (text for text in inputs if len(text) > MAX_EMBED_INPUT_CHARS),
+        None,
+    )
+    if oversized is not None:
+        return JSONResponse(
+            {
+                "error": {
+                    "code": 400,
+                    "message": (
+                        "Embedding input exceeds simulated model context: "
+                        f"{len(oversized)} characters"
+                    ),
+                }
+            },
+            status_code=400,
+        )
     return {
         "object": "list",
         "model": body.get("model", "sim-embed"),
