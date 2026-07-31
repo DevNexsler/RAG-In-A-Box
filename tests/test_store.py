@@ -777,6 +777,27 @@ def test_schema_evolution_new_metadata_field():
         assert "section" in store._metadata_subfields()
 
 
+def test_change_hash_projection_survives_sparse_fragment_after_schema_widening():
+    """A later row may omit a metadata field already present in the schema."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "hashed.md", "c:0", "hashed", vec, change_hash="sha-abc"
+            )
+        ])
+        store.upsert_nodes([
+            _make_node_with_meta("legacy.md", "c:0", "legacy", vec)
+        ])
+
+        assert store.list_doc_change_hashes() == {
+            "hashed.md": "sha-abc",
+            "legacy.md": "",
+        }
+
+
 def test_schema_evolution_preserves_vectors():
     """Schema evolution should not corrupt existing vectors."""
     with tempfile.TemporaryDirectory() as tmpdir:
