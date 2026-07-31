@@ -365,6 +365,9 @@ def test_index_document_flow_runs_real_process_doc_task_without_prefect_context(
     store = MagicMock()
     store.list_doc_mtimes.return_value = {}
     store.list_doc_change_hashes.return_value = {}
+    # Empty index: nothing indexed yet, so an outage-degraded doc has no good
+    # version to protect and is written as a stub (see the write guard, #0619).
+    store.contains_doc_id.return_value = False
     embed = MagicMock()
     embed.embed_texts.side_effect = lambda texts: [[0.1, 0.2, 0.3] for _ in texts]
 
@@ -455,6 +458,9 @@ def _run_single_doc(tmp_path, root, f, ocr_provider):
     store = MagicMock()
     store.list_doc_mtimes.return_value = {}
     store.list_doc_change_hashes.return_value = {}
+    # Empty index: nothing indexed yet, so an outage-degraded doc has no good
+    # version to protect and is written as a stub (see the write guard, #0619).
+    store.contains_doc_id.return_value = False
     embed = MagicMock()
     embed.embed_texts.side_effect = lambda texts: [[0.1, 0.2, 0.3] for _ in texts]
 

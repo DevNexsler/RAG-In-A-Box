@@ -176,6 +176,55 @@ async def test_degraded_enrichment_still_indexes(indexed_corpus, api, mcp_sessio
 
 @pytest.mark.skipif(
     E2E_REAL,
+    reason="enrichment is live in real mode; the sim's hangup fault can't be injected into real OpenRouter",
+)
+async def test_provider_hangup_keeps_the_enriched_row(indexed_corpus, api, mcp_session):
+    """#0619: a provider that is GONE must not cost the document its enrichment.
+
+    The difference from test_degraded_enrichment_still_indexes is the prior
+    state: there the doc was new (a bare row beats no row), here it is already
+    indexed and enriched, so the outage-time write must be dropped in favor of
+    what is already served.
+    """
+    content = b"# Ledger\n\nThe periwinkle harbor ledger lists every mooring fee.\n"
+    first = await _upload_and_index(api, mcp_session, "outage-note.md", content)
+    # Indexing ASSIGNS the doc its id-stamped path; re-uploading the original
+    # bare name would mint a NEW document and leave the original row untouched,
+    # which would make this test pass without ever exercising the guard.
+    assigned, doc_id = first["rel_path"], first["doc_id"]
+
+    payload = await mcp_session.call_tool_json(
+        "file_search", {"query": "periwinkle harbor ledger", "top_k": 5})
+    hits = [h for h in payload["results"] if h["doc_id"] == doc_id]
+    assert hits, payload["results"]
+    loc = hits[0]["loc"]
+    good = await mcp_session.call_tool_json(
+        "file_get_chunk", {"doc_id": doc_id, "loc": loc})
+    assert good["enr_summary"], good
+
+    # The provider container is recreated: every enrichment call is cut mid-flight
+    # for the whole of the next index pass.
+    await _arm_fault("/api/v1/chat/completions", "hangup", times=50)
+    resp = await api.post("/api/upload", files={"file": (
+        assigned, content + b"\nA later line arrives while the provider is down.\n")})
+    assert resp.status_code == 201, resp.text
+    second = await mcp_session.call_tool_json(
+        "file_index_document", {"target": assigned, "source_name": "documents"})
+    assert second["doc_id"] == doc_id, (
+        f"outage pass hit a different document ({second['doc_id']}), so the "
+        f"guard was never exercised"
+    )
+
+    after = await mcp_session.call_tool_json(
+        "file_get_chunk", {"doc_id": doc_id, "loc": loc})
+    assert after["enr_summary"] == good["enr_summary"], (
+        "a provider outage overwrote the enriched row with an empty one"
+    )
+    assert after["text"] == good["text"], "outage-time write replaced served content"
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
     reason="enrichment is live in real mode; simulator truncation cannot be armed",
 )
 async def test_reasoning_only_enrichment_retries_with_populated_facets(

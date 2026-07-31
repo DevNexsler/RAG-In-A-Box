@@ -2439,6 +2439,43 @@ def test_file_status_refreshes_cache_after_lance_manifest_error(tmp_path):
         mcp_server._cache_identity = old_identity
 
 
+def test_get_deps_adopts_a_swapped_cache_even_when_the_old_address_is_reused(tmp_path):
+    """#0619: the swap marker used to be id(_cache).
+
+    CPython hands a freed tuple's address to the next tuple, so a cache swapped in
+    by a caller (or a test) could read as unchanged, fall through to the signature
+    branch, and be rebuilt from config.yaml mid-request — dropping the caller onto
+    the service_unavailable path. The marker holds the tuple itself, so a recycled
+    address cannot mask the swap.
+    """
+    old = (
+        mcp_server._cache,
+        mcp_server._cache_index_signature,
+        mcp_server._cache_identity,
+    )
+    try:
+        store, embed = MagicMock(), MagicMock()
+        config = {"index_root": str(tmp_path), "embeddings": {"provider": "openrouter"}}
+        mcp_server._cache = (store, embed, config)
+        # The marker left behind by the PREVIOUS cache, whose address this tuple
+        # was handed. Its signature is stale, so an unnoticed swap rebuilds.
+        mcp_server._cache_identity = id(mcp_server._cache)
+        mcp_server._cache_index_signature = (1, 1)
+
+        with patch.object(mcp_server, "_build_store_and_embed") as build:
+            got_store, got_embed, got_config = mcp_server._get_deps()
+
+        assert build.call_count == 0, "a reused address masked the cache swap"
+        assert got_store is store and got_embed is embed and got_config is config
+        assert mcp_server._cache_identity is mcp_server._cache
+    finally:
+        (
+            mcp_server._cache,
+            mcp_server._cache_index_signature,
+            mcp_server._cache_identity,
+        ) = old
+
+
 def test_file_status_ignores_zombie_indexer_pid(tmp_path):
     """Zombie indexer PID should be treated as not running and cleaned up."""
     zombie_pid = os.fork()
