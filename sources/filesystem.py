@@ -84,6 +84,8 @@ class FilesystemSource:
                 "abs_path": r["abs_path"],
                 "rel_path": r["rel_path"],
             }
+            if r.get("skip_reason"):
+                metadata["skip_reason"] = r["skip_reason"]
             metadata.update(_communication_sidecar_metadata(abs_path))
             yield SourceRecord(
                 doc_id=r["doc_id"],
@@ -92,6 +94,7 @@ class FilesystemSource:
                 mtime=r["mtime"],
                 size=r["size"],
                 metadata=metadata,
+                change_hash=r.get("change_hash", ""),
             )
 
     def extract(self, record: SourceRecord) -> ExtractionResult:

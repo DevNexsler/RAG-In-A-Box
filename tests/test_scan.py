@@ -2,6 +2,7 @@
 
 import os
 import inspect
+import logging
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -187,17 +188,87 @@ def test_scan_record_fields():
         assert Path(r["abs_path"]).exists()
 
 
-def test_scan_skips_zero_byte_files():
+def test_scan_marks_zero_byte_files_for_skip_ledger():
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
-        (root / "empty.pdf").write_bytes(b"")
+        empty = root / "empty.pdf"
+        empty.write_bytes(b"")
         (root / "note.md").write_text("content")
 
         records = scan_vault_task.fn(root, ["**/*.pdf", "**/*.md"], [])
 
-        doc_ids = {r["doc_id"] for r in records}
-        assert doc_ids == {"note.md"}
-        assert (root / "empty.pdf").exists()
+        by_id = {r["doc_id"]: r for r in records}
+        assert set(by_id) == {"empty.pdf", "note.md"}
+        assert by_id["empty.pdf"]["skip_reason"] == "empty_file"
+        assert by_id["empty.pdf"]["change_hash"].startswith("empty_file:")
+        assert empty.exists()
+
+
+def test_full_flow_suppresses_unchanged_empty_file_until_changed(tmp_path, caplog):
+    root = tmp_path / "documents"
+    root.mkdir()
+    empty = root / "empty@00emp@.pdf"
+    empty.write_bytes(b"")
+    index_root = tmp_path / "index"
+    config = {
+        "index_root": str(index_root),
+        "sources": [
+            {
+                "type": "filesystem",
+                "name": "documents",
+                "root": str(root),
+                "scan": {"include": ["**/*.pdf"], "exclude": []},
+            }
+        ],
+        "chunking": {
+            "max_chars": 1800,
+            "overlap": 200,
+            "semantic": {"enabled": False},
+        },
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "media": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+    store = MagicMock()
+    store.list_doc_ids.return_value = []
+    store.list_doc_mtimes.return_value = {}
+    store.list_doc_change_hashes.return_value = {}
+    store.count_chunks.return_value = 0
+    store.fts_available.return_value = True
+    taxonomy = MagicMock()
+    taxonomy.count.return_value = 0
+
+    with patch("flow_index_vault.load_config", return_value=config), \
+         patch("flow_index_vault.get_run_logger", return_value=logging.getLogger("test")), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=store), \
+         patch("flow_index_vault.build_embed_provider", return_value=MagicMock()), \
+         patch("flow_index_vault.build_ocr_provider", return_value=None), \
+         patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("core.taxonomy.load_taxonomy_store", return_value=taxonomy), \
+         patch("flow_index_vault.process_doc_task") as process, \
+         patch("flow_index_vault.delete_docs_task"), \
+         patch("flow_index_vault.index_stats_task"), \
+         patch("flow_index_vault.write_index_metadata_task"):
+        fiv.index_vault_flow.fn("dummy.yaml")
+        first_entry = fiv._load_skip_ledger(index_root)["docs"]["documents::00emp"]
+        fiv.index_vault_flow.fn("dummy.yaml")
+        empty.write_bytes(b"%PDF-1.4 now populated")
+        fiv.index_vault_flow.fn("dummy.yaml")
+
+    assert first_entry["reasons"] == ["empty_file"]
+    assert first_entry["change_key"].startswith("empty_file:")
+    process.assert_called_once()
+    assert "documents::00emp" not in fiv._load_skip_ledger(index_root)["docs"]
+    warnings = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("Skipping empty file:")
+    ]
+    assert len(warnings) == 1
+    store.upsert_nodes.assert_not_called()
 
 
 def test_taxonomy_usage_accumulator_flushes_once_serially():
@@ -1592,7 +1663,7 @@ def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
         name = "documents"
 
         def scan(self):
-            return iter([
+            records = [
                 SourceRecord(
                     doc_id=f"doc-{i}",
                     natural_key=f"doc-{i}.txt",
@@ -1602,7 +1673,23 @@ def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
                     metadata={"abs_path": str(tmp_path / f"doc-{i}.txt"), "ext": "txt"},
                 )
                 for i in range(1100)
-            ])
+            ]
+            records.append(
+                SourceRecord(
+                    doc_id="empty",
+                    natural_key="empty.pdf",
+                    source_type="pdf",
+                    mtime=1.0,
+                    size=0,
+                    metadata={
+                        "abs_path": str(tmp_path / "empty.pdf"),
+                        "ext": "pdf",
+                        "skip_reason": "empty_file",
+                    },
+                    change_hash="empty_file:0:1",
+                )
+            )
+            return iter(records)
 
         def set_ocr_provider(self, provider):
             return None
@@ -1631,7 +1718,10 @@ def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
                             with patch("flow_index_vault.build_ocr_provider", return_value=None):
                                 with patch("sources.build_source", return_value=_FakeSource()):
                                     with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
-                                        with patch("flow_index_vault._process_docs", return_value=[]):
+                                        with patch(
+                                            "flow_index_vault._process_docs",
+                                            return_value=[],
+                                        ) as process_mock:
                                             with patch("flow_index_vault.delete_docs_task") as delete_mock:
                                                 with patch("flow_index_vault.index_stats_task"):
                                                     with patch("flow_index_vault.write_index_metadata_task"):
@@ -1641,6 +1731,9 @@ def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
     shadow_store.reset_table.assert_called_once_with()
     active_store.promote_table.assert_called_once_with("chunks__shadow")
     delete_mock.assert_not_called()
+    processed = process_mock.call_args.args[0]
+    assert len(processed) == 1100
+    assert all(not doc.get("skip_reason") for doc in processed)
 
 
 def test_large_degraded_requeue_does_not_trigger_shadow_rebuild(tmp_path):
