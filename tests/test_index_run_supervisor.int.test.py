@@ -30,7 +30,15 @@ def test_real_sigkill_records_signal_and_sampled_peak_rss(tmp_path):
         [
             sys.executable,
             "-c",
-            "payload = bytearray(8 * 1024 * 1024); import time; time.sleep(30)",
+            (
+                "import json, os, pathlib, time; "
+                "payload = bytearray(8 * 1024 * 1024); "
+                f"pathlib.Path({str(tmp_path / 'indexer.heartbeat')!r}).write_text("
+                "json.dumps({'run_id': os.environ['INDEX_RUN_ID'], "
+                "'updated_at': '2026-07-28T00:05:00+00:00', 'phase': 'process', "
+                "'queued': 10, 'processed': 3, 'skipped': 1})); "
+                "time.sleep(30)"
+            ),
         ],
         log_path=tmp_path / "indexer.log",
     )
@@ -38,6 +46,7 @@ def test_real_sigkill_records_signal_and_sampled_peak_rss(tmp_path):
     _wait_for(
         lambda: supervisor.status_summary()["current"]["peak_rss_bytes"] > 0
     )
+    _wait_for((tmp_path / "indexer.heartbeat").exists)
 
     os.killpg(pid, signal.SIGKILL)
     terminal = _wait_for(
@@ -51,6 +60,13 @@ def test_real_sigkill_records_signal_and_sampled_peak_rss(tmp_path):
 
     assert terminal["termination_signal"] == signal.SIGKILL
     assert terminal["peak_rss_bytes"] > 0
+    assert terminal["queued"] == 10
+    assert terminal["processed"] == 3
+    assert terminal["skipped"] == 1
+    assert "ERROR index_run_supervisor" in (tmp_path / "indexer.log").read_text()
+    assert f"Index run {launch['run_id']} ended without completion" in (
+        tmp_path / "indexer.log"
+    ).read_text()
     assert supervisor.status_summary()["unresolved_failure"] is True
 
 

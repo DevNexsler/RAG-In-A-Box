@@ -90,7 +90,8 @@ class LiteLLMFallback:
         # unreachable endpoint propagates as a transient error to resolve_with_fallback.
         try:
             return call_with_retry(_once, attempts=self.attempts, backoff=self.backoff,
-                                   label=f"litellm-fallback {self.model}")
+                                   label=f"litellm-fallback {self.model}",
+                                   circuit_key=self.base_url)
         except Exception as exc:
             if is_transient(exc):
                 raise

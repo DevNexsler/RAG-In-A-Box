@@ -83,6 +83,16 @@ def inject_id_into_filename(filename: str, doc_id: str) -> str:
     return f"{stem}@{doc_id}@{ext}"
 
 
+class StrandedCohortError(ValueError):
+    """An exact-hash identity change would strand a canonical's duplicate cohort.
+
+    Raised when a canonical row's content identity is asked to move to a new
+    hash while other rows still reference it as their canonical (an in-place
+    edit, or a forged identity claim). Callers can dissolve the stale cohort
+    (``reset_exact_hash_cohort``) and retry the identity operation.
+    """
+
+
 class DocIDStore:
     """SQLite-backed persistent document ID registry.
 
@@ -117,6 +127,7 @@ class DocIDStore:
     MOVED = "moved"                  # file moved, rel_path updated
     DELETED = "deleted"              # file removed from vault
     COLLISION = "collision"          # duplicate ID detected, re-assigned
+    RETOKENIZED = "retokenized"      # rejected claim replaced by a fresh ID
     RENAME_FAILED = "rename_failed"  # OS refused the rename
     MIGRATED = "migrated"            # legacy path-based ID migrated
 
@@ -190,6 +201,12 @@ class DocIDStore:
             "CREATE INDEX IF NOT EXISTS idx_doc_registry_size_hash "
             "ON doc_registry(size_bytes, content_hash)"
         )
+        # lookup_id is on the per-file scan path (deposit-owned files resolve
+        # by path every sweep); without this index each lookup is a full scan.
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_registry_rel_path "
+            "ON doc_registry(rel_path)"
+        )
         c.execute(
             "UPDATE doc_registry SET first_seen_at = created "
             "WHERE first_seen_at IS NULL"
@@ -199,13 +216,26 @@ class DocIDStore:
         c.commit()
 
     def next_id(self) -> str:
-        """Atomically increment counter and return the next base-62 5-char ID."""
+        """Atomically increment counter and return the next base-62 5-char ID.
+
+        Skips IDs that already name a document (adopted from filenames during
+        a registry rebuild) or that were retired: the counter must never
+        re-mint an ID that a different file already carries.
+        """
         with self._lock:
             c = self._conn
-            c.execute("UPDATE counter SET value = value + 1 WHERE id = 1")
-            row = c.execute("SELECT value FROM counter WHERE id = 1").fetchone()
-            c.commit()
-            return _int_to_base62(row[0])
+            while True:
+                c.execute("UPDATE counter SET value = value + 1 WHERE id = 1")
+                row = c.execute("SELECT value FROM counter WHERE id = 1").fetchone()
+                candidate = _int_to_base62(row[0])
+                taken = c.execute(
+                    "SELECT 1 FROM doc_registry WHERE doc_id = ? "
+                    "UNION ALL SELECT 1 FROM retired_ids WHERE doc_id = ? LIMIT 1",
+                    (candidate, candidate),
+                ).fetchone()
+                if taken is None:
+                    c.commit()
+                    return candidate
 
     def register(
         self,
@@ -274,6 +304,21 @@ class DocIDStore:
                 "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (doc_id,)
             ).fetchone()
             return row[0] if row else None
+
+    def stored_file_identity(self, doc_id: str) -> tuple[int, bytes] | None:
+        """Return the (size_bytes, content_hash) recorded for a doc_id.
+
+        None when the row is missing or predates the dedupe pass (no content
+        identity recorded) — callers cannot verify content for those rows.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT size_bytes, content_hash FROM doc_registry WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return int(row[0]), row[1]
 
     def lookup_id(self, rel_path: str) -> str | None:
         """Return the doc_id for a rel_path, or None if not found."""
@@ -492,7 +537,7 @@ class DocIDStore:
             (row[0],),
         ).fetchone()
         if has_old_siblings is not None:
-            raise ValueError(
+            raise StrandedCohortError(
                 f"cannot move canonical {row[0]} to a new hash while old cohort still points to it"
             )
 

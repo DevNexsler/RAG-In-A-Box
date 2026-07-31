@@ -8,14 +8,25 @@ Fault notes:
     indexed_corpus itself (the per-test /admin/reset wipes the live sink, so
     asserting on a later GET /hooks/received would race with reset ordering).
 """
+import json
 import os
+import re
+import tempfile
+import time
 import uuid
+from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 
 from tests.e2e.client import get_hook_events, search_hits
-from tests.e2e.conftest import E2E_SIM_URL
+from tests.e2e.conftest import (
+    E2E_SIM_URL,
+    _compose_cp_into_documents,
+    indexer_log_lines,
+    wait_for_index,
+)
 
 pytestmark = pytest.mark.anyio
 E2E_REAL = os.environ.get("E2E_REAL") == "1"
@@ -88,6 +99,52 @@ async def test_recovery_from_embeddings_429(indexed_corpus, api, mcp_session):
 
 @pytest.mark.skipif(
     E2E_REAL,
+    reason="the 429 must be injected by the sim; real OpenRouter cannot be forced to rate-limit",
+)
+async def test_forced_429_writes_only_timestamped_lines_to_indexer_log(
+    indexed_corpus, api, mcp_session,
+):
+    """#0546 acceptance, measured where the damage happened: indexer.log.
+
+    An embeddings 429 surfaces as httpx.HTTPStatusError, whose str() ends with
+    "\\nFor more information check: <mdn url>". Interpolated verbatim, each retry
+    wrote a second untimestamped, unattributable physical line — 27% of a nightly
+    capture, evicting most of the reviewable window. Every line must be a record.
+    """
+    content = b"# Ledger\n\nThe obsidian ledger reconciliation runs at midnight.\n"
+    resp = await api.post("/api/upload", files={"file": ("retry-log-note.md", content)})
+    assert resp.status_code == 201, resp.text
+
+    # Fault the sweep (not the single-doc path): the full-flow subprocess is what
+    # writes indexer.log. Two 429s per batch, absorbed by call_with_retry.
+    await _arm_fault("/api/v1/embeddings", "429", times=2)
+    started = await mcp_session.call_tool_json("file_index_update", {})
+    assert started.get("status") == "started", started
+
+    # Don't race the subprocess: file_status can still read "idle" for a moment
+    # after launch, which would let wait_for_index return before anything logged.
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if (await mcp_session.call_tool_json("file_status", {})).get("indexer_running"):
+            break
+        await anyio.sleep(1)
+    await wait_for_index(mcp_session, min_docs=1)
+
+    lines = indexer_log_lines()
+    assert lines, "indexer.log is empty — the sweep did not log to it"
+
+    orphans = [line for line in lines if not re.match(r"^\d{4}-\d{2}-\d{2} ", line)]
+    assert not orphans, f"{len(orphans)} untimestamped continuation lines: {orphans[:5]}"
+
+    # Proof the flood path actually ran, i.e. this test would have caught the bug:
+    # the retry warning is present, on one line, with the provider text collapsed.
+    retries = [line for line in lines if "failed transiently" in line]
+    assert retries, "no retry warning logged — the 429 fault never reached the embed call"
+    assert any("For more information check" in line for line in retries), retries[:3]
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
     reason="enrichment is live in real mode; the sim's chat fault can't be injected into real OpenRouter",
 )
 async def test_degraded_enrichment_still_indexes(indexed_corpus, api, mcp_session):
@@ -119,6 +176,55 @@ async def test_degraded_enrichment_still_indexes(indexed_corpus, api, mcp_sessio
 
 @pytest.mark.skipif(
     E2E_REAL,
+    reason="enrichment is live in real mode; the sim's hangup fault can't be injected into real OpenRouter",
+)
+async def test_provider_hangup_keeps_the_enriched_row(indexed_corpus, api, mcp_session):
+    """#0619: a provider that is GONE must not cost the document its enrichment.
+
+    The difference from test_degraded_enrichment_still_indexes is the prior
+    state: there the doc was new (a bare row beats no row), here it is already
+    indexed and enriched, so the outage-time write must be dropped in favor of
+    what is already served.
+    """
+    content = b"# Ledger\n\nThe periwinkle harbor ledger lists every mooring fee.\n"
+    first = await _upload_and_index(api, mcp_session, "outage-note.md", content)
+    # Indexing ASSIGNS the doc its id-stamped path; re-uploading the original
+    # bare name would mint a NEW document and leave the original row untouched,
+    # which would make this test pass without ever exercising the guard.
+    assigned, doc_id = first["rel_path"], first["doc_id"]
+
+    payload = await mcp_session.call_tool_json(
+        "file_search", {"query": "periwinkle harbor ledger", "top_k": 5})
+    hits = [h for h in payload["results"] if h["doc_id"] == doc_id]
+    assert hits, payload["results"]
+    loc = hits[0]["loc"]
+    good = await mcp_session.call_tool_json(
+        "file_get_chunk", {"doc_id": doc_id, "loc": loc})
+    assert good["enr_summary"], good
+
+    # The provider container is recreated: every enrichment call is cut mid-flight
+    # for the whole of the next index pass.
+    await _arm_fault("/api/v1/chat/completions", "hangup", times=50)
+    resp = await api.post("/api/upload", files={"file": (
+        assigned, content + b"\nA later line arrives while the provider is down.\n")})
+    assert resp.status_code == 201, resp.text
+    second = await mcp_session.call_tool_json(
+        "file_index_document", {"target": assigned, "source_name": "documents"})
+    assert second["doc_id"] == doc_id, (
+        f"outage pass hit a different document ({second['doc_id']}), so the "
+        f"guard was never exercised"
+    )
+
+    after = await mcp_session.call_tool_json(
+        "file_get_chunk", {"doc_id": doc_id, "loc": loc})
+    assert after["enr_summary"] == good["enr_summary"], (
+        "a provider outage overwrote the enriched row with an empty one"
+    )
+    assert after["text"] == good["text"], "outage-time write replaced served content"
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
     reason="enrichment is live in real mode; simulator truncation cannot be armed",
 )
 async def test_reasoning_only_enrichment_retries_with_populated_facets(
@@ -141,3 +247,82 @@ async def test_reasoning_only_enrichment_retries_with_populated_facets(
     )
     assert chunk["enr_summary"]
     assert chunk["enr_doc_type"]
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
+    reason="the real embeddings API is the thing being simulated here",
+)
+async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_session):
+    """#0569: an attachment whose stored conversation context is larger than the
+    embed model's context window must still land in the index.
+
+    That context block is embedded as ONE un-chunked input. Un-bounded, it
+    overruns the model's window and the provider rejects the whole batch with a
+    400 — deterministically, so the doc is re-fetched, re-OCR'd, re-enriched and
+    re-embedded on every run and is never searchable. Both prod poison-pill docs
+    (laura-sanchez msg693) failed exactly here.
+    """
+    stem = f"oversized-context-{uuid.uuid4().hex[:8]}"
+    phrase = "zephyr cantilever manifest"
+    sent_at = "2026-06-01T10:00:30Z"
+    # A channel with no indexed messages, so the targeted index path falls back
+    # to the sidecar's OWN stored context block — the prod shape for a freshly
+    # deposited attachment whose channel history is not in the index yet.
+    channel = f"ops-{stem}"
+    sidecar = {
+        "schema_version": 1,
+        "source": "quo",
+        "message": {
+            "source_message_id": f"{stem}-msg",
+            "sender": "Field Agent",
+            "sent_at": sent_at,
+        },
+        "channel": {"source_channel_id": channel},
+        "media": {
+            "media_index": 0,
+            "media_type": "document",
+            "original_filename": f"{stem}.md",
+        },
+        "context": {
+            "schema_version": 1,
+            "same_channel_before": [
+                {
+                    "source_message_id": f"{stem}-ctx",
+                    "sender": "Dispatch",
+                    "sent_at": "2026-06-01T09:59:30Z",
+                    "origin_source": "quo",
+                    "channel_id": channel,
+                    # Comfortably past the sim's stand-in context window.
+                    "text": "the shipment manifest was revised again. " * 8000,
+                }
+            ],
+        },
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = Path(tmp) / f"{stem}.md"
+        doc.write_text(f"# Manifest\n\nThe {phrase} is attached.\n")
+        (Path(tmp) / f"{stem}.json").write_text(json.dumps(sidecar))
+        _compose_cp_into_documents(Path(tmp) / f"{stem}.json")
+        _compose_cp_into_documents(doc)
+
+    result = await mcp_session.call_tool_json(
+        "file_index_document", {"target": f"{stem}.md", "source_name": "documents"})
+    assert result.get("status") == "indexed", result
+
+    # file_index_document returning "indexed" means the WRITE landed, not that the
+    # serving store has adopted it. Every other test in this file synchronises
+    # here before asserting on search results; this one did not.
+    await wait_for_index(mcp_session, min_docs=1)
+
+    # Assert PRESENCE, not rank. Under provider-sim an embedding is
+    # sha256(text) plus a 0.1-weighted per-token nudge, so vector similarity
+    # carries no semantic signal and "is it in the top 5" is a coin flip on the
+    # random `stem` baked into this doc's text — this assertion failed 2 of 6
+    # staging-e2e runs at top_k=5 with no production code change between them.
+    # What #0569 is actually about is whether the doc reaches the index at all:
+    # unbounded, its context block 400s and the doc is never written.
+    payload = await mcp_session.call_tool_json(
+        "file_search", {"query": phrase, "top_k": 50})
+    assert search_hits(payload, stem), payload["results"]

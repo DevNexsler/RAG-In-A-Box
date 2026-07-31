@@ -30,6 +30,14 @@ app = FastAPI(title="provider-sim")
 SINK_EVENTS: list[Any] = []
 ARMED_FAULTS: list[dict[str, Any]] = []  # {route_prefix, fault, times, seconds}
 
+# The embedding model's context window, expressed in characters: a hermetic
+# image can't fetch BPE ranks, so the sim has no tokenizer. The staging config
+# sets embeddings.max_input_tokens far enough below this that any input the
+# client bounded is comfortably under the window whatever its token density,
+# and any unbounded one is far over it — which is what a real provider does
+# with an oversized input: reject the WHOLE batch, deterministically (#0569).
+MAX_EMBED_INPUT_CHARS = 200_000
+
 # --------------------------------------------------------------------------
 # Deterministic helpers
 # --------------------------------------------------------------------------
@@ -172,6 +180,17 @@ def _fault_response(fault: str) -> Response | None:
                 },
             }
         )
+    if fault == "hangup":
+        # Every other fault here is an ANSWER the provider gave. This one models
+        # the provider not being there at all — a container recreate mid-flight
+        # (#0619) — by cutting the connection after the headers, with no body.
+        # The client raises httpx.RemoteProtocolError, the connection-level
+        # failure shape production sees as [Errno 111] Connection refused.
+        async def _cut():
+            raise RuntimeError("simulated connection hangup")
+            yield b""  # unreachable; makes _cut an async generator
+
+        return StreamingResponse(_cut(), media_type="application/json")
     return None  # "timeout" delays, then falls through to normal handling
 
 
@@ -217,11 +236,30 @@ async def health() -> dict:
 
 
 @app.post("/api/v1/embeddings")
-async def embeddings(request: Request) -> dict:
+async def embeddings(request: Request):
     body = await request.json()
     inputs = body.get("input", [])
     if isinstance(inputs, str):
         inputs = [inputs]
+    for text in inputs:
+        if len(text) > MAX_EMBED_INPUT_CHARS:
+            # Same shape OpenRouter returns when one input overruns the model's
+            # context window: the WHOLE batch is rejected with a 400, and it
+            # never gets smaller on retry (#0569).
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": 400,
+                        "message": (
+                            "This model's maximum context length is "
+                            f"{MAX_EMBED_INPUT_CHARS} characters. However, your "
+                            f"prompt contains {len(text)}. Please reduce the "
+                            "length of the input prompt."
+                        ),
+                    }
+                },
+            )
     return {
         "object": "list",
         "model": body.get("model", "sim-embed"),
@@ -379,7 +417,7 @@ async def admin_reset() -> dict:
     return {"ok": True}
 
 
-_KNOWN_FAULTS = {"429", "timeout", "garbage", "reasoning_only"}
+_KNOWN_FAULTS = {"429", "timeout", "garbage", "reasoning_only", "hangup"}
 
 
 @app.post("/admin/fault")

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from core.config import filesystem_source_roots, load_config
 from core.artifacts import is_communication_sidecar
+from core.logging_setup import configure_logging_from_config
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
 from core.tracing import get_tracer
@@ -53,6 +54,9 @@ _DEFAULT_SEARCH_TOP_K = 8
 _RECENT_SORT_POOL = 50
 _PROVIDER_FAILURE_LOOKBACK_SECONDS = 24 * 60 * 60
 _PROVIDER_FAILURE_MAX_BYTES = 128 * 1024 * 1024
+# Input-invalid rejections: the provider answered and refused one request's
+# payload, so they never indicate provider unavailability (#0705).
+_CLIENT_INVALID_HTTP_STATUSES = frozenset({400, 413, 422})
 _COMPACT_EXCLUDED_METADATA_KEYS = {
     "_node_content",
     "_node_type",
@@ -538,7 +542,10 @@ def _build_store_and_embed(config_path: str = "config.yaml"):
 
 _cache: tuple | None = None
 _cache_index_signature: tuple[int, int] | None = None
-_cache_identity: int | None = None
+# The cache tuple ITSELF, not its id(): a freed tuple's address can be handed to
+# the next one, and then a swapped-in cache reads as unchanged. Holding the object
+# both keeps the comparison honest and keeps the address from being recycled.
+_cache_identity: tuple | None = None
 _DEEP_HEALTH_CACHE_TTL_SECONDS = 600
 _DEEP_HEALTH_SNAPSHOT = "index_health.json"
 _deep_health_cache: dict | None = None
@@ -607,16 +614,16 @@ def _get_deps(config_path: str = "config.yaml"):
     if _cache is None:
         _cache = _build_store_and_embed(config_path)
         _cache_index_signature = _index_metadata_signature(_cache[2])
-        _cache_identity = id(_cache)
+        _cache_identity = _cache
     else:
         current_signature = _index_metadata_signature(_cache[2])
-        if _cache_identity != id(_cache):
+        if _cache_identity is not _cache:
             _cache_index_signature = current_signature
-            _cache_identity = id(_cache)
+            _cache_identity = _cache
         elif current_signature != _cache_index_signature:
             _cache = _build_store_and_embed(config_path)
             _cache_index_signature = _index_metadata_signature(_cache[2])
-            _cache_identity = id(_cache)
+            _cache_identity = _cache
     return _cache[0], _cache[1], _cache[2]
 
 
@@ -1078,6 +1085,13 @@ def _provider_failure_kind(line: str) -> tuple[str, str, str] | None:
     if "ocr failed for page" in lower:
         return "ocr_vision_page", "ocr_vision", "page_ocr"
     status_code = _http_status_from_log_line(line)
+    # 400/413/422 mean one document's input was rejected — that stays visible
+    # through per-document accounting (degraded ledger / skip ledger, #0569),
+    # not the provider-availability ledger (#0705: two bad documents falsely
+    # marked openrouter_embeddings and deep health critical). Auth (401/403),
+    # rate limits (429), and 5xx still count against the provider.
+    if status_code in _CLIENT_INVALID_HTTP_STATUSES:
+        return None
     failure_marker = (
         status_code is not None and status_code >= 400
     ) or any(
@@ -2572,9 +2586,12 @@ def _file_index_update_impl(config_path: str = "config.yaml", source_name: str |
     # PrefectServer or let it auto-start an ephemeral one — a per-run temporary
     # server orphans when earlyoom kills this subprocess before teardown.
     # Ephemeral auto-start is disabled in the deployment env for the same reason.
+    # indexer.log is line-parsed (nightly log review, in-container pattern watcher),
+    # so the child uses the shared setup: one record == one physical line, library
+    # warnings timestamped, repeated retry warnings collapsed with a count (#0546).
     script = (
-        "import logging\n"
-        "logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')\n"
+        "from core.logging_setup import configure_logging\n"
+        "configure_logging('INFO')\n"
         "from flow_index_vault import index_vault_flow\n"
         f"index_vault_flow({config_path!r}, source_name={source_name!r})\n"
     )
@@ -3681,9 +3698,9 @@ if __name__ == "__main__":
 
     config = load_config()
 
-    # Configure root logger from config (Prefect flow/task logs are independent)
-    log_level = config.get("logging", {}).get("level", "WARNING").upper()
-    logging.basicConfig(level=getattr(logging, log_level, logging.WARNING))
+    # Configure root logger from config (Prefect flow/task logs are independent).
+    # One record == one physical line, warnings captured (#0546).
+    configure_logging_from_config(config)
 
     mcp_cfg = config.get("mcp", {})
 

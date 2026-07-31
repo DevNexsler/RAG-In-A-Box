@@ -408,6 +408,26 @@ async def test_fault_armed_429_exhausts(client):
 
 
 @pytest.mark.anyio
+async def test_fault_armed_hangup_cuts_the_connection(client):
+    # Unlike 429/garbage, this fault is not an answer: the provider is gone
+    # mid-request (#0619). The caller must get no usable response at all.
+    arm = await client.post(
+        "/admin/fault",
+        json={"route_prefix": "/api/v1/chat/completions", "fault": "hangup", "times": 1},
+    )
+    assert arm.status_code == 200
+    # Over real HTTP this surfaces as httpx.RemoteProtocolError (transient, per
+    # core.resilience); in-process via ASGITransport the generator's error
+    # propagates directly. Either way: no response body.
+    with pytest.raises((httpx.RemoteProtocolError, RuntimeError)):
+        await client.post("/api/v1/chat/completions", json=_chat_payload("hello"))
+
+    # single-shot: the provider answers normally once the fault exhausts
+    resp = await client.post("/api/v1/chat/completions", json=_chat_payload("hello"))
+    assert resp.status_code == 200
+
+
+@pytest.mark.anyio
 async def test_fault_header_garbage(client):
     resp = await client.post(
         "/api/v1/embeddings",

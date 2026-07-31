@@ -11,10 +11,12 @@ Checks: OpenRouter/DeepInfra API keys, config_test.yaml present in CWD,
 LiteLLM OCR/vision aliases available, prod indexer idle, comm-store Postgres
 reachable.
 """
+import json
 import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -160,9 +162,15 @@ def check_prod_indexer_idle() -> tuple[bool, str]:
         detail = proc.stderr.strip()[:120]
         return True, ("prod container not running or no heartbeat file"
                       + (f" ({detail})" if detail else ""))
+    raw_heartbeat = proc.stdout.strip()
     try:
-        age = time.time() - float(proc.stdout.strip())
-    except ValueError:
+        try:
+            heartbeat_at = float(raw_heartbeat)
+        except ValueError:
+            payload = json.loads(raw_heartbeat)
+            heartbeat_at = datetime.fromisoformat(payload["updated_at"]).timestamp()
+        age = time.time() - heartbeat_at
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return True, "heartbeat unreadable; assuming idle"
     if age < HEARTBEAT_ACTIVE_THRESHOLD_S:
         return False, (f"prod indexer active (heartbeat {age:.0f}s old, "

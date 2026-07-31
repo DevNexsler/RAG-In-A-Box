@@ -10,7 +10,10 @@ the indexer is progressing normally, producing a *false* 503 that ops "fixes"
 by restarting (aborting the sweep). The scan must re-stamp as it goes.
 """
 
+import json
+import logging
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import flow_index_vault
 
@@ -97,3 +100,49 @@ def test_scan_stamps_heartbeat_even_when_empty(tmp_path, monkeypatch):
     assert records == []
     assert record_map == {}
     assert len(stamps) == 2  # start + complete, no per-record stamps
+
+
+def test_heartbeat_persists_run_identity_and_queue_progress(tmp_path, monkeypatch):
+    monkeypatch.setenv("INDEX_RUN_ID", "run-progress")
+    flow_index_vault._RUNTIME.clear()
+    flow_index_vault._initialize_run_progress()
+    flow_index_vault._update_run_progress(
+        queued=10,
+        processed=3,
+        skipped=1,
+        phase="process",
+    )
+
+    flow_index_vault._write_heartbeat(tmp_path)
+
+    payload = json.loads(flow_index_vault._heartbeat_path(tmp_path).read_text())
+    assert payload["run_id"] == "run-progress"
+    assert payload["phase"] == "process"
+    assert payload["queued"] == 10
+    assert payload["processed"] == 3
+    assert payload["skipped"] == 1
+    assert payload["updated_at"]
+
+
+def test_completion_summary_names_queue_progress_and_elapsed():
+    logger = Mock(spec=logging.Logger)
+
+    flow_index_vault._log_run_completion(
+        logger,
+        run_id="run-complete",
+        queued=10,
+        processed=10,
+        skipped=2,
+        elapsed_seconds=12.5,
+    )
+
+    logger.info.assert_called_once_with(
+        "Index run completion: run_id=%s queued=%d processed=%d skipped=%d "
+        "elapsed=%.1fs completion=%.1f%%",
+        "run-complete",
+        10,
+        10,
+        2,
+        12.5,
+        100.0,
+    )
