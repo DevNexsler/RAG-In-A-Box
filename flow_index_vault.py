@@ -79,6 +79,7 @@ from core.config import filesystem_source_roots, load_config
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
+from core.dedupe import compute_file_identity
 from core.resilience import is_transient
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment
@@ -100,7 +101,8 @@ from providers.embed.base import EmbedProvider
 from providers.media import DEFAULT_VIDEO_MODEL, build_media_provider
 from providers.ocr import build_ocr_provider
 from doc_id_store import (
-    DocIDStore, extract_id_from_filename, inject_id_into_filename,
+    DocIDStore, StrandedCohortError, extract_id_from_filename,
+    inject_id_into_filename,
     strip_id_from_filename as _strip_id_from_filename,
 )
 from core.tracing import get_tracer, setup_tracing
@@ -395,6 +397,66 @@ def _is_communication_sidecar(path: Path) -> bool:
 # --- Tasks (one responsibility each) ---
 
 
+def _file_matches_stored_identity(
+    doc_id_store: DocIDStore, doc_id: str, full_path: Path
+) -> bool:
+    """True if full_path's bytes match the registry's recorded content identity.
+
+    Rows that predate the dedupe pass carry no hash and cannot be checked —
+    treat those as matching rather than refusing every legacy move.
+    """
+    stored = doc_id_store.stored_file_identity(doc_id)
+    if stored is None:
+        return True
+    size_bytes, content_hash = stored
+    try:
+        if full_path.stat().st_size != size_bytes:
+            return False
+        return compute_file_identity(full_path).content_hash == content_hash
+    except OSError:
+        return False
+
+
+class _SweepLedger:
+    """Per-scan tally of contested filename tokens and how they were resolved.
+
+    A stream of `ID collision` warnings cannot distinguish a sweep that cleared
+    62 claims from one re-deciding the same 62 for the fourth time — which is
+    how 62 / 0 / 43 / 117 across four scans of one unchanged vault read as
+    progress (#0545). Every scan therefore states what it saw and what it
+    actually changed, and the invariant ``contested == retokenized + remaining``
+    holds: a claim is either cleared off the filename or still stamped on it.
+
+    ``remaining`` is the number that must fall to zero for the sweep to have
+    converged. It stays positive for deposit-owned paths, whose filenames an
+    external producer owns and the scan may never rewrite — real, standing
+    residue that must be visible rather than silently counted as resolved.
+    """
+
+    __slots__ = ("contested", "retokenized", "remaining")
+
+    def __init__(self) -> None:
+        self.contested = 0
+        self.retokenized = 0
+        self.remaining = 0
+
+    def cleared(self) -> None:
+        """A rejected claim whose file now carries its fresh ID on disk."""
+        self.contested += 1
+        self.retokenized += 1
+
+    def unresolved(self) -> None:
+        """A rejected claim whose stale token survives in the filename."""
+        self.contested += 1
+        self.remaining += 1
+
+    def log_summary(self, logger) -> None:
+        logger.info(
+            "Doc-ID sweep: %d contested / %d re-tokenized / %d remaining",
+            self.contested, self.retokenized, self.remaining,
+        )
+
+
 def scan_filesystem_records(
     vault_root: str | Path,
     include: list[str],
@@ -414,6 +476,14 @@ def scan_filesystem_records(
     any file it no longer sees, so renaming creates an endless duplicate loop
     (deposit -> rename -> "missing" -> re-deposit). Those files keep their
     names; their doc_id lives only in the registry, keyed by relative path.
+
+    A filename token is an identity *claim*, not a grant: external producers
+    mint their own @NNNNN@ tokens (attachment counters, review copies), so a
+    token is only honored when this registry issued it — and only re-pointed
+    to a new path when the registered file is actually gone (a real move).
+    Any other claim gets a fresh ID. The one exception is a scan over an
+    empty registry (lost/rebuilt), where filenames are the only surviving
+    ID record and every token is adopted as-is.
     """
     root = Path(vault_root)
     norm_prefixes = [p.strip("/") + "/" for p in (no_rename_prefixes or []) if p.strip("/")]
@@ -423,20 +493,30 @@ def scan_filesystem_records(
     if logger is None:
         logger = _get_logger()
 
+    adopt_unknown_ids = doc_id_store is not None and doc_id_store.count() == 0
+
     records = []
+    ledger = _SweepLedger()
     # Track IDs seen this scan to detect collisions (two files with same @XXXXX@)
     seen_ids: dict[str, str] = {}  # doc_id → rel_path of first file seen
 
     # os.walk with followlinks=True so symlinked directories (e.g. NAS mounts) are traversed.
     # Path.rglob does not follow symlinks in Python 3.13+.
     # Track visited real paths to guard against symlink cycles.
+    #
+    # Traversal is sorted, because walk order decides identity: it picks which
+    # file wins a contested token and the order fresh IDs are drawn from the
+    # counter. os.walk yields whatever the filesystem hands back, so two scans
+    # of an unchanged vault could adjudicate it differently and each blame the
+    # other's result (#0545). Sorting makes a rescan reproduce its predecessor.
     visited: set[str] = set()
-    for dirpath, _dirnames, filenames in os.walk(root, followlinks=True):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         real = os.path.realpath(dirpath)
         if real in visited:
             continue
         visited.add(real)
-        for fname in filenames:
+        dirnames.sort()
+        for fname in sorted(filenames):
             full_path = Path(dirpath) / fname
             rel_str = str(full_path.relative_to(root)).replace("\\", "/")
             if _matches_any(rel_str, exclude):
@@ -449,69 +529,129 @@ def scan_filesystem_records(
                 continue
             empty_file = stat.st_size == 0
 
-            # Skip communication sidecars: these *.json files are attachment
-            # metadata consumed by the communication-context provider, not
-            # standalone documents. The message context they carry is already
-            # folded into their sibling attachment's enrichment, so indexing
-            # them adds nothing and re-processing thousands of them every run
-            # is pure waste.
-            if fname.lower().endswith(".json") and _is_communication_sidecar(full_path):
+            # Communication sidecars are metadata, not standalone documents.
+            # Tokenless sidecars can skip immediately. Token-bearing sidecars
+            # still need global identity adjudication below: producer-minted
+            # tokens otherwise survive every audit sweep and keep colliding
+            # with live documents. They are excluded from records after any
+            # required re-tokenization, so they are never indexed on their own.
+            is_communication_sidecar = (
+                fname.lower().endswith(".json")
+                and _is_communication_sidecar(full_path)
+            )
+            if is_communication_sidecar and extract_id_from_filename(fname) is None:
                 continue
 
             # --- Persistent doc_id assignment ---
-            existing_id = extract_id_from_filename(fname)
+            claimed_token = extract_id_from_filename(fname)
+            existing_id = claimed_token
+            # A path that already has a registered identity was adjudicated on
+            # an earlier sweep: deposit-owned (no-rename) and rename-failed
+            # files keep their stale token in the filename forever, and resolve
+            # by path below. Re-logging the same collision every sweep would
+            # bury the audit log — but the claim is still counted, so the
+            # ledger keeps reporting the standing residue.
+            path_adjudicated = False
             if existing_id and doc_id_store:
+                path_adjudicated = doc_id_store.lookup_id(rel_str) is not None
                 # Check for retired ID: was this ID previously deleted?
                 # Copy-pasted files may carry a stale @XXXXX@ from a deleted doc.
                 if doc_id_store.is_retired(existing_id):
-                    retired = doc_id_store.retired_info(existing_id)
-                    last_path = retired["last_path"] if retired else "unknown"
-                    logger.warning(
-                        "Retired ID %s (was %s) found on %s — assigning fresh ID",
-                        existing_id, last_path, rel_str,
-                    )
-                    doc_id_store.log_event(
-                        DocIDStore.COLLISION, existing_id, rel_str,
-                        detail=f"retired ID, previously used by {last_path}",
-                    )
+                    if not path_adjudicated:
+                        retired = doc_id_store.retired_info(existing_id)
+                        last_path = retired["last_path"] if retired else "unknown"
+                        logger.warning(
+                            "Retired ID %s (was %s) found on %s — assigning fresh ID",
+                            existing_id, last_path, rel_str,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.COLLISION, existing_id, rel_str,
+                            detail=f"retired ID, previously used by {last_path}",
+                        )
                     existing_id = None  # fall through to "no ID" path below
                 # Check for collision: another file already claimed this ID
                 elif existing_id in seen_ids:
                     # Collision! Re-assign a fresh ID to this file
-                    logger.warning(
-                        "ID collision: %s already used by %s — re-assigning %s",
-                        existing_id, seen_ids[existing_id], rel_str,
-                    )
-                    doc_id_store.log_event(
-                        DocIDStore.COLLISION, existing_id, rel_str,
-                        detail=f"already claimed by {seen_ids[existing_id]}",
-                    )
-                    existing_id = None  # fall through to "no ID" path below
-                else:
-                    stored_path = doc_id_store.lookup_path(existing_id)
-                    if (
-                        stored_path
-                        and stored_path != rel_str
-                        and (root / stored_path).is_file()
-                    ):
-                        # Targeted scans see only one file, so seen_ids cannot
-                        # detect an alias already owned by another live path.
-                        # Preserve that owner and assign this file a fresh ID.
+                    if not path_adjudicated:
                         logger.warning(
-                            "ID collision: %s already registered to %s — re-assigning %s",
-                            existing_id, stored_path, rel_str,
+                            "ID collision: %s already used by %s — re-assigning %s",
+                            existing_id, seen_ids[existing_id], rel_str,
                         )
                         doc_id_store.log_event(
                             DocIDStore.COLLISION, existing_id, rel_str,
-                            detail=f"already registered to live path {stored_path}",
+                            detail=f"already claimed by {seen_ids[existing_id]}",
                         )
-                        existing_id = None
+                    existing_id = None  # fall through to "no ID" path below
+                else:
+                    stored_path = doc_id_store.lookup_path(existing_id)
+                    if stored_path is None and not adopt_unknown_ids:
+                        # Token this registry never issued (producer-minted or
+                        # copied in from elsewhere) — not an identity claim.
+                        # Adopting it would also plant a collision in the
+                        # counter's future ID space.
+                        if not path_adjudicated:
+                            logger.warning(
+                                "Unissued ID %s on %s — assigning fresh ID",
+                                existing_id, rel_str,
+                            )
+                            doc_id_store.log_event(
+                                DocIDStore.COLLISION, existing_id, rel_str,
+                                detail="token never issued by this registry",
+                            )
+                        existing_id = None  # fall through to "no ID" path below
+                    elif (
+                        stored_path is not None
+                        and stored_path != rel_str
+                        and (root / stored_path).is_file()
+                    ):
+                        # The ID's registered file still exists elsewhere, so
+                        # this is a copy or a forged claim, not a move — the
+                        # registered owner keeps the ID regardless of which
+                        # file the walk visits first.
+                        if not path_adjudicated:
+                            logger.warning(
+                                "ID %s belongs to %s which still exists — re-assigning %s",
+                                existing_id, stored_path, rel_str,
+                            )
+                            doc_id_store.log_event(
+                                DocIDStore.COLLISION, existing_id, rel_str,
+                                detail=f"still owned by {stored_path}",
+                            )
+                        existing_id = None  # fall through to "no ID" path below
+                    elif (
+                        stored_path is not None
+                        and stored_path != rel_str
+                        and not _file_matches_stored_identity(
+                            doc_id_store, existing_id, full_path
+                        )
+                    ):
+                        # The registered file is gone, but these bytes don't
+                        # match the row's recorded content identity — a
+                        # vanished owner's token re-surfacing on unrelated
+                        # content (producer copy), not a move.
+                        if not path_adjudicated:
+                            logger.warning(
+                                "ID %s vanished from %s but %s carries different "
+                                "content — assigning fresh ID",
+                                existing_id, stored_path, rel_str,
+                            )
+                            doc_id_store.log_event(
+                                DocIDStore.COLLISION, existing_id, rel_str,
+                                detail=f"content mismatch with vanished {stored_path}",
+                            )
+                        existing_id = None  # fall through to "no ID" path below
                     else:
                         doc_id = existing_id
                         seen_ids[doc_id] = rel_str
-                        # A missing old path means this is a real move.
+                        # Register/update mapping in SQLite (a real move, or a
+                        # bootstrap adoption on an empty registry)
                         if stored_path != rel_str:
                             doc_id_store.register(doc_id, rel_str)
+
+            # The token was rejected above: the file claimed an identity it is
+            # not entitled to, and gets a fresh one below. Whether that fresh
+            # ID also reaches the filename decides cleared vs. unresolved.
+            claim_rejected = claimed_token is not None and existing_id is None
 
             if existing_id is None and doc_id_store and any(
                 rel_str.startswith(p) for p in norm_prefixes
@@ -523,6 +663,24 @@ def scan_filesystem_records(
                     doc_id = doc_id_store.next_id()
                     doc_id_store.register(doc_id, rel_str)
                 seen_ids[doc_id] = rel_str
+                if claim_rejected:
+                    # The producer owns this filename, so the contested token
+                    # stays on disk no matter how often the sweep runs. Say so
+                    # once, and keep counting it every scan.
+                    if not path_adjudicated:
+                        logger.warning(
+                            "Claim %s on deposit-owned %s cannot be cleared from "
+                            "the filename — identity is %s in the registry",
+                            claimed_token, rel_str, doc_id,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.RETOKENIZED, doc_id, rel_str,
+                            detail=(
+                                f"replaces contested claim {claimed_token}; "
+                                "filename is deposit-owned and unchanged"
+                            ),
+                        )
+                    ledger.unresolved()
             elif existing_id is None and doc_id_store:
                 # No ID in filename (or collision stripped it) — assign one and rename
                 doc_id = doc_id_store.next_id()
@@ -543,14 +701,33 @@ def scan_filesystem_records(
                     doc_id = rel_str
                     doc_id_store.register(doc_id, rel_str)
                     seen_ids[doc_id] = rel_str
+                    if claim_rejected:
+                        ledger.unresolved()
                 else:
                     full_path = new_full_path
                     rel_str = str(full_path.relative_to(root)).replace("\\", "/")
                     doc_id_store.register(doc_id, rel_str)
                     seen_ids[doc_id] = rel_str
+                    if claim_rejected:
+                        # Record which ID actually replaced the rejected claim.
+                        # The warnings above say only what the scan *will* do;
+                        # without this an operator cannot tell a resolved claim
+                        # from one re-decided every run (#0545).
+                        logger.warning(
+                            "Re-tokenized %s: rejected claim %s replaced by fresh ID %s",
+                            rel_str, claimed_token, doc_id,
+                        )
+                        doc_id_store.log_event(
+                            DocIDStore.RETOKENIZED, doc_id, rel_str,
+                            detail=f"replaces contested claim {claimed_token}",
+                        )
+                        ledger.cleared()
             elif not doc_id_store:
                 # Fallback: no doc_id_store (shouldn't happen in normal flow)
                 doc_id = rel_str
+
+            if is_communication_sidecar:
+                continue
 
             record = {
                 "doc_id": doc_id,
@@ -570,6 +747,8 @@ def scan_filesystem_records(
                     f"empty_file:{stat.st_size}:{stat.st_mtime_ns}"
                 )
             records.append(record)
+
+    ledger.log_summary(logger)
     return records
 
 
@@ -1626,6 +1805,35 @@ def _keep_indexed_version_on_outage(doc_id: str, store: LanceDBStore, logger) ->
     return True
 
 
+def _run_identity_op_with_stranded_cohort_recovery(
+    operation,
+    registry: DocIDStore,
+    store: LanceDBStore,
+    bare_id: str,
+    source_name: str,
+    logger,
+):
+    """Run a registry identity operation, recovering a stranded cohort once.
+
+    A ``StrandedCohortError`` means this document's bytes changed while old
+    duplicates still point at it as canonical (an in-place edit). Failing open
+    here would index the new content under an identity the registry still
+    records with the old hash. Instead, dissolve the stale cohort — members
+    are reopened for re-election on their next pass — and retry the operation
+    against the now-unreferenced identity.
+    """
+    try:
+        return operation()
+    except StrandedCohortError:
+        logger.warning(
+            "Content changed under canonical %s while its cohort still points "
+            "to it — dissolving stale cohort and re-claiming",
+            bare_id,
+        )
+        _reset_invalid_dedupe_cohort(registry, store, bare_id, source_name, logger)
+        return operation()
+
+
 def _process_doc_task(
     doc: dict,
     *,
@@ -1727,14 +1935,17 @@ def _process_doc_task(
                 if winner is not None and winner.get("doc_id") != bare_id:
                     canonical_ns = f"{source_name}::{winner['doc_id']}"
                     if store.contains_doc_id(canonical_ns):
-                        registry.update_dedupe_identity(
-                            bare_id,
-                            size_bytes=len(raw_bytes),
-                            content_hash=digest,
-                            hash_algo="blake3",
-                            dedupe_status="duplicate",
-                            canonical_doc_id=winner["doc_id"],
-                            duplicate_reason="exact content match at index time",
+                        _run_identity_op_with_stranded_cohort_recovery(
+                            lambda: registry.update_dedupe_identity(
+                                bare_id,
+                                size_bytes=len(raw_bytes),
+                                content_hash=digest,
+                                hash_algo="blake3",
+                                dedupe_status="duplicate",
+                                canonical_doc_id=winner["doc_id"],
+                                duplicate_reason="exact content match at index time",
+                            ),
+                            registry, store, bare_id, source_name, logger,
                         )
                     else:
                         logger.warning(
@@ -1746,12 +1957,15 @@ def _process_doc_task(
                         )
                         winner = None
                 if winner is None:
-                    winner = registry.claim_canonical_by_exact_hash(
-                        bare_id,
-                        len(raw_bytes),
-                        digest,
-                        hash_algo="blake3",
-                        duplicate_reason="exact content match at index time",
+                    winner = _run_identity_op_with_stranded_cohort_recovery(
+                        lambda: registry.claim_canonical_by_exact_hash(
+                            bare_id,
+                            len(raw_bytes),
+                            digest,
+                            hash_algo="blake3",
+                            duplicate_reason="exact content match at index time",
+                        ),
+                        registry, store, bare_id, source_name, logger,
                     )
             except Exception as exc:
                 logger.warning("Dedupe gate failed for %s (indexing normally): %s", doc_id, exc)
