@@ -17,10 +17,10 @@ ephemeral-server auto-start, so a missing ``PREFECT_API_URL`` fails loudly
 rather than silently leaking orphan servers.
 """
 
-import logging
 import os
 
 from core.config import load_config
+from core.logging_setup import configure_logging_from_config
 from core.tracing import setup_tracing
 from mcp_server import (
     build_index_scheduler,
@@ -34,8 +34,8 @@ from prefect_server import PrefectServer
 def main() -> None:
     config = load_config()
 
-    log_level = config.get("logging", {}).get("level", "WARNING").upper()
-    logging.basicConfig(level=getattr(logging, log_level, logging.WARNING))
+    # One record == one physical line, warnings captured (#0546).
+    configure_logging_from_config(config)
 
     # No-op unless config has tracing.enabled: true; never raises.
     setup_tracing(config, "doc-organizer")

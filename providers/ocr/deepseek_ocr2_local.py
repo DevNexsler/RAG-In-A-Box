@@ -43,6 +43,7 @@ class DeepSeekOCR2Local(OCRProvider):
         return call_with_retry(
             _do, attempts=self.attempts, backoff=self.backoff,
             label=f"deepseek-ocr {endpoint}",
+            circuit_key=self.base_url,
         )
 
     def extract(self, file_path: str | Path, page: Optional[int] = None) -> str:

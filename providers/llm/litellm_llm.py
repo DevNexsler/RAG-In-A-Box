@@ -10,7 +10,7 @@ from typing import Any, TypedDict
 
 import httpx
 
-from core.resilience import TransientError
+from core.resilience import CIRCUITS, TransientError
 from doc_enrichment import enrichment_response_schema
 from providers.llm.trace_recorder import LLMTraceRecorder
 
@@ -239,13 +239,17 @@ class LiteLLMGenerator:
             try:
                 attempt_payload = copy.deepcopy(payload)
                 trace_request["payload"] = attempt_payload
-                resp = httpx.post(
-                    f"{self.base_url}/chat/completions",
-                    json=attempt_payload,
-                    headers=headers,
-                    timeout=request_timeout,
-                )
-                resp.raise_for_status()
+                # The breaker fails fast (CircuitOpenError, a TransientError) while
+                # this proxy is in cooldown, so a proxy recreate is discovered once
+                # per provider instead of once per document (#0619).
+                with CIRCUITS.guard(self.base_url):
+                    resp = httpx.post(
+                        f"{self.base_url}/chat/completions",
+                        json=attempt_payload,
+                        headers=headers,
+                        timeout=request_timeout,
+                    )
+                    resp.raise_for_status()
                 data = resp.json()
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 self.trace_recorder.record(

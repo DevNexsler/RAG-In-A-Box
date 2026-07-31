@@ -14,14 +14,22 @@ On exhaustion the original exception is re-raised UNCHANGED, so the caller's exi
 degrade path still fires (note_degradation/failed_enrichment -> the degraded ledger ->
 the doc is retried on a later run). Retry handles the seconds-scale blip; the degraded
 ledger handles the minutes/hours-scale outage. Together that is the self-healing.
+
+Between the two sits the per-endpoint circuit breaker (EndpointCircuits): a refused
+connection is not information about the document, it is information about the provider,
+so it is remembered per base_url instead of being re-discovered once per document.
 """
 from __future__ import annotations
 
 import logging
+import threading
 import time
-from typing import Callable, TypeVar
+from contextlib import contextmanager
+from typing import Callable, Iterator, TypeVar
 
 import httpx
+
+from core.logging_setup import MAX_ERROR_CHARS, collapse
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +77,127 @@ def is_transient(exc: BaseException) -> bool:
     return False
 
 
+# --- Per-endpoint circuit breaker -------------------------------------------
+#
+# A connection-level failure says the provider is gone, not that this document is
+# bad — yet without a breaker every document rediscovers it, each burning its own
+# retry ladder against a socket that refuses instantly (#0619: 209 connection-refused
+# warnings in one 2-minute litellm-proxy recreate). After CIRCUIT_FAILURE_THRESHOLD
+# consecutive connection-level failures to one base_url, calls to it fail fast for
+# CIRCUIT_COOLDOWN_SECONDS; one probe is admitted once the cooldown elapses.
+
+CIRCUIT_FAILURE_THRESHOLD = 3
+CIRCUIT_COOLDOWN_SECONDS = 60.0
+
+# Failures that mean "no one answered at this address". A 5xx or a malformed body
+# is deliberately NOT here: the endpoint answered, so that is per-request news.
+_CONNECTION_LEVEL_EXC = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    ConnectionError,
+)
+
+
+class CircuitOpenError(TransientError):
+    """The endpoint is in cooldown after repeated connection-level failures.
+
+    Transient by inheritance: the caller degrades the doc to the ledger and it
+    self-heals once the provider is back, exactly as an outage-time timeout would."""
+
+
+def is_connection_level(exc: BaseException) -> bool:
+    """True if `exc` means the endpoint could not be reached at all."""
+    return isinstance(exc, _CONNECTION_LEVEL_EXC)
+
+
+class EndpointCircuits:
+    """Circuit state for every endpoint, keyed by base_url. Thread-safe: indexing
+    processes documents concurrently against the same providers."""
+
+    def __init__(
+        self,
+        *,
+        threshold: int = CIRCUIT_FAILURE_THRESHOLD,
+        cooldown: float = CIRCUIT_COOLDOWN_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._threshold = max(1, threshold)
+        self._cooldown = cooldown
+        self._clock = clock
+        self._lock = threading.Lock()
+        # key -> {"failures": int, "open_until": float | None}
+        self._state: dict[str, dict] = {}
+
+    def reset(self) -> None:
+        with self._lock:
+            self._state.clear()
+
+    def is_open(self, key: str | None) -> bool:
+        """True while `key` is in cooldown — no point retrying it right now."""
+        if not key:
+            return False
+        with self._lock:
+            state = self._state.get(key)
+            open_until = state and state["open_until"]
+            return open_until is not None and self._clock() < open_until
+
+    def _enter(self, key: str) -> None:
+        with self._lock:
+            state = self._state.get(key)
+            open_until = state and state["open_until"]
+            if open_until is None:
+                return
+            if self._clock() < open_until:
+                raise CircuitOpenError(
+                    f"circuit open for {key} after {state['failures']} consecutive "
+                    f"connection failures — {open_until - self._clock():.0f}s of cooldown left"
+                )
+            # Cooldown elapsed: admit exactly one probe. Concurrent callers keep
+            # failing fast until the probe reports back.
+            state["open_until"] = self._clock() + self._cooldown
+
+    def _record(self, key: str, exc: BaseException | None) -> None:
+        with self._lock:
+            state = self._state.setdefault(key, {"failures": 0, "open_until": None})
+            if exc is None or not is_connection_level(exc):
+                # Answered (or succeeded) — the endpoint is reachable.
+                state["failures"] = 0
+                state["open_until"] = None
+                return
+            state["failures"] += 1
+            if state["failures"] >= self._threshold and state["open_until"] is None:
+                state["open_until"] = self._clock() + self._cooldown
+                logger.warning(
+                    "%s refused %d consecutive connections — pausing calls to it for %.0fs",
+                    key, state["failures"], self._cooldown,
+                )
+            elif state["open_until"] is not None:
+                # A failed probe re-arms the cooldown from now.
+                state["open_until"] = self._clock() + self._cooldown
+
+    @contextmanager
+    def guard(self, key: str | None) -> Iterator[None]:
+        """Short-circuit the block when `key`'s endpoint is in cooldown, and feed
+        its outcome back into that endpoint's failure run. `key=None` disables it."""
+        if not key:
+            yield
+            return
+        self._enter(key)
+        try:
+            yield
+        except CircuitOpenError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 — classify, then re-raise
+            self._record(key, exc)
+            raise
+        else:
+            self._record(key, None)
+
+
+CIRCUITS = EndpointCircuits()
+
+
 def call_with_retry(
     fn: Callable[[], T],
     *,
@@ -77,6 +206,8 @@ def call_with_retry(
     label: str = "external call",
     classify: Callable[[BaseException], bool] = is_transient,
     sleep: Callable[[float], None] = time.sleep,
+    circuit_key: str | None = None,
+    circuits: EndpointCircuits | None = None,
 ) -> T:
     """Call `fn()`; retry on TRANSIENT failures with backoff, raise PERMANENT ones
     immediately. After `attempts` transient failures, re-raise the last exception so
@@ -84,19 +215,40 @@ def call_with_retry(
 
     `backoff[i]` is the delay before attempt i+1 (the last value repeats). A caller can
     override `classify` (e.g. to honor a Retry-After) or inject `sleep` (tests).
+
+    Pass `circuit_key` (the provider's base_url) to route the call through the
+    per-endpoint breaker: while that endpoint is in cooldown the call fails
+    immediately with CircuitOpenError instead of re-walking the retry ladder.
     """
+    breaker = circuits if circuits is not None else CIRCUITS
     last: BaseException | None = None
     for i in range(max(1, attempts)):
         try:
-            return fn()
+            with breaker.guard(circuit_key):
+                return fn()
+        except CircuitOpenError:
+            raise  # known-down provider: never sleep on it
         except Exception as exc:  # noqa: BLE001 — classify, then retry or re-raise
             last = exc
             if not classify(exc) or i >= attempts - 1:
                 raise
+            if breaker.is_open(circuit_key):
+                # This attempt tripped the breaker: the endpoint is down for
+                # everyone, so re-raise the real error now instead of sleeping.
+                raise
             delay = backoff[min(i, len(backoff) - 1)] if backoff else 0.0
+            # #0546: a provider error's str() can contain a newline (litellm's
+            # RateLimitError ends with "\nFor more information check: <mdn url>").
+            # collapse() flattens it BEFORE truncating, so one retry warning is one
+            # physical line; dedup_key lets RepeatCollapseFilter fold a 429 storm
+            # into one line per window with a count instead of one line per attempt.
             logger.warning(
                 "%s: attempt %d/%d failed transiently (%s: %s) — retrying in %.0fs",
-                label, i + 1, attempts, type(exc).__name__, str(exc)[:160], delay,
+                label, i + 1, attempts, type(exc).__name__,
+                collapse(exc, MAX_ERROR_CHARS), delay,
+                extra={"dedup_key": (
+                    "core.resilience.retry", label, type(exc).__name__,
+                )},
             )
             sleep(delay)
     assert last is not None  # pragma: no cover — loop always runs >=1

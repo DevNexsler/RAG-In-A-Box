@@ -18,6 +18,7 @@ import logging
 import time
 
 from providers.embed.base import EmbedProvider
+from providers.embed.limits import bound_inputs, resolve_max_input_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +50,14 @@ class OllamaEmbedProvider(EmbedProvider):
         query_instruction: str = DEFAULT_QUERY_INSTRUCTION,
         batch_size: int = 64,
         timeout: float = 300.0,
+        max_input_tokens: int | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
         self.query_instruction = query_instruction
         self.batch_size = batch_size
         self.timeout = timeout
+        self.max_input_tokens = max_input_tokens or resolve_max_input_tokens(model_name)
         self._model_loaded = False
 
         logger.info(
@@ -119,6 +122,9 @@ class OllamaEmbedProvider(EmbedProvider):
         """Call /v1/embeddings with retry and backoff for cold-start resilience."""
         import httpx
 
+        texts = bound_inputs(
+            texts, self.max_input_tokens, label=f"ollama-embed[{self.model_name}]",
+        )
         use_timeout = WARMUP_TIMEOUT if not self._model_loaded else self.timeout
         last_exc: Exception | None = None
 

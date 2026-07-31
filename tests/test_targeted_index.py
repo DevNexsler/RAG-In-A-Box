@@ -182,6 +182,50 @@ def test_index_document_flow_skips_unchanged_without_processing(tmp_path):
     proc.fn.assert_not_called()
 
 
+def test_index_document_flow_suppresses_unchanged_empty_file_until_changed(
+    tmp_path, caplog
+):
+    root, f = _make_attachment(
+        tmp_path, "email-attachments/empty@00emp@.pdf", data=b""
+    )
+    index_root = tmp_path / "index"
+    cfg = _fs_config(root, index_root)
+    store = MagicMock()
+    store.list_doc_mtimes.return_value = {}
+    store.list_doc_change_hashes.return_value = {}
+
+    with patch("flow_index_vault.load_config", return_value=cfg), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=store), \
+         patch("flow_index_vault.build_embed_provider", return_value=MagicMock()), \
+         patch("flow_index_vault.build_ocr_provider", return_value=None), \
+         patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("flow_index_vault.process_doc_task") as proc:
+        first = fiv.index_document_flow(target=str(f), source_name="documents")
+        second = fiv.index_document_flow(target=str(f), source_name="documents")
+        empty_entry = _ledger(
+            tmp_path, "skip_docs.json"
+        )["docs"]["documents::00emp"]
+        f.write_bytes(b"%PDF-1.4 now populated")
+        changed = fiv.index_document_flow(target=str(f), source_name="documents")
+
+    assert first["status"] == second["status"] == "skipped"
+    assert first["reason"] == second["reason"] == "empty_file"
+    assert first["doc_id"] == "documents::00emp"
+    assert empty_entry["reasons"] == ["empty_file"]
+    assert empty_entry["change_key"].startswith("empty_file:")
+    assert changed["status"] == "indexed"
+    proc.fn.assert_called_once()
+    assert "documents::00emp" not in _ledger(
+        tmp_path, "skip_docs.json"
+    )["docs"]
+    warnings = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("Skipping empty file:")
+    ]
+    assert len(warnings) == 1
+
+
 def test_index_document_flow_indexes_new_file(tmp_path):
     root, f = _make_attachment(tmp_path, "email-attachments/a@00xyz@.txt", data=b"hello text")
     cfg = _fs_config(root, tmp_path / "index")
@@ -321,6 +365,9 @@ def test_index_document_flow_runs_real_process_doc_task_without_prefect_context(
     store = MagicMock()
     store.list_doc_mtimes.return_value = {}
     store.list_doc_change_hashes.return_value = {}
+    # Empty index: nothing indexed yet, so an outage-degraded doc has no good
+    # version to protect and is written as a stub (see the write guard, #0619).
+    store.contains_doc_id.return_value = False
     embed = MagicMock()
     embed.embed_texts.side_effect = lambda texts: [[0.1, 0.2, 0.3] for _ in texts]
 
@@ -411,6 +458,9 @@ def _run_single_doc(tmp_path, root, f, ocr_provider):
     store = MagicMock()
     store.list_doc_mtimes.return_value = {}
     store.list_doc_change_hashes.return_value = {}
+    # Empty index: nothing indexed yet, so an outage-degraded doc has no good
+    # version to protect and is written as a stub (see the write guard, #0619).
+    store.contains_doc_id.return_value = False
     embed = MagicMock()
     embed.embed_texts.side_effect = lambda texts: [[0.1, 0.2, 0.3] for _ in texts]
 

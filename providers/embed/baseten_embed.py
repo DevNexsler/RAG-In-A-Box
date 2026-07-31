@@ -18,6 +18,7 @@ import time
 import httpx
 
 from providers.embed.base import EmbedProvider
+from providers.embed.limits import bound_inputs, resolve_max_input_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class BasetenEmbedProvider(EmbedProvider):
         query_instruction: str = DEFAULT_QUERY_INSTRUCTION,
         batch_size: int = 64,
         timeout: float = 120.0,
+        max_input_tokens: int | None = None,
     ):
         self.model_id = model_id
         self.model_name = model_name
@@ -55,6 +57,7 @@ class BasetenEmbedProvider(EmbedProvider):
         self.query_instruction = query_instruction
         self.batch_size = batch_size
         self.timeout = timeout
+        self.max_input_tokens = max_input_tokens or resolve_max_input_tokens(model_name)
         self.base_url = (
             f"https://model-{model_id}.api.baseten.co"
             f"/environments/production/sync"
@@ -72,6 +75,9 @@ class BasetenEmbedProvider(EmbedProvider):
 
     def _call_embeddings(self, texts: list[str]) -> list[list[float]]:
         """Call /v1/embeddings with retry and backoff."""
+        texts = bound_inputs(
+            texts, self.max_input_tokens, label=f"baseten-embed[{self.model_name}]",
+        )
         headers = {
             "Authorization": f"Api-Key {self.api_key}",
             "Content-Type": "application/json",
