@@ -311,6 +311,18 @@ async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_
         "file_index_document", {"target": f"{stem}.md", "source_name": "documents"})
     assert result.get("status") == "indexed", result
 
+    # file_index_document returning "indexed" means the WRITE landed, not that the
+    # serving store has adopted it. Every other test in this file synchronises
+    # here before asserting on search results; this one did not.
+    await wait_for_index(mcp_session, min_docs=1)
+
+    # Assert PRESENCE, not rank. Under provider-sim an embedding is
+    # sha256(text) plus a 0.1-weighted per-token nudge, so vector similarity
+    # carries no semantic signal and "is it in the top 5" is a coin flip on the
+    # random `stem` baked into this doc's text — this assertion failed 2 of 6
+    # staging-e2e runs at top_k=5 with no production code change between them.
+    # What #0569 is actually about is whether the doc reaches the index at all:
+    # unbounded, its context block 400s and the doc is never written.
     payload = await mcp_session.call_tool_json(
-        "file_search", {"query": phrase, "top_k": 5})
+        "file_search", {"query": phrase, "top_k": 50})
     assert search_hits(payload, stem), payload["results"]
