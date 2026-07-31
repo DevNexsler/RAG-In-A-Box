@@ -15,6 +15,7 @@ from pathlib import Path
 
 from core.config import filesystem_source_roots, load_config
 from core.artifacts import is_communication_sidecar
+from core.logging_setup import configure_logging_from_config
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.storage import SearchHit
 from core.tracing import get_tracer
@@ -2582,9 +2583,12 @@ def _file_index_update_impl(config_path: str = "config.yaml", source_name: str |
     # PrefectServer or let it auto-start an ephemeral one — a per-run temporary
     # server orphans when earlyoom kills this subprocess before teardown.
     # Ephemeral auto-start is disabled in the deployment env for the same reason.
+    # indexer.log is line-parsed (nightly log review, in-container pattern watcher),
+    # so the child uses the shared setup: one record == one physical line, library
+    # warnings timestamped, repeated retry warnings collapsed with a count (#0546).
     script = (
-        "import logging\n"
-        "logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')\n"
+        "from core.logging_setup import configure_logging\n"
+        "configure_logging('INFO')\n"
         "from flow_index_vault import index_vault_flow\n"
         f"index_vault_flow({config_path!r}, source_name={source_name!r})\n"
     )
@@ -3691,9 +3695,9 @@ if __name__ == "__main__":
 
     config = load_config()
 
-    # Configure root logger from config (Prefect flow/task logs are independent)
-    log_level = config.get("logging", {}).get("level", "WARNING").upper()
-    logging.basicConfig(level=getattr(logging, log_level, logging.WARNING))
+    # Configure root logger from config (Prefect flow/task logs are independent).
+    # One record == one physical line, warnings captured (#0546).
+    configure_logging_from_config(config)
 
     mcp_cfg = config.get("mcp", {})
 

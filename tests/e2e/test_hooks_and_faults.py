@@ -9,13 +9,16 @@ Fault notes:
     asserting on a later GET /hooks/received would race with reset ordering).
 """
 import os
+import re
+import time
 import uuid
 
+import anyio
 import httpx
 import pytest
 
 from tests.e2e.client import get_hook_events, search_hits
-from tests.e2e.conftest import E2E_SIM_URL
+from tests.e2e.conftest import E2E_SIM_URL, indexer_log_lines, wait_for_index
 
 pytestmark = pytest.mark.anyio
 E2E_REAL = os.environ.get("E2E_REAL") == "1"
@@ -84,6 +87,52 @@ async def test_recovery_from_embeddings_429(indexed_corpus, api, mcp_session):
     audit_events = {e["event"] for e in log["entries"]}
     assert audit_events, log
     assert not audit_events & {"rename_failed", "collision"}, log["entries"]
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
+    reason="the 429 must be injected by the sim; real OpenRouter cannot be forced to rate-limit",
+)
+async def test_forced_429_writes_only_timestamped_lines_to_indexer_log(
+    indexed_corpus, api, mcp_session,
+):
+    """#0546 acceptance, measured where the damage happened: indexer.log.
+
+    An embeddings 429 surfaces as httpx.HTTPStatusError, whose str() ends with
+    "\\nFor more information check: <mdn url>". Interpolated verbatim, each retry
+    wrote a second untimestamped, unattributable physical line — 27% of a nightly
+    capture, evicting most of the reviewable window. Every line must be a record.
+    """
+    content = b"# Ledger\n\nThe obsidian ledger reconciliation runs at midnight.\n"
+    resp = await api.post("/api/upload", files={"file": ("retry-log-note.md", content)})
+    assert resp.status_code == 201, resp.text
+
+    # Fault the sweep (not the single-doc path): the full-flow subprocess is what
+    # writes indexer.log. Two 429s per batch, absorbed by call_with_retry.
+    await _arm_fault("/api/v1/embeddings", "429", times=2)
+    started = await mcp_session.call_tool_json("file_index_update", {})
+    assert started.get("status") == "started", started
+
+    # Don't race the subprocess: file_status can still read "idle" for a moment
+    # after launch, which would let wait_for_index return before anything logged.
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if (await mcp_session.call_tool_json("file_status", {})).get("indexer_running"):
+            break
+        await anyio.sleep(1)
+    await wait_for_index(mcp_session, min_docs=1)
+
+    lines = indexer_log_lines()
+    assert lines, "indexer.log is empty — the sweep did not log to it"
+
+    orphans = [line for line in lines if not re.match(r"^\d{4}-\d{2}-\d{2} ", line)]
+    assert not orphans, f"{len(orphans)} untimestamped continuation lines: {orphans[:5]}"
+
+    # Proof the flood path actually ran, i.e. this test would have caught the bug:
+    # the retry warning is present, on one line, with the provider text collapsed.
+    retries = [line for line in lines if "failed transiently" in line]
+    assert retries, "no retry warning logged — the 429 fault never reached the embed call"
+    assert any("For more information check" in line for line in retries), retries[:3]
 
 
 @pytest.mark.skipif(

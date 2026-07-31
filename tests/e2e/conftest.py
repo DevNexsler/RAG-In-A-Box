@@ -129,6 +129,27 @@ def _compose_cp_into_documents(local: Path) -> None:
     )
 
 
+def indexer_log_lines() -> list[str]:
+    """Physical, non-blank lines of the candidate container's ``indexer.log``.
+
+    Read from inside the container because that file — not container stdout — is
+    what the nightly log review and the in-container pattern watcher parse line by
+    line (#0546). Returns [] if no sweep has written it yet.
+    """
+    completed = subprocess.run(
+        [
+            "docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T",
+            "doc-organizer-staging", "sh", "-c",
+            "cat /data/index/indexer.log 2>/dev/null || true",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line for line in completed.stdout.splitlines() if line.strip()]
+
+
 async def _build_corpus() -> dict:
     uploaded = {}
     async with httpx.AsyncClient(
