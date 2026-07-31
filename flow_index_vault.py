@@ -78,6 +78,7 @@ from core.config import filesystem_source_roots, load_config
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
+from core.resilience import is_transient
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
@@ -1384,11 +1385,26 @@ def _index_duplicate_delivery_context(
     return True
 
 
+def _retry_only_if_transient(task, task_run, state) -> bool:
+    """Prefect retry gate: retry only what core.resilience calls transient.
+
+    A deterministic failure — an embed 400 on an invalid input, a corrupt file —
+    cannot succeed on an immediate retry. Retrying one anyway doubles the wasted
+    OCR + enrichment + embed work before the doc is skipped regardless (#0569),
+    while a provider blip (5xx/timeout) is exactly what the retry is for.
+    """
+    try:
+        state.result(raise_on_failure=True)
+    except Exception as exc:  # noqa: BLE001 — classify, don't handle
+        return is_transient(exc)
+    return False
+
+
 # No timeout_seconds here: Prefect cannot interrupt tasks running in worker
 # threads (its own warning says so), so a timeout was a false safety net that
 # logged one warning per task (~1350/run). Freeze detection is owned by the
 # indexer heartbeat (_write_heartbeat) + the /health 503.
-@task(retries=1)
+@task(retries=1, retry_condition_fn=_retry_only_if_transient)
 def process_doc_task(doc: dict) -> None:
     """Serialize equal-content decisions until their canonical is indexed."""
     registry = _RUNTIME.get("doc_id_store")
@@ -2157,6 +2173,22 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
         except Exception as exc:
             outcome = "failed"
             logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
+            if not is_transient(exc):
+                # Terminal failure (deterministic 400, corrupt source): re-running
+                # it produces the same failure, so quarantine it with the file's
+                # change key exactly like a permanent skip. Without this the doc
+                # is re-fetched, re-OCR'd, re-enriched and re-embedded on every
+                # run, forever (#0569) — the skip ledger's bounded retry turns
+                # that into one attempt per day until the content changes.
+                lock = _RUNTIME.get("degraded_lock")
+                if lock is not None:
+                    with lock:
+                        doc_id = doc["doc_id"]
+                        _RUNTIME.setdefault("skip_now", {})[doc_id] = {
+                            "reasons": [f"terminal_error:{type(exc).__name__}"],
+                            "change_key": _change_key(doc),
+                        }
+                        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
             return doc["doc_id"]
         finally:
             if debug_concurrency:

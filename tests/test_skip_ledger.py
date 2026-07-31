@@ -8,6 +8,7 @@ younger than _SKIP_RETRY_SECONDS, then re-attempts it once (bounded retry —
 never permanently abandoned). A changed file is re-evaluated immediately.
 """
 
+import threading
 from types import SimpleNamespace
 
 import flow_index_vault as fiv
@@ -353,3 +354,80 @@ def test_degraded_no_text_doc_stays_in_degraded_lane(monkeypatch):
     fiv.process_doc_task.fn(_no_text_doc(doc_id))
     assert collect_skips() == []
     assert collect_degradations() == [Degradation("ocr_timeout")]
+
+
+# --- terminal processing failures must be quarantined, not retried forever ---
+
+def _failing_runtime():
+    return {
+        "degraded_lock": threading.Lock(),
+        "degraded_now": {},
+        "degraded_clean": set(),
+        "skip_now": {},
+        "skip_clean": set(),
+    }
+
+
+def _run_one_failing(monkeypatch, exc):
+    """Run one doc through _process_docs where processing raises `exc`."""
+    runtime = _failing_runtime()
+    monkeypatch.setattr(fiv, "_RUNTIME", runtime)
+    doc = {"doc_id": "documents::000dU", "mtime": 1.0, "change_hash": "h1",
+           "rel_path": "a.pdf"}
+
+    def _boom(_doc):
+        raise exc
+
+    monkeypatch.setattr(fiv, "process_doc_task", _boom)
+    failed = fiv._process_docs([doc], concurrency=1)
+    return runtime, failed
+
+
+def test_terminal_failure_is_quarantined_in_the_skip_ledger(monkeypatch):
+    # #0569: a deterministic embed 400 (oversized input, invalid request) can
+    # never succeed on a re-run, so the doc must be recorded with its change
+    # key instead of being re-OCR'd and re-embedded once per run, forever.
+    exc = RuntimeError(
+        'OpenRouter embeddings error 400: HTTP 400: {"code":20015,'
+        '"message":"The parameter is invalid. Please check again."}'
+    )
+    runtime, failed = _run_one_failing(monkeypatch, exc)
+
+    assert failed == ["documents::000dU"]
+    entry = runtime["skip_now"]["documents::000dU"]
+    assert entry["change_key"] == "h1"
+    assert entry["reasons"] == ["terminal_error:RuntimeError"]
+    assert "documents::000dU" in runtime["degraded_clean"]
+
+
+def test_transient_failure_is_not_quarantined(monkeypatch):
+    # A provider outage is not the doc's fault — it stays out of the skip
+    # ledger so the next run retries it immediately.
+    from core.resilience import TransientError
+
+    runtime, failed = _run_one_failing(monkeypatch, TransientError("upstream 503"))
+
+    assert failed == ["documents::000dU"]
+    assert runtime["skip_now"] == {}
+
+
+# --- the Prefect task must not retry a deterministic failure ---
+
+def _retry_decision(exc):
+    from prefect.states import Failed
+
+    return fiv.process_doc_task.retry_condition_fn(
+        fiv.process_doc_task, None, Failed(data=exc)
+    )
+
+
+def test_deterministic_failure_is_not_retried():
+    # "Retry 1/1 will start immediately" against a structurally invalid input
+    # can never succeed; it only doubles the wasted embed calls (#0569).
+    assert _retry_decision(RuntimeError("OpenRouter embeddings error 400")) is False
+
+
+def test_transient_failure_is_still_retried():
+    from core.resilience import TransientError
+
+    assert _retry_decision(TransientError("upstream 503")) is True

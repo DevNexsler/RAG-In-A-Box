@@ -17,6 +17,7 @@ import httpx
 
 from core.resilience import TransientError, call_with_retry
 from providers.embed.base import EmbedProvider
+from providers.embed.limits import bound_inputs, resolve_max_input_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class OpenRouterEmbedProvider(EmbedProvider):
         batch_size: int = 64,
         timeout: float = 120.0,
         base_url: str | None = None,
+        max_input_tokens: int | None = None,
     ):
         self.model = model
         self.model_name = model  # alias for SemanticEmbeddingAdapter compatibility
@@ -58,6 +60,7 @@ class OpenRouterEmbedProvider(EmbedProvider):
         self.batch_size = batch_size
         self.timeout = timeout
         self._base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
+        self.max_input_tokens = max_input_tokens or resolve_max_input_tokens(model)
 
         if not self.api_key:
             raise ValueError(
@@ -71,6 +74,9 @@ class OpenRouterEmbedProvider(EmbedProvider):
     def _call_embeddings(self, texts: list[str]) -> list[list[float]]:
         """Call /v1/embeddings via the shared resilience layer (retries transient
         5xx/429/timeouts; permanent 4xx raise straight through)."""
+        texts = bound_inputs(
+            texts, self.max_input_tokens, label=f"openrouter-embed[{self.model}]",
+        )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

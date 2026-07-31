@@ -8,17 +8,25 @@ Fault notes:
     indexed_corpus itself (the per-test /admin/reset wipes the live sink, so
     asserting on a later GET /hooks/received would race with reset ordering).
 """
+import json
 import os
 import re
+import tempfile
 import time
 import uuid
+from pathlib import Path
 
 import anyio
 import httpx
 import pytest
 
 from tests.e2e.client import get_hook_events, search_hits
-from tests.e2e.conftest import E2E_SIM_URL, indexer_log_lines, wait_for_index
+from tests.e2e.conftest import (
+    E2E_SIM_URL,
+    _compose_cp_into_documents,
+    indexer_log_lines,
+    wait_for_index,
+)
 
 pytestmark = pytest.mark.anyio
 E2E_REAL = os.environ.get("E2E_REAL") == "1"
@@ -190,3 +198,70 @@ async def test_reasoning_only_enrichment_retries_with_populated_facets(
     )
     assert chunk["enr_summary"]
     assert chunk["enr_doc_type"]
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
+    reason="the real embeddings API is the thing being simulated here",
+)
+async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_session):
+    """#0569: an attachment whose stored conversation context is larger than the
+    embed model's context window must still land in the index.
+
+    That context block is embedded as ONE un-chunked input. Un-bounded, it
+    overruns the model's window and the provider rejects the whole batch with a
+    400 — deterministically, so the doc is re-fetched, re-OCR'd, re-enriched and
+    re-embedded on every run and is never searchable. Both prod poison-pill docs
+    (laura-sanchez msg693) failed exactly here.
+    """
+    stem = f"oversized-context-{uuid.uuid4().hex[:8]}"
+    phrase = "zephyr cantilever manifest"
+    sent_at = "2026-06-01T10:00:30Z"
+    # A channel with no indexed messages, so the targeted index path falls back
+    # to the sidecar's OWN stored context block — the prod shape for a freshly
+    # deposited attachment whose channel history is not in the index yet.
+    channel = f"ops-{stem}"
+    sidecar = {
+        "schema_version": 1,
+        "source": "quo",
+        "message": {
+            "source_message_id": f"{stem}-msg",
+            "sender": "Field Agent",
+            "sent_at": sent_at,
+        },
+        "channel": {"source_channel_id": channel},
+        "media": {
+            "media_index": 0,
+            "media_type": "document",
+            "original_filename": f"{stem}.md",
+        },
+        "context": {
+            "schema_version": 1,
+            "same_channel_before": [
+                {
+                    "source_message_id": f"{stem}-ctx",
+                    "sender": "Dispatch",
+                    "sent_at": "2026-06-01T09:59:30Z",
+                    "origin_source": "quo",
+                    "channel_id": channel,
+                    # Comfortably past the sim's stand-in context window.
+                    "text": "the shipment manifest was revised again. " * 8000,
+                }
+            ],
+        },
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = Path(tmp) / f"{stem}.md"
+        doc.write_text(f"# Manifest\n\nThe {phrase} is attached.\n")
+        (Path(tmp) / f"{stem}.json").write_text(json.dumps(sidecar))
+        _compose_cp_into_documents(Path(tmp) / f"{stem}.json")
+        _compose_cp_into_documents(doc)
+
+    result = await mcp_session.call_tool_json(
+        "file_index_document", {"target": f"{stem}.md", "source_name": "documents"})
+    assert result.get("status") == "indexed", result
+
+    payload = await mcp_session.call_tool_json(
+        "file_search", {"query": phrase, "top_k": 5})
+    assert search_hits(payload, stem), payload["results"]
