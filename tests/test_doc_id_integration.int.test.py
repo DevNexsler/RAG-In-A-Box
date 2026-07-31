@@ -691,7 +691,9 @@ class TestRetiredIdReuse:
 
 
 class TestZeroByteFiles:
-    def test_zero_byte_file_is_ignored_and_does_not_burn_doc_id(self, vault_and_index):
+    def test_zero_byte_file_gets_persistent_id_for_skip_ledger(
+        self, vault_and_index
+    ):
         vault, index = vault_and_index
 
         store, doc_id_store, embed = _setup_runtime(index, vault)
@@ -701,16 +703,20 @@ class TestZeroByteFiles:
 
             empty_records = scan_vault_task.fn(vault, ["**/*.pdf"], [])
 
-            assert empty_records == []
-            assert empty_pdf.exists()
-            assert empty_pdf.name == "empty.pdf"
+            assert len(empty_records) == 1
+            assert empty_records[0]["doc_id"] == "00001"
+            assert empty_records[0]["rel_path"] == "empty@00001@.pdf"
+            assert empty_records[0]["skip_reason"] == "empty_file"
+            assert not empty_pdf.exists()
+            assert (vault / "empty@00001@.pdf").exists()
 
             (vault / "recipe.md").write_text(_MD_RECIPE)
             valid_records = scan_vault_task.fn(vault, ["**/*.pdf", "**/*.md"], [])
 
-            assert len(valid_records) == 1
-            assert valid_records[0]["doc_id"] == "00001"
-            assert valid_records[0]["rel_path"] == "recipe@00001@.md"
-            assert (vault / "recipe@00001@.md").exists()
+            assert len(valid_records) == 2
+            recipe = next(r for r in valid_records if r["ext"] == "md")
+            assert recipe["doc_id"] == "00002"
+            assert recipe["rel_path"] == "recipe@00002@.md"
+            assert (vault / "recipe@00002@.md").exists()
         finally:
             _teardown_runtime()

@@ -445,9 +445,7 @@ def scan_filesystem_records(
                 stat = full_path.stat()
             except OSError:
                 continue
-            if stat.st_size == 0:
-                logger.warning("Skipping empty file: %s", rel_str)
-                continue
+            empty_file = stat.st_size == 0
 
             # Skip communication sidecars: these *.json files are attachment
             # metadata consumed by the communication-context provider, not
@@ -552,14 +550,24 @@ def scan_filesystem_records(
                 # Fallback: no doc_id_store (shouldn't happen in normal flow)
                 doc_id = rel_str
 
-            records.append({
+            record = {
                 "doc_id": doc_id,
                 "rel_path": rel_str,
                 "abs_path": str(full_path.resolve()),
                 "mtime": stat.st_mtime,
                 "size": stat.st_size,
                 "ext": full_path.suffix.lower().lstrip(".") or "bin",
-            })
+            }
+            if empty_file:
+                # Keep terminal scan decisions in the normal record stream so
+                # the flow can persist them in the skip ledger. The key changes
+                # on either size or nanosecond mtime, immediately re-admitting
+                # a producer artifact once content arrives.
+                record["skip_reason"] = "empty_file"
+                record["change_hash"] = (
+                    f"empty_file:{stat.st_size}:{stat.st_mtime_ns}"
+                )
+            records.append(record)
     return records
 
 
@@ -1101,6 +1109,30 @@ def _merge_skip_ledger(
     for doc_id, info in skip_now.items():
         docs[doc_id] = {**info, "skipped_at": now}
     return {"docs": docs}
+
+
+def _persist_scan_skips(index_root: Path, records: list[dict], logger) -> None:
+    """Persist terminal scan decisions as one ledger update before extraction."""
+    if not records:
+        return
+    skip_now = {}
+    for record in records:
+        reason = str(record["skip_reason"])
+        doc_id = str(record["doc_id"])
+        skip_now[doc_id] = {
+            "reasons": [reason],
+            "change_key": _change_key(record),
+        }
+        if reason == "empty_file":
+            logger.warning(
+                "Skipping empty file: %s", record.get("rel_path", doc_id)
+            )
+    updated = _merge_skip_ledger(
+        _load_skip_ledger(index_root),
+        skip_now,
+        set(),
+    )
+    _save_skip_ledger(index_root, updated)
 
 
 def _reap_vanished_registry_rows(
@@ -2369,6 +2401,11 @@ def _scan_and_register_sources(
                 "ext": rec.metadata.get("ext", ""),
                 "source_type": rec.source_type,
                 "source_name": src.name,
+                **(
+                    {"skip_reason": rec.metadata["skip_reason"]}
+                    if rec.metadata.get("skip_reason")
+                    else {}
+                ),
             })
             source_records_by_ns_doc_id[ns_doc_id] = rec
             doc_id_store.register(ns_doc_id, rec.natural_key, source_name=src.name)
@@ -2746,6 +2783,17 @@ def index_vault_flow(
             skip_stats["due"],
             skip_stats["restamped"],
         )
+    scan_skips = [
+        record for record in to_add_or_update if record.get("skip_reason")
+    ]
+    _persist_scan_skips(index_root, scan_skips, logger)
+    if scan_skips:
+        scan_skip_ids = {record["doc_id"] for record in scan_skips}
+        to_add_or_update = [
+            record
+            for record in to_add_or_update
+            if record["doc_id"] not in scan_skip_ids
+        ]
     full_processing_doc_ids = {
         str(record.get("doc_id", "")) for record in to_add_or_update
     }
@@ -2821,7 +2869,9 @@ def index_vault_flow(
         store.set_memory_observer(memory_observer)
         store.reset_table()
         _RUNTIME["store"] = store
-        docs_to_process = scanned
+        docs_to_process = [
+            record for record in scanned if not record.get("skip_reason")
+        ]
         docs_to_delete = []
         storage_insert_doc_ids = {str(doc["doc_id"]) for doc in docs_to_process}
         context_refresh_doc_ids = set()
@@ -3221,6 +3271,8 @@ def resolve_single_record(
         "ext": r["ext"],
         "source_type": canonical_source_type(r["ext"]),
         "source_name": source_name,
+        "change_hash": r.get("change_hash", ""),
+        **({"skip_reason": r["skip_reason"]} if r.get("skip_reason") else {}),
     }
 
 
@@ -3508,6 +3560,17 @@ def _index_document_unlocked(
             "reason": "not_found",
             "target": request.target,
             "source_name": request.source_name,
+        }
+
+    if record.get("skip_reason"):
+        admitted, _ = _apply_skip_ledger(index_root, [record])
+        if admitted:
+            _persist_scan_skips(index_root, admitted, _get_logger())
+        return {
+            "status": "skipped",
+            "reason": record["skip_reason"],
+            "doc_id": record["doc_id"],
+            "rel_path": record["rel_path"],
         }
 
     if not request.force:
