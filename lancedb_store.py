@@ -1295,7 +1295,11 @@ class LanceDBStore:
                     columns={"doc_id": "doc_id", "ch": "metadata.change_hash"}
                 )
             except pa.ArrowInvalid as exc:
-                if "projection supplied fewer column indices" not in str(exc):
+                message = str(exc)
+                if (
+                    "projection supplied fewer column indices" not in message
+                    or "ran out at field 'metadata'" not in message
+                ):
                     raise
                 logger.warning(
                     "Lance nested change_hash projection hit a sparse metadata "
