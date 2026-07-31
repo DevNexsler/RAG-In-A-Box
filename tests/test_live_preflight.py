@@ -5,9 +5,11 @@ exercised against simulated success/failure conditions, and main() is checked
 for failure aggregation (report everything, not just the first problem).
 """
 
+import json
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -340,6 +342,14 @@ def _fake_run(stdout="", returncode=0, raise_exc=None):
 
 def test_indexer_heartbeat_fresh_fails(monkeypatch):
     hb = str(time.time() - 10)  # 10s old — actively writing
+    monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout=hb))
+    ok, reason = lp.check_prod_indexer_idle()
+    assert not ok
+    assert "active" in reason.lower()
+
+
+def test_indexer_structured_heartbeat_fresh_fails(monkeypatch):
+    hb = json.dumps({"updated_at": datetime.now(timezone.utc).isoformat()})
     monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout=hb))
     ok, reason = lp.check_prod_indexer_idle()
     assert not ok

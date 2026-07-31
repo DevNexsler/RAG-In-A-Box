@@ -298,6 +298,75 @@ class IndexRunSupervisor:
             temp_path.unlink(missing_ok=True)
             logger.warning("Cannot compact index log %s: %s", path, exc)
 
+    def _append_lifecycle_log(
+        self,
+        attempt: dict[str, Any],
+        level: str,
+        message: str,
+    ) -> None:
+        """Append supervisor-owned lifecycle truth to the collector-visible log."""
+        path = Path(attempt.get("log_path") or self.index_root / "indexer.log")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as handle:
+                handle.write(
+                    f"{timestamp} {level} index_run_supervisor: {message}\n"
+                )
+        except OSError as exc:
+            logger.error("Cannot append index lifecycle log %s: %s", path, exc)
+
+    def _read_progress(self, run_id: object) -> dict[str, Any]:
+        """Read the latest atomic child heartbeat when it belongs to this run."""
+        try:
+            payload = json.loads((self.index_root / "indexer.heartbeat").read_text())
+        except (OSError, ValueError, TypeError):
+            return {}
+        if not isinstance(payload, dict) or payload.get("run_id") != run_id:
+            return {}
+        progress: dict[str, Any] = {}
+        for field in ("queued", "processed", "skipped"):
+            value = payload.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                progress[field] = value
+        if isinstance(payload.get("phase"), str):
+            progress["phase"] = payload["phase"]
+        if isinstance(payload.get("updated_at"), str):
+            progress["last_heartbeat_at"] = payload["updated_at"]
+        return progress
+
+    @staticmethod
+    def _progress_text(attempt: dict[str, Any]) -> str:
+        def value(field: str) -> object:
+            current = attempt.get(field)
+            return current if current is not None else "unknown"
+
+        return (
+            f"queued={value('queued')} processed={value('processed')} "
+            f"skipped={value('skipped')}"
+        )
+
+    def _log_incomplete_terminal(
+        self,
+        terminal: dict[str, Any],
+        *,
+        previous: bool,
+    ) -> None:
+        prefix = "Previous index run" if previous else "Index run"
+        self._append_lifecycle_log(
+            terminal,
+            "ERROR",
+            (
+                f"{prefix} {terminal.get('run_id', 'unknown')} ended without "
+                f"completion: status={terminal.get('status', 'unknown')} "
+                f"reason={terminal.get('terminal_reason', 'unknown')} "
+                f"signal={terminal.get('termination_signal')} "
+                f"exit_code={terminal.get('exit_code')} "
+                f"{self._progress_text(terminal)} "
+                f"last_heartbeat={terminal.get('last_heartbeat_at', 'unknown')}"
+            ),
+        )
+
     def _active_identity_failure(self, current: dict[str, Any]) -> str | None:
         try:
             pid = int(current.get("pid") or 0)
@@ -361,6 +430,7 @@ class IndexRunSupervisor:
                 "terminal_reason": reason,
             }
         )
+        terminal.update(self._read_progress(current.get("run_id")))
         return terminal
 
     def _reconcile_locked(
@@ -390,6 +460,7 @@ class IndexRunSupervisor:
             state["last_attempt"] = terminal
             self._clear_pid_locked(current.get("pid"))
             self._write_state_locked(state)
+            self._log_incomplete_terminal(terminal, previous=True)
             return state, None, False
 
         # Upgrade the legacy PID-only contract without losing an in-progress run.
@@ -479,6 +550,15 @@ class IndexRunSupervisor:
             if active:
                 if should_monitor:
                     self._ensure_monitor(active, process=None)
+                self._append_lifecycle_log(
+                    active,
+                    "WARNING",
+                    (
+                        f"Index run start stood down: active run {active['run_id']} "
+                        f"status={active.get('status', 'unknown')} "
+                        f"pid={active.get('pid', 'unknown')}"
+                    ),
+                )
                 return {
                     "status": "already_running",
                     "pid": int(active["pid"]),
@@ -494,6 +574,7 @@ class IndexRunSupervisor:
                 "source_name": source_name,
                 "started_at": _utc_now(),
                 "peak_rss_bytes": 0,
+                "log_path": str(Path(log_path)),
                 "monitor_owner_id": self._owner_id,
                 "monitor_lease_expires_at": self._wall_clock()
                 + self._monitor_lease_seconds,
@@ -514,6 +595,7 @@ class IndexRunSupervisor:
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
+                    env={**os.environ, "INDEX_RUN_ID": attempt["run_id"]},
                 )
                 pid = int(process.pid)
                 process_starttime = self._starttime_reader(pid)
@@ -647,12 +729,15 @@ class IndexRunSupervisor:
                     else ("clean_exit" if returncode == 0 else "process_exit")
                 ),
             }
+            terminal.update(self._read_progress(run_id))
             state["current"] = None
             state["last_attempt"] = terminal
             if status == "succeeded":
                 state["last_success"] = terminal
             self._clear_pid_locked(current.get("pid"))
             self._write_state_locked(state)
+            if status != "succeeded":
+                self._log_incomplete_terminal(terminal, previous=False)
 
     def _finish_lost(self, run_id: str, reason: str) -> None:
         with self._locked():
@@ -669,6 +754,7 @@ class IndexRunSupervisor:
             state["last_attempt"] = terminal
             self._clear_pid_locked(current.get("pid"))
             self._write_state_locked(state)
+            self._log_incomplete_terminal(terminal, previous=False)
 
     def _monitor(self, run_id: str, pid: int, process: Any | None) -> None:
         try:

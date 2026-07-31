@@ -44,6 +44,7 @@ from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Executor, wait
 from contextlib import nullcontext
 from contextvars import ContextVar, copy_context
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -762,6 +763,52 @@ def _heartbeat_path(index_root: Path) -> Path:
     return Path(index_root) / "indexer.heartbeat"
 
 
+def _initialize_run_progress() -> None:
+    """Initialize process-local counters identified by the supervisor run id."""
+    _RUNTIME["run_progress_lock"] = threading.Lock()
+    _RUNTIME["run_progress"] = {
+        "run_id": os.environ.get("INDEX_RUN_ID", "unmanaged"),
+        "phase": "initialize",
+        "queued": None,
+        "processed": 0,
+        "skipped": 0,
+    }
+
+
+def _update_run_progress(**updates: Any) -> None:
+    """Set progress fields under one lock."""
+    lock = _RUNTIME.get("run_progress_lock")
+    progress = _RUNTIME.get("run_progress")
+    if lock is None or not isinstance(progress, dict):
+        return
+    allowed = {"phase", "queued", "processed", "skipped"}
+    with lock:
+        for field, value in updates.items():
+            if field in allowed:
+                progress[field] = value
+
+
+def _advance_run_progress(*, skipped: bool) -> None:
+    """Record one fully attempted queue item."""
+    lock = _RUNTIME.get("run_progress_lock")
+    progress = _RUNTIME.get("run_progress")
+    if lock is None or not isinstance(progress, dict):
+        return
+    with lock:
+        progress["processed"] = int(progress.get("processed") or 0) + 1
+        if skipped:
+            progress["skipped"] = int(progress.get("skipped") or 0) + 1
+
+
+def _run_progress_snapshot() -> dict[str, Any]:
+    lock = _RUNTIME.get("run_progress_lock")
+    progress = _RUNTIME.get("run_progress")
+    if lock is None or not isinstance(progress, dict):
+        return {}
+    with lock:
+        return dict(progress)
+
+
 def _write_heartbeat(index_root) -> None:
     """Stamp the indexer progress heartbeat. The /health endpoint reports the
     indexer as frozen (HTTP 503) when this file's age exceeds
@@ -770,9 +817,38 @@ def _write_heartbeat(index_root) -> None:
     if index_root is None:
         return
     try:
-        _heartbeat_path(index_root).write_text(str(time.time()))
+        payload = _run_progress_snapshot()
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        path = _heartbeat_path(index_root)
+        temp_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        temp_path.write_text(json.dumps(payload, sort_keys=True))
+        os.replace(temp_path, path)
     except Exception:
         pass
+
+
+def _log_run_completion(
+    logger: logging.Logger,
+    *,
+    run_id: str,
+    queued: int,
+    processed: int,
+    skipped: int,
+    elapsed_seconds: float,
+) -> None:
+    completion = 100.0 if queued == 0 else processed * 100.0 / queued
+    logger.info(
+        "Index run completion: run_id=%s queued=%d processed=%d skipped=%d "
+        "elapsed=%.1fs completion=%.1f%%",
+        run_id,
+        queued,
+        processed,
+        skipped,
+        elapsed_seconds,
+        completion,
+    )
 
 
 # How often the source scan re-stamps the heartbeat, in records. The scan is a
@@ -2129,6 +2205,7 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
         if observer is not None:
             observer.sample("doc_start", phase="process", doc_id=doc["doc_id"])
         outcome = "ok"
+        skipped_outcome = False
         # Heartbeat: a worker picking up a doc means the indexer is progressing.
         # When all workers are stuck (a freeze) this stops, and /health flips to 503.
         _write_heartbeat(_RUNTIME.get("index_root"))
@@ -2150,6 +2227,7 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
             process_doc_task(doc)
             reasons = collect_degradations()
             skips = collect_skips()
+            skipped_outcome = bool(skips)
             lock = _RUNTIME.get("degraded_lock")
             if lock is not None:
                 with lock:
@@ -2210,6 +2288,8 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
                     doc_id=doc["doc_id"],
                     outcome=outcome,
                 )
+            _advance_run_progress(skipped=skipped_outcome)
+            _write_heartbeat(_RUNTIME.get("index_root"))
 
     if concurrency <= 1 or len(docs) <= 1:
         for doc in docs:
@@ -2516,6 +2596,7 @@ def index_vault_flow(
     _RUNTIME.clear()
     import time
     logger = get_run_logger()
+    _initialize_run_progress()
     config = _LOCKED_INDEX_CONFIG.get() or load_config(config_path)
     memory_observer = MemoryObserver.from_config(config, logger)
     _RUNTIME["memory_observer"] = memory_observer
@@ -2909,6 +2990,13 @@ def index_vault_flow(
         context_refresh_doc_ids = set()
 
     _RUNTIME["storage_insert_doc_ids"] = storage_insert_doc_ids
+    _update_run_progress(
+        phase="process",
+        queued=len(docs_to_process),
+        processed=0,
+        skipped=0,
+    )
+    _write_heartbeat(index_root)
 
     # A daily full-table compaction can consume several GiB on the production
     # corpus. Run it before document processing creates its own resident state,
@@ -2970,6 +3058,7 @@ def index_vault_flow(
     # heartbeat-free window. Stamp across its boundaries so a big finalize
     # doesn't false-503 /health as a freeze (#0127).
     memory_observer.sample("phase_start", phase="finalize")
+    _update_run_progress(phase="finalize")
     _write_heartbeat(index_root)
 
     if docs_to_delete:
@@ -3152,6 +3241,17 @@ def index_vault_flow(
         _RUNTIME.get("_warnings") or None,
     )
     memory_observer.sample("phase_finish", phase="finalize")
+    progress = _run_progress_snapshot()
+    _log_run_completion(
+        logger,
+        run_id=str(progress.get("run_id", "unmanaged")),
+        queued=int(progress.get("queued") or 0),
+        processed=int(progress.get("processed") or 0),
+        skipped=int(progress.get("skipped") or 0),
+        elapsed_seconds=run_seconds,
+    )
+    _update_run_progress(phase="completed")
+    _write_heartbeat(index_root)
     logger.info(f"index_vault_flow finished in {run_seconds:.1f}s")
 
 
