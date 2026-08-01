@@ -112,6 +112,21 @@ def test_example_config_keeps_memory_observability_opt_in():
     assert config["memory_observability"]["enabled"] is False
 
 
+def test_docker_build_context_excludes_eval_artifacts():
+    """The production Dockerfile copies the whole repo root (``COPY . .``), so
+    every local artifact tree must be excluded via ``.dockerignore``. `.evals`
+    accumulates gate runs, reports, and candidate artifacts; without an ignore
+    entry it rides into every production build context (7.62 GB transfer on
+    the 2026-08-01 PR #89 hotfix build)."""
+    patterns = {
+        line.strip()
+        for line in Path(".dockerignore").read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+
+    assert ".evals" in patterns
+
+
 def test_dockerfile_declares_health_check_on_health_endpoint():
     """The image must ship a HEALTHCHECK so the container's health is visible
     (docker ps / .State.Health) instead of relying only on an external probe
