@@ -11,12 +11,10 @@ Checks: OpenRouter/DeepInfra API keys, config_test.yaml present in CWD,
 LiteLLM OCR/vision aliases available, prod indexer idle, comm-store Postgres
 reachable.
 """
-import json
 import os
+import shlex
 import subprocess
 import sys
-import time
-from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -24,12 +22,49 @@ import psycopg
 import yaml
 
 PROBE_TIMEOUT_S = 5
-# An indexing run touches the heartbeat continuously; if it is fresher than
-# this, the prod indexer is actively writing and would contend with the live
-# tier for shared OCR/vision providers — so we refuse to start.
-HEARTBEAT_ACTIVE_THRESHOLD_S = 120
 PROD_CONTAINER = "doc-organizer"
-HEARTBEAT_PATH = "/data/index/indexer.heartbeat"
+INDEXER_PID_PATH = "/data/index/indexer.pid"
+
+
+def build_indexer_pid_probe(
+        pid_path: str | Path = INDEXER_PID_PATH,
+        proc_root: str | Path = "/proc",
+) -> str:
+    """Build fail-closed shell probe for an indexer PID inside its container."""
+    return f"""
+pid_file={shlex.quote(str(pid_path))}
+proc_root={shlex.quote(str(proc_root))}
+if [ ! -e "$pid_file" ]; then
+    printf 'idle\\n'
+    exit 0
+fi
+pid=$(cat "$pid_file") || exit 10
+case "$pid" in
+    ''|*[!0-9]*|0) printf 'invalid indexer pid file\\n' >&2; exit 11 ;;
+esac
+status="$proc_root/$pid/status"
+if [ ! -e "$status" ]; then
+    printf 'idle\\n'
+    exit 0
+fi
+state=$(awk '$1 == "State:" {{ print $2; exit }}' "$status") || exit 12
+if [ -z "$state" ]; then
+    printf 'cannot read indexer process state\\n' >&2
+    exit 13
+fi
+if [ "$state" = Z ]; then
+    printf 'idle\\n'
+    exit 0
+fi
+cmdline=$(tr '\\000' ' ' < "$proc_root/$pid/cmdline") || exit 14
+case "$cmdline" in
+    *index_vault_flow*|*flow_index_vault*) printf 'active:%s\\n' "$pid" ;;
+    *) printf 'pid does not identify indexer process\\n' >&2; exit 15 ;;
+esac
+""".strip()
+
+
+INDEXER_PID_PROBE = build_indexer_pid_probe()
 
 
 def main_checkout_root() -> Path:
@@ -144,38 +179,26 @@ def check_litellm_ocr() -> tuple[bool, str]:
 
 
 def check_prod_indexer_idle() -> tuple[bool, str]:
-    cmd = ["docker", "exec", PROD_CONTAINER, "cat", HEARTBEAT_PATH]
+    cmd = ["docker", "exec", PROD_CONTAINER, "sh", "-c", INDEXER_PID_PROBE]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=PROBE_TIMEOUT_S * 2)
     except FileNotFoundError:
-        return True, ("WARNING: docker binary missing — cannot check prod "
-                      "indexer heartbeat; assuming idle")
+        return False, "docker binary missing — cannot verify prod indexer PID"
     except subprocess.TimeoutExpired:
-        return True, ("WARNING: docker exec timed out — cannot verify prod "
-                      "indexer heartbeat; assuming idle")
+        return False, "docker exec timed out — cannot verify prod indexer PID"
     if proc.returncode != 0:
-        # Container not running, or heartbeat file absent: nothing is
-        # contending for shared LiteLLM/local inference hardware. Surface
-        # stderr so operators can tell
-        # container-not-running vs daemon-unreachable vs file-absent apart.
         detail = proc.stderr.strip()[:120]
-        return True, ("prod container not running or no heartbeat file"
-                      + (f" ({detail})" if detail else ""))
-    raw_heartbeat = proc.stdout.strip()
-    try:
-        try:
-            heartbeat_at = float(raw_heartbeat)
-        except ValueError:
-            payload = json.loads(raw_heartbeat)
-            heartbeat_at = datetime.fromisoformat(payload["updated_at"]).timestamp()
-        age = time.time() - heartbeat_at
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return True, "heartbeat unreadable; assuming idle"
-    if age < HEARTBEAT_ACTIVE_THRESHOLD_S:
-        return False, (f"prod indexer active (heartbeat {age:.0f}s old, "
-                       f"threshold {HEARTBEAT_ACTIVE_THRESHOLD_S}s); rerun later")
-    return True, f"prod indexer idle (heartbeat {age:.0f}s old)"
+        return False, ("cannot verify prod indexer PID"
+                       + (f" ({detail})" if detail else ""))
+    result = proc.stdout.strip()
+    if result == "idle":
+        return True, "prod indexer idle (no live indexer PID)"
+    if result.startswith("active:"):
+        raw_pid = result.removeprefix("active:")
+        if raw_pid.isdigit() and int(raw_pid) > 0:
+            return False, f"prod indexer active (pid {raw_pid}); rerun later"
+    return False, f"unexpected prod indexer probe output: {result[:120]!r}"
 
 
 def check_comm_postgres() -> tuple[bool, str]:

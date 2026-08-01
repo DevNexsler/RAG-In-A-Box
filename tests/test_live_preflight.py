@@ -5,11 +5,8 @@ exercised against simulated success/failure conditions, and main() is checked
 for failure aggregation (report everything, not just the first problem).
 """
 
-import json
 import re
 import subprocess
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -332,83 +329,152 @@ def test_litellm_ocr_reports_each_missing_alias(
 # check_prod_indexer_idle
 # ---------------------------------------------------------------------------
 
-def _fake_run(stdout="", returncode=0, raise_exc=None):
+def _fake_run(stdout="", stderr="", returncode=0, raise_exc=None, calls=None):
     def run(cmd, **kw):
+        if calls is not None:
+            calls.append((cmd, kw))
         if raise_exc is not None:
             raise raise_exc
-        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
     return run
 
 
-def test_indexer_heartbeat_fresh_fails(monkeypatch):
-    hb = str(time.time() - 10)  # 10s old — actively writing
-    monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout=hb))
+def _run_indexer_pid_probe(tmp_path, *, pid=None, state=None, cmdline=None):
+    pid_path = tmp_path / "indexer.pid"
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    if pid is not None:
+        pid_path.write_text(str(pid))
+        if state is not None:
+            process_dir = proc_root / str(pid)
+            process_dir.mkdir()
+            (process_dir / "status").write_text(f"State:\t{state}\n")
+            if cmdline is not None:
+                (process_dir / "cmdline").write_bytes(cmdline)
+    return subprocess.run(
+        ["sh", "-c", lp.build_indexer_pid_probe(pid_path, proc_root)],
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("probe_state", "expected"),
+    [
+        ({}, "idle"),
+        ({"pid": 4242}, "idle"),
+        ({"pid": 4242, "state": "Z (zombie)"}, "idle"),
+    ],
+)
+def test_indexer_pid_probe_accepts_only_verified_idle_states(
+        tmp_path, probe_state, expected):
+    proc = _run_indexer_pid_probe(tmp_path, **probe_state)
+
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == expected
+
+
+def test_indexer_pid_probe_identifies_matching_live_process(tmp_path):
+    proc = _run_indexer_pid_probe(
+        tmp_path,
+        pid=4242,
+        state="S (sleeping)",
+        cmdline=b"python\0-c\0from flow_index_vault import index_vault_flow\0",
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "active:4242"
+
+
+@pytest.mark.parametrize(
+    ("probe_state", "expected_error"),
+    [
+        ({"pid": "not-a-pid"}, "invalid indexer pid file"),
+        (
+            {"pid": 4242, "state": "S (sleeping)", "cmdline": b"python\0worker.py\0"},
+            "pid does not identify indexer process",
+        ),
+        ({"pid": 4242, "state": "S (sleeping)"}, "cmdline"),
+    ],
+)
+def test_indexer_pid_probe_fails_closed_on_ambiguous_state(
+        tmp_path, probe_state, expected_error):
+    proc = _run_indexer_pid_probe(tmp_path, **probe_state)
+
+    assert proc.returncode != 0
+    assert expected_error in proc.stderr.lower()
+
+
+def test_indexer_active_pid_fails_even_without_heartbeat(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        lp.subprocess,
+        "run",
+        _fake_run(stdout="active:4242\n", calls=calls),
+    )
+
     ok, reason = lp.check_prod_indexer_idle()
+
     assert not ok
     assert "active" in reason.lower()
+    assert "4242" in reason
+    command = calls[0][0]
+    assert command[:3] == ["docker", "exec", lp.PROD_CONTAINER]
+    probe = command[-1]
+    assert lp.INDEXER_PID_PATH in probe
+    assert 'status="$proc_root/$pid/status"' in probe
+    assert '"$proc_root/$pid/cmdline"' in probe
+    assert "flow_index_vault" in probe
 
 
-def test_indexer_structured_heartbeat_fresh_fails(monkeypatch):
-    hb = json.dumps({"updated_at": datetime.now(timezone.utc).isoformat()})
-    monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout=hb))
+def test_indexer_no_pid_is_idle(monkeypatch):
+    monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout="idle\n"))
+
     ok, reason = lp.check_prod_indexer_idle()
+    assert ok
+    assert "idle" in reason.lower()
+
+
+def test_indexer_probe_nonzero_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        lp.subprocess,
+        "run",
+        _fake_run(stderr="container is not running", returncode=1),
+    )
+
+    ok, reason = lp.check_prod_indexer_idle()
+
     assert not ok
-    assert "active" in reason.lower()
+    assert "container is not running" in reason
 
 
-def test_indexer_heartbeat_stale_passes(monkeypatch):
-    hb = str(time.time() - 3600)  # an hour quiet
-    monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout=hb))
-    ok, reason = lp.check_prod_indexer_idle()
-    assert ok
-
-
-def test_indexer_heartbeat_boundary_uses_named_threshold(monkeypatch):
-    # just over the threshold: idle
-    hb = str(time.time() - (lp.HEARTBEAT_ACTIVE_THRESHOLD_S + 5))
-    monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout=hb))
-    ok, _ = lp.check_prod_indexer_idle()
-    assert ok
-
-
-def test_indexer_heartbeat_just_under_threshold_fails(monkeypatch):
-    # just under the threshold: still active — pins the comparison direction
-    hb = str(time.time() - (lp.HEARTBEAT_ACTIVE_THRESHOLD_S - 5))
-    monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout=hb))
-    ok, reason = lp.check_prod_indexer_idle()
-    assert not ok
-    assert "active" in reason.lower()
-
-
-def test_indexer_container_not_running_passes(monkeypatch):
-    # docker exec nonzero rc: container down or heartbeat file absent
-    monkeypatch.setattr(lp.subprocess, "run",
-                        _fake_run(stdout="", returncode=1))
-    ok, reason = lp.check_prod_indexer_idle()
-    assert ok
-
-
-def test_indexer_docker_binary_missing_passes_with_warning(monkeypatch):
+def test_indexer_docker_binary_missing_fails_closed(monkeypatch):
     monkeypatch.setattr(lp.subprocess, "run",
                         _fake_run(raise_exc=FileNotFoundError("docker")))
+
     ok, reason = lp.check_prod_indexer_idle()
-    assert ok
+
+    assert not ok
     assert "docker" in reason.lower()
-    assert "warn" in reason.lower()
 
 
-def test_indexer_docker_timeout_passes(monkeypatch):
+def test_indexer_docker_timeout_fails_closed(monkeypatch):
     exc = subprocess.TimeoutExpired(cmd=["docker"], timeout=10)
     monkeypatch.setattr(lp.subprocess, "run", _fake_run(raise_exc=exc))
+
     ok, reason = lp.check_prod_indexer_idle()
-    assert ok
+
+    assert not ok
+    assert "timed out" in reason.lower()
 
 
-def test_indexer_unparseable_heartbeat_passes_with_note(monkeypatch):
+def test_indexer_unexpected_probe_output_fails_closed(monkeypatch):
     monkeypatch.setattr(lp.subprocess, "run", _fake_run(stdout="garbage\n"))
+
     ok, reason = lp.check_prod_indexer_idle()
-    assert ok
-    assert "unreadable" in reason.lower() or "unparse" in reason.lower()
+
+    assert not ok
+    assert "unexpected" in reason.lower()
 
 
 # ---------------------------------------------------------------------------
