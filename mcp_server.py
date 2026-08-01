@@ -2567,7 +2567,11 @@ def _file_index_update_impl(config_path: str = "config.yaml", source_name: str |
     """
     import sys
 
-    config = load_config(config_path)
+    app_root = Path(__file__).resolve().parent
+    resolved_config_path = Path(config_path)
+    if not resolved_config_path.is_absolute():
+        resolved_config_path = app_root / resolved_config_path
+    config = load_config(str(resolved_config_path))
     if source_name is not None:
         source_name = str(source_name).strip()
         valid_sources = _configured_source_names(config)
@@ -2590,10 +2594,12 @@ def _file_index_update_impl(config_path: str = "config.yaml", source_name: str |
     # so the child uses the shared setup: one record == one physical line, library
     # warnings timestamped, repeated retry warnings collapsed with a count (#0546).
     script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(app_root)!r})\n"
         "from core.logging_setup import configure_logging\n"
         "configure_logging('INFO')\n"
         "from flow_index_vault import index_vault_flow\n"
-        f"index_vault_flow({config_path!r}, source_name={source_name!r})\n"
+        f"index_vault_flow({str(resolved_config_path)!r}, source_name={source_name!r})\n"
     )
 
     launch = _get_index_run_supervisor(config).start(

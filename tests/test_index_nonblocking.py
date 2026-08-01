@@ -114,7 +114,10 @@ def test_index_update_can_start_source_scoped_run(tmp_path, monkeypatch):
 
     assert result["status"] == "started"
     assert result["source_name"] == "sor"
-    assert "source_name='sor'" in popen_args[0][3]
+    child_script = popen_args[0][3]
+    app_root = str(Path(mcp_server.__file__).resolve().parent)
+    assert f"sys.path.insert(0, {app_root!r})" in child_script
+    assert f"index_vault_flow({str(Path(app_root, 'config.yaml'))!r}" in child_script
 
 
 def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
