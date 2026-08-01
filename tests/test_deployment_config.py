@@ -146,3 +146,14 @@ def test_dockerfile_declares_health_check_on_health_endpoint():
     hc_block = dockerfile[hc_index:]
     assert "/health" in hc_block
     assert "curl" not in hc_block and "wget" not in hc_block
+
+
+def test_dockerignore_excludes_generated_repository_directories():
+    """Generated local state must never enter production build contexts."""
+    ignored_roots = {
+        line.strip().rstrip("/")
+        for line in Path(".dockerignore").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    assert {".worktrees", ".gitnexus", "logs", "test_index"} <= ignored_roots
