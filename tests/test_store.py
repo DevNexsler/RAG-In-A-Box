@@ -10,8 +10,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pyarrow as pa
 import pytest
 
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
@@ -775,6 +777,151 @@ def test_schema_evolution_new_metadata_field():
         doc_ids = set(store.list_doc_ids())
         assert doc_ids == {"a.pdf", "b.md"}
         assert "section" in store._metadata_subfields()
+
+
+def test_change_hash_projection_survives_sparse_fragment_after_schema_widening():
+    """A later row may omit a metadata field already present in the schema."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "hashed.md", "c:0", "hashed", vec, change_hash="sha-abc"
+            )
+        ])
+        store.upsert_nodes([
+            _make_node_with_meta("legacy.md", "c:0", "legacy", vec)
+        ])
+
+        assert store.list_doc_change_hashes() == {
+            "hashed.md": "sha-abc",
+            "legacy.md": "",
+        }
+
+
+class _ChangeHashProjectionDataset:
+    def __init__(self, *, projected_table=None, projection_error=None, batches=()):
+        self.projected_table = projected_table
+        self.projection_error = projection_error
+        self.batches = batches
+        self.to_table_calls = []
+        self.to_batches_calls = []
+
+    def to_table(self, *, columns):
+        self.to_table_calls.append(columns)
+        if self.projection_error is not None:
+            raise self.projection_error
+        return self.projected_table
+
+    def to_batches(self, *, columns, batch_size):
+        self.to_batches_calls.append((columns, batch_size))
+        return iter(self.batches)
+
+
+def _store_for_change_hash_projection(dataset):
+    store = LanceDBStore.__new__(LanceDBStore)
+    store._metadata_subfields = lambda: {"change_hash"}
+    store._run_read_with_recovery = lambda operation, default: operation()
+    store._vs = SimpleNamespace(
+        table=SimpleNamespace(to_lance=lambda: dataset)
+    )
+    return store
+
+
+def test_change_hash_projection_narrow_projection_avoids_batch_fallback():
+    dataset = _ChangeHashProjectionDataset(
+        projected_table=pa.table({
+            "doc_id": ["hashed.md", "legacy.md", None],
+            "ch": ["sha-abc", None, "ignored"],
+        })
+    )
+    store = _store_for_change_hash_projection(dataset)
+
+    assert store.list_doc_change_hashes() == {
+        "hashed.md": "sha-abc",
+        "legacy.md": "",
+    }
+    assert dataset.to_table_calls == [
+        {"doc_id": "doc_id", "ch": "metadata.change_hash"}
+    ]
+    assert dataset.to_batches_calls == []
+
+
+def test_change_hash_projection_exact_sparse_metadata_error_uses_bounded_batches():
+    batch = pa.record_batch({
+        "doc_id": ["hashed.md", "legacy.md", None],
+        "metadata": pa.array([
+            {"change_hash": "sha-abc"},
+            {"change_hash": None},
+            {"change_hash": "ignored"},
+        ]),
+    })
+    dataset = _ChangeHashProjectionDataset(
+        projection_error=pa.ArrowInvalid(
+            "projection supplied fewer column indices; "
+            "ran out at field 'metadata'"
+        ),
+        batches=[batch],
+    )
+    store = _store_for_change_hash_projection(dataset)
+
+    assert store.list_doc_change_hashes() == {
+        "hashed.md": "sha-abc",
+        "legacy.md": "",
+    }
+    assert dataset.to_batches_calls == [(["doc_id", "metadata"], 1024)]
+
+
+@pytest.mark.parametrize("message", [
+    "projection supplied fewer column indices",
+    "ran out at field 'metadata'",
+    "unrelated invalid Arrow projection",
+])
+def test_change_hash_projection_near_match_arrow_invalid_is_rethrown(message):
+    error = pa.ArrowInvalid(message)
+    dataset = _ChangeHashProjectionDataset(projection_error=error)
+    store = _store_for_change_hash_projection(dataset)
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        store.list_doc_change_hashes()
+
+    assert caught.value is error
+    assert dataset.to_batches_calls == []
+
+
+def test_change_hash_projection_large_metadata_streams_multiple_bounded_batches():
+    row_count = 2050
+    payload = "x" * 16_384
+    rows = [
+        {"change_hash": None if index % 11 == 0 else f"sha-{index}", "payload": payload}
+        for index in range(row_count)
+    ]
+    table = pa.table({
+        "doc_id": [f"doc-{index}.md" for index in range(row_count)],
+        "metadata": pa.array(rows),
+    })
+    batches = table.to_batches(max_chunksize=1024)
+    dataset = _ChangeHashProjectionDataset(
+        projection_error=pa.ArrowInvalid(
+            "projection supplied fewer column indices; "
+            "ran out at field 'metadata'"
+        ),
+        batches=batches,
+    )
+    store = _store_for_change_hash_projection(dataset)
+
+    hashes = store.list_doc_change_hashes()
+
+    assert len(batches) == 3
+    assert hashes == {
+        f"doc-{index}.md": "" if index % 11 == 0 else f"sha-{index}"
+        for index in range(row_count)
+    }
+    assert dataset.to_table_calls == [
+        {"doc_id": "doc_id", "ch": "metadata.change_hash"}
+    ]
+    assert dataset.to_batches_calls == [(["doc_id", "metadata"], 1024)]
 
 
 def test_schema_evolution_preserves_vectors():

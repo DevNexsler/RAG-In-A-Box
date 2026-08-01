@@ -1280,21 +1280,51 @@ class LanceDBStore:
         """Return {doc_id: change_hash} for content-hash change detection.
 
         Returns {} if no doc carries a change_hash yet (old index, or before any
-        hash-aware run) — callers then fall back to mtime comparison.
+        hash-aware run) — callers then fall back to mtime comparison. Lance 9
+        cannot project a nested struct child across a sparse fragment that omits
+        that child, so that exact reader failure falls back to bounded batches
+        of the complete metadata struct.
         """
         if "change_hash" not in self._metadata_subfields():
             return {}
 
         def _op():
             ds = self._vs.table.to_lance()
-            t = ds.to_table(columns={"doc_id": "doc_id", "ch": "metadata.change_hash"})
+            try:
+                t = ds.to_table(
+                    columns={"doc_id": "doc_id", "ch": "metadata.change_hash"}
+                )
+            except pa.ArrowInvalid as exc:
+                message = str(exc)
+                if (
+                    "projection supplied fewer column indices" not in message
+                    or "ran out at field 'metadata'" not in message
+                ):
+                    raise
+                logger.warning(
+                    "Lance nested change_hash projection hit a sparse metadata "
+                    "fragment; retrying with bounded full-struct batches"
+                )
+                out: dict[str, str] = {}
+                for batch in ds.to_batches(
+                    columns=["doc_id", "metadata"], batch_size=1024
+                ):
+                    ids = batch.column("doc_id").to_pylist()
+                    metadata = batch.column("metadata")
+                    field_index = metadata.type.get_field_index("change_hash")
+                    hashes = metadata.field(field_index).to_pylist()
+                    for doc_id, change_hash in zip(ids, hashes):
+                        if doc_id is not None:
+                            out[doc_id] = change_hash or ""
+                return out
+
             ids = t["doc_id"].to_pylist()
             hashes = t["ch"].to_pylist()
-            out: dict[str, str] = {}
-            for d, h in zip(ids, hashes):
-                if d is not None:
-                    out[d] = h or ""
-            return out
+            return {
+                doc_id: change_hash or ""
+                for doc_id, change_hash in zip(ids, hashes)
+                if doc_id is not None
+            }
 
         return self._run_read_with_recovery(_op, {})
 
