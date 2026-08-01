@@ -127,12 +127,21 @@ def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
     monkeypatch.setenv("INDEX_ROOT", str(tmp_path))
     _patch_index_config(monkeypatch, mcp_server, tmp_path)
 
-    # Launch a long-lived dummy subprocess and write its PID file manually,
-    # simulating an in-progress indexer run.
+    # Launch a long-lived dummy subprocess and wait until its interpreter is
+    # running before exposing its PID.  Without this handshake, a loaded host
+    # can inspect /proc/<pid>/cmdline before the child has published it.
     dummy = subprocess.Popen(
-        [sys.executable, "-c", "import time; index_vault_flow = True; time.sleep(30)"],
+        [
+            sys.executable,
+            "-c",
+            "import time; index_vault_flow = True; print('ready', flush=True); time.sleep(30)",
+        ],
         start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
     )
+    assert dummy.stdout is not None
+    assert dummy.stdout.readline() == "ready\n"
     pid_file = tmp_path / "indexer.pid"
     pid_file.write_text(str(dummy.pid))
 
@@ -145,6 +154,7 @@ def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
     finally:
         dummy.terminate()
         dummy.wait()
+        dummy.stdout.close()
         pid_file.unlink(missing_ok=True)
 
 
