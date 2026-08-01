@@ -173,13 +173,17 @@ reports every problem) and **only exit code 0 releases the spend**:
 | `api_keys` | `OPENROUTER_API_KEY` and `DEEPINFRA_API_KEY` non-empty | set them in `.env` (dotenv is loaded) |
 | `config_test` | `config_test.yaml` present in CWD | it's gitignored so fresh worktrees don't have it — copy from the main checkout (the failure message prints the path) |
 | `litellm_ocr` | reads the first existing config candidate (CWD/worktree `config.yaml` before the main checkout), authenticates a non-generating `GET {ocr.endpoint}/models`, and confirms both configured aliases | config/endpoint/model alias/credential missing, endpoint unreachable, authentication rejected, malformed response, or either alias absent; credentials belong only in `LITELLM_API_KEY` or `LITELLM_MASTER_KEY` |
-| `prod_indexer_idle` | prod container heartbeat (`/data/index/indexer.heartbeat`) older than 120 s | **"prod indexer active — rerun when quiet"**: the prod indexer is mid-run and would contend with the live tier for shared LiteLLM/local inference hardware. Wait for it to finish and re-run; the preflight itself is the poll (it prints the heartbeat age). |
+| `prod_indexer_idle` | `/data/index/indexer.pid` is absent or points to no live process; a live PID must be non-zombie and its `/proc/<pid>/cmdline` must identify the indexer | **"prod indexer active — rerun when quiet"**: the prod indexer is mid-run and would contend with the live tier for shared LiteLLM/local inference hardware. Wait for it to finish and re-run. Docker failures, malformed PID state, unreadable process metadata, foreign PID reuse, and unexpected probe output all fail closed. |
 | `comm_postgres` | `COMM_DATA_STORE_DSN` answers `SELECT 1` | DSN unset or Postgres down |
 
 The LiteLLM probe is fail-closed: missing configuration, network/auth errors,
 invalid JSON/schema, and missing aliases all fail preflight without generating
 model output. Failure messages identify the endpoint/check but never print the
 credential.
+
+The production-indexer probe is also fail-closed. Only an explicit, successful
+container probe proving there is no live indexer PID reports idle; inability to
+verify container or process state blocks the live tier.
 
 **Worktree setup**: linked worktrees need their own copies of three
 gitignored files from the main checkout — `config_test.yaml`, `.env`,

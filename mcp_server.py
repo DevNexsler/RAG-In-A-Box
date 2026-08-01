@@ -228,6 +228,28 @@ def _fts_rebuild_failed_count(index_root: Path) -> int:
         return 0
 
 
+def _index_run_started_ts(current_run: object, pid_file: Path) -> float | None:
+    """Epoch seconds at which the active index run started, if knowable.
+
+    The supervisor records the authoritative start on the run itself. The pid
+    file is only a stand-in for the legacy pid-only contract: the supervisor
+    re-stamps it on every reconcile, so its mtime tracks liveness rather than
+    run start and must not be trusted once supervisor state exists.
+    """
+    if isinstance(current_run, dict):
+        started_at = current_run.get("started_at")
+        if not isinstance(started_at, str):
+            return None
+        try:
+            return datetime.fromisoformat(started_at).timestamp()
+        except ValueError:
+            return None
+    try:
+        return pid_file.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _disk_usage_max_percent() -> float:
     """High-water mark for index-filesystem usage (env-tunable via
     DISK_USAGE_MAX_PERCENT). Junk or out-of-range values fall back to the
@@ -292,13 +314,24 @@ def _health_probe(config: dict) -> tuple[dict, int]:
     payload.update(disk)
     if running:
         hb = index_root / "indexer.heartbeat"
-        pidf = index_root / "indexer.pid"
         max_age = float(os.environ.get("INDEXER_HEARTBEAT_MAX_AGE", "1800"))
-        # Heartbeat age. Until the first heartbeat is written (indexer
-        # still in Prefect/flow setup), fall back to the pid-file mtime
-        # (~= start time) so a just-started run isn't a false stall.
-        ref = hb if hb.exists() else pidf
-        age = (time.time() - ref.stat().st_mtime) if ref.exists() else None
+        # Age of the newest progress evidence *for this run*. One heartbeat file
+        # is reused by every run, so a heartbeat older than the current run was
+        # written by an earlier one and says nothing about this one; the run's
+        # own start is the floor until it stamps for the first time (#0515 —
+        # a run spent 17 min in config load, writer-lock wait and store recovery
+        # before its first stamp and inherited the previous run's staleness).
+        # Once it stamps, its own heartbeat is newer and wins, so a run that
+        # really does freeze still ages past max_age.
+        stamps = [
+            ts
+            for ts in (
+                hb.stat().st_mtime if hb.exists() else None,
+                _index_run_started_ts(current_run, index_root / "indexer.pid"),
+            )
+            if ts is not None
+        ]
+        age = (time.time() - max(stamps)) if stamps else None
         if age is None or age > max_age:
             return (
                 {
