@@ -2761,6 +2761,89 @@ def test_health_probe_stalled_heartbeat_still_503s(tmp_path):
     assert payload["status"] == "stalled"
 
 
+def _live_index_run_state(started_ago_s: float) -> dict:
+    """Supervisor state for a live run whose monitor lives in another process.
+
+    The fresh monitor lease is what keeps reconcile from demoting the run to
+    `lost` when its pid is not a real indexer, so the probe sees `running`.
+    """
+    from datetime import datetime, timezone
+
+    run = {
+        "run_id": "live-run",
+        "status": "running",
+        "pid": 999999,
+        "pgid": 999999,
+        "process_starttime_ticks": 1,
+        "source_name": None,
+        "started_at": datetime.fromtimestamp(
+            time.time() - started_ago_s, tz=timezone.utc
+        ).isoformat(),
+        "peak_rss_bytes": 1,
+        "monitor_owner_id": "another-process",
+        "monitor_lease_expires_at": time.time() + 3600,
+    }
+    return {"version": 1, "current": run, "last_attempt": run, "last_success": None}
+
+
+def test_health_probe_before_first_heartbeat_is_not_stalled(tmp_path):
+    """A young run must not inherit the *previous* run's heartbeat age (#0515).
+
+    `indexer.heartbeat` is one file reused by every run, so between process
+    start and the first stamp (config load, writer-lock wait, store recovery —
+    17 minutes in the incident) the probe was reading the last run's mtime and
+    calling the new run frozen. Docker-health flipped the container unhealthy
+    while indexing was progressing normally.
+    """
+    import json
+
+    hb = tmp_path / "indexer.heartbeat"
+    hb.write_text("beat")  # left behind by the previous run
+    stale = time.time() - 4000  # default max age is 1800s
+    os.utime(hb, (stale, stale))
+    (tmp_path / "index_run_state.json").write_text(json.dumps(_live_index_run_state(120)))
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["indexer"] == "running"
+    assert payload["heartbeat_age_s"] == pytest.approx(120, abs=10)
+
+
+def test_health_probe_stalls_when_the_current_run_stops_progressing(tmp_path):
+    """The run's own start is a floor, not a licence: once the run itself has
+    been quiet past the max age, the frozen-indexer 503 must still fire."""
+    import json
+
+    hb = tmp_path / "indexer.heartbeat"
+    hb.write_text("beat")
+    stale = time.time() - 4000
+    os.utime(hb, (stale, stale))
+    (tmp_path / "index_run_state.json").write_text(json.dumps(_live_index_run_state(4200)))
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "stalled"
+    assert payload["heartbeat_age_s"] == pytest.approx(4000, abs=10)
+
+
+def test_health_probe_long_run_with_fresh_heartbeat_is_ok(tmp_path):
+    """Newest progress evidence wins: a long-running run that keeps stamping is
+    healthy, however old its start time is."""
+    import json
+
+    (tmp_path / "indexer.heartbeat").write_text("beat")
+    (tmp_path / "index_run_state.json").write_text(json.dumps(_live_index_run_state(9000)))
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["heartbeat_age_s"] == 0
+
+
 def test_health_probe_running_with_fts_failure_degrades(tmp_path):
     """FTS failure is surfaced even while an indexer run is in progress."""
     import json
