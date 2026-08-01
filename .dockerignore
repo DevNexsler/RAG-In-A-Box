@@ -1,8 +1,12 @@
 .git
+.worktrees
+.gitnexus
 .venv
 __pycache__
 *.pyc
 .pytest_cache
+logs/
+test_index/
 models/
 *.lance
 .env
