@@ -11,6 +11,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -250,45 +251,53 @@ def main(argv=None):
 
     run_dir = Path(args.run_dir) if args.run_dir else RUN_ROOT / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
+    prefect_home_existed = "PREFECT_HOME" in os.environ
+    prior_prefect_home = os.environ.get("PREFECT_HOME")
+    os.environ["PREFECT_HOME"] = tempfile.mkdtemp(prefix="prefect-home-", dir=run_dir)
+    try:
+        all_tiers = TIERS + [E2E_REAL_TIER]
+        if args.only:
+            selected = [t for t in all_tiers if t.name == args.only]
+        elif args.fast:
+            selected = TIERS[:[t.name for t in TIERS].index("integration") + 1]
+        else:
+            selected = list(TIERS) + ([E2E_REAL_TIER] if args.with_real_e2e else [])
 
-    all_tiers = TIERS + [E2E_REAL_TIER]
-    if args.only:
-        selected = [t for t in all_tiers if t.name == args.only]
-    elif args.fast:
-        selected = TIERS[:[t.name for t in TIERS].index("integration") + 1]
-    else:
-        selected = list(TIERS) + ([E2E_REAL_TIER] if args.with_real_e2e else [])
+        results = {}
+        all_ok = True
+        # Machine-readable per-tier states for result.json: every tier (including
+        # static, which emits no junit artifact) starts as not_run; selected tiers
+        # become pass/fail when run, or skipped when a prior tier failed.
+        states = {t.name: "not_run" for t in all_tiers}
+        for i, tier in enumerate(selected):
+            if not args.only and not next_tier_allowed(tier.name, results, selected):
+                print(f"STOP: {tier.name} skipped (prior tier failed)", flush=True)
+                for rest in selected[i:]:
+                    states[rest.name] = "skipped"
+                break
+            print(f"=== {tier.name} ===", flush=True)
+            ok = dispatch(tier, run_dir)
+            results[tier.name] = ok
+            states[tier.name] = "pass" if ok else "fail"
+            print(f"{'PASS' if ok else 'FAIL'}: {tier.name}", flush=True)
+            if not ok:
+                all_ok = False
 
-    results = {}
-    all_ok = True
-    # Machine-readable per-tier states for result.json: every tier (including
-    # static, which emits no junit artifact) starts as not_run; selected tiers
-    # become pass/fail when run, or skipped when a prior tier failed.
-    states = {t.name: "not_run" for t in all_tiers}
-    for i, tier in enumerate(selected):
-        if not args.only and not next_tier_allowed(tier.name, results, selected):
-            print(f"STOP: {tier.name} skipped (prior tier failed)", flush=True)
-            for rest in selected[i:]:
-                states[rest.name] = "skipped"
-            break
-        print(f"=== {tier.name} ===", flush=True)
-        ok = dispatch(tier, run_dir)
-        results[tier.name] = ok
-        states[tier.name] = "pass" if ok else "fail"
-        print(f"{'PASS' if ok else 'FAIL'}: {tier.name}", flush=True)
-        if not ok:
-            all_ok = False
+        # Written BEFORE gate_report.py runs so the report can prefer the runner's
+        # own verdict over artifact inference.
+        (run_dir / "result.json").write_text(json.dumps(
+            {"tiers": states, "overall": "pass" if all_ok else "fail"}, indent=2) + "\n")
 
-    # Written BEFORE gate_report.py runs so the report can prefer the runner's
-    # own verdict over artifact inference.
-    (run_dir / "result.json").write_text(json.dumps(
-        {"tiers": states, "overall": "pass" if all_ok else "fail"}, indent=2) + "\n")
+        if Path("scripts/gate_report.py").exists():
+            subprocess.run([sys.executable, "scripts/gate_report.py", str(run_dir)], check=False)
 
-    if Path("scripts/gate_report.py").exists():
-        subprocess.run([sys.executable, "scripts/gate_report.py", str(run_dir)], check=False)
-
-    print(f"gate: {'PASS' if all_ok else 'FAIL'} (artifacts: {run_dir})", flush=True)
-    return 0 if all_ok else 1
+        print(f"gate: {'PASS' if all_ok else 'FAIL'} (artifacts: {run_dir})", flush=True)
+        return 0 if all_ok else 1
+    finally:
+        if prefect_home_existed:
+            os.environ["PREFECT_HOME"] = prior_prefect_home
+        else:
+            os.environ.pop("PREFECT_HOME", None)
 
 
 if __name__ == "__main__":
