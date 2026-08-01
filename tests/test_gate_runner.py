@@ -12,6 +12,13 @@ from scripts.gate import TIERS, next_tier_allowed, preflight_passed
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_makefile_uses_overridable_project_python():
+    text = (REPO_ROOT / "Makefile").read_text()
+    assert "PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)" in text
+    assert "\tpython " not in text
+    assert text.count("\t$(PYTHON) ") == 8
+
+
 def _run_gate(args, tmp_path, env=None):
     full_env = {**os.environ, **(env or {})}
     return subprocess.run(
