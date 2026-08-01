@@ -6,10 +6,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import scripts.gate as gate
 from scripts.gate import TIERS, next_tier_allowed, preflight_passed
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_makefile_uses_overridable_project_python():
+    text = (REPO_ROOT / "Makefile").read_text()
+    assert "PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)" in text
+    assert "\tpython " not in text
+    assert text.count("\t$(PYTHON) ") == 8
 
 
 def _run_gate(args, tmp_path, env=None):
@@ -103,6 +112,56 @@ def test_result_json_all_pass(tmp_path, monkeypatch):
     data = _read_result(run_dir)
     assert data["overall"] == "pass"
     assert data["tiers"] == {**{name: "pass" for name in ALL_TIERS}, "e2e-real": "not_run"}
+
+
+def test_each_gate_run_uses_unique_prefect_home_and_restores_ambient(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ambient = str(tmp_path / "ambient-prefect-home")
+    monkeypatch.setenv("PREFECT_HOME", ambient)
+    seen = []
+
+    def capture_prefect_home(tier, run_dir):
+        seen.append(Path(os.environ["PREFECT_HOME"]))
+        return True
+
+    monkeypatch.setattr(gate, "dispatch", capture_prefect_home)
+    run_dir = tmp_path / "run"
+
+    assert gate.main(["--only", "unit", "--run-dir", str(run_dir)]) == 0
+    assert os.environ["PREFECT_HOME"] == ambient
+    assert gate.main(["--only", "unit", "--run-dir", str(run_dir)]) == 0
+    assert os.environ["PREFECT_HOME"] == ambient
+
+    assert len(seen) == 2
+    assert all(path.parent == run_dir for path in seen)
+    assert all(path.name.startswith("prefect-home-") for path in seen)
+    assert seen[0] != seen[1]
+    assert all(path.is_dir() for path in seen)
+
+
+def test_gate_restores_prefect_home_when_dispatch_raises(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ambient = str(tmp_path / "ambient-prefect-home")
+    monkeypatch.setenv("PREFECT_HOME", ambient)
+
+    def raise_error(tier, run_dir):
+        raise RuntimeError("dispatch failed")
+
+    monkeypatch.setattr(gate, "dispatch", raise_error)
+
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        gate.main(["--only", "unit", "--run-dir", str(tmp_path / "run")])
+
+    assert os.environ["PREFECT_HOME"] == ambient
+
+
+def test_gate_leaves_prefect_home_absent_when_initially_absent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PREFECT_HOME", raising=False)
+    monkeypatch.setattr(gate, "dispatch", lambda tier, run_dir: True)
+
+    assert gate.main(["--only", "unit", "--run-dir", str(tmp_path / "run")]) == 0
+    assert "PREFECT_HOME" not in os.environ
 
 
 def test_result_json_marks_skipped_after_failure(tmp_path, monkeypatch):
