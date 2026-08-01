@@ -18,13 +18,15 @@ from extractors import (
 )
 from flow_index_vault import (
     _DEGRADED_MAX_ATTEMPTS,
+    _DEGRADED_MAX_UNRESOLVED_RUNS,
     _DEGRADED_RETRY_BASE_SECONDS,
     _DEGRADED_RETRY_CAP_SECONDS,
     _degraded_backoff_seconds,
-    _include_degraded_docs,
     _load_degraded_ledger,
     _merge_degraded_ledger,
+    _reconcile_degraded_docs,
     _save_degraded_ledger,
+    _save_degraded_unresolved,
 )
 
 
@@ -89,10 +91,22 @@ def test_collector_is_thread_isolated():
         assert results[f"t{i}"] == [Degradation(f"t{i}")]
 
 
-# --- re-include logic ---
+# --- re-include / reconciliation logic ---
 
 def _scanned(*doc_ids):
     return [{"doc_id": d, "mtime": 1.0} for d in doc_ids]
+
+
+def _reconcile(scanned, queued, ledger, sources=("documents",), full_scan=True, **kw):
+    """Reconcile against a full scan of `sources` by default."""
+    return _reconcile_degraded_docs(
+        scanned, queued, ledger, scanned_sources=set(sources), full_scan=full_scan, **kw
+    )
+
+
+def _include_degraded_docs(scanned, queued, ledger, **kw):
+    """The re-queue half of reconciliation — what the old reader returned."""
+    return _reconcile(scanned, queued, ledger, **kw)[0]
 
 
 def test_include_degraded_requeues_ledger_docs():
@@ -118,6 +132,99 @@ def test_include_degraded_ignores_docs_no_longer_scanned():
     ledger = {"docs": {"documents::gone": {"reasons": ["x"], "attempts": 1}}}
     out = _include_degraded_docs(_scanned("documents::other"), [], ledger)
     assert out == []
+
+
+# --- total reconciliation (ticket #0618) ---
+
+def test_reconcile_partitions_every_entry_exactly_once():
+    # The ledger's size must equal the sum of the buckets — that identity is
+    # what stops an entry from vanishing into the gap between the ledger and
+    # the 'Re-queued N' count.
+    ledger = {"docs": {
+        "documents::queued": {"reasons": ["x"], "attempts": 1},
+        "documents::requeue": {"reasons": ["x"], "attempts": 1},
+        "documents::capped": {"reasons": ["x"], "attempts": _DEGRADED_MAX_ATTEMPTS},
+        "documents::gone": {"reasons": ["x"], "attempts": 1},
+        "comm_messages::other": {"reasons": ["x"], "attempts": 1},
+    }}
+    queued = [{"doc_id": "documents::queued", "mtime": 2.0}]
+    _, _, report = _reconcile(
+        _scanned("documents::queued", "documents::requeue"), queued, ledger,
+        sources=("documents",), full_scan=False,
+    )
+    assert report["already_queued"] == ["documents::queued"]
+    assert report["requeued"] == ["documents::requeue"]
+    assert report["capped"] == ["documents::capped"]
+    assert report["unresolved"] == ["documents::gone"]
+    assert report["source_not_scanned"] == ["comm_messages::other"]
+    assert report["total"] == 5
+    assert report["total"] == sum(
+        len(report[b]) for b in
+        ("already_queued", "requeued", "capped", "unresolved", "source_not_scanned")
+    )
+
+
+def test_reconcile_ages_entry_missing_from_its_own_scanned_source():
+    ledger = {"docs": {"documents::gone": {"reasons": ["x"], "attempts": 1}}}
+    _, ledger, report = _reconcile(_scanned("documents::other"), [], ledger)
+    assert report["unresolved"] == ["documents::gone"]
+    assert ledger["docs"]["documents::gone"]["unresolved_runs"] == 1
+    assert report["terminal"] == {}
+
+
+def test_reconcile_escalates_entry_stuck_unresolved_to_terminal():
+    # Ticket #0618: 16 comm_messages entries sat at attempts=1 for eight weeks
+    # because their source rows left the configured query. Ageing bounds that.
+    ledger = {"docs": {"comm_messages::dup": {"reasons": ["enrichment_failed"], "attempts": 1}}}
+    for _ in range(_DEGRADED_MAX_UNRESOLVED_RUNS):
+        _, ledger, report = _reconcile(
+            _scanned("comm_messages::real"), [], ledger, sources=("comm_messages",)
+        )
+    assert "comm_messages::dup" not in ledger["docs"], "must not linger in the retry ledger"
+    assert report["terminal"]["comm_messages::dup"]["unresolved_runs"] == (
+        _DEGRADED_MAX_UNRESOLVED_RUNS
+    )
+    assert report["terminal"]["comm_messages::dup"]["reasons"] == ["enrichment_failed"]
+
+
+def test_reconcile_resolving_entry_resets_the_unresolved_streak():
+    ledger = {"docs": {"documents::flaky": {
+        "reasons": ["x"], "attempts": 1, "unresolved_runs": _DEGRADED_MAX_UNRESOLVED_RUNS - 1,
+    }}}
+    _, ledger, report = _reconcile(_scanned("documents::flaky"), [], ledger)
+    assert report["requeued"] == ["documents::flaky"]
+    assert "unresolved_runs" not in ledger["docs"]["documents::flaky"]
+
+
+def test_reconcile_source_scoped_run_never_ages_another_source():
+    # A source-scoped index is no evidence about the sources it did not scan.
+    ledger = {"docs": {"documents::img1": {"reasons": ["x"], "attempts": 1}}}
+    for _ in range(_DEGRADED_MAX_UNRESOLVED_RUNS + 2):
+        _, ledger, report = _reconcile(
+            _scanned("comm_messages::m"), [], ledger,
+            sources=("comm_messages",), full_scan=False,
+        )
+    assert report["source_not_scanned"] == ["documents::img1"]
+    assert ledger["docs"]["documents::img1"] == {"reasons": ["x"], "attempts": 1}
+
+
+def test_reconcile_full_scan_ages_entry_from_a_removed_source():
+    # A namespace that is no longer configured at all can only be concluded
+    # dead by a full scan — and then it must age out, not accumulate forever.
+    ledger = {"docs": {"retired::doc": {"reasons": ["x"], "attempts": 1}}}
+    _, ledger, report = _reconcile(
+        _scanned("documents::img1"), [], ledger, sources=("documents",), full_scan=True
+    )
+    assert report["unresolved"] == ["retired::doc"]
+    assert ledger["docs"]["retired::doc"]["unresolved_runs"] == 1
+
+
+def test_reconcile_empty_ledger_is_a_noop():
+    queued = [{"doc_id": "documents::new", "mtime": 1.0}]
+    out, ledger, report = _reconcile(_scanned("documents::new"), queued, {"docs": {}})
+    assert out == queued
+    assert ledger == {"docs": {}}
+    assert report["total"] == 0
 
 
 # --- merge logic ---
@@ -334,3 +441,64 @@ def test_migration_does_not_reopen_v2_capped_docs(tmp_path):
     (tmp_path / "degraded_docs.json").write_text(json.dumps(v2))
     ledger = _load_degraded_ledger(tmp_path)
     assert ledger["docs"]["documents::ocr"]["attempts"] == 5
+
+
+# --- #0618 termination invariant (reconciliation pass 2026-08-01) ---
+#
+# Production evidence this encodes: on 2026-08-01 the live ledger held 70
+# entries while every run logged "Re-queued 2 degraded docs" — the other 68
+# were `comm_messages::` rows whose upstream source row had left the configured
+# scan query (comm-store sets canonical_message_id on cross-delivery duplicates,
+# and the source query filters `canonical_message_id IS NULL`). Nine of them had
+# been frozen at attempts=1 since 2026-06-01. The old reader intersected ledger
+# ids with the scan and dropped the misses on the floor, so such an entry was
+# never retried, never cleared and never counted: it stayed in the retry ledger
+# forever. This test fails against that reader and passes once every entry is
+# accounted for and aged.
+
+def test_unresolvable_entry_reaches_a_terminal_state():
+    """An entry a successful full scan cannot resolve must leave the retry
+    ledger within a bounded number of runs instead of sitting there forever."""
+    import flow_index_vault as fiv
+
+    stuck = "comm_messages::zoho_mail/<vmZUp-N3T8aXVF8P2j20Ag@geopod-ismtpd-2>"
+    ledger = {"docs": {stuck: {"reasons": ["enrichment_failed"], "attempts": 1}}}
+    scanned = _scanned("comm_messages::still-here")
+
+    bound = getattr(fiv, "_DEGRADED_MAX_UNRESOLVED_RUNS", 3)
+    for run in range(1, 4 * bound + 1):
+        if hasattr(fiv, "_reconcile_degraded_docs"):
+            _, ledger, _report = fiv._reconcile_degraded_docs(
+                scanned, [], ledger,
+                scanned_sources={"comm_messages"}, full_scan=True,
+            )
+        else:  # pre-fix reader: returns the queue only, never touches the ledger
+            fiv._include_degraded_docs(scanned, [], ledger)
+        if stuck not in ledger.get("docs", {}):
+            break
+    else:
+        raise AssertionError(
+            f"unresolvable ledger entry still in the retry ledger after "
+            f"{4 * bound} full-scan runs — it can never be retried or cleared"
+        )
+    assert run <= bound, f"took {run} runs to reach a terminal state (bound {bound})"
+
+
+def test_terminal_write_failure_does_not_lose_entries(tmp_path, monkeypatch):
+    """If the terminal ledger cannot be written, the escalated entries must stay
+    in the ACTIVE ledger — otherwise a failed write drops them from both files.
+
+    Found by an adversarial review of PR #81 during the 2026-08-01 reconciliation:
+    _save_degraded_unresolved swallowed OSError while the caller unconditionally
+    persisted the active ledger with those entries already removed. This host has
+    filled its disk before (#0232/#58), so the failure path is reachable.
+    """
+    import flow_index_vault as fiv
+
+    assert _save_degraded_unresolved.__doc__, "helper must document its contract"
+
+    monkeypatch.setattr(
+        fiv.Path, "write_text",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("No space left on device")),
+    )
+    assert fiv._save_degraded_unresolved(tmp_path, {"docs": {"documents::x": {}}}) is False

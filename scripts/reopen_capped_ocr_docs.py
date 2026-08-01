@@ -23,7 +23,7 @@ Background
 Docs that degrade during indexing (OCR/vision timeouts, enrichment failures)
 land in ``degraded_docs.json`` and are re-queued on later runs until they either
 succeed or reach ``_DEGRADED_MAX_ATTEMPTS`` (5), after which they are abandoned
-as "persistent" and never retried again (flow_index_vault._include_degraded_docs).
+as "persistent" and never retried again (flow_index_vault._reconcile_degraded_docs).
 
 This script resets ``attempts`` to 0 for capped docs whose failures are ALL
 OCR/vision-class. Docs capped for other reasons (e.g. enrichment_failed) are

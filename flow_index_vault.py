@@ -1114,43 +1114,144 @@ def _save_degraded_ledger(index_root: Path, ledger: dict) -> None:
         logging.getLogger(__name__).warning("Failed to save degraded ledger: %s", exc)
 
 
-def _include_degraded_docs(
+# A ledger entry that a successful scan cannot resolve is aged, not ignored:
+# after this many consecutive resolvable-but-missing runs it moves to the
+# terminal ledger (#0618). The old reader intersected ledger ids with the scan
+# and dropped the misses on the floor, so an entry whose source row left the
+# configured query — e.g. the 16 comm_messages recorded before upstream dedupe
+# set canonical_message_id — was never retried, never cleared, and never
+# counted. Ageing bounds that: an entry either heals, caps, or escalates.
+_DEGRADED_MAX_UNRESOLVED_RUNS = 3
+
+
+def _degraded_unresolved_path(index_root: Path) -> Path:
+    return Path(index_root) / "degraded_unresolved.json"
+
+
+def _load_degraded_unresolved(index_root: Path) -> dict:
+    try:
+        payload = json.loads(
+            _degraded_unresolved_path(index_root).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        payload = None
+    if not (isinstance(payload, dict) and isinstance(payload.get("docs"), dict)):
+        return {"docs": {}}
+    return payload
+
+
+def _save_degraded_unresolved(index_root: Path, ledger: dict) -> bool:
+    """Persist the terminal ledger. Returns False if it could not be written.
+
+    The caller drops the escalated entries from the ACTIVE ledger, so a
+    swallowed write failure here would lose them from both files (this host has
+    filled its disk before — #0232/#58). Report the failure instead.
+    """
+    try:
+        _degraded_unresolved_path(index_root).write_text(
+            json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        return True
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "Failed to save unresolved degraded ledger: %s", exc
+        )
+        return False
+
+
+def _reconcile_degraded_docs(
     scanned: list[dict],
     to_add_or_update: list[dict],
     ledger: dict,
+    scanned_sources: set[str],
+    full_scan: bool,
     *,
     now: float | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], dict, dict]:
     """Re-queue docs that previously indexed with transient degradations
     (OCR/vision timeouts, enrichment failures) even though their mtime is
-    unchanged. Entries past _DEGRADED_MAX_ATTEMPTS are left alone — those
-    are persistent (e.g. corrupt source files), not transient.
+    unchanged — and account for every entry that is not re-queued.
 
-    A doc is only re-admitted once its exponential backoff window has elapsed
-    since the last attempt, so a down provider is not re-hit every sweep.
-    Legacy entries with no ``last_attempt_at`` are treated as due immediately.
+    Each active entry lands in exactly one disjoint bucket, so the ledger's
+    size always equals the sum of the reported counts and no entry can go
+    missing without a log line:
+
+    - ``already_queued`` — the genuine diff already picked it up this run
+    - ``capped``         — past _DEGRADED_MAX_ATTEMPTS: persistent (e.g. a
+                           corrupt source file), deliberately not retried
+    - ``backoff``        — resolvable, but its exponential backoff window has
+                           not elapsed yet, so a down provider is not re-hit
+                           every sweep. Entries with no ``last_attempt_at``
+                           are due immediately.
+    - ``requeued``       — resolved against this scan and forced back in
+    - ``source_not_scanned`` — its source did not run this pass (a
+                           source-scoped index); untouched, not aged
+    - ``unresolved``     — its source scanned fine but the id is gone, so
+                           nothing can ever resolve it: age it, and after
+                           _DEGRADED_MAX_UNRESOLVED_RUNS escalate it out to
+                           the terminal ledger
+
+    Returns (queue, active ledger after reconciliation, report). The report's
+    ``terminal`` entries are the ones the caller must persist to the terminal
+    ledger before it writes the returned active ledger.
     """
-    docs = ledger.get("docs", {})
+    docs = dict(ledger.get("docs", {}))
+    report = {
+        "total": len(docs),
+        "already_queued": [],
+        "capped": [],
+        "backoff": [],
+        "requeued": [],
+        "source_not_scanned": [],
+        "unresolved": [],
+        "terminal": {},
+    }
     if not docs:
-        return to_add_or_update
+        return to_add_or_update, ledger, report
+
     if now is None:
         now = time.time()
-    retry_ids = {
-        doc_id
-        for doc_id, entry in docs.items()
-        if int(entry.get("attempts", 0)) < _DEGRADED_MAX_ATTEMPTS
-        and (now - float(entry.get("last_attempt_at", 0.0)))
-        >= _degraded_backoff_seconds(entry)
-    }
-    if not retry_ids:
-        return to_add_or_update
     existing = {str(r.get("doc_id", "")) for r in to_add_or_update}
     by_id = {str(r.get("doc_id", "")): r for r in scanned}
-    forced = list(to_add_or_update)
-    for doc_id in sorted(retry_ids):
-        if doc_id not in existing and doc_id in by_id:
-            forced.append(by_id[doc_id])
-    return forced
+    queue = list(to_add_or_update)
+
+    for doc_id in sorted(docs):
+        entry = dict(docs[doc_id])
+        if doc_id in existing:
+            bucket = "already_queued"
+        elif int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS:
+            bucket = "capped"
+        elif doc_id in by_id:
+            # Resolvable — but only re-admit once the backoff window elapsed.
+            if (now - float(entry.get("last_attempt_at", 0.0))) >= _degraded_backoff_seconds(entry):
+                queue.append(by_id[doc_id])
+                bucket = "requeued"
+            else:
+                bucket = "backoff"
+        elif str(doc_id).split("::", 1)[0] not in scanned_sources and not full_scan:
+            # Source-scoped run: another source's entries are not evidence of
+            # anything. Only a full scan can conclude a namespace is gone.
+            bucket = "source_not_scanned"
+        else:
+            bucket = "unresolved"
+
+        if bucket == "unresolved":
+            runs = int(entry.get("unresolved_runs", 0)) + 1
+            entry["unresolved_runs"] = runs
+            report["unresolved"].append(doc_id)
+            if runs >= _DEGRADED_MAX_UNRESOLVED_RUNS:
+                report["terminal"][doc_id] = entry
+                docs.pop(doc_id, None)
+            else:
+                docs[doc_id] = entry
+        else:
+            # It resolved (or was never a candidate this run) — a later miss
+            # starts its own streak rather than inheriting a stale one.
+            if entry.pop("unresolved_runs", None) is not None:
+                docs[doc_id] = entry
+            report[bucket].append(doc_id)
+
+    return queue, {**ledger, "docs": docs}, report
 
 
 def _merge_degraded_ledger(
@@ -3130,13 +3231,75 @@ def index_vault_flow(
         scanned, stored_mtimes, stored_change_hashes
     )
     degraded_ledger = _load_degraded_ledger(index_root)
-    before_degraded = len(to_add_or_update)
-    to_add_or_update = _include_degraded_docs(scanned, to_add_or_update, degraded_ledger)
-    if len(to_add_or_update) > before_degraded:
+    to_add_or_update, degraded_ledger, degraded_report = _reconcile_degraded_docs(
+        scanned,
+        to_add_or_update,
+        degraded_ledger,
+        scanned_sources={s.name for s in all_sources},
+        full_scan=source_name is None,
+    )
+    if degraded_report["total"]:
+        if degraded_report["requeued"]:
+            logger.info(
+                "Re-queued %d degraded docs for self-heal",
+                len(degraded_report["requeued"]),
+            )
+        # Every entry is accounted for, so a stuck item can no longer hide in
+        # the gap between the ledger's size and the re-queued count (#0618).
         logger.info(
-            "Re-queued %d degraded docs for self-heal",
-            len(to_add_or_update) - before_degraded,
+            "Degraded ledger: %d entries — %d re-queued, %d already queued, "
+            "%d capped, %d awaiting backoff, %d source not scanned, %d unresolved",
+            degraded_report["total"],
+            len(degraded_report["requeued"]),
+            len(degraded_report["already_queued"]),
+            len(degraded_report["capped"]),
+            len(degraded_report["backoff"]),
+            len(degraded_report["source_not_scanned"]),
+            len(degraded_report["unresolved"]),
         )
+        if degraded_report["unresolved"]:
+            logger.warning(
+                "%d degraded entries unresolvable against a successful scan "
+                "(escalate after %d runs): %s",
+                len(degraded_report["unresolved"]),
+                _DEGRADED_MAX_UNRESOLVED_RUNS,
+                degraded_report["unresolved"],
+            )
+        if degraded_report["terminal"]:
+            # Persist the escalation BEFORE dropping the entries from the
+            # active ledger: a crash between the two writes duplicates an
+            # entry (the next run re-converges it) instead of losing it.
+            unresolved_ledger = _load_degraded_unresolved(index_root)
+            unresolved_ledger.setdefault("docs", {}).update(
+                degraded_report["terminal"]
+            )
+            if _save_degraded_unresolved(index_root, unresolved_ledger):
+                logger.error(
+                    "%d degraded entries stuck unresolved for %d runs — escalated "
+                    "to %s and removed from the retry ledger: %s",
+                    len(degraded_report["terminal"]),
+                    _DEGRADED_MAX_UNRESOLVED_RUNS,
+                    _degraded_unresolved_path(index_root).name,
+                    sorted(degraded_report["terminal"]),
+                )
+                _RUNTIME.setdefault("_warnings", []).append(
+                    f"degraded_unresolved:{len(degraded_report['terminal'])}"
+                )
+            else:
+                # The terminal ledger did not land. Keep the entries in the
+                # active ledger rather than dropping them from both files —
+                # the next run re-ages and re-escalates them.
+                degraded_ledger["docs"].update(degraded_report["terminal"])
+                logger.error(
+                    "%d degraded entries could not be escalated to %s — kept in "
+                    "the retry ledger for the next run",
+                    len(degraded_report["terminal"]),
+                    _degraded_unresolved_path(index_root).name,
+                )
+        # The end-of-run merge re-loads the ledger from disk, so the ageing
+        # and escalation above have to land now to survive this run.
+        if degraded_report["unresolved"]:
+            _save_degraded_ledger(index_root, degraded_ledger)
     # Drop docs already decided 'do not index' (duplicate/oversized/corrupt)
     # whose file is unchanged — stops the reprocess-every-run loop — and claim
     # the bounded retries this run hands out.
