@@ -116,3 +116,28 @@ def test_scan_leaves_non_cliq_message_text_and_hash_unchanged():
     assert record.metadata["_text"] == raw_text
     expected_hash = hashlib.blake2b(raw_text.encode(), digest_size=16).hexdigest()
     assert record.change_hash == expected_hash
+
+
+def test_scan_preserves_opaque_source_message_ids_verbatim():
+    """Ticket #0618: the ledger holds keys like
+    `zoho_cliq/1780327866430%2015958014910122`, which looked like an `_` that
+    had been round-tripped through a URL encoder on our write path. It is not
+    — those are the literal `source_message_id` values upstream stores, and
+    the doc_id must reproduce them byte-for-byte. A doc_id that does not equal
+    the id the store keys on can never be looked up, re-queued, or cleared, so
+    this seam must never gain encoding, escaping, or normalization.
+    """
+    opaque = [
+        "1780327866430%2015958014910122",   # upstream's own percent sequence
+        "1780327866430_15958014910122",     # its canonical underscore twin
+        "<7r3ekCixTQ6Uw7mj7RXcJQ@geopod-ismtpd-canary-0>",
+        "id with spaces/and+plus",
+    ]
+    source, _ = _source(
+        [_message(i, f"body for {i}", source="zoho_mail") for i in opaque], []
+    )
+
+    records = list(source.scan())
+
+    assert [r.doc_id for r in records] == [f"zoho_mail/{i}" for i in opaque]
+    assert [r.natural_key for r in records] == [r.doc_id for r in records]

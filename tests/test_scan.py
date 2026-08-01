@@ -1820,6 +1820,102 @@ def test_large_degraded_requeue_does_not_trigger_shadow_rebuild(tmp_path):
     active_store.promote_table.assert_not_called()
 
 
+def _run_flow_over_scan(tmp_path, index_root, scanned_doc_ids, source_name="documents"):
+    """Drive index_vault_flow over a fake source that yields `scanned_doc_ids`.
+
+    Every doc is already stored at the same mtime, so the genuine diff is
+    empty and the run exercises the degraded-ledger reconciliation only.
+    """
+    from sources.base import SourceRecord
+    from flow_index_vault import index_vault_flow
+
+    stored = {f"{source_name}::{d}": 1.0 for d in scanned_doc_ids}
+
+    active_store = MagicMock()
+    active_store.list_doc_ids.return_value = list(stored.keys())
+    active_store.list_doc_mtimes.return_value = stored
+    active_store.count_chunks.return_value = len(stored)
+    active_store.fts_available.return_value = True
+
+    fake_registry = MagicMock()
+    fake_registry.count.return_value = 1
+    fake_taxonomy = MagicMock()
+    fake_taxonomy.count.return_value = 0
+
+    class _FakeSource:
+        name = source_name
+
+        def scan(self):
+            return iter([
+                SourceRecord(
+                    doc_id=d, natural_key=f"{d}.txt", source_type="txt",
+                    mtime=1.0, size=4,
+                    metadata={"abs_path": str(tmp_path / f"{d}.txt"), "ext": "txt"},
+                )
+                for d in scanned_doc_ids
+            ])
+
+        def set_ocr_provider(self, provider):
+            return None
+
+        def close(self):
+            return None
+
+    config = {
+        "index_root": str(index_root),
+        "sources": [{"type": "filesystem", "name": source_name, "root": str(tmp_path)}],
+        "chunking": {"max_chars": 1800, "overlap": 200, "semantic": {"enabled": False}},
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+
+    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+        with patch("flow_index_vault.load_config", return_value=config):
+            with patch("flow_index_vault.open_store_with_recovery", return_value=active_store):
+                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                            with patch("sources.build_source", return_value=_FakeSource()):
+                                with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                    with patch("flow_index_vault._process_docs", return_value=[]):
+                                        with patch("flow_index_vault.delete_docs_task"):
+                                            with patch("flow_index_vault.index_stats_task"):
+                                                with patch("flow_index_vault.write_index_metadata_task"):
+                                                    index_vault_flow.fn("dummy.yaml")
+
+
+def test_flow_records_degraded_entries_missing_from_successful_scan(tmp_path):
+    """Ticket #0618: a ledger entry whose source row leaves the configured
+    scan query is stranded forever — never re-queued, never cleared, and
+    absent from the 'Re-queued N' count.
+
+    Production instance: 16 comm_messages entries recorded before upstream
+    dedupe (migration 029) set `canonical_message_id`, which removed those
+    rows from the source query. The reconciliation must notice the miss and
+    age the entry rather than silently ignoring it.
+    """
+    from flow_index_vault import _load_degraded_ledger, _save_degraded_ledger
+
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True, exist_ok=True)
+    stranded = "documents::vanished"
+    _save_degraded_ledger(index_root, {"version": 2, "docs": {
+        "documents::present": {"reasons": ["enrichment_failed"], "attempts": 1},
+        stranded: {"reasons": ["enrichment_failed"], "attempts": 1},
+    }})
+
+    _run_flow_over_scan(tmp_path, index_root, ["present"])
+
+    entry = _load_degraded_ledger(index_root)["docs"][stranded]
+    assert entry["unresolved_runs"] == 1, (
+        "an active ledger entry the scan cannot resolve must be counted, "
+        f"not silently skipped — got {entry!r}"
+    )
+
+
 def test_index_flow_syncs_folder_taxonomy_from_sources(tmp_path):
     """Index flow should sync real folder paths into taxonomy before enrichment."""
     from sources.base import SourceRecord
