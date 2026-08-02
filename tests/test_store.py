@@ -800,6 +800,96 @@ def test_change_hash_projection_survives_sparse_fragment_after_schema_widening()
         }
 
 
+def _claim_columns_the_file_lacks(index_root: str, table_name: str = "chunks") -> None:
+    """Recreate #0771: a fragment manifest claiming columns its data file lacks.
+
+    Production got here through a daily compaction, which cannot be driven
+    deterministically from a test. The damage it left can: rewrite a sparse
+    fragment's manifest entry so it claims the full schema, which is exactly
+    what the surviving production fragment did (107 field ids over a 67-column
+    file). Lance then rejects every scan that touches the fragment.
+    """
+    import lance
+    from lance import LanceOperation
+    from lance.fragment import FragmentMetadata
+
+    dataset_path = str(Path(index_root) / f"{table_name}.lance")
+    dataset = lance.dataset(dataset_path)
+    widest = max(dataset.get_fragments(), key=lambda f: len(f.metadata.files[0].fields))
+    full_fields = list(widest.metadata.files[0].fields)
+    full_indices = list(widest.metadata.files[0].column_indices)
+
+    # Drop the wide rows so the sparse fragment is the first one any scan
+    # reads — in production the damaged fragment sorted first, which is why
+    # even a limit=1 probe died and the store could not be opened at all.
+    dataset.delete("doc_id = 'wide.md'")
+    dataset = lance.dataset(dataset_path)
+    (sparse,) = dataset.get_fragments()
+
+    metadata = sparse.metadata.to_json()
+    metadata["files"][0]["fields"] = full_fields
+    metadata["files"][0]["column_indices"] = full_indices
+    lance.LanceDataset.commit(
+        dataset_path,
+        LanceOperation.Rewrite(
+            groups=[
+                LanceOperation.RewriteGroup(
+                    old_fragments=[sparse.metadata],
+                    new_fragments=[FragmentMetadata.from_json(json.dumps(metadata))],
+                )
+            ],
+            rewritten_indices=[],
+        ),
+        read_version=dataset.version,
+    )
+
+
+def test_store_open_repairs_fragment_that_overclaims_its_columns():
+    """#0771: one over-claiming fragment must not make the whole table unreadable."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "wide.md", "c:0", "wide", vec, **{f"k{i}": "v" for i in range(20)}
+            )
+        ])
+        store.upsert_nodes([_make_node_with_meta("narrow.md", "c:0", "narrow", vec)])
+
+        _claim_columns_the_file_lacks(tmpdir)
+
+        dataset_path = str(Path(tmpdir) / "chunks.lance")
+        with pytest.raises(pa.ArrowInvalid):
+            lance.dataset(dataset_path).to_table()
+
+        # Opening the store must repair the claim rather than surface the
+        # ArrowInvalid, which is what froze indexing for ~62 h.
+        reopened = LanceDBStore(tmpdir, "chunks")
+
+        rows = reopened._vs.table.to_lance().to_table()
+        assert rows.num_rows == 1
+        assert rows.column("doc_id").to_pylist() == ["narrow.md"]
+        # The rows were never damaged, only the claim about them: the columns
+        # the file really holds must still carry their values.
+        assert rows.column("text").to_pylist() == ["narrow"]
+
+
+def test_overclaimed_file_column_count_reads_lances_reported_width():
+    """The repair depends on parsing the real column count out of Lance's error."""
+    from lancedb_store import _overclaimed_file_column_count
+
+    assert _overclaimed_file_column_count(
+        pa.ArrowInvalid(
+            "External error: Invalid user input: The projection specified the "
+            "column index 67 but there are only 67 columns in the file, "
+            "/home/runner/work/lance/lance/rust/lance-file/src/reader.rs:1259:28"
+        )
+    ) == 67
+    assert _overclaimed_file_column_count(pa.ArrowInvalid("manifest was not found")) is None
+
+
 class _ChangeHashProjectionDataset:
     def __init__(self, *, projected_table=None, projection_error=None, batches=()):
         self.projected_table = projected_table
