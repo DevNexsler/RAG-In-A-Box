@@ -240,7 +240,7 @@ class LanceDBStore:
             # intact, only the manifest's column claim is wrong, so rolling
             # the table back (the corruption path below) would throw away
             # good data for a metadata defect (#0771).
-            if _overclaimed_file_column_count(exc) is not None and self._repair_overclaiming_fragments():
+            if _overclaimed_file_column_count(exc) is not None and self._try_repair_overclaiming_fragments():
                 logger.warning(
                     "Repaired over-claiming Lance fragment(s) while opening %s: %s",
                     self.table_name,
@@ -350,6 +350,14 @@ class LanceDBStore:
         except TableNotFoundError:
             return
 
+    def _try_repair_overclaiming_fragments(self) -> bool:
+        """Attempt the repair without letting its own failure mask the open error."""
+        try:
+            return self._repair_overclaiming_fragments()
+        except Exception:
+            logger.exception("Fragment repair failed for %s", self.table_name)
+            return False
+
     def _repair_overclaiming_fragments(self) -> bool:
         """Re-commit fragments whose manifest claims columns their file lacks.
 
@@ -409,11 +417,19 @@ class LanceDBStore:
                 continue
 
             entry = overclaiming[0]
+            if len(entry["fields"]) != len(entry["column_indices"]):
+                logger.warning(
+                    "Fragment %s has %d field ids for %d column indices; not repairing",
+                    fragment.fragment_id,
+                    len(entry["fields"]),
+                    len(entry["column_indices"]),
+                )
+                continue
             claimed_columns = max(entry["column_indices"]) + 1
             kept = [
                 (field_id, column_index)
                 for field_id, column_index in zip(
-                    entry["fields"], entry["column_indices"], strict=True
+                    entry["fields"], entry["column_indices"]
                 )
                 # -1 marks a struct container, which occupies no column of its
                 # own; it stays so its surviving children keep their parent.
