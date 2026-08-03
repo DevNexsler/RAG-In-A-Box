@@ -21,6 +21,7 @@ from flow_index_vault import (
     _DEGRADED_MAX_UNRESOLVED_RUNS,
     _DEGRADED_RETRY_BASE_SECONDS,
     _DEGRADED_RETRY_CAP_SECONDS,
+    _change_key,
     _degraded_backoff_seconds,
     _load_degraded_ledger,
     _merge_degraded_ledger,
@@ -558,3 +559,104 @@ def test_terminal_write_failure_does_not_lose_entries(tmp_path, monkeypatch):
         lambda *a, **kw: (_ for _ in ()).throw(OSError("No space left on device")),
     )
     assert fiv._save_degraded_unresolved(tmp_path, {"docs": {"documents::x": {}}}) is False
+
+
+# --- #0830 production-shaped regression (written by the 2026-08-03 reconciliation) ---
+#
+# Production state observed at 2026-08-03 09:32 UTC on doc-organizer:
+#   degraded_docs.json: documents::001Og / documents::001Oo
+#     {"attempts": 0, "transient_attempts": 204, "reasons": ["vision_sidecar_failed"]}
+#     and NO "change_key" — the ledger predates key persistence.
+#   chunks.lance: 0 rows for both ids (never indexed, so the normal source/index
+#     diff selects them on every scan).
+#   indexer.log: 19 retries that day, ~16 min apart — the scheduler cadence, not
+#     the 6h cap the ledger's 204 tries should have produced.
+#
+# These two tests pin the migration path the shipped fix has to survive: a
+# ledger entry with no stored change key, which is what every real entry looks
+# like at deploy time.
+
+def _merge_with_keys(ledger, degraded_now, clean_now, *, change_keys, now):
+    """Merge, passing change keys only if this tree's merge accepts them.
+
+    Lets the production-shaped #0830 tests fail on BEHAVIOUR against a tree
+    that cannot persist change keys, rather than on a TypeError.
+    """
+    import inspect
+    if "change_keys" in inspect.signature(_merge_degraded_ledger).parameters:
+        return _merge_degraded_ledger(
+            ledger, degraded_now, clean_now, change_keys=change_keys, now=now
+        )
+    return _merge_degraded_ledger(ledger, degraded_now, clean_now, now=now)
+
+
+def test_keyless_prod_ledger_entry_starts_backing_off_after_one_stamping_run():
+    """A pre-existing keyless entry may retry once, then must back off.
+
+    The fix keys "unchanged" off a stored change_key. Production entries have
+    none, so the first post-deploy run necessarily fails open and processes the
+    doc — that run is what stamps the key. Every run after it must defer.
+    """
+    doc_id = "documents::001Og"
+    record = {"doc_id": doc_id, "mtime": 1750000000.0, "change_hash": "provider-error-body"}
+    keyless = {
+        "reasons": ["vision_sidecar_failed"],
+        "attempts": 0,
+        "transient_attempts": 204,
+        "last_attempt_at": 1000.0,
+    }
+
+    # Run 1: no stored key -> fail open, doc is processed (and the run stamps a key).
+    queue, _, report = _reconcile([record], [record], {"docs": {doc_id: keyless}}, now=1001.0)
+    assert queue == [record], "keyless entry must not be silently dropped"
+    assert report["already_queued"] == [doc_id]
+
+    # That run's merge stamps the key from the same record the diff selected.
+    stamped = _merge_with_keys(
+        {"docs": {doc_id: keyless}},
+        {doc_id: ["vision_sidecar_failed"]},
+        set(),
+        change_keys={doc_id: _change_key(record)},
+        now=1001.0,
+    )
+    assert stamped["docs"][doc_id]["change_key"] == "provider-error-body"
+
+    # Run 2, one scheduler tick (16 min) later: now it must defer.
+    queue2, _, report2 = _reconcile([record], [record], stamped, now=1001.0 + 16 * 60)
+    assert queue2 == [], "unchanged never-indexed doc must not be reprocessed inside backoff"
+    assert report2["backoff"] == [doc_id]
+
+
+def test_prod_cadence_is_capped_at_six_hours_not_the_scheduler_tick():
+    """Replay a 24h day of 16-minute scans; count how often the doc is processed.
+
+    On origin/main this is ~90 (every scan). The 6h cap allows at most 4.
+    """
+    doc_id = "documents::001Oo"
+    record = {"doc_id": doc_id, "mtime": 1750000000.0, "change_hash": "provider-error-body"}
+    ledger = {"docs": {doc_id: {
+        "reasons": ["vision_sidecar_failed"],
+        "attempts": 0,
+        "transient_attempts": 204,
+        "last_attempt_at": 0.0,
+        "change_key": "provider-error-body",
+    }}}
+
+    processed = 0
+    tick = 16 * 60
+    for i in range(24 * 60 * 60 // tick):
+        now = i * tick
+        queue, ledger, _ = _reconcile([record], [record], ledger, now=now)
+        if queue:
+            processed += 1
+            # A processed run re-stamps the attempt and increments the transient count.
+            ledger = _merge_with_keys(
+                ledger,
+                {doc_id: ["vision_sidecar_failed"]},
+                set(),
+                change_keys={doc_id: _change_key(record)},
+                now=now,
+            )
+
+    assert processed <= 4, f"6h cap allows <=4 attempts/day, got {processed}"
+    assert processed >= 1, "backoff must not become a permanent block"
