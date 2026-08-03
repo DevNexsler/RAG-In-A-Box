@@ -361,6 +361,62 @@ def test_include_degraded_waits_for_backoff_window():
     assert [r["doc_id"] for r in out] == ["documents::img1"]
 
 
+def test_normal_diff_degraded_doc_waits_for_backoff_when_unchanged():
+    doc_id = "documents::provider-error"
+    record = {"doc_id": doc_id, "mtime": 1.0, "change_hash": "error-v1"}
+    entry = {
+        "reasons": ["vision_sidecar_failed"],
+        "attempts": 0,
+        "transient_attempts": 191,
+        "last_attempt_at": 1000.0,
+        "change_key": "error-v1",
+    }
+    ledger = {"docs": {doc_id: entry}}
+
+    before_due, _, report = _reconcile(
+        [record], [record], ledger, now=1000.0 + _DEGRADED_RETRY_CAP_SECONDS - 1
+    )
+    at_due, _, due_report = _reconcile(
+        [record], [record], ledger, now=1000.0 + _DEGRADED_RETRY_CAP_SECONDS
+    )
+
+    assert before_due == []
+    assert report["backoff"] == [doc_id]
+    assert at_due == [record]
+    assert due_report["already_queued"] == [doc_id]
+
+
+def test_normal_diff_changed_degraded_doc_bypasses_backoff():
+    doc_id = "documents::regenerated"
+    regenerated = {"doc_id": doc_id, "mtime": 2.0, "change_hash": "content-v2"}
+    ledger = {"docs": {doc_id: {
+        "reasons": ["vision_sidecar_failed"],
+        "attempts": 0,
+        "transient_attempts": 191,
+        "last_attempt_at": 1000.0,
+        "change_key": "error-v1",
+    }}}
+
+    out, _, report = _reconcile(
+        [regenerated], [regenerated], ledger, now=1001.0
+    )
+
+    assert out == [regenerated]
+    assert report["already_queued"] == [doc_id]
+
+
+def test_merge_stamps_degraded_input_change_key():
+    merged = _merge_degraded_ledger(
+        {"docs": {}},
+        {"documents::img1": ["vision_sidecar_failed"]},
+        set(),
+        change_keys={"documents::img1": "error-v1"},
+        now=1234.0,
+    )
+
+    assert merged["docs"]["documents::img1"]["change_key"] == "error-v1"
+
+
 def test_include_degraded_legacy_entry_without_timestamp_is_due():
     # Entries stamped before this change lack last_attempt_at -> retry now,
     # exactly as they did before backoff (no regression on first encounter).

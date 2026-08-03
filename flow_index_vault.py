@@ -1176,13 +1176,15 @@ def _reconcile_degraded_docs(
     size always equals the sum of the reported counts and no entry can go
     missing without a log line:
 
-    - ``already_queued`` — the genuine diff already picked it up this run
+    - ``already_queued`` — the genuine diff picked up a changed input, or an
+                           unchanged input whose retry window elapsed
     - ``capped``         — past _DEGRADED_MAX_ATTEMPTS: persistent (e.g. a
                            corrupt source file), deliberately not retried
-    - ``backoff``        — resolvable, but its exponential backoff window has
-                           not elapsed yet, so a down provider is not re-hit
-                           every sweep. Entries with no ``last_attempt_at``
-                           are due immediately.
+    - ``backoff``        — resolvable and unchanged, but its exponential
+                           backoff window has not elapsed yet, so a down
+                           provider is not re-hit every sweep. Entries with
+                           no ``last_attempt_at`` or change key are due
+                           immediately.
     - ``requeued``       — resolved against this scan and forced back in
     - ``source_not_scanned`` — its source did not run this pass (a
                            source-scoped index); untouched, not aged
@@ -1212,13 +1214,29 @@ def _reconcile_degraded_docs(
     if now is None:
         now = time.time()
     existing = {str(r.get("doc_id", "")) for r in to_add_or_update}
+    queued_by_id = {
+        str(record.get("doc_id", "")): record for record in to_add_or_update
+    }
     by_id = {str(r.get("doc_id", "")): r for r in scanned}
     queue = list(to_add_or_update)
+    deferred: set[str] = set()
 
     for doc_id in sorted(docs):
         entry = dict(docs[doc_id])
         if doc_id in existing:
-            bucket = "already_queued"
+            stored_change_key = str(entry.get("change_key") or "")
+            unchanged = (
+                bool(stored_change_key)
+                and stored_change_key == _change_key(queued_by_id[doc_id])
+            )
+            backoff_elapsed = (
+                now - float(entry.get("last_attempt_at", 0.0))
+            ) >= _degraded_backoff_seconds(entry)
+            if unchanged and not backoff_elapsed:
+                deferred.add(doc_id)
+                bucket = "backoff"
+            else:
+                bucket = "already_queued"
         elif int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS:
             bucket = "capped"
         elif doc_id in by_id:
@@ -1251,6 +1269,12 @@ def _reconcile_degraded_docs(
                 docs[doc_id] = entry
             report[bucket].append(doc_id)
 
+    if deferred:
+        queue = [
+            record
+            for record in queue
+            if str(record.get("doc_id", "")) not in deferred
+        ]
     return queue, {**ledger, "docs": docs}, report
 
 
@@ -1259,6 +1283,7 @@ def _merge_degraded_ledger(
     degraded_now: dict[str, list],
     clean_now: set[str],
     *,
+    change_keys: dict[str, str] | None = None,
     now: float | None = None,
 ) -> dict:
     """Fold one run's outcomes into the ledger: clean docs drop out, degraded
@@ -1270,6 +1295,7 @@ def _merge_degraded_ledger(
     Bare-string reasons (legacy callers) count as doc-specific."""
     if now is None:
         now = time.time()
+    change_keys = change_keys or {}
     docs = dict(ledger.get("docs", {}))
     for doc_id in clean_now:
         docs.pop(doc_id, None)
@@ -1284,6 +1310,9 @@ def _merge_degraded_ledger(
             # Stamp the try so _include_degraded_docs can space out re-queues.
             "last_attempt_at": float(now),
         }
+        change_key = str(change_keys.get(doc_id) or prev.get("change_key") or "")
+        if change_key:
+            entry["change_key"] = change_key
         transient_attempts = int(prev.get("transient_attempts", 0))
         if degradations and all(d.transient for d in degradations):
             transient_attempts += 1
@@ -3618,8 +3647,16 @@ def index_vault_flow(
     degraded_now = _RUNTIME.get("degraded_now", {})
     clean_now = _RUNTIME.get("degraded_clean", set())
     if degraded_now or clean_now:
+        degraded_change_keys = {
+            str(doc["doc_id"]): _change_key(doc)
+            for doc in docs_to_process
+            if str(doc["doc_id"]) in degraded_now
+        }
         updated_ledger = _merge_degraded_ledger(
-            _load_degraded_ledger(index_root), degraded_now, clean_now
+            _load_degraded_ledger(index_root),
+            degraded_now,
+            clean_now,
+            change_keys=degraded_change_keys,
         )
         _save_degraded_ledger(index_root, updated_ledger)
         if degraded_now:
@@ -4079,7 +4116,10 @@ def _record_single_doc_outcome(index_root: Path, doc: dict) -> None:
             )
     elif reasons:
         degraded = _merge_degraded_ledger(
-            _load_degraded_ledger(index_root), {doc_id: reasons}, set()
+            _load_degraded_ledger(index_root),
+            {doc_id: reasons},
+            set(),
+            change_keys={doc_id: _change_key(doc)},
         )
         _save_degraded_ledger(index_root, degraded)
         skip_ledger = _load_skip_ledger(index_root)
