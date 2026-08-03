@@ -510,6 +510,7 @@ def test_index_document_flow_stub_indexed_image_lands_in_degraded_ledger(tmp_pat
     )
     assert "ocr_describe_failed" in entry["reasons"]
     assert entry.get("attempts", 0) == 0  # transient outage must not burn the cap (#0251)
+    assert entry["change_key"] == f"mtime:{f.stat().st_mtime}"
 
 
 def test_index_document_flow_describe_failure_lands_in_degraded_ledger(tmp_path):
