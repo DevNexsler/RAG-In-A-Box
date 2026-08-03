@@ -114,7 +114,10 @@ def test_index_update_can_start_source_scoped_run(tmp_path, monkeypatch):
 
     assert result["status"] == "started"
     assert result["source_name"] == "sor"
-    assert "source_name='sor'" in popen_args[0][3]
+    child_script = popen_args[0][3]
+    app_root = str(Path(mcp_server.__file__).resolve().parent)
+    assert f"sys.path.insert(0, {app_root!r})" in child_script
+    assert f"index_vault_flow({str(Path(app_root, 'config.yaml'))!r}" in child_script
 
 
 def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
@@ -127,12 +130,21 @@ def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
     monkeypatch.setenv("INDEX_ROOT", str(tmp_path))
     _patch_index_config(monkeypatch, mcp_server, tmp_path)
 
-    # Launch a long-lived dummy subprocess and write its PID file manually,
-    # simulating an in-progress indexer run.
+    # Launch a long-lived dummy subprocess and wait until its interpreter is
+    # running before exposing its PID.  Without this handshake, a loaded host
+    # can inspect /proc/<pid>/cmdline before the child has published it.
     dummy = subprocess.Popen(
-        [sys.executable, "-c", "import time; index_vault_flow = True; time.sleep(30)"],
+        [
+            sys.executable,
+            "-c",
+            "import time; index_vault_flow = True; print('ready', flush=True); time.sleep(30)",
+        ],
         start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
     )
+    assert dummy.stdout is not None
+    assert dummy.stdout.readline() == "ready\n"
     pid_file = tmp_path / "indexer.pid"
     pid_file.write_text(str(dummy.pid))
 
@@ -145,6 +157,7 @@ def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
     finally:
         dummy.terminate()
         dummy.wait()
+        dummy.stdout.close()
         pid_file.unlink(missing_ok=True)
 
 

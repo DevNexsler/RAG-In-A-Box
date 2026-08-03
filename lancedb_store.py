@@ -37,6 +37,13 @@ _CORRUPT_LANCE_MARKERS = (
     "manifest was not found",
 )
 _LANCE_CORRUPTION_MARKERS = _CORRUPT_LANCE_MARKERS
+# Lance raises this when a fragment's manifest entry claims more columns than
+# its data file physically holds. It names the file's real column count, which
+# is the only way to learn that count without decoding the file (#0771).
+_OVERCLAIMED_COLUMNS_RE = re.compile(
+    r"projection specified the column index \d+ "
+    r"but there are only (\d+) columns in the file"
+)
 _STALE_READ_MARKERS = (
     ".lance/_versions/",
     ".lance/data/",
@@ -229,13 +236,24 @@ class LanceDBStore:
         try:
             self._probe_table_read()
         except Exception as exc:
-            if not self._is_probable_corruption_error(exc) or not self._recover_corrupt_table():
+            # An over-claiming fragment is repaired in place: the rows are
+            # intact, only the manifest's column claim is wrong, so rolling
+            # the table back (the corruption path below) would throw away
+            # good data for a metadata defect (#0771).
+            if _overclaimed_file_column_count(exc) is not None and self._try_repair_overclaiming_fragments():
+                logger.warning(
+                    "Repaired over-claiming Lance fragment(s) while opening %s: %s",
+                    self.table_name,
+                    exc,
+                )
+            elif not self._is_probable_corruption_error(exc) or not self._recover_corrupt_table():
                 raise
-            logger.warning(
-                "Recovered probable LanceDB corruption while opening %s: %s",
-                self.table_name,
-                exc,
-            )
+            else:
+                logger.warning(
+                    "Recovered probable LanceDB corruption while opening %s: %s",
+                    self.table_name,
+                    exc,
+                )
             self._vs = self._build_vector_store()
             self._ensure_scalar_index()
             self._probe_table_read()
@@ -331,6 +349,131 @@ class LanceDBStore:
             self._vs.table.to_lance().to_table(limit=1)
         except TableNotFoundError:
             return
+
+    def _try_repair_overclaiming_fragments(self) -> bool:
+        """Attempt the repair without letting its own failure mask the open error."""
+        try:
+            return self._repair_overclaiming_fragments()
+        except Exception:
+            logger.exception("Fragment repair failed for %s", self.table_name)
+            return False
+
+    def _repair_overclaiming_fragments(self) -> bool:
+        """Re-commit fragments whose manifest claims columns their file lacks.
+
+        A daily compaction committed a fragment whose data-file entry carried
+        the whole current schema (107 field ids) while the file it points at
+        holds only 67 columns. Lance refuses *any* scan that touches such a
+        fragment, so a single 9-row fragment made the whole table unreadable
+        and froze indexing for ~62 h (#0771).
+
+        The rows themselves are fine — every column the file does hold reads
+        back normally. Truncating the manifest claim to those columns leaves
+        exactly the shape a naturally sparse fragment has (the table already
+        carries 471 of them), and the dropped sub-fields read back as null,
+        which is what they already were. Returns True when at least one
+        fragment was repaired.
+        """
+        import lance
+        from lance import LanceOperation
+        from lance.fragment import FragmentMetadata
+
+        dataset_path = self._dataset_path()
+        if not Path(dataset_path).exists():
+            return False
+
+        try:
+            dataset = lance.dataset(dataset_path)
+        except Exception as exc:
+            logger.warning("Cannot open %s to repair fragments: %s", dataset_path, exc)
+            return False
+
+        repaired = 0
+        for fragment in dataset.get_fragments():
+            try:
+                fragment.to_table(limit=1)
+                continue
+            except Exception as exc:
+                actual_columns = _overclaimed_file_column_count(exc)
+            if actual_columns is None:
+                continue
+
+            metadata = fragment.metadata.to_json()
+            overclaiming = [
+                entry
+                for entry in metadata["files"]
+                if max(entry["column_indices"], default=-1) >= actual_columns
+            ]
+            # The error names one column count; with several candidate files
+            # there is no way to tell which one it describes, so leave the
+            # fragment alone rather than guess and drop live columns.
+            if len(overclaiming) != 1:
+                logger.warning(
+                    "Fragment %s claims columns its file lacks but has %d candidate "
+                    "data files; not repairing automatically",
+                    fragment.fragment_id,
+                    len(overclaiming),
+                )
+                continue
+
+            entry = overclaiming[0]
+            if len(entry["fields"]) != len(entry["column_indices"]):
+                logger.warning(
+                    "Fragment %s has %d field ids for %d column indices; not repairing",
+                    fragment.fragment_id,
+                    len(entry["fields"]),
+                    len(entry["column_indices"]),
+                )
+                continue
+            claimed_columns = max(entry["column_indices"]) + 1
+            kept = [
+                (field_id, column_index)
+                for field_id, column_index in zip(
+                    entry["fields"], entry["column_indices"]
+                )
+                # -1 marks a struct container, which occupies no column of its
+                # own; it stays so its surviving children keep their parent.
+                if column_index < actual_columns
+            ]
+            entry["fields"] = [field_id for field_id, _ in kept]
+            entry["column_indices"] = [column_index for _, column_index in kept]
+
+            try:
+                lance.LanceDataset.commit(
+                    dataset_path,
+                    LanceOperation.Rewrite(
+                        groups=[
+                            LanceOperation.RewriteGroup(
+                                old_fragments=[fragment.metadata],
+                                new_fragments=[
+                                    FragmentMetadata.from_json(json.dumps(metadata))
+                                ],
+                            )
+                        ],
+                        rewritten_indices=[],
+                    ),
+                    read_version=dataset.version,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to repair over-claiming fragment %s: %s",
+                    fragment.fragment_id,
+                    exc,
+                )
+                continue
+
+            logger.warning(
+                "Repaired Lance fragment %s in %s: manifest claimed %d columns, "
+                "file holds %d",
+                fragment.fragment_id,
+                dataset_path,
+                claimed_columns,
+                actual_columns,
+            )
+            repaired += 1
+            dataset = lance.dataset(dataset_path)
+
+        return repaired > 0
 
     def _recover_corrupt_table(self) -> bool:
         """Rollback to the newest readable Lance version and rewrite the dataset."""
@@ -2057,6 +2200,12 @@ class LanceDBStore:
             return hits
 
         return self._run_read_with_recovery(_op, [])
+
+
+def _overclaimed_file_column_count(exc: Exception) -> int | None:
+    """Physical column count Lance reports when a fragment over-claims, else None."""
+    match = _OVERCLAIMED_COLUMNS_RE.search(str(exc))
+    return int(match.group(1)) if match else None
 
 
 def _looks_like_corrupt_lance_error(exc: Exception) -> bool:
