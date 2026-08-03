@@ -2015,6 +2015,7 @@ def _fts_unindexed_rows(tmpdir: str) -> int:
 def test_pre_index_maintenance_orders_prune_compact_marker():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
         order: list[str] = []
 
         with (
@@ -2042,6 +2043,62 @@ def test_pre_index_maintenance_orders_prune_compact_marker():
             "compact",
             "marker",
         ]
+
+
+def test_unreadable_compaction_is_restored_and_not_recorded(caplog):
+    """A successful worker exit must not commit an unreadable latest version."""
+    import lance
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "wide.md",
+                "c:0",
+                "wide",
+                vec,
+                **{f"k{i}": "v" for i in range(20)},
+            )
+        ])
+        store.upsert_nodes([
+            _make_node_with_meta("narrow.md", "c:0", "narrow", vec)
+        ])
+
+        with patch.object(store, "_compaction_due", return_value=True), patch.object(
+            store,
+            "_compact_data_files",
+            side_effect=lambda: _claim_columns_the_file_lacks(tmpdir, "test_chunks"),
+        ):
+            compacted = store._compact_data_files_if_due(date.today())
+
+        assert compacted is False
+        assert not _compaction_marker(tmpdir).exists()
+        restored = lance.dataset(store._dataset_path()).to_table()
+        assert set(restored.column("doc_id").to_pylist()) == {"wide.md", "narrow.md"}
+        assert "restored pre-compaction version" in caplog.text
+
+
+def test_readable_compaction_probes_each_fragment_before_recording():
+    """Every output fragment gets a bounded read before cadence is recorded."""
+    import lance
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        fragments = [MagicMock(), MagicMock(), MagicMock()]
+        dataset = SimpleNamespace(version=7, get_fragments=lambda: fragments)
+
+        with patch.object(store, "_compaction_due", return_value=True), patch.object(
+            store, "_compact_data_files"
+        ), patch.object(lance, "dataset", return_value=dataset):
+            compacted = store._compact_data_files_if_due(date.today())
+
+        assert compacted is True
+        assert _compaction_marker(tmpdir).exists()
+        for fragment in fragments:
+            fragment.to_table.assert_called_once_with(limit=1)
 
 
 def test_data_compaction_runs_binary_copy_in_short_lived_subprocess():
@@ -2291,6 +2348,7 @@ def test_current_marker_skips_compaction_but_merges_indices():
 def test_compaction_failure_leaves_marker_absent_and_still_merges_indices():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
         table = MagicMock()
         with (
             patch.object(store, "_compaction_due", return_value=True),
@@ -2314,6 +2372,7 @@ def test_compaction_failure_leaves_marker_absent_and_still_merges_indices():
 def test_index_merge_failure_after_successful_compaction_keeps_compaction_marker():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
         table = MagicMock()
         with (
             patch.object(store, "_compaction_due", return_value=True),

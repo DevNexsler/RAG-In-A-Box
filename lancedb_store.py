@@ -1612,9 +1612,12 @@ class LanceDBStore:
         if not self._compaction_due(today):
             return False
 
+        import lance
+
         from core.resilience import call_with_retry
 
         try:
+            pre_compaction_version = lance.dataset(self._dataset_path()).version
             call_with_retry(
                 self._compact_data_files,
                 attempts=3,
@@ -1628,12 +1631,55 @@ class LanceDBStore:
             )
             return False
 
+        try:
+            compacted = lance.dataset(self._dataset_path())
+            fragment_count = self._probe_dataset_fragments(compacted)
+        except Exception as exc:
+            logger.error(
+                "Daily Lance compaction produced an unreadable fragment set (%s); "
+                "restoring pre-compaction version %s",
+                exc,
+                pre_compaction_version,
+            )
+            try:
+                lance.dataset(
+                    self._dataset_path(), version=pre_compaction_version
+                ).restore()
+                restored = lance.dataset(self._dataset_path())
+                restored_fragment_count = self._probe_dataset_fragments(restored)
+            except Exception:
+                logger.exception(
+                    "Failed to restore pre-compaction Lance version %s",
+                    pre_compaction_version,
+                )
+                return False
+
+            self._checkout_latest()
+            logger.warning(
+                "Daily Lance compaction rejected; restored pre-compaction version "
+                "%s with %d readable fragments; retrying next run",
+                pre_compaction_version,
+                restored_fragment_count,
+            )
+            return False
+
+        logger.info(
+            "Daily Lance compaction verified %d readable fragments", fragment_count
+        )
         self._record_compaction(today)
         # The child committed a new manifest using an independent Lance
         # session. Refresh the parent's one stable handle exactly once before
         # any write, merge, or restore-point operation uses it.
         self._checkout_latest()
         return True
+
+    @staticmethod
+    def _probe_dataset_fragments(dataset) -> int:
+        """Read one row from every fragment and return the fragment count."""
+        fragments = list(dataset.get_fragments())
+        for fragment in fragments:
+            fragment.to_table(limit=1)
+        return len(fragments)
 
     def _compact_data_files(self) -> None:
         """Compact in a worker whose native allocations are released on exit."""
