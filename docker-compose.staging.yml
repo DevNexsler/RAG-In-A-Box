@@ -31,6 +31,12 @@ services:
       E2E_QUERY_FINGERPRINT_KEY: ${E2E_QUERY_FINGERPRINT_KEY:-}
       COMM_DATA_STORE_DSN: postgresql://comm:comm@comm-postgres:5432/comm
       SOR_DSN: postgresql://comm:comm@comm-postgres:5432/comm
+      # /data/index is a volume on the *host* filesystem, so the production 90%
+      # disk high-water mark would fail this service's own healthcheck (and
+      # kill `up --wait`) whenever the host is nearly full (#0910). Disk
+      # pressure is production's operator signal (#0232), not a property under
+      # test in the hermetic tier; 100 is the validated ceiling.
+      DISK_USAGE_MAX_PERCENT: "100"
     volumes:
       # STAGING_CONFIG selects the provider wiring: unset = all-sim
       # (deterministic, the default gate uses this); config.staging.realmedia.yaml

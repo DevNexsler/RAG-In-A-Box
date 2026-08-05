@@ -60,6 +60,20 @@ def test_docker_compose_bounds_lance_retention_and_monitors_disk():
     assert "DISK_USAGE_MAX_PERCENT=${DISK_USAGE_MAX_PERCENT:-90}" in env
 
 
+def test_staging_compose_pins_disk_threshold_off_host_state():
+    """The hermetic staging tier must not inherit production's 90% disk
+    high-water mark. /health inside the candidate stats the filesystem backing
+    /data/index — a volume on the *host* — so on a host at/above the mark the
+    service's own healthcheck 503s disk_full and `up --wait` kills the tier
+    before a single test runs (#0910). Disk pressure is production's operator
+    signal (#0232), not a property under test here; 100 is the validated
+    ceiling of DISK_USAGE_MAX_PERCENT."""
+    compose = yaml.safe_load(Path("docker-compose.staging.yml").read_text())
+    env = compose["services"]["doc-organizer-staging"]["environment"]
+
+    assert env["DISK_USAGE_MAX_PERCENT"] == "100"
+
+
 def test_compose_disables_prefect_ephemeral_server():
     """Production must disable Prefect's ephemeral-server auto-start (#0325).
 
