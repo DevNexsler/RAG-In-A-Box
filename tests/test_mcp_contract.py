@@ -2585,7 +2585,7 @@ def test_probe_path_helper_accepts_health_and_subpaths():
     assert mcp_server._is_unauthenticated_probe_path("/healthz") is False
 
 
-def test_health_probe_ok_when_idle_and_no_warnings(tmp_path):
+def test_health_probe_ok_when_idle_and_no_warnings(tmp_path, healthy_disk):
     """Idle indexer with no recorded FTS failures probes healthy — and always
     carries index-filesystem telemetry (#0232)."""
     payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
@@ -2605,6 +2605,19 @@ def _disk_usage(used_percent: float):
     total = 100 * 2**30
     used = int(total * used_percent / 100)
     return namedtuple("usage", "total used free")(total, used, total - used)
+
+
+@pytest.fixture
+def healthy_disk():
+    """Pin disk telemetry below the high-water mark for non-disk assertions.
+
+    The probe stats the real filesystem backing ``tmp_path``, so on a host
+    at/above DISK_USAGE_MAX_PERCENT the disk_full status would overwrite the
+    ok/degraded/index_failed statuses these tests assert (#0910). Disk
+    behaviour keeps its own tests with explicit usage patches.
+    """
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(50)):
+        yield
 
 
 def test_health_probe_disk_high_water_503s(tmp_path):
@@ -2712,7 +2725,7 @@ def test_health_probe_fts_failure_composes_with_disk_fields(tmp_path):
     assert payload["fts_rebuild_failed"] == 1
 
 
-def test_health_probe_degraded_when_fts_rebuild_failed(tmp_path):
+def test_health_probe_degraded_when_fts_rebuild_failed(tmp_path, healthy_disk):
     """A recorded fts_rebuild_failed warning must 503 the probe (#0106).
 
     Keyword search silently going stale used to be invisible: the flow ends
@@ -2733,7 +2746,7 @@ def test_health_probe_degraded_when_fts_rebuild_failed(tmp_path):
     assert payload["fts_rebuild_failed"] == 1
 
 
-def test_health_probe_running_fresh_heartbeat_is_ok(tmp_path):
+def test_health_probe_running_fresh_heartbeat_is_ok(tmp_path, healthy_disk):
     """A live indexer with a fresh heartbeat probes healthy."""
     (tmp_path / "indexer.heartbeat").write_text("beat")
 
@@ -2786,7 +2799,7 @@ def _live_index_run_state(started_ago_s: float) -> dict:
     return {"version": 1, "current": run, "last_attempt": run, "last_success": None}
 
 
-def test_health_probe_before_first_heartbeat_is_not_stalled(tmp_path):
+def test_health_probe_before_first_heartbeat_is_not_stalled(tmp_path, healthy_disk):
     """A young run must not inherit the *previous* run's heartbeat age (#0515).
 
     `indexer.heartbeat` is one file reused by every run, so between process
@@ -2829,7 +2842,7 @@ def test_health_probe_stalls_when_the_current_run_stops_progressing(tmp_path):
     assert payload["heartbeat_age_s"] == pytest.approx(4000, abs=10)
 
 
-def test_health_probe_long_run_with_fresh_heartbeat_is_ok(tmp_path):
+def test_health_probe_long_run_with_fresh_heartbeat_is_ok(tmp_path, healthy_disk):
     """Newest progress evidence wins: a long-running run that keeps stamping is
     healthy, however old its start time is."""
     import json
@@ -2844,7 +2857,7 @@ def test_health_probe_long_run_with_fresh_heartbeat_is_ok(tmp_path):
     assert payload["heartbeat_age_s"] == 0
 
 
-def test_health_probe_running_with_fts_failure_degrades(tmp_path):
+def test_health_probe_running_with_fts_failure_degrades(tmp_path, healthy_disk):
     """FTS failure is surfaced even while an indexer run is in progress."""
     import json
 
@@ -2861,7 +2874,7 @@ def test_health_probe_running_with_fts_failure_degrades(tmp_path):
     assert payload["fts_rebuild_failed"] == 1
 
 
-def test_health_probe_idle_after_killed_indexer_stays_failed(tmp_path):
+def test_health_probe_idle_after_killed_indexer_stays_failed(tmp_path, healthy_disk):
     """SIGKILL terminal state must survive PID cleanup and keep health red."""
     import json
 
