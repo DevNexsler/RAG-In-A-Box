@@ -198,9 +198,9 @@ def test_extract_markdown_unicode(tmp_path):
 
 def _make_test_pdf(path: Path, pages_text: list[str]) -> None:
     """Create a test PDF with the given text on each page."""
-    import fitz
+    import pymupdf
 
-    doc = fitz.open()
+    doc = pymupdf.open()
     for text in pages_text:
         page = doc.new_page()
         page.insert_text((72, 100), text, fontsize=12)
@@ -224,17 +224,88 @@ def test_extract_pdf_text_only(tmp_path):
     assert not any(p.was_ocr for p in result.pages)
 
 
+def test_extract_pdf_does_not_import_legacy_fitz_alias(tmp_path, monkeypatch):
+    """PDF extraction must use PyMuPDF's canonical import without a warning."""
+    import builtins
+    import warnings
+
+    import pymupdf
+
+    from extractors import extract_pdf
+
+    pdf_path = tmp_path / "canonical-import.pdf"
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 100), "Canonical PyMuPDF import", fontsize=12)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    real_import = builtins.__import__
+
+    def warn_on_legacy_import(name, *args, **kwargs):
+        if name == "fitz":
+            warnings.warn("legacy fitz import", DeprecationWarning, stacklevel=2)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", warn_on_legacy_import)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = extract_pdf(pdf_path, strategy="text_only")
+
+    assert "Canonical PyMuPDF import" in result.full_text
+    assert not [warning for warning in caught if "legacy fitz import" in str(warning.message)]
+
+
+def test_no_source_file_imports_legacy_fitz_alias():
+    """No module anywhere may import the legacy `fitz` alias — #0946.
+
+    PyMuPDF >= 1.28.2 (published 2026-08-06) prints this to **stdout**, not
+    through `warnings`, the first time `fitz` is imported:
+
+        warning: The `fitz` API is deprecated and will be removed in future.
+        Use `import pymupdf` instead.
+
+    The full-flow indexer subprocess's stdout is captured into `indexer.log`,
+    so the line lands there untimestamped and reintroduces exactly the
+    regression #0546 fixed — an unattributable physical line that evicts the
+    reviewable window. It is caught in staging by
+    `test_forced_429_writes_only_timestamped_lines_to_indexer_log`.
+
+    `requirements.txt` pins only `pymupdf>=1.24.0`, so every fresh build
+    resolves a version that warns. The sibling test above guards `extract_pdf`
+    alone; this one guards the whole repo, because any module reaching the
+    indexer stdout brings the line back.
+    """
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    skip = {".venv", ".git", ".worktrees", "node_modules", "__pycache__", ".evals"}
+    pattern = re.compile(r"^\s*(?:import\s+fitz|from\s+fitz\s+import)\b", re.MULTILINE)
+
+    offenders = []
+    for path in root.rglob("*.py"):
+        if skip & set(path.relative_to(root).parts):
+            continue
+        for match in pattern.finditer(path.read_text(encoding="utf-8", errors="replace")):
+            line_no = path.read_text(encoding="utf-8", errors="replace")[: match.start()].count("\n") + 1
+            offenders.append(f"{path.relative_to(root)}:{line_no}")
+
+    assert not offenders, (
+        "legacy `fitz` import(s) found — use `import pymupdf`; these print an "
+        f"untimestamped warning into indexer.log: {offenders}"
+    )
+
+
 def test_extract_pdf_encrypted_is_skipped(tmp_path):
     """A password-protected PDF opens but raises on page read; it must be flagged
     as an 'encrypted_pdf' skip (so it lands in the skip ledger and isn't
     re-extracted/re-thrown every run) rather than bubbling an exception."""
-    import fitz
+    import pymupdf
     from extractors import begin_degradation_capture, collect_skips, extract_pdf
 
     pdf_path = tmp_path / "encrypted.pdf"
-    doc = fitz.open()
+    doc = pymupdf.open()
     doc.new_page().insert_text((72, 100), "secret content", fontsize=12)
-    doc.save(str(pdf_path), encryption=fitz.PDF_ENCRYPT_AES_256,
+    doc.save(str(pdf_path), encryption=pymupdf.PDF_ENCRYPT_AES_256,
              user_pw="pw", owner_pw="pw")
     doc.close()
 
@@ -247,12 +318,12 @@ def test_extract_pdf_encrypted_is_skipped(tmp_path):
 
 def test_extract_pdf_text_then_ocr_sufficient_text(tmp_path):
     """text_then_ocr doesn't call OCR when there's enough native text."""
-    import fitz
+    import pymupdf
     from extractors import extract_pdf
 
     # Create a PDF with enough text (insert multiple lines to exceed 200 chars)
     pdf_path = tmp_path / "test.pdf"
-    doc = fitz.open()
+    doc = pymupdf.open()
     page = doc.new_page()
     y = 72
     for i in range(20):
@@ -312,11 +383,11 @@ def test_extract_pdf_respects_ocr_page_limit(tmp_path):
 
 def test_extract_pdf_single_empty_page(tmp_path):
     """PDF with one blank page returns only metadata header (no document text)."""
-    import fitz
+    import pymupdf
     from extractors import extract_pdf
 
     pdf_path = tmp_path / "blank.pdf"
-    doc = fitz.open()
+    doc = pymupdf.open()
     doc.new_page()  # blank page, no text inserted
     doc.save(str(pdf_path))
     doc.close()

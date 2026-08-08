@@ -295,10 +295,10 @@ def extract_pdf(
     PDF metadata (title, author, creation date, page count) is extracted and
     stored in result.frontmatter. A metadata header is prepended to the first page.
     """
-    import fitz  # PyMuPDF
+    import pymupdf
 
     try:
-        doc = fitz.open(str(file_path))
+        doc = pymupdf.open(str(file_path))
     except Exception as e:
         # Corrupt / encrypted / truncated PDF — won't open on retry either.
         # Mark as a skip so it isn't re-attempted every run.
@@ -363,7 +363,7 @@ def _ocr_count(pages: list[PageText]) -> int:
 
 
 def _ocr_page(
-    doc,  # fitz.Document
+    doc,  # pymupdf.Document
     page_num: int,
     ocr_provider: Optional[OCRProvider],
     ocr_page_limit: int,
