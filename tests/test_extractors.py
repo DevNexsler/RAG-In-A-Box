@@ -255,6 +255,46 @@ def test_extract_pdf_does_not_import_legacy_fitz_alias(tmp_path, monkeypatch):
     assert not [warning for warning in caught if "legacy fitz import" in str(warning.message)]
 
 
+def test_no_source_file_imports_legacy_fitz_alias():
+    """No module anywhere may import the legacy `fitz` alias — #0946.
+
+    PyMuPDF >= 1.28.2 (published 2026-08-06) prints this to **stdout**, not
+    through `warnings`, the first time `fitz` is imported:
+
+        warning: The `fitz` API is deprecated and will be removed in future.
+        Use `import pymupdf` instead.
+
+    The full-flow indexer subprocess's stdout is captured into `indexer.log`,
+    so the line lands there untimestamped and reintroduces exactly the
+    regression #0546 fixed — an unattributable physical line that evicts the
+    reviewable window. It is caught in staging by
+    `test_forced_429_writes_only_timestamped_lines_to_indexer_log`.
+
+    `requirements.txt` pins only `pymupdf>=1.24.0`, so every fresh build
+    resolves a version that warns. The sibling test above guards `extract_pdf`
+    alone; this one guards the whole repo, because any module reaching the
+    indexer stdout brings the line back.
+    """
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    skip = {".venv", ".git", ".worktrees", "node_modules", "__pycache__", ".evals"}
+    pattern = re.compile(r"^\s*(?:import\s+fitz|from\s+fitz\s+import)\b", re.MULTILINE)
+
+    offenders = []
+    for path in root.rglob("*.py"):
+        if skip & set(path.relative_to(root).parts):
+            continue
+        for match in pattern.finditer(path.read_text(encoding="utf-8", errors="replace")):
+            line_no = path.read_text(encoding="utf-8", errors="replace")[: match.start()].count("\n") + 1
+            offenders.append(f"{path.relative_to(root)}:{line_no}")
+
+    assert not offenders, (
+        "legacy `fitz` import(s) found — use `import pymupdf`; these print an "
+        f"untimestamped warning into indexer.log: {offenders}"
+    )
+
+
 def test_extract_pdf_encrypted_is_skipped(tmp_path):
     """A password-protected PDF opens but raises on page read; it must be flagged
     as an 'encrypted_pdf' skip (so it lands in the skip ledger and isn't
