@@ -3,10 +3,12 @@
 No external services needed. Uses mocks and direct function calls."""
 
 import os
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import anyio
 import pytest
 
 from core.storage import SearchHit
@@ -2575,6 +2577,32 @@ def test_file_status_ignores_non_indexer_pid_file(tmp_path):
 # ---------------------------------------------------------------------------
 # /health probe (_health_probe) — unauthenticated docker-health endpoint
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_slow_provider_probe_does_not_block_liveness_probe():
+    """A slow sibling probe must not starve /health on the shared event loop."""
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+
+    def slow_probe(_config):
+        slow_started.set()
+        assert release_slow.wait(timeout=2)
+        return {"status": "ok"}, 200
+
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(mcp_server._run_health_probe, slow_probe, {})
+        assert await anyio.to_thread.run_sync(slow_started.wait, 1)
+
+        with anyio.fail_after(0.5):
+            payload, status_code = await mcp_server._run_health_probe(
+                lambda _config: ({"status": "ok"}, 200),
+                {},
+            )
+
+        assert status_code == 200
+        assert payload == {"status": "ok"}
+        release_slow.set()
 
 
 def test_probe_path_helper_accepts_health_and_subpaths():
