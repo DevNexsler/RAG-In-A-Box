@@ -1733,6 +1733,59 @@ def test_deep_health_reports_retry_pending_source_as_degraded(tmp_path):
     assert result["overall"] == "degraded"
 
 
+def test_deep_health_surfaces_actionable_corrupt_document_ids(tmp_path):
+    import json
+    from doc_id_store import DocIDStore
+
+    docs_root = tmp_path / "documents"
+    docs_root.mkdir()
+    (docs_root / "mangled.pdf").write_bytes(b"%PDF-1.7\\r\\n%\xef\xbf\xbd")
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register(
+        "documents::001sp", "mangled.pdf", source_name="documents"
+    )
+    registry.close()
+    (tmp_path / "skip_docs.json").write_text(
+        json.dumps(
+            {
+                "docs": {
+                    "documents::001sp": {
+                        "reasons": ["corrupt_mangled_binary"],
+                        "change_key": "h1",
+                        "skipped_at": 1000.0,
+                    }
+                }
+            }
+        )
+    )
+
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [
+                {"type": "filesystem", "name": "documents", "root": str(docs_root)}
+            ],
+        },
+        doc_ids=[],
+        chunk_count=0,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-08-10T00:00:00+00:00",
+    )
+
+    assert result["overall"] == "degraded"
+    assert result["checks"]["actionable_skips"] == {
+        "count": 1,
+        "by_reason": {"corrupt_mangled_binary": ["documents::001sp"]},
+    }
+    assert result["sources"]["documents"]["actionable_skip_doc_ids"] == [
+        "documents::001sp"
+    ]
+
+
 @pytest.mark.parametrize(
     ("http_status", "reason_phrase"),
     [

@@ -573,6 +573,26 @@ def test_index_document_flow_skip_outcome_lands_in_skip_ledger(tmp_path):
     assert "pdf_unreadable" in entry["reasons"]
 
 
+def test_index_document_flow_parks_unchanged_mangled_pdf(tmp_path):
+    """Repeated targeted requests must honor permanent actionable skips."""
+    root, f = _make_attachment(
+        tmp_path,
+        "email-attachments/mangled@00hex@.pdf",
+        data=(
+            b"%PDF-1.7\\r\\n%\xef\xbf\xbd\xef\xbf\xbd\\n"
+            b"1 0 obj\\r\\n<< /Type /Catalog >>\\r\\nendobj\\r\\n"
+        ),
+    )
+
+    first, _ = _run_single_doc(tmp_path, root, f, None)
+    second, second_store = _run_single_doc(tmp_path, root, f, None)
+
+    assert first["status"] == "indexed"
+    assert second["status"] == "skipped"
+    assert second["reason"] == "corrupt_mangled_binary"
+    second_store.upsert_nodes.assert_not_called()
+
+
 def test_index_document_flow_skip_outcome_clears_stale_degraded_entry(tmp_path):
     """Targeted skip classification must occupy only the skip retry lane."""
     import json

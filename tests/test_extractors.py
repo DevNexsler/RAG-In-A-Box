@@ -316,6 +316,23 @@ def test_extract_pdf_encrypted_is_skipped(tmp_path):
     assert "encrypted_pdf" in collect_skips()
 
 
+def test_extract_pdf_classifies_text_mangled_binary_as_actionable_corruption(tmp_path):
+    """A PDF decoded/re-written as text is irrecoverable until source changes."""
+    from extractors import begin_degradation_capture, collect_skips, extract_pdf
+
+    pdf_path = tmp_path / "mangled.pdf"
+    pdf_path.write_bytes(
+        b"%PDF-1.7\\r\\n%\xef\xbf\xbd\xef\xbf\xbd\\n"
+        b"1 0 obj\\r\\n<< /Type /Catalog >>\\r\\nendobj\\r\\n"
+    )
+
+    begin_degradation_capture()
+    result = extract_pdf(pdf_path, strategy="text_only")
+
+    assert result.full_text == ""
+    assert collect_skips() == ["corrupt_mangled_binary"]
+
+
 def test_extract_pdf_text_then_ocr_sufficient_text(tmp_path):
     """text_then_ocr doesn't call OCR when there's enough native text."""
     import pymupdf

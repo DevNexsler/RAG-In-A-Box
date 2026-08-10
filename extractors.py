@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 from core.resilience import is_transient
+from core.skip_policy import CORRUPT_MANGLED_BINARY
 from providers.media.base import MediaPolicyError, MediaProvider
 from providers.ocr.base import OCRProvider
 
@@ -278,6 +279,30 @@ def _format_pdf_metadata_header(meta: dict) -> str:
     return "\n".join(lines)
 
 
+def _looks_like_mangled_pdf_binary(file_path: str | Path) -> bool:
+    """Detect PDF bytes irreversibly decoded and re-written as UTF-8 text.
+
+    Mangled files retain the PDF version prefix but replace the required real
+    header newline with literal escape text and binary comment bytes with
+    U+FFFD. Requiring all three signals avoids classifying ordinary malformed
+    PDFs, which retain the normal bounded-retry policy.
+    """
+    try:
+        with Path(file_path).open("rb") as handle:
+            header = handle.read(4096)
+    except OSError:
+        return False
+    first_line = header[:64]
+    has_literal_newline = b"\\r\\n" in first_line or b"\\n" in first_line
+    has_real_newline = b"\r" in first_line or b"\n" in first_line
+    return (
+        header.startswith(b"%PDF-")
+        and has_literal_newline
+        and not has_real_newline
+        and b"\xef\xbf\xbd" in header
+    )
+
+
 def extract_pdf(
     file_path: str | Path,
     strategy: str = "text_then_ocr",
@@ -296,6 +321,14 @@ def extract_pdf(
     stored in result.frontmatter. A metadata header is prepended to the first page.
     """
     import pymupdf
+
+    if _looks_like_mangled_pdf_binary(file_path):
+        logger.warning(
+            "PDF contains text-mangled binary bytes and requires source recovery: %s",
+            file_path,
+        )
+        note_skip(CORRUPT_MANGLED_BINARY)
+        return ExtractionResult.from_text("", frontmatter={})
 
     try:
         doc = pymupdf.open(str(file_path))
