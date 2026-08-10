@@ -4191,6 +4191,18 @@ def _index_document_unlocked(
         }
 
     if not request.force:
+        admitted, _ = _apply_skip_ledger(index_root, [record])
+        if not admitted:
+            entry = _load_skip_ledger(index_root).get("docs", {}).get(
+                str(record["doc_id"]), {}
+            )
+            reasons = entry.get("reasons", []) if isinstance(entry, dict) else []
+            return {
+                "status": "skipped",
+                "reason": reasons[0] if reasons else "skip_ledger",
+                "doc_id": record["doc_id"],
+                "rel_path": record["rel_path"],
+            }
         to_process, _ = diff_index_task.fn(
             [record], store.list_doc_mtimes(), store.list_doc_change_hashes()
         )
