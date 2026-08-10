@@ -128,10 +128,10 @@ def test_provider_error_sidecars_do_not_become_content_duplicates(runtime):
     assert registry.duplicate_refs_for_canonical("00001") == []
     assert store.list_doc_ids() == []
     assert [[d.reason for d in noted] for noted in degradations] == [
-        ["vision_sidecar_failed"],
-        ["vision_sidecar_failed"],
+        ["vision_sidecar_failed:blocked_on_upstream"],
+        ["vision_sidecar_failed:blocked_on_upstream"],
     ]
-    assert all(noted[0].transient for noted in degradations)
+    assert all(not noted[0].transient for noted in degradations)
 
 
 def test_provider_error_sidecar_is_retry_pending_when_dedupe_disabled(runtime):
@@ -154,7 +154,7 @@ def test_provider_error_sidecar_is_retry_pending_when_dedupe_disabled(runtime):
 
     assert store.list_doc_ids() == []
     assert [d.reason for d in fiv.collect_degradations()] == [
-        "vision_sidecar_failed"
+        "vision_sidecar_failed:blocked_on_upstream"
     ]
     assert fiv.collect_skips() == []
 
@@ -228,7 +228,9 @@ def test_provider_error_sidecar_stays_excluded_when_legacy_cleanup_fails(runtime
 
     assert store.list_doc_ids() == []
     noted = fiv.collect_degradations()
-    assert [degradation.reason for degradation in noted] == ["vision_sidecar_failed"]
+    assert [degradation.reason for degradation in noted] == [
+        "vision_sidecar_failed:blocked_on_upstream"
+    ]
 
 
 def test_provider_error_cohort_cleanup_recovers_after_lance_delete_failure(runtime):

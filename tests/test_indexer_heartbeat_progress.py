@@ -146,3 +146,24 @@ def test_completion_summary_names_queue_progress_and_elapsed():
         12.5,
         100.0,
     )
+
+
+def test_completion_summary_surfaces_actionable_skip_ids():
+    logger = Mock(spec=logging.Logger)
+
+    flow_index_vault._log_run_completion(
+        logger,
+        run_id="run-actionable",
+        queued=0,
+        processed=0,
+        skipped=0,
+        elapsed_seconds=1.0,
+        actionable_skips={
+            "corrupt_mangled_binary": ["documents::001sp", "documents::001su"]
+        },
+    )
+
+    logger.warning.assert_called_once_with(
+        "Index run has permanent actionable skips: %s",
+        {"corrupt_mangled_binary": ["documents::001sp", "documents::001su"]},
+    )

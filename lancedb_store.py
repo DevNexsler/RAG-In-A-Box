@@ -84,6 +84,103 @@ _DOCUMENT_WRITE_LOCK_STRIPES = 256
 _COMPACTION_MARKER_SUFFIX = ".last-compaction"
 _PROCESS_DOCUMENT_LOCKS: dict[str, threading.RLock] = {}
 _PROCESS_DOCUMENT_LOCKS_GUARD = threading.Lock()
+_SCHEMA_EVOLUTION_MAX_ROW_DIVISOR = 8
+
+
+def _cgroup_memory_limit_bytes(
+    memory_max_path: Path | None = None,
+    *,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+) -> int:
+    """Return effective cgroup-v2 limit, falling back to physical memory."""
+    if memory_max_path is not None:
+        candidates = [memory_max_path]
+    else:
+        relative_cgroup = Path("/")
+        try:
+            for line in proc_cgroup_path.read_text().splitlines():
+                hierarchy, controllers, cgroup_path = line.split(":", 2)
+                if hierarchy == "0" and not controllers:
+                    relative_cgroup = Path(cgroup_path)
+                    break
+        except (OSError, ValueError):
+            pass
+
+        leaf = cgroup_root / str(relative_cgroup).removeprefix("/")
+        candidates = []
+        current = leaf
+        while current == cgroup_root or current.is_relative_to(cgroup_root):
+            candidates.append(current / "memory.max")
+            if current == cgroup_root:
+                break
+            current = current.parent
+
+    finite_limits: list[int] = []
+    for candidate in candidates:
+        try:
+            raw_limit = candidate.read_text().strip()
+        except OSError:
+            continue
+        if raw_limit == "max":
+            continue
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            continue
+        if limit > 0:
+            finite_limits.append(limit)
+
+    if finite_limits:
+        return min(finite_limits)
+
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    page_count = os.sysconf("SC_PHYS_PAGES")
+    physical_memory = page_size * page_count
+    if physical_memory <= 0:
+        raise RuntimeError("Cannot determine memory limit for metadata schema evolution")
+    return physical_memory
+
+
+class _SchemaEvolutionRWLock:
+    """Let normal writes overlap while schema replacement remains exclusive."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @contextmanager
+    def read(self):
+        with self._condition:
+            while self._writer or self._waiting_writers:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def write(self):
+        with self._condition:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._condition.wait()
+                self._writer = True
+            finally:
+                self._waiting_writers -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer = False
+                self._condition.notify_all()
 
 
 def _lance_version_retention_minutes() -> float:
@@ -227,7 +324,7 @@ class LanceDBStore:
     def __init__(self, index_root: str | Path, table_name: str = "chunks") -> None:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
-        self._schema_lock = threading.Lock()
+        self._schema_lock = _SchemaEvolutionRWLock()
         self._completed_insert_doc_ids: set[str] = set()
         self._exclusive_writer_depth = 0
         self._memory_observer = None
@@ -705,35 +802,82 @@ class LanceDBStore:
     def _evolve_metadata_schema(self, new_fields: set[str]) -> None:
         """Add new string sub-fields to the metadata struct column.
 
-        Reads the entire table as Arrow, adds empty-string columns for each
-        new field, reconstructs the metadata struct, and replaces the table.
+        Streams cgroup-sized Arrow batches, reconstructs each metadata struct,
+        and atomically replaces the table without whole-table materialization.
         """
         import lancedb as ldb
 
         table = self._vs.table
-        arrow_table = table.to_arrow()
-
-        # Extract existing metadata struct arrays
-        meta_chunked = arrow_table.column("metadata")
-        meta_col = meta_chunked.combine_chunks()  # StructArray (not ChunkedArray)
-        meta_type = meta_col.type
+        dataset = table.to_lance()
+        source_schema = dataset.schema
+        metadata_index = source_schema.get_field_index("metadata")
+        metadata_field = source_schema.field(metadata_index)
+        meta_type = metadata_field.type
         existing_names = [meta_type.field(i).name for i in range(meta_type.num_fields)]
-
-        # Build new struct arrays: existing + new fields filled with ""
-        n_rows = len(arrow_table)
-        arrays = [meta_col.field(name) for name in existing_names]
         fields = [meta_type.field(i) for i in range(meta_type.num_fields)]
 
         for fname in sorted(new_fields):
             if fname not in existing_names:
-                arrays.append(pa.array([""] * n_rows, type=pa.utf8()))
                 fields.append(pa.field(fname, pa.utf8()))
 
-        new_struct = pa.StructArray.from_arrays(arrays, fields=fields)
+        widened_metadata_field = pa.field(
+            metadata_field.name,
+            pa.struct(fields),
+            nullable=metadata_field.nullable,
+            metadata=metadata_field.metadata,
+        )
+        widened_schema = source_schema.set(metadata_index, widened_metadata_field)
+        row_count = dataset.count_rows()
+        memory_limit_bytes = _cgroup_memory_limit_bytes()
+        logger.warning(
+            "Widening Lance metadata schema: fields=%s rows=%d memory_limit_bytes=%d",
+            sorted(new_fields),
+            row_count,
+            memory_limit_bytes,
+            extra={
+                "new_fields": sorted(new_fields),
+                "row_count": row_count,
+                "memory_limit_bytes": memory_limit_bytes,
+            },
+        )
+        max_row_bytes = max(
+            1,
+            memory_limit_bytes // _SCHEMA_EVOLUTION_MAX_ROW_DIVISOR,
+        )
+        logger.info(
+            "Streaming Lance metadata schema rewrite one row at a time; "
+            "max_row_bytes=%d",
+            max_row_bytes,
+            extra={"max_row_bytes": max_row_bytes},
+        )
 
-        # Replace metadata column in the table
-        col_idx = arrow_table.schema.get_field_index("metadata")
-        new_arrow = arrow_table.set_column(col_idx, pa.field("metadata", new_struct.type), new_struct)
+        def _widened_batches():
+            for batch in dataset.to_batches(
+                batch_size=1,
+                batch_readahead=1,
+                fragment_readahead=1,
+                scan_in_order=True,
+                strict_batch_size=True,
+            ):
+                meta_col = batch.column(metadata_index)
+                arrays = [meta_col.field(name) for name in existing_names]
+                arrays.extend(
+                    pa.array([""] * batch.num_rows, type=pa.utf8())
+                    for _ in range(len(fields) - len(existing_names))
+                )
+                widened_metadata = pa.StructArray.from_arrays(arrays, fields=fields)
+                widened_batch = batch.set_column(
+                    metadata_index,
+                    widened_metadata_field,
+                    widened_metadata,
+                )
+                if widened_batch.nbytes > max_row_bytes:
+                    raise MemoryError(
+                        "Cannot widen Lance metadata schema: single row requires "
+                        f"{widened_batch.nbytes} Arrow bytes, exceeding the "
+                        f"cgroup-derived {max_row_bytes}-byte envelope"
+                    )
+                yield widened_batch
 
         db = ldb.connect(self.index_root)
         temp_name = f"{self.table_name}__schema_tmp"
@@ -760,7 +904,11 @@ class LanceDBStore:
         backup_created = False
         try:
             try:
-                db.create_table(temp_name, new_arrow)
+                reader = pa.RecordBatchReader.from_batches(
+                    widened_schema,
+                    _widened_batches(),
+                )
+                db.create_table(temp_name, reader, schema=widened_schema)
             except Exception:
                 if temp_path.exists():
                     shutil.rmtree(temp_path)
@@ -1135,56 +1283,71 @@ class LanceDBStore:
             else:
                 memory_fields = {"doc_ids": sorted(doc_ids)}
 
-            # Detect new metadata fields and evolve schema if needed
-            with self._measure_memory("storage_schema", **memory_fields):
-                existing_subfields = self._metadata_subfields()
-                if existing_subfields:  # table already has data
-                    incoming_keys: set[str] = set()
-                    for n in nodes:
-                        if n.metadata:
-                            incoming_keys.update(n.metadata.keys())
-                    if incoming_keys:
-                        # Threaded indexing shares one store instance; re-check missing
-                        # fields under a lock so temp-table schema evolution is serialized.
-                        with self._schema_lock:
-                            existing_subfields = self._metadata_subfields()
-                            new_fields = incoming_keys - existing_subfields
-                            if new_fields:
-                                self._evolve_metadata_schema(new_fields)
+            incoming_keys = {
+                key
+                for node in nodes
+                if node.metadata
+                for key in node.metadata
+            }
+            existing_subfields = self._metadata_subfields()
+            needs_schema_evolution = bool(
+                existing_subfields
+                and incoming_keys - existing_subfields
+            )
+            schema_session = (
+                self._schema_lock.write()
+                if needs_schema_evolution
+                else self._schema_lock.read()
+            )
 
-            # New documents are proven absent by the flow diff. Avoid a no-op
-            # delete: Lance commits it as a full metadata version anyway, so a
-            # large insert batch otherwise doubles manifests and retained
-            # transaction state before final pruning.
-            if delete_existing:
-                with self._measure_memory("storage_delete", **memory_fields):
-                    for doc_id in doc_ids:
-                        try:
-                            self._vs.delete(doc_id)
-                        except TableNotFoundError:
-                            pass  # Table not created yet on first run
-                        except Exception as e:
-                            logger.warning("Failed to delete old data for %s: %s", doc_id, e)
-                            continue
-                        self._completed_insert_doc_ids.discard(doc_id)
-            # Add new nodes
-            try:
-                with self._measure_memory("storage_add", **memory_fields):
-                    self._vs.add(nodes)
-            except Exception:
+            # A schema writer replaces the table directory, so it must exclude
+            # every commit from snapshot selection through the replacement.
+            # Ordinary writes share the read side and retain their concurrency.
+            with schema_session:
+                with self._measure_memory("storage_schema", **memory_fields):
+                    if needs_schema_evolution:
+                        existing_subfields = self._metadata_subfields()
+                        new_fields = incoming_keys - existing_subfields
+                        if new_fields:
+                            self._evolve_metadata_schema(new_fields)
+
+                # New documents are proven absent by the flow diff. Avoid a no-op
+                # delete: Lance commits it as a full metadata version anyway, so a
+                # large insert batch otherwise doubles manifests and retained
+                # transaction state before final pruning.
                 if delete_existing:
-                    logger.critical(
-                        "Failed to add %d nodes for doc_ids=%s after old chunks were deleted; "
-                        "these docs will self-heal on the next index run",
-                        len(nodes), sorted(doc_ids),
-                    )
-                else:
-                    logger.critical(
-                        "Failed to insert %d nodes for doc_ids=%s; "
-                        "these docs will self-heal on the next index run",
-                        len(nodes), sorted(doc_ids),
-                    )
-                raise
+                    with self._measure_memory("storage_delete", **memory_fields):
+                        for doc_id in doc_ids:
+                            try:
+                                self._vs.delete(doc_id)
+                            except TableNotFoundError:
+                                pass  # Table not created yet on first run
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to delete old data for %s: %s",
+                                    doc_id,
+                                    e,
+                                )
+                                continue
+                            self._completed_insert_doc_ids.discard(doc_id)
+                # Add new nodes
+                try:
+                    with self._measure_memory("storage_add", **memory_fields):
+                        self._vs.add(nodes)
+                except Exception:
+                    if delete_existing:
+                        logger.critical(
+                            "Failed to add %d nodes for doc_ids=%s after old chunks were deleted; "
+                            "these docs will self-heal on the next index run",
+                            len(nodes), sorted(doc_ids),
+                        )
+                    else:
+                        logger.critical(
+                            "Failed to insert %d nodes for doc_ids=%s; "
+                            "these docs will self-heal on the next index run",
+                            len(nodes), sorted(doc_ids),
+                        )
+                    raise
 
     def _load_unique_canonical_rows(
         self, table: Any, canonical_doc_id: str

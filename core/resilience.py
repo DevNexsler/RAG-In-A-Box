@@ -22,9 +22,12 @@ so it is remembered per base_url instead of being re-discovered once per documen
 from __future__ import annotations
 
 import logging
+import math
+import random
 import threading
 import time
 from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from typing import Callable, Iterator, TypeVar
 
 import httpx
@@ -63,6 +66,14 @@ class TransientError(RuntimeError):
 
     Subclasses RuntimeError so that if retries exhaust, the re-raised error is still a
     RuntimeError to callers that catch that (backward-compatible)."""
+
+
+class RateLimitError(TransientError):
+    """Rate-limit signal without an HTTP 429 response, such as a 200 error body."""
+
+    def __init__(self, message: str, *, retry_after: str | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 def is_transient(exc: BaseException) -> bool:
@@ -198,6 +209,48 @@ class EndpointCircuits:
 CIRCUITS = EndpointCircuits()
 
 
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Return a valid 429 Retry-After delay, supporting seconds and HTTP dates."""
+    if isinstance(exc, RateLimitError):
+        value = exc.retry_after
+    elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+        value = exc.response.headers.get("Retry-After")
+    else:
+        return None
+    if not value:
+        return None
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            delay = parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, delay) if math.isfinite(delay) else None
+
+
+def _retry_delay(
+    exc: BaseException,
+    retry_index: int,
+    backoff: tuple[float, ...],
+) -> float:
+    """Choose adaptive rate-limit delay or caller's fast transient ladder."""
+    fallback = backoff[min(retry_index, len(backoff) - 1)] if backoff else 0.0
+    is_rate_limit = isinstance(exc, RateLimitError) or (
+        isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429
+    )
+    if not is_rate_limit:
+        return fallback
+
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        return retry_after
+
+    base = max(0.0, backoff[0]) if backoff else 0.0
+    exponential = base * (2 ** retry_index)
+    return exponential + random.uniform(0.0, exponential * 0.25)
+
+
 def call_with_retry(
     fn: Callable[[], T],
     *,
@@ -213,8 +266,10 @@ def call_with_retry(
     immediately. After `attempts` transient failures, re-raise the last exception so
     the caller can degrade the doc (-> degraded ledger -> self-heal next run).
 
-    `backoff[i]` is the delay before attempt i+1 (the last value repeats). A caller can
-    override `classify` (e.g. to honor a Retry-After) or inject `sleep` (tests).
+    `backoff[i]` is the delay before attempt i+1 (the last value repeats). HTTP 429
+    honors `Retry-After`; without one it uses exponential backoff with jitter based
+    on `backoff[0]`. Other transient failures retain the caller's fast ladder. A
+    caller can override `classify` or inject `sleep` (tests).
 
     Pass `circuit_key` (the provider's base_url) to route the call through the
     per-endpoint breaker: while that endpoint is in cooldown the call fails
@@ -236,7 +291,7 @@ def call_with_retry(
                 # This attempt tripped the breaker: the endpoint is down for
                 # everyone, so re-raise the real error now instead of sleeping.
                 raise
-            delay = backoff[min(i, len(backoff) - 1)] if backoff else 0.0
+            delay = _retry_delay(exc, i, backoff)
             # #0546: a provider error's str() can contain a newline (litellm's
             # RateLimitError ends with "\nFor more information check: <mdn url>").
             # collapse() flattens it BEFORE truncating, so one retry warning is one

@@ -1,6 +1,7 @@
 """Tests for LanceDBStore (uses a temp directory, no mocks needed)."""
 
 import json
+import logging
 
 import multiprocessing
 import subprocess
@@ -16,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pyarrow as pa
 import pytest
 
+import lancedb_store as lancedb_store_module
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
 from lancedb_store import LanceDBStore, open_store_with_recovery
 
@@ -1156,6 +1158,274 @@ def test_schema_evolution_multiple_new_fields():
         subfields = store._metadata_subfields()
         assert "section" in subfields
         assert "sentiment" in subfields
+
+
+def test_schema_evolution_streams_large_table_within_cgroup_envelope():
+    """Widening 66k rows must never materialize the whole table as Arrow."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 32
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "seed.md",
+                "c:0",
+                "x" * 512,
+                vec,
+                source_type="md",
+            )
+        ])
+
+        seed = store._vs.table.to_arrow().slice(0, 1).to_pylist()[0]
+        schema = store._vs.table.schema
+
+        def _large_table_batches():
+            remaining = 66_000 - 1
+            while remaining:
+                row_count = min(1_000, remaining)
+                yield from pa.Table.from_pylist(
+                    [seed] * row_count,
+                    schema=schema,
+                ).to_batches()
+                remaining -= row_count
+
+        store._vs.table.add(_large_table_batches())
+        assert store._vs.table.count_rows() == 66_000
+
+        cgroup_limit = 64 * 1024 * 1024
+        arrow_envelope = cgroup_limit // 8
+        largest_arrow_allocation = 0
+        table_type = type(store._vs.table)
+        dataset_type = type(store._vs.table.to_lance())
+        real_to_arrow = table_type.to_arrow
+        real_to_batches = dataset_type.to_batches
+
+        def _reject_unbounded_materialization(table, *args, **kwargs):
+            nonlocal largest_arrow_allocation
+            materialized = real_to_arrow(table, *args, **kwargs)
+            largest_arrow_allocation = max(
+                largest_arrow_allocation,
+                materialized.nbytes,
+            )
+            if materialized.nbytes > arrow_envelope:
+                raise AssertionError(
+                    "metadata widening exceeded cgroup-derived Arrow envelope: "
+                    f"{materialized.nbytes} > {arrow_envelope}"
+                )
+            return materialized
+
+        def _measure_streamed_batches(dataset, *args, **kwargs):
+            nonlocal largest_arrow_allocation
+            for batch in real_to_batches(dataset, *args, **kwargs):
+                largest_arrow_allocation = max(
+                    largest_arrow_allocation,
+                    batch.nbytes,
+                )
+                assert batch.nbytes <= arrow_envelope
+                yield batch
+
+        with patch(
+            "lancedb_store._cgroup_memory_limit_bytes",
+            return_value=cgroup_limit,
+            create=True,
+        ), patch.object(
+            table_type,
+            "to_arrow",
+            _reject_unbounded_materialization,
+        ), patch.object(
+            dataset_type,
+            "to_batches",
+            _measure_streamed_batches,
+        ):
+            store.upsert_nodes([
+                _make_node_with_meta(
+                    "new.md",
+                    "c:0",
+                    "new field",
+                    vec,
+                    content_status="indexed",
+                )
+            ])
+
+        assert 0 < largest_arrow_allocation <= arrow_envelope
+        assert store._vs.table.count_rows() == 66_001
+        assert "content_status" in store._metadata_subfields()
+
+
+def test_schema_evolution_reads_real_cgroup_memory_limit(tmp_path):
+    memory_max = tmp_path / "memory.max"
+    memory_max.write_text("8589934592\n")
+
+    assert (
+        lancedb_store_module._cgroup_memory_limit_bytes(memory_max_path=memory_max)
+        == 8 * 1024 * 1024 * 1024
+    )
+
+
+def test_schema_evolution_uses_smallest_nested_cgroup_limit(tmp_path):
+    cgroup_root = tmp_path / "cgroup"
+    leaf = cgroup_root / "workload" / "child"
+    leaf.mkdir(parents=True)
+    (cgroup_root / "memory.max").write_text("17179869184\n")
+    (cgroup_root / "workload" / "memory.max").write_text("8589934592\n")
+    (leaf / "memory.max").write_text("max\n")
+    proc_cgroup = tmp_path / "self.cgroup"
+    proc_cgroup.write_text("0::/workload/child\n")
+
+    assert lancedb_store_module._cgroup_memory_limit_bytes(
+        cgroup_root=cgroup_root,
+        proc_cgroup_path=proc_cgroup,
+    ) == 8 * 1024 * 1024 * 1024
+
+
+def test_schema_evolution_rejects_single_row_over_cgroup_envelope():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 8
+        store.upsert_nodes([_make_node_with_meta("seed.md", "c:0", "seed", vec)])
+        oversized = _make_node_with_meta(
+            "large.md",
+            "c:0",
+            "x" * (3 * 1024 * 1024),
+            vec,
+        )
+        store.upsert_nodes([oversized])
+
+        with patch(
+            "lancedb_store._cgroup_memory_limit_bytes",
+            return_value=16 * 1024 * 1024,
+        ), pytest.raises(RuntimeError, match="single row"):
+            store.upsert_nodes([
+                _make_node_with_meta(
+                    "next.md",
+                    "c:0",
+                    "next",
+                    vec,
+                    content_status="indexed",
+                )
+            ])
+
+        assert "content_status" not in store._metadata_subfields()
+        assert set(store.list_doc_ids()) == {"seed.md", "large.md"}
+
+
+def test_schema_evolution_logs_fields_and_row_count_before_widening(caplog):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 8
+        store.upsert_nodes([_make_node_with_meta("seed.md", "c:0", "seed", vec)])
+
+        caplog.set_level(logging.INFO, logger="lancedb_store")
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "next.md",
+                "c:0",
+                "next",
+                vec,
+                content_status="indexed",
+                content_failure_reasons="",
+            )
+        ])
+
+        widening_record = next(
+            record
+            for record in caplog.records
+            if record.getMessage().startswith("Widening Lance metadata schema")
+        )
+        assert widening_record.new_fields == [
+            "content_failure_reasons",
+            "content_status",
+        ]
+        assert widening_record.row_count == 1
+
+
+def test_schema_evolution_blocks_writes_until_atomic_swap_finishes():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 8
+        store.upsert_nodes([_make_node_with_meta("seed.md", "c:0", "seed", vec)])
+
+        normal_write_at_add = threading.Event()
+        release_normal_write = threading.Event()
+        evolution_scanning = threading.Event()
+        release_evolution = threading.Event()
+        errors: list[Exception] = []
+        dataset_type = type(store._vs.table.to_lance())
+        real_to_batches = dataset_type.to_batches
+        old_vector_store = store._vs
+        vector_store_type = type(old_vector_store)
+        real_add = vector_store_type.add
+        normal_thread_id: int | None = None
+
+        def _pause_normal_add(vector_store, nodes):
+            if (
+                vector_store is old_vector_store
+                and threading.get_ident() == normal_thread_id
+            ):
+                normal_write_at_add.set()
+                if not release_normal_write.wait(5):
+                    raise TimeoutError("test did not release normal write")
+            return real_add(vector_store, nodes)
+
+        def _pause_first_schema_scan(dataset, *args, **kwargs):
+            iterator = real_to_batches(dataset, *args, **kwargs)
+            evolution_scanning.set()
+            if not release_evolution.wait(5):
+                raise TimeoutError("test did not release schema evolution")
+            yield from iterator
+
+        def _widen_schema():
+            try:
+                store.upsert_nodes([
+                    _make_node_with_meta(
+                        "widening.md",
+                        "c:0",
+                        "widening",
+                        vec,
+                        content_status="indexed",
+                    )
+                ])
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        def _normal_write():
+            nonlocal normal_thread_id
+            normal_thread_id = threading.get_ident()
+            try:
+                store.upsert_nodes([
+                    _make_node_with_meta("concurrent.md", "c:0", "concurrent", vec)
+                ])
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with patch.object(
+            vector_store_type,
+            "add",
+            _pause_normal_add,
+        ), patch.object(dataset_type, "to_batches", _pause_first_schema_scan):
+            normal_thread = threading.Thread(target=_normal_write)
+            normal_thread.start()
+            assert normal_write_at_add.wait(5)
+
+            evolution_thread = threading.Thread(target=_widen_schema)
+            evolution_thread.start()
+            try:
+                assert not evolution_scanning.wait(0.2)
+            finally:
+                release_normal_write.set()
+                evolution_scanning.wait(5)
+                release_evolution.set()
+
+            normal_thread.join(10)
+            evolution_thread.join(10)
+
+        assert not evolution_thread.is_alive()
+        assert not normal_thread.is_alive()
+        assert errors == []
+        assert set(store.list_doc_ids()) == {
+            "seed.md",
+            "widening.md",
+            "concurrent.md",
+        }
 
 
 def test_schema_evolution_concurrent_new_fields_on_shared_store():

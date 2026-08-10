@@ -271,6 +271,77 @@ def test_full_flow_suppresses_unchanged_empty_file_until_changed(tmp_path, caplo
     store.upsert_nodes.assert_not_called()
 
 
+def test_full_flow_surfaces_parked_provider_error_without_self_heal_claim(
+    tmp_path, caplog
+):
+    root = tmp_path / "documents"
+    root.mkdir()
+    artifact = root / "photo.jpg.vl@001Og@.json"
+    artifact.write_text(
+        '{"server":"qwen3-vl","tool":"vl_describe",'
+        '"error":"provider offline","issue":{"kind":"offline"}}'
+    )
+    scanned = scan_vault_task.fn(root, ["**/*.json"], [])
+    assert len(scanned) == 1
+    index_root = tmp_path / "index"
+    index_root.mkdir()
+    fiv._save_degraded_ledger(index_root, {"version": 2, "docs": {
+        "documents::001Og": {
+            "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+            "attempts": 0,
+            "blocked_attempts": 3,
+            "change_key": fiv._change_key(scanned[0]),
+            "last_attempt_at": 1.0,
+        }
+    }})
+    config = {
+        "index_root": str(index_root),
+        "sources": [{
+            "type": "filesystem",
+            "name": "documents",
+            "root": str(root),
+            "scan": {"include": ["**/*.json"], "exclude": []},
+        }],
+        "chunking": {
+            "max_chars": 1800,
+            "overlap": 200,
+            "semantic": {"enabled": False},
+        },
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "media": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+    store = MagicMock()
+    store.list_doc_ids.return_value = []
+    store.list_doc_mtimes.return_value = {}
+    store.list_doc_change_hashes.return_value = {}
+    store.count_chunks.return_value = 0
+    store.fts_available.return_value = True
+    taxonomy = MagicMock()
+    taxonomy.count.return_value = 0
+
+    with patch("flow_index_vault.load_config", return_value=config), \
+         patch("flow_index_vault.get_run_logger", return_value=logging.getLogger("test")), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=store), \
+         patch("flow_index_vault.build_embed_provider", return_value=MagicMock()), \
+         patch("flow_index_vault.build_ocr_provider", return_value=None), \
+         patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("core.taxonomy.load_taxonomy_store", return_value=taxonomy), \
+         patch("flow_index_vault.process_doc_task") as process, \
+         patch("flow_index_vault.delete_docs_task"), \
+         patch("flow_index_vault.index_stats_task"), \
+         patch("flow_index_vault.write_index_metadata_task"):
+        fiv.index_vault_flow.fn("dummy.yaml")
+
+    process.assert_not_called()
+    assert "parked at terminal cap" in caplog.text
+    assert "vision_sidecar_failed:blocked_on_upstream" in caplog.text
+    assert "will self-heal next run" not in caplog.text
+
+
 def test_taxonomy_usage_accumulator_flushes_once_serially():
     """Index workers queue taxonomy usage; one writer drains it after the batch."""
     accumulator = TaxonomyUsageAccumulator()
