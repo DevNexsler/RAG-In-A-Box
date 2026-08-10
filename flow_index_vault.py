@@ -81,6 +81,7 @@ from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
 from core.dedupe import compute_file_identity
 from core.resilience import is_transient
+from core.skip_policy import actionable_skip_docs, is_permanent_skip_entry
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
@@ -1016,6 +1017,7 @@ def _log_run_completion(
     processed: int,
     skipped: int,
     elapsed_seconds: float,
+    actionable_skips: dict[str, list[str]] | None = None,
 ) -> None:
     completion = 100.0 if queued == 0 else processed * 100.0 / queued
     logger.info(
@@ -1028,6 +1030,10 @@ def _log_run_completion(
         elapsed_seconds,
         completion,
     )
+    if actionable_skips:
+        logger.warning(
+            "Index run has permanent actionable skips: %s", actionable_skips
+        )
 
 
 # How often the source scan re-stamps the heartbeat, in records. The scan is a
@@ -1397,10 +1403,12 @@ def _exclude_skipped_docs(
     already decided 'do not index' and the file is unchanged. A doc whose key
     differs (file modified) is kept, so the skip decision is re-evaluated.
 
-    Exclusion is bounded: an entry past its _skip_retry_due_at is due for one
-    re-attempt (kept), so a skipped doc is never permanently abandoned.
-    Legacy entries with no skipped_at stamp are due immediately and get
-    stamped by their next merge."""
+    Exclusion is bounded for ordinary skips: an entry past its
+    _skip_retry_due_at is due for one re-attempt. Explicit actionable corruption
+    stays parked while its source key is unchanged because retry cannot recover
+    destroyed bytes. Every changed source is still re-evaluated immediately.
+    Legacy entries with no skipped_at stamp are due immediately and get stamped
+    by their next merge."""
     docs = ledger.get("docs", {})
     if not docs:
         return to_add_or_update, 0
@@ -1413,7 +1421,12 @@ def _exclude_skipped_docs(
         if (
             entry is not None
             and entry.get("change_key") == _change_key(r)
-            and now < _skip_retry_due_at(doc_id, float(entry.get("skipped_at") or 0.0))
+            and (
+                is_permanent_skip_entry(entry)
+                or now < _skip_retry_due_at(
+                    doc_id, float(entry.get("skipped_at") or 0.0)
+                )
+            )
         ):
             skipped += 1
         else:
@@ -3717,6 +3730,7 @@ def index_vault_flow(
         processed=int(progress.get("processed") or 0),
         skipped=int(progress.get("skipped") or 0),
         elapsed_seconds=run_seconds,
+        actionable_skips=actionable_skip_docs(_load_skip_ledger(index_root)),
     )
     _update_run_progress(phase="completed")
     _write_heartbeat(index_root)

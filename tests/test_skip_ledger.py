@@ -84,6 +84,44 @@ def test_entry_past_retry_window_is_due():
     assert [r["doc_id"] for r in kept] == ["d::1"] and n == 0
 
 
+def test_actionable_corruption_is_terminal_while_source_is_unchanged():
+    ledger = {
+        "docs": {
+            "documents::001sp": _entry(
+                "h1", skipped_at=1000.0, reasons=["corrupt_mangled_binary"]
+            )
+        }
+    }
+
+    kept, excluded = _exclude_skipped_docs(
+        [_rec("documents::001sp", change_hash="h1")],
+        ledger,
+        now=1000.0 + 100 * _SKIP_RETRY_SECONDS,
+    )
+
+    assert kept == []
+    assert excluded == 1
+
+
+def test_actionable_corruption_is_reevaluated_when_source_changes():
+    ledger = {
+        "docs": {
+            "documents::001sp": _entry(
+                "h1", skipped_at=1000.0, reasons=["corrupt_mangled_binary"]
+            )
+        }
+    }
+
+    kept, excluded = _exclude_skipped_docs(
+        [_rec("documents::001sp", change_hash="restored")],
+        ledger,
+        now=1000.0 + 100 * _SKIP_RETRY_SECONDS,
+    )
+
+    assert [record["doc_id"] for record in kept] == ["documents::001sp"]
+    assert excluded == 0
+
+
 def test_legacy_entry_without_stamp_is_due_immediately():
     # pre-bounded-retry ledger entries carry no skipped_at: one-time
     # re-evaluation, after which the merge stamps them

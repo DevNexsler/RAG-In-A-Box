@@ -17,6 +17,7 @@ from core.config import filesystem_source_roots, load_config
 from core.artifacts import is_communication_sidecar
 from core.logging_setup import configure_logging_from_config
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
+from core.skip_policy import actionable_skip_docs
 from core.storage import SearchHit
 from core.tracing import get_tracer
 from lancedb_store import LanceDBStore, open_store_with_recovery
@@ -1307,6 +1308,18 @@ def _compute_deep_health(
         registry_stats=registry_stats,
         indexed_doc_ids={str(doc_id) for doc_id in doc_ids},
     )
+    try:
+        skip_ledger = json.loads(
+            (index_root / "skip_docs.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, TypeError):
+        skip_ledger = {"docs": {}}
+    actionable_skips = actionable_skip_docs(skip_ledger)
+    actionable_ids = {
+        doc_id
+        for doc_ids_for_reason in actionable_skips.values()
+        for doc_id in doc_ids_for_reason
+    }
     provider_failures = _recent_provider_failures(index_root)
     source_names = sorted(
         set(configured_sources)
@@ -1365,6 +1378,11 @@ def _compute_deep_health(
             status = "indexing" if indexer_running else "degraded"
             reason = "retry_pending"
         source_statuses.append(status)
+        source_actionable_ids = sorted(
+            doc_id
+            for doc_id in actionable_ids
+            if _source_name_from_doc_id(doc_id) == source_name
+        )
         sources[source_name] = {
             "status": status,
             "reason": reason,
@@ -1384,23 +1402,29 @@ def _compute_deep_health(
             "deleted_object_group_count": deleted_object_group_count,
             "intentionally_empty_group_count": intentionally_empty_group_count,
             "unindexed_registry_doc_count": unindexed_registry_doc_count,
+            "actionable_skip_doc_count": len(source_actionable_ids),
+            "actionable_skip_doc_ids": source_actionable_ids,
             "registry_latest_seen_at": _iso_or_none(registry_latest_seen_at),
             "index_latest_mtime": index_latest_mtime,
             "index_latest_mtime_iso": _iso_or_none(index_latest_mtime),
         }
+
+    overall = _overall_deep_health(
+        source_statuses,
+        fts_available=fts_available,
+        indexer_running=indexer_running,
+        registry_error=registry_error,
+        provider_status=provider_failures["status"],
+    )
+    if actionable_ids and overall in {"ok", "unknown"}:
+        overall = "degraded"
 
     return {
         "cached": False,
         "last_ran_at": _utc_iso(time.time()),
         "ttl_seconds": _DEEP_HEALTH_CACHE_TTL_SECONDS,
         "uses_llm": False,
-        "overall": _overall_deep_health(
-            source_statuses,
-            fts_available=fts_available,
-            indexer_running=indexer_running,
-            registry_error=registry_error,
-            provider_status=provider_failures["status"],
-        ),
+        "overall": overall,
         "sources": sources,
         "checks": {
             "registry_available": registry_error is None,
@@ -1416,6 +1440,10 @@ def _compute_deep_health(
             "not_extractable_log_error": coverage_error,
             "provider_status": provider_failures["status"],
             "provider_failures": provider_failures,
+            "actionable_skips": {
+                "count": len(actionable_ids),
+                "by_reason": actionable_skips,
+            },
         },
     }
 
