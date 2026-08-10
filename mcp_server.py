@@ -285,6 +285,11 @@ def _index_disk_usage(index_root: Path) -> dict:
     }
 
 
+async def _run_health_probe(probe, config: dict) -> tuple[dict, int]:
+    """Run synchronous probe work without blocking the HTTP event loop."""
+    return await asyncio.to_thread(probe, config)
+
+
 def _health_probe(config: dict) -> tuple[dict, int]:
     """Payload and HTTP status for the unauthenticated /health probe.
 
@@ -3644,7 +3649,7 @@ if HAS_MCP and FastMCP is not None:
                 # current/last attempt is healthy. See _health_probe.
                 async def _health(request):
                     try:
-                        payload, status_code = _health_probe(config)
+                        payload, status_code = await _run_health_probe(_health_probe, config)
                         return JSONResponse(payload, status_code=status_code)
                     except Exception as exc:
                         # Never let a health-check bug cause a false outage.
@@ -3652,7 +3657,9 @@ if HAS_MCP and FastMCP is not None:
 
                 async def _health_providers(request):
                     try:
-                        payload, status_code = _provider_health_probe(config)
+                        payload, status_code = await _run_health_probe(
+                            _provider_health_probe, config
+                        )
                         return JSONResponse(payload, status_code=status_code)
                     except Exception as exc:
                         return JSONResponse(
