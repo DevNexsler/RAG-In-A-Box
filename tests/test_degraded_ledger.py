@@ -281,6 +281,72 @@ def test_merge_doc_specific_failure_still_charges_attempts():
     assert merged["docs"]["a"]["attempts"] == 1
 
 
+def test_unchanged_upstream_artifact_parks_after_three_attempts():
+    from extractors import Degradation
+
+    doc_id = "documents::001Og"
+    record = {"doc_id": doc_id, "mtime": 1.0, "change_hash": "error-v1"}
+    blocked = Degradation(
+        "vision_sidecar_failed:blocked_on_upstream", transient=False
+    )
+    ledger = {"docs": {}}
+
+    for attempt in range(1, 4):
+        ledger = _merge_degraded_ledger(
+            ledger,
+            {doc_id: [blocked]},
+            set(),
+            change_keys={doc_id: _change_key(record)},
+            now=float(attempt),
+        )
+        assert ledger["docs"][doc_id].get("blocked_attempts") == attempt
+
+    # Never-indexed artifacts enter the normal diff every run. Terminal state
+    # must suppress that queue too, not only the degraded-ledger requeue lane.
+    queue, _, report = _reconcile(
+        [record], [record], ledger, now=1.0 + _DEGRADED_RETRY_CAP_SECONDS
+    )
+
+    assert queue == []
+    assert report["capped"] == [doc_id]
+
+
+def test_changed_upstream_artifact_restarts_terminal_attempt_count():
+    from extractors import Degradation
+
+    doc_id = "documents::001Oo"
+    blocked = Degradation(
+        "vision_sidecar_failed:blocked_on_upstream", transient=False
+    )
+    ledger = {"docs": {doc_id: {
+        "reasons": [blocked.reason],
+        "attempts": 0,
+        "blocked_attempts": 2,
+        "change_key": "error-v1",
+    }}}
+
+    changed_record = {
+        "doc_id": doc_id,
+        "mtime": 2.0,
+        "change_hash": "error-v2",
+    }
+    queue, _, report = _reconcile(
+        [changed_record], [changed_record], ledger, now=3.0
+    )
+    assert queue == [changed_record]
+    assert report["already_queued"] == [doc_id]
+
+    merged = _merge_degraded_ledger(
+        ledger,
+        {doc_id: [blocked]},
+        set(),
+        change_keys={doc_id: "error-v2"},
+        now=3.0,
+    )
+
+    assert merged["docs"][doc_id]["blocked_attempts"] == 1
+
+
 # --- provider-outage repro (ticket #0251) ---
 
 def _dead_port() -> int:

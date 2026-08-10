@@ -912,6 +912,12 @@ def _refresh_repaired_sidecar_docs(
 # so a genuinely-flaky doc gets more chances before we give up.
 _DEGRADED_MAX_ATTEMPTS = 12
 
+# Stored provider-error artifacts cannot heal through another indexer pass: the
+# upstream producer must replace their bytes. Give that producer a short grace
+# window, then park an unchanged artifact instead of retrying it forever.
+_DEGRADED_MAX_BLOCKED_ATTEMPTS = 3
+_BLOCKED_UPSTREAM_REASON_SUFFIX = ":blocked_on_upstream"
+
 # The v1 ledger cap was 5. The v1->v2 migration keys "was this capped under v1"
 # off this historical value, NOT the live cap above — otherwise raising the live
 # cap silently stops reopening the outage-burned v1 docs the migration exists to
@@ -934,7 +940,11 @@ def _degraded_backoff_seconds(entry: dict) -> float:
     provider outage (all transient) still widens the window even though it
     never charges the abandonment cap.
     """
-    tries = int(entry.get("attempts", 0)) + int(entry.get("transient_attempts", 0))
+    tries = (
+        int(entry.get("attempts", 0))
+        + int(entry.get("transient_attempts", 0))
+        + int(entry.get("blocked_attempts", 0))
+    )
     return min(_DEGRADED_RETRY_BASE_SECONDS * (2 ** tries), _DEGRADED_RETRY_CAP_SECONDS)
 
 
@@ -1178,8 +1188,9 @@ def _reconcile_degraded_docs(
 
     - ``already_queued`` — the genuine diff picked up a changed input, or an
                            unchanged input whose retry window elapsed
-    - ``capped``         — past _DEGRADED_MAX_ATTEMPTS: persistent (e.g. a
-                           corrupt source file), deliberately not retried
+    - ``capped``         — past _DEGRADED_MAX_ATTEMPTS, or a stored provider
+                           error unchanged for _DEGRADED_MAX_BLOCKED_ATTEMPTS:
+                           persistent, deliberately not retried
     - ``backoff``        — resolvable and unchanged, but its exponential
                            backoff window has not elapsed yet, so a down
                            provider is not re-hit every sweep. Entries with
@@ -1229,15 +1240,27 @@ def _reconcile_degraded_docs(
                 bool(stored_change_key)
                 and stored_change_key == _change_key(queued_by_id[doc_id])
             )
+            capped = (
+                int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
+                or int(entry.get("blocked_attempts", 0))
+                >= _DEGRADED_MAX_BLOCKED_ATTEMPTS
+            )
             backoff_elapsed = (
                 now - float(entry.get("last_attempt_at", 0.0))
             ) >= _degraded_backoff_seconds(entry)
-            if unchanged and not backoff_elapsed:
+            if unchanged and capped:
+                deferred.add(doc_id)
+                bucket = "capped"
+            elif unchanged and not backoff_elapsed:
                 deferred.add(doc_id)
                 bucket = "backoff"
             else:
                 bucket = "already_queued"
-        elif int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS:
+        elif (
+            int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
+            or int(entry.get("blocked_attempts", 0))
+            >= _DEGRADED_MAX_BLOCKED_ATTEMPTS
+        ):
             bucket = "capped"
         elif doc_id in by_id:
             # Resolvable — but only re-admit once the backoff window elapsed.
@@ -1314,7 +1337,18 @@ def _merge_degraded_ledger(
         if change_key:
             entry["change_key"] = change_key
         transient_attempts = int(prev.get("transient_attempts", 0))
-        if degradations and all(d.transient for d in degradations):
+        blocked_on_upstream = bool(degradations) and all(
+            d.reason.endswith(_BLOCKED_UPSTREAM_REASON_SUFFIX)
+            for d in degradations
+        )
+        if blocked_on_upstream:
+            same_source = bool(change_key) and change_key == str(
+                prev.get("change_key") or ""
+            )
+            entry["blocked_attempts"] = (
+                int(prev.get("blocked_attempts", 0)) if same_source else 0
+            ) + 1
+        elif degradations and all(d.transient for d in degradations):
             transient_attempts += 1
         else:
             entry["attempts"] += 1
@@ -2027,10 +2061,14 @@ def _process_doc_task(
                             doc_id,
                             exc,
                         )
-                reason, transient = provider_error
-                note_degradation(reason, transient=transient)
+                reason, _provider_was_transient = provider_error
+                note_degradation(
+                    f"{reason}{_BLOCKED_UPSTREAM_REASON_SUFFIX}",
+                    transient=False,
+                )
                 logger.warning(
-                    "Provider error artifact is retry-pending, not content: %s",
+                    "Provider error artifact is blocked on upstream replacement, "
+                    "not content: %s",
                     doc_id,
                 )
                 return
@@ -3325,6 +3363,20 @@ def index_vault_flow(
                     len(degraded_report["terminal"]),
                     _degraded_unresolved_path(index_root).name,
                 )
+        if degraded_report["capped"]:
+            capped_reasons = {
+                doc_id: degraded_ledger["docs"][doc_id].get("reasons", [])
+                for doc_id in degraded_report["capped"]
+            }
+            logger.error(
+                "%d degraded docs parked at terminal cap; source change or manual "
+                "action required: %s",
+                len(degraded_report["capped"]),
+                capped_reasons,
+            )
+            _RUNTIME.setdefault("_warnings", []).append(
+                f"degraded_capped:{len(degraded_report['capped'])}"
+            )
         # The end-of-run merge re-loads the ledger from disk, so the ageing
         # and escalation above have to land now to survive this run.
         if degraded_report["unresolved"]:
@@ -3659,10 +3711,36 @@ def index_vault_flow(
             change_keys=degraded_change_keys,
         )
         _save_degraded_ledger(index_root, updated_ledger)
-        if degraded_now:
+        blocked_upstream = {
+            doc_id
+            for doc_id in degraded_now
+            if any(
+                str(reason).endswith(_BLOCKED_UPSTREAM_REASON_SUFFIX)
+                for reason in updated_ledger["docs"].get(doc_id, {}).get("reasons", [])
+            )
+        }
+        self_healable = set(degraded_now) - blocked_upstream
+        if self_healable:
             logger.warning(
                 "%d docs indexed with degradations (will self-heal next run): %s",
-                len(degraded_now), sorted(degraded_now)[:10],
+                len(self_healable), sorted(self_healable)[:10],
+            )
+        if blocked_upstream:
+            parked = {
+                doc_id
+                for doc_id in blocked_upstream
+                if int(updated_ledger["docs"][doc_id].get("blocked_attempts", 0))
+                >= _DEGRADED_MAX_BLOCKED_ATTEMPTS
+            }
+            logger.error(
+                "%d docs blocked on unchanged upstream provider-error artifacts; "
+                "%d parked at terminal cap, source replacement required: %s",
+                len(blocked_upstream),
+                len(parked),
+                sorted(blocked_upstream)[:10],
+            )
+            _RUNTIME.setdefault("_warnings", []).append(
+                f"blocked_upstream_docs:{len(blocked_upstream)}"
             )
 
     # An outage inside a run must be visible in the run summary, not only by
