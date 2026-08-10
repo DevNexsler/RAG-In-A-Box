@@ -1,5 +1,6 @@
 import io
 import logging
+import random
 
 import httpx
 import pytest
@@ -47,6 +48,54 @@ def test_retries_transient_then_succeeds():
     assert out == "ok"
     assert calls["n"] == 3
     assert slept == [0.1, 0.2]          # backed off before retries 2 and 3
+
+
+def test_rate_limit_honors_retry_after_seconds():
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/embeddings")
+    resp = httpx.Response(429, headers={"Retry-After": "37"}, request=req)
+    rate_limit = httpx.HTTPStatusError(
+        "429 Too Many Requests", request=req, response=resp,
+    )
+    calls = {"n": 0}
+    slept = []
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise rate_limit
+        return "ok"
+
+    assert call_with_retry(
+        fn, attempts=2, backoff=(2.0,), sleep=slept.append,
+    ) == "ok"
+    assert slept == [37.0]
+
+
+def test_rate_limit_without_retry_after_uses_exponential_backoff_with_jitter(
+    monkeypatch,
+):
+    rate_limit = _http_status(429)
+    calls = {"n": 0}
+    slept = []
+    jitter_bounds = []
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise rate_limit
+        return "ok"
+
+    def fixed_jitter(lower, upper):
+        jitter_bounds.append((lower, upper))
+        return upper
+
+    monkeypatch.setattr(random, "uniform", fixed_jitter)
+
+    assert call_with_retry(
+        fn, attempts=3, backoff=(2.0, 5.0), sleep=slept.append,
+    ) == "ok"
+    assert jitter_bounds == [(0.0, 0.5), (0.0, 1.0)]
+    assert slept == [2.5, 5.0]
 
 
 def test_permanent_failure_not_retried():

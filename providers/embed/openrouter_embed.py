@@ -15,7 +15,7 @@ import os
 
 import httpx
 
-from core.resilience import TransientError, call_with_retry
+from core.resilience import RateLimitError, TransientError, call_with_retry
 from providers.embed.base import EmbedProvider
 from providers.embed.limits import bound_inputs, resolve_max_input_tokens
 
@@ -98,7 +98,11 @@ class OpenRouterEmbedProvider(EmbedProvider):
                 err = data.get("error") or {}
                 code = err.get("code")
                 message = str(err.get("message", data))[:300]
-                if code == 429 or (isinstance(code, int) and 500 <= code < 600):
+                if code == 429:
+                    raise RateLimitError(
+                        f"OpenRouter upstream {code} in 200 body: {message}"
+                    )
+                if isinstance(code, int) and 500 <= code < 600:
                     raise TransientError(f"OpenRouter upstream {code} in 200 body: {message}")
                 raise RuntimeError(f"OpenRouter embeddings error {code}: {message}")
             results = sorted(data["data"], key=lambda x: x["index"])
