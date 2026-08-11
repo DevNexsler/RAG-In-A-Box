@@ -85,6 +85,9 @@ _COMPACTION_MARKER_SUFFIX = ".last-compaction"
 _PROCESS_DOCUMENT_LOCKS: dict[str, threading.RLock] = {}
 _PROCESS_DOCUMENT_LOCKS_GUARD = threading.Lock()
 _SCHEMA_EVOLUTION_MAX_ROW_DIVISOR = 8
+_SCHEMA_EVOLUTION_MAX_WRITE_CHUNK_DIVISOR = 64
+_SCHEMA_EVOLUTION_SCAN_ROWS = 256
+_SCHEMA_EVOLUTION_RSS_SAFETY_PERCENT = 10
 
 
 def _cgroup_memory_limit_bytes(
@@ -802,8 +805,8 @@ class LanceDBStore:
     def _evolve_metadata_schema(self, new_fields: set[str]) -> None:
         """Add new string sub-fields to the metadata struct column.
 
-        Streams cgroup-sized Arrow batches, reconstructs each metadata struct,
-        and atomically replaces the table without whole-table materialization.
+        Writes cgroup-sized Arrow chunks, reconstructs each metadata struct,
+        and atomically replaces the table without whole-table buffering.
         """
         import lancedb as ldb
 
@@ -840,20 +843,28 @@ class LanceDBStore:
                 "memory_limit_bytes": memory_limit_bytes,
             },
         )
+        max_write_chunk_bytes = max(
+            1,
+            memory_limit_bytes // _SCHEMA_EVOLUTION_MAX_WRITE_CHUNK_DIVISOR,
+        )
         max_row_bytes = max(
             1,
             memory_limit_bytes // _SCHEMA_EVOLUTION_MAX_ROW_DIVISOR,
         )
         logger.info(
-            "Streaming Lance metadata schema rewrite one row at a time; "
-            "max_row_bytes=%d",
+            "Writing Lance metadata schema rewrite in bounded chunks; "
+            "max_write_chunk_bytes=%d max_row_bytes=%d",
+            max_write_chunk_bytes,
             max_row_bytes,
-            extra={"max_row_bytes": max_row_bytes},
+            extra={
+                "max_write_chunk_bytes": max_write_chunk_bytes,
+                "max_row_bytes": max_row_bytes,
+            },
         )
 
         def _widened_batches():
             for batch in dataset.to_batches(
-                batch_size=1,
+                batch_size=_SCHEMA_EVOLUTION_SCAN_ROWS,
                 batch_readahead=1,
                 fragment_readahead=1,
                 scan_in_order=True,
@@ -871,13 +882,24 @@ class LanceDBStore:
                     widened_metadata_field,
                     widened_metadata,
                 )
-                if widened_batch.nbytes > max_row_bytes:
-                    raise MemoryError(
-                        "Cannot widen Lance metadata schema: single row requires "
-                        f"{widened_batch.nbytes} Arrow bytes, exceeding the "
-                        f"cgroup-derived {max_row_bytes}-byte envelope"
+                pending = [widened_batch]
+                while pending:
+                    write_batch = pending.pop()
+                    if write_batch.nbytes <= max_write_chunk_bytes:
+                        yield write_batch
+                        continue
+                    if write_batch.num_rows == 1:
+                        raise RuntimeError(
+                            "Cannot widen Lance metadata schema: single row requires "
+                            f"{write_batch.nbytes} Arrow bytes, exceeding the "
+                            f"cgroup-derived {min(max_row_bytes, max_write_chunk_bytes)}-byte "
+                            "write chunk"
+                        )
+                    midpoint = write_batch.num_rows // 2
+                    pending.append(
+                        write_batch.slice(midpoint, write_batch.num_rows - midpoint)
                     )
-                yield widened_batch
+                    pending.append(write_batch.slice(0, midpoint))
 
         db = ldb.connect(self.index_root)
         temp_name = f"{self.table_name}__schema_tmp"
@@ -904,11 +926,92 @@ class LanceDBStore:
         backup_created = False
         try:
             try:
-                reader = pa.RecordBatchReader.from_batches(
-                    widened_schema,
-                    _widened_batches(),
+                page_size = os.sysconf("SC_PAGE_SIZE")
+
+                def _rss_bytes() -> int:
+                    resident_pages = int(
+                        Path("/proc/self/statm").read_text().split()[1]
+                    )
+                    return resident_pages * page_size
+
+                baseline_rss_bytes = _rss_bytes()
+                max_rss_delta_bytes = (
+                    max(
+                        1,
+                        (memory_limit_bytes - baseline_rss_bytes)
+                        * (100 - _SCHEMA_EVOLUTION_RSS_SAFETY_PERCENT)
+                        // 100,
+                    )
+                    if baseline_rss_bytes < memory_limit_bytes
+                    else None
                 )
-                db.create_table(temp_name, reader, schema=widened_schema)
+                peak_rss_bytes = baseline_rss_bytes
+                stop_rss_sampler = threading.Event()
+
+                def _sample_rss() -> None:
+                    nonlocal peak_rss_bytes
+                    while not stop_rss_sampler.wait(0.02):
+                        try:
+                            peak_rss_bytes = max(peak_rss_bytes, _rss_bytes())
+                        except (OSError, ValueError, IndexError):
+                            logger.warning(
+                                "Could not sample RSS during metadata schema evolution",
+                                exc_info=True,
+                            )
+                            return
+
+                rss_sampler = threading.Thread(
+                    target=_sample_rss,
+                    name="schema-evolution-rss",
+                    daemon=True,
+                )
+                rss_sampler.start()
+                temp_table = None
+                batches_written = 0
+                try:
+                    for widened_batch in _widened_batches():
+                        if temp_table is None:
+                            temp_table = db.create_table(
+                                temp_name,
+                                widened_batch,
+                                schema=widened_schema,
+                            )
+                        else:
+                            temp_table.add(widened_batch)
+                        batches_written += 1
+                        peak_rss_bytes = max(peak_rss_bytes, _rss_bytes())
+                        rss_delta_bytes = peak_rss_bytes - baseline_rss_bytes
+                        if (
+                            max_rss_delta_bytes is not None
+                            and rss_delta_bytes > max_rss_delta_bytes
+                        ):
+                            raise MemoryError(
+                                "Cannot widen Lance metadata schema: observed RSS delta "
+                                f"{rss_delta_bytes} bytes exceeds cgroup-headroom budget "
+                                f"{max_rss_delta_bytes} bytes"
+                            )
+                    if temp_table is None:
+                        db.create_table(temp_name, schema=widened_schema)
+                finally:
+                    stop_rss_sampler.set()
+                    rss_sampler.join(timeout=1)
+
+                peak_rss_bytes = max(peak_rss_bytes, _rss_bytes())
+                logger.info(
+                    "Wrote bounded Lance metadata schema rewrite: batches=%d "
+                    "baseline_rss_bytes=%d peak_rss_bytes=%d rss_delta_bytes=%d",
+                    batches_written,
+                    baseline_rss_bytes,
+                    peak_rss_bytes,
+                    peak_rss_bytes - baseline_rss_bytes,
+                    extra={
+                        "batches_written": batches_written,
+                        "baseline_rss_bytes": baseline_rss_bytes,
+                        "peak_rss_bytes": peak_rss_bytes,
+                        "rss_delta_bytes": peak_rss_bytes - baseline_rss_bytes,
+                        "max_rss_delta_bytes": max_rss_delta_bytes,
+                    },
+                )
             except Exception:
                 if temp_path.exists():
                     shutil.rmtree(temp_path)
