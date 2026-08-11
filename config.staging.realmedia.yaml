@@ -52,6 +52,42 @@ sources:
         mtime_column: updated_at
         metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, sent_at, direction]
 
+      - source_type: sor_unit
+        query: |
+          SELECT bu.id, COALESCE(bu.updated_at, bu.created_at) AS _mtime,
+                 unit_title.title
+                 || COALESCE(E'\nBed: ' || bu."Bed"::text, '') || COALESCE(' Bath: ' || bu."Bath"::text, '')
+                 || COALESCE(E'\n\n' || bu."Description", '')
+                 || E'\nStatus: ' || COALESCE(bu."Status", '') AS _text,
+                 unit_title.title, bu."Unit" AS unit, bu."Status" AS status,
+                 b."Nick_Name" AS building
+          FROM "Building Units" bu
+          LEFT JOIN "Buildings" b ON b.id = bu."Buildings_id"
+          CROSS JOIN LATERAL (
+            SELECT regexp_replace(btrim(COALESCE(b."Nick_Name", '')), '[[:space:]]+', ' ', 'g') AS building,
+                   regexp_replace(btrim(COALESCE(bu."Unit", '')), '[[:space:]]+', ' ', 'g') AS unit
+          ) normalized
+          CROSS JOIN LATERAL (
+            SELECT btrim(CASE
+              WHEN normalized.building = '' AND normalized.unit = '' THEN 'Unit'
+              WHEN normalized.building = '' THEN
+                CASE WHEN normalized.unit ~* '^unit($|[[:space:]])'
+                     THEN normalized.unit ELSE 'Unit ' || normalized.unit END
+              WHEN normalized.unit = '' THEN normalized.building
+              WHEN normalized.building ~* '(^|[[:space:]])unit$' THEN
+                normalized.building || ' ' || regexp_replace(
+                  normalized.unit, '^unit[[:space:]]*', '', 'i'
+                )
+              WHEN normalized.unit ~* '^unit($|[[:space:]])' THEN
+                normalized.building || ' ' || normalized.unit
+              ELSE normalized.building || ' Unit ' || normalized.unit
+            END) AS title
+          ) unit_title
+        id_template: "unit/{id}"
+        text_column: _text
+        mtime_column: _mtime
+        metadata_columns: [title, unit, status, building]
+
 pdf:
   strategy: "text_then_ocr"
   ocr_page_limit: 20
