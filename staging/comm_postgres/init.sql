@@ -47,3 +47,35 @@ VALUES
     ('sms',   'msg-005', 'field',   'Erin Walsh',   'inbound',
      'Crew reached the periwinkle substation, inspection starts at noon.',
      '2026-06-01T10:04:00Z', '2026-06-01T10:04:00Z');
+
+CREATE TABLE "Buildings" (
+    id               integer PRIMARY KEY,
+    "Nick_Name"      text,
+    created_at        timestamptz NOT NULL,
+    updated_at        timestamptz
+);
+
+CREATE TABLE "Building Units" (
+    id               integer PRIMARY KEY,
+    "Buildings_id"   integer REFERENCES "Buildings" (id),
+    "Unit"           text,
+    "Bed"            numeric,
+    "Bath"           numeric,
+    "Description"    text,
+    "Status"         text,
+    created_at        timestamptz NOT NULL,
+    updated_at        timestamptz
+);
+
+INSERT INTO "Buildings" (id, "Nick_Name", created_at, updated_at)
+VALUES
+    (1, '  South   Main Apartments Unit  ', '2026-06-01T09:00:00Z', '2026-06-01T09:00:00Z'),
+    (2, '125 S 13TH STREET LLC',          '2026-06-01T09:00:00Z', '2026-06-01T09:00:00Z');
+
+INSERT INTO "Building Units"
+    (id, "Buildings_id", "Unit", "Bed", "Bath", "Description", "Status", created_at, updated_at)
+VALUES
+    (104, 1, ' Unit   5 ', 2, 1, 'South Main staging unit.', 'Occupied',
+     '2026-06-01T09:00:00Z', '2026-06-01T09:00:00Z'),
+    (105, 2, 'B',          1, 1, '13th Street staging unit.', 'Vacant',
+     '2026-06-01T09:00:00Z', '2026-06-01T09:00:00Z');
