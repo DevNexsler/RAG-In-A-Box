@@ -1,12 +1,38 @@
 """SOR (postgres comm-store) tool surface: schema, guarded queries, and the
 postgres-source → index sweep path."""
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
 pytestmark = pytest.mark.anyio
 
 _COMM_LOOKUP_BUDGET = 3000
+_ROOT = Path(__file__).resolve().parents[2]
+_COMPOSE_FILE = _ROOT / "docker-compose.staging.yml"
+
+
+def _raw_lance_row(doc_id: str) -> dict:
+    script = (
+        "import json,sys; from lancedb_store import LanceDBStore; "
+        "store=LanceDBStore('/data/index','chunks'); "
+        "rows=store._vs.table.search(None).where("
+        "f\"doc_id = '{sys.argv[1]}'\",prefilter=True)"
+        ".select(['doc_id','text','metadata']).limit(1).to_list(); "
+        "print(json.dumps(rows[0] if rows else {},default=str))"
+    )
+    completed = subprocess.run(
+        [
+            "docker", "compose", "-f", str(_COMPOSE_FILE), "exec", "-T",
+            "doc-organizer-staging", "python", "-c", script, doc_id,
+        ],
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
 
 
 async def test_sor_schema_lists_messages_table(mcp_session):
@@ -58,6 +84,19 @@ async def test_sor_sweep_indexed_messages_searchable(indexed_corpus, mcp_session
     assert "periwinkle" in (top.get("snippet") or "").lower(), top
     assert top.get("direction") == "inbound", top
     assert top.get("sender") == "Erin Walsh", top
+
+
+def test_sor_unit_title_reaches_raw_lance_metadata_and_chunk_header(indexed_corpus):
+    expected_titles = {
+        "sor::unit/104": "South Main Apartments Unit 5",
+        "sor::unit/105": "125 S 13TH STREET LLC Unit B",
+    }
+
+    for doc_id, expected_title in expected_titles.items():
+        row = _raw_lance_row(doc_id)
+        assert row, f"no Lance row for {doc_id}"
+        assert row["metadata"]["title"] == expected_title
+        assert f"[Document: {expected_title}" in row["text"]
 
 
 async def test_comm_lookup_finds_seeded_message_compactly(indexed_corpus, mcp_session):

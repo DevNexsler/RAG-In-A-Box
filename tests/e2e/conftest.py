@@ -27,8 +27,8 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures" / "e2e"
 COMPOSE_FILE = ROOT / "docker-compose.staging.yml"
 
-# 5 uploaded files + 5 seeded sor messages
-EXPECTED_CORPUS_DOCS = 10
+# 5 uploaded files + 5 seeded messages + 2 seeded SOR units
+EXPECTED_CORPUS_DOCS = 12
 INDEX_TIMEOUT_S = 180
 POLL_INTERVAL_S = 3
 

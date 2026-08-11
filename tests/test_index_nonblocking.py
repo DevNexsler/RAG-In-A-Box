@@ -149,11 +149,13 @@ def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
     pid_file.write_text(str(dummy.pid))
 
     try:
-        result = mcp_server._file_index_update_impl("config.yaml")
+        with patch("subprocess.Popen") as popen:
+            result = mcp_server._file_index_update_impl("config.yaml")
         assert result.get("status") == "already_running", (
             f"Expected 'already_running' while a subprocess is alive, got {result!r}"
         )
         assert result.get("pid") == dummy.pid
+        popen.assert_not_called()
     finally:
         dummy.terminate()
         dummy.wait()
