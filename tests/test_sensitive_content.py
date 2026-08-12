@@ -113,6 +113,10 @@ def test_authorization_credentials_are_still_redacted():
         "authorization: dXNlcjpwYXNzd29yZDEyMzQ1Njc4",
         "Header was Basic dXNlcjpwYXNzd29yZDEyMw== when it failed.",
         "retry with bearer 4f7c1b9e2a8d6c0e5b3a9f1d7e2c",
+        # Digit-free base64: caught by the mixed-case branch, not by a digit.
+        "sent Basic dXNlcjpwYXNzd29yZA==",
+        "sent Basic dXNlcnBhc3N3b3JkYWJjZGVm",
+        "Proxy-Authorization: Basic abcdefghijklmnopqrst",
     ]
     for text in cases:
         redacted = redact_sensitive_text(text)

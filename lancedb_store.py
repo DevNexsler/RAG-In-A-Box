@@ -321,12 +321,109 @@ def _duplicate_natural_key(duplicate_ref: dict[str, Any]) -> str:
     return doc_id.split("::", 1)[1].strip()
 
 
+def _lance_row_count(table_path: Path) -> int | None:
+    """Row count of a Lance table directory, or None if it cannot be read."""
+    try:
+        import lance
+
+        return lance.dataset(str(table_path)).count_rows()
+    except Exception:
+        return None
+
+
+@contextmanager
+def schema_swap_lock(
+    index_root: str | Path, table_name: str, *, blocking: bool = True
+):
+    """Cross-process lock held across the two renames that install a new schema.
+
+    Yields True when the lock is held. A non-blocking caller that yields False
+    knows another process is mid-swap right now, which is what distinguishes a
+    live swap from an abandoned one: the kernel drops the lock when the holder
+    dies, mtimes cannot tell those apart, and a container can restart faster
+    than any age threshold worth using.
+    """
+    lock_root = Path(index_root) / ".lancedb-write-locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_file = (lock_root / f"{table_name}-schema-swap.lock").open("a+")
+    flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), flags)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+def restore_interrupted_schema_swap(
+    index_root: str | Path, table_name: str = "chunks"
+) -> bool:
+    """Put the original table back when a metadata widening died mid-swap.
+
+    `_evolve_metadata_schema` installs the widened copy with two renames:
+    `<table>` -> `<table>__schema_backup`, then `<table>__schema_tmp` ->
+    `<table>`. A process death between them leaves no active table at all, and
+    simply opening the store then serves an uninitialized table — while the next
+    widening drops the backup as stale, which would turn a sub-millisecond crash
+    window into permanent data loss. Restoring the original is always the safe
+    move: the new metadata field is still absent, so the migration just runs
+    again (measured at 8.6 s / 498 MiB on the live table).
+    """
+    root = Path(index_root)
+    backup_path = root / f"{table_name}__schema_backup.lance"
+    if not backup_path.exists():
+        return False
+    with schema_swap_lock(root, table_name, blocking=False) as acquired:
+        if not acquired:
+            return False
+        table_path = root / f"{table_name}.lance"
+        temp_path = root / f"{table_name}__schema_tmp.lance"
+        if not backup_path.exists():
+            return False
+        backup_rows = _lance_row_count(backup_path)
+        if not backup_rows:
+            return False
+        if table_path.exists():
+            # An empty active table beside a populated backup is the same
+            # accident seen one restart later: the swap died and something then
+            # created a fresh empty table over the gap.
+            if _lance_row_count(table_path):
+                return False
+            logger.error(
+                "Active %s.lance holds no rows while %s.lance holds %d: restoring "
+                "the backup left by an interrupted metadata schema swap",
+                table_name,
+                backup_path.stem,
+                backup_rows,
+            )
+            shutil.rmtree(table_path)
+        else:
+            logger.error(
+                "No active %s.lance but %s.lance holds %d rows: restoring the "
+                "backup left by an interrupted metadata schema swap",
+                table_name,
+                backup_path.stem,
+                backup_rows,
+            )
+        shutil.move(str(backup_path), str(table_path))
+        if temp_path.exists():
+            shutil.rmtree(temp_path)
+        return True
+
+
 class LanceDBStore:
     """Implements StorageInterface using LlamaIndex's LanceDBVectorStore."""
 
     def __init__(self, index_root: str | Path, table_name: str = "chunks") -> None:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
+        restore_interrupted_schema_swap(self.index_root, self.table_name)
         self._schema_lock = _SchemaEvolutionRWLock()
         self._completed_insert_doc_ids: set[str] = set()
         self._exclusive_writer_depth = 0
@@ -1017,9 +1114,13 @@ class LanceDBStore:
                     shutil.rmtree(temp_path)
                 raise
 
-            shutil.move(str(table_path), str(backup_path))
-            backup_created = True
-            shutil.move(str(temp_path), str(table_path))
+            # Held across both renames so a concurrently opening store cannot
+            # mistake the gap between them for an abandoned swap and restore the
+            # backup out from under us.
+            with schema_swap_lock(self.index_root, self.table_name):
+                shutil.move(str(table_path), str(backup_path))
+                backup_created = True
+                shutil.move(str(temp_path), str(table_path))
         except Exception:
             if backup_created and not table_path.exists() and backup_path.exists():
                 try:
