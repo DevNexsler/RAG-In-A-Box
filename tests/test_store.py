@@ -723,17 +723,35 @@ def test_search_hit_preserves_importance_fields():
 
 
 def test_schema_evolution_create_failure_preserves_existing_table(monkeypatch):
-    """A failed schema evolution must not drop the existing table."""
+    """A mid-write schema failure must preserve the table and clean work paths."""
     import lancedb
 
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
         vec = [0.1] * 768
-        store.upsert_nodes([
-            _make_node_with_meta("a.md", "c:0", "alpha", vec)
-        ])
+        store.upsert_nodes(
+            [
+                _make_node_with_meta(
+                    f"seed-{index}.md",
+                    "c:0",
+                    f"alpha {index}",
+                    vec,
+                )
+                for index in range(300)
+            ]
+        )
 
         real_connect = lancedb.connect
+
+        class FailingAddTable:
+            def __init__(self, table):
+                self._table = table
+
+            def __getattr__(self, name):
+                return getattr(self._table, name)
+
+            def add(self, *args, **kwargs):
+                raise RuntimeError("chunk add failed")
 
         class FailingCreateDB:
             def __init__(self, db):
@@ -743,20 +761,20 @@ def test_schema_evolution_create_failure_preserves_existing_table(monkeypatch):
                 return getattr(self._db, name)
 
             def create_table(self, *args, **kwargs):
-                (Path(tmpdir) / "test_chunks__schema_tmp.lance").mkdir()
-                raise RuntimeError("create_table failed")
+                return FailingAddTable(self._db.create_table(*args, **kwargs))
 
         monkeypatch.setattr(lancedb, "connect", lambda uri: FailingCreateDB(real_connect(uri)))
 
-        with pytest.raises(RuntimeError, match="create_table failed"):
+        with pytest.raises(RuntimeError, match="chunk add failed"):
             store.upsert_nodes([
                 _make_node_with_meta("b.md", "c:0", "beta", vec, section="Intro")
             ])
 
         restored = LanceDBStore(tmpdir, "test_chunks")
-        assert restored.list_doc_ids() == ["a.md"]
-        assert restored.get_chunk("a.md", "c:0").text == "alpha"
+        assert restored.count_chunks() == 300
+        assert restored.get_chunk("seed-0.md", "c:0").text == "alpha 0"
         assert not (Path(tmpdir) / "test_chunks__schema_tmp.lance").exists()
+        assert not (Path(tmpdir) / "test_chunks__schema_backup.lance").exists()
 
 
 # --- Schema evolution tests ---

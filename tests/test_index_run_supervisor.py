@@ -261,6 +261,125 @@ def test_startup_reports_crash_left_predecessor_progress_to_index_log(tmp_path):
     assert "reason=process_missing_on_reconcile" in log_path.read_text()
 
 
+def test_startup_promotes_completed_predecessor_heartbeat_to_success(tmp_path):
+    """Restart after final heartbeat must retain completed run as success."""
+    log_path = tmp_path / "indexer.log"
+    log_path.write_text("Index run completion: completion=100.0%\n")
+    active = {
+        "run_id": "run-completed-before-restart",
+        "status": "running",
+        "pid": 919191,
+        "pgid": 919191,
+        "process_starttime_ticks": 111,
+        "source_name": None,
+        "started_at": "2026-08-12T04:00:00+00:00",
+        "peak_rss_bytes": 1234,
+        "log_path": str(log_path),
+    }
+    (tmp_path / "index_run_state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "current": active,
+                "last_attempt": active,
+                "last_success": None,
+            }
+        )
+    )
+    (tmp_path / "indexer.heartbeat").write_text(
+        json.dumps(
+            {
+                "run_id": "run-completed-before-restart",
+                "updated_at": "2026-08-12T04:19:51.135622+00:00",
+                "phase": "completed",
+                "queued": 95,
+                "processed": 95,
+                "skipped": 12,
+            }
+        )
+    )
+
+    from index_run_supervisor import IndexRunSupervisor
+
+    supervisor = IndexRunSupervisor(
+        tmp_path,
+        pid_alive=lambda _pid: False,
+        process_matches=lambda _pid: True,
+        monitor_interval=0.01,
+    )
+
+    summary = supervisor.status_summary()
+    terminal = summary["last_attempt"]
+    assert terminal["status"] == "succeeded"
+    assert terminal["terminal_reason"] == "completed_heartbeat_on_reconcile"
+    assert terminal["queued"] == 95
+    assert terminal["processed"] == 95
+    assert terminal["skipped"] == 12
+    assert terminal["last_heartbeat_at"] == "2026-08-12T04:19:51.135622+00:00"
+    assert summary["last_success"] == terminal
+    assert summary["unresolved_failure"] is False
+    assert "ended without completion" not in log_path.read_text()
+
+
+def test_startup_does_not_promote_unproven_completion_heartbeats(tmp_path):
+    """Only same-run, current, complete queue evidence can prove success."""
+    valid = {
+        "run_id": "run-under-test",
+        "updated_at": "2026-08-12T04:19:51.135622+00:00",
+        "phase": "completed",
+        "queued": 10,
+        "processed": 10,
+        "skipped": 1,
+    }
+    cases = {
+        "running": {**valid, "phase": "process"},
+        "partial": {**valid, "processed": 9},
+        "stale": {**valid, "updated_at": "2026-08-12T03:59:59+00:00"},
+        "malformed": {**valid, "queued": True},
+        "different-run": {**valid, "run_id": "another-run"},
+    }
+
+    from index_run_supervisor import IndexRunSupervisor
+
+    for case, heartbeat in cases.items():
+        root = tmp_path / case
+        root.mkdir()
+        active = {
+            "run_id": "run-under-test",
+            "status": "running",
+            "pid": 919191,
+            "pgid": 919191,
+            "process_starttime_ticks": 111,
+            "source_name": None,
+            "started_at": "2026-08-12T04:00:00+00:00",
+            "peak_rss_bytes": 1234,
+            "log_path": str(root / "indexer.log"),
+        }
+        (root / "index_run_state.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "current": active,
+                    "last_attempt": active,
+                    "last_success": None,
+                }
+            )
+        )
+        (root / "indexer.heartbeat").write_text(json.dumps(heartbeat))
+
+        supervisor = IndexRunSupervisor(
+            root,
+            pid_alive=lambda _pid: False,
+            process_matches=lambda _pid: True,
+            monitor_interval=0.01,
+        )
+        summary = supervisor.status_summary()
+
+        assert summary["last_attempt"]["status"] == "lost", case
+        assert summary["last_success"] is None, case
+        assert summary["unresolved_failure"] is True, case
+
+
 def test_monitor_records_success_and_peak_rss_atomically(tmp_path):
     process = FakeProcess()
     samples = iter([10_000, 30_000, 20_000])
