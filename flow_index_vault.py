@@ -82,6 +82,11 @@ from core.artifacts import is_communication_sidecar
 from core.dedupe import compute_file_identity
 from core.resilience import is_transient
 from core.skip_policy import actionable_skip_docs, is_permanent_skip_entry
+from core.sensitive_content import (
+    redact_sensitive_text,
+    sanitize_metadata,
+    sanitize_sensitive_content,
+)
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
 from doc_enrichment import enrich_document, empty_enrichment
 from extractors import (
@@ -1738,6 +1743,7 @@ def _index_duplicate_delivery_context(
         getattr(source_record, "metadata", {}) if source_record is not None else {}
     )
     source_metadata = source_metadata if isinstance(source_metadata, dict) else {}
+    source_metadata, _sensitive_metadata_kinds = sanitize_metadata(source_metadata)
     provider = _RUNTIME.get("communication_context_provider")
     item = communication_item_from_record(doc, source_metadata)
     if item is None or provider is None:
@@ -2214,7 +2220,34 @@ def _process_doc_task(
         source_metadata = (
             getattr(source_record, "metadata", {}) if source_record is not None else {}
         )
-        full_text = _with_communication_caption(result.full_text, source_metadata)
+        source_metadata = source_metadata if isinstance(source_metadata, dict) else {}
+        sensitive_decision = sanitize_sensitive_content(
+            result.full_text,
+            source_type=source_type,
+            metadata=source_metadata,
+        )
+        if sensitive_decision.quarantine:
+            if store.contains_doc_id(doc_id):
+                store.delete_by_doc_ids([doc_id])
+            note_skip("sensitive_content_quarantined")
+            logger.warning(
+                "Quarantined credential-bearing message %s (categories=%s)",
+                doc_id,
+                ",".join(sensitive_decision.finding_kinds),
+            )
+            return
+        if sensitive_decision.finding_kinds:
+            logger.warning(
+                "Redacted sensitive content in %s (categories=%s)",
+                doc_id,
+                ",".join(sensitive_decision.finding_kinds),
+            )
+        source_metadata = sensitive_decision.metadata
+        sanitized_event_text = sensitive_decision.text
+        full_text = _with_communication_caption(
+            sensitive_decision.text,
+            source_metadata,
+        )
         # Strip decode-loop / padding repetition before it reaches chunking:
         # OCR "OO OO OO" loops, PDF sentence loops, marketing-mail invisible
         # padding, empty spreadsheet rows. Healthy text is untouched.
@@ -2230,6 +2263,7 @@ def _process_doc_task(
                     envelope = communication_context_provider.get_context_envelope(comm_item)
                     context_text = format_context_envelope_for_prompt(envelope)
                     context_meta = envelope_metadata(envelope)
+                    context_meta, _context_metadata_kinds = sanitize_metadata(context_meta)
                     context_span.set_attribute("before_count", len(envelope.same_channel_before))
                     context_span.set_attribute("after_count", len(envelope.same_channel_after))
                     context_span.set_attribute("has_context", bool(context_text))
@@ -2258,7 +2292,7 @@ def _process_doc_task(
             return
 
         # --- Extract document-level metadata ---
-        fm = result.frontmatter  # from Markdown frontmatter; empty dict for PDF/images
+        fm, _frontmatter_sensitive_kinds = sanitize_metadata(result.frontmatter)
         title = fm.get("title") or extract_title(full_text, doc_id)
         tags = normalize_tags(fm.get("tags"))
         folder = derive_folder(rel_path)
@@ -2405,6 +2439,7 @@ def _process_doc_task(
                 page_body = page_text.text
                 if page_text.page == 0:
                     page_body = _with_communication_caption(page_body, source_metadata)
+                page_body = redact_sensitive_text(page_body)
                 page_body = collapse_runaway_repetition(page_body)
                 raw_chunks = _split_section(
                     page_body, splitter, semantic_splitter, semantic_threshold
@@ -2557,7 +2592,7 @@ def _process_doc_task(
             source_type=source_type,
             rel_path=rel_path,
             abs_path=str(doc.get("abs_path", "")),
-            text=result.full_text,
+            text=sanitized_event_text,
             metadata=doc_meta,
             chunks=chunks,
         )

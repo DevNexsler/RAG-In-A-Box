@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from core.sensitive_content import redact_sensitive_text
+
 
 @dataclass(frozen=True)
 class CommunicationMessage:
@@ -411,7 +413,7 @@ def format_context_envelope_for_prompt(envelope: ContextEnvelope) -> str:
         if lines:
             sections.append(f"{label} MESSAGES")
             sections.extend(lines)
-    return "\n".join(sections)
+    return redact_sensitive_text("\n".join(sections))
 
 
 def envelope_metadata(envelope: ContextEnvelope) -> dict[str, str]:
