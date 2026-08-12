@@ -48,18 +48,25 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
-        # Bare "Bearer <token>" / "Basic <token>" written inline in prose. The
-        # value must carry a digit: without that, ordinary English gets redacted
-        # because "/" and "-" are token characters. Live index rows contained
-        # "Can maintenance complete the basic entry-point/conditions" and
-        # "basic bedroom/bathroom" — 47 such matches over 25 documents, every
-        # digit-free match in the corpus and not one of them a credential.
-        # Base64 and hex credentials of any real length carry digits; a
-        # digit-free Basic value is still caught by the header form above.
+        # Bare "Bearer <token>" / "Basic <token>" written inline in prose. Taking
+        # any 16+ token characters here redacts ordinary English, because "/" and
+        # "-" are token characters: live index rows contained "Can maintenance
+        # complete the basic entry-point/conditions" and "basic bedroom/bathroom"
+        # — 47 such matches over 25 documents, not one a credential. So the value
+        # must look like a token rather than words: either it carries a digit or
+        # base64 punctuation, or it is one unbroken mixed-case run.
+        #
+        # Residual gap, accepted knowingly: an all-lowercase, digit-free,
+        # separator-free value (e.g. "bearer abcdefghijklmnopq") is not matched,
+        # because that is indistinguishable from a long word. The explicit
+        # "Authorization:" form above catches it whenever the header names it,
+        # and secret_assignment catches "token=..." style.
         "authorization_header",
         re.compile(
-            r"(?i)\b(?:bearer|basic)\s+(?=[A-Za-z0-9._~+/=-]*[0-9])"
-            r"[A-Za-z0-9._~+/=-]{16,}"
+            r"(?i)\b(?:bearer|basic)\s+(?:"
+            r"(?=[A-Za-z0-9._~+/=-]*[0-9+=_])[A-Za-z0-9._~+/=-]{16,}"
+            r"|(?-i:(?=[A-Za-z]*[a-z])(?=[A-Za-z]*[A-Z])[A-Za-z]{16,})"
+            r")"
         ),
     ),
     (
