@@ -3,6 +3,7 @@ import pytest
 from core.sensitive_content import (
     REDACTION_MARKER,
     contains_sensitive_content,
+    redact_sensitive_text,
     sanitize_sensitive_content,
 )
 
@@ -85,3 +86,35 @@ def test_normal_operational_text_is_not_changed_or_flagged():
     assert decision.finding_kinds == ()
     assert decision.quarantine is False
     assert contains_sensitive_content(text) is False
+
+
+def test_prose_containing_basic_or_bearer_is_not_redacted():
+    """Real message text, taken verbatim from live index rows.
+
+    The first version of the authorization pattern matched "basic" followed by
+    16+ token characters, and "/" and "-" are token characters, so ordinary
+    maintenance and leasing language was rewritten to a redaction marker: 47
+    matches over 25 production documents, none of them credentials.
+    """
+    prose = [
+        "Can maintenance complete the basic entry-point/conditions check?",
+        "Includes basic bedroom/bathroom counts and prices.",
+        "The lead completed a basic prequalification already.",
+        "Gunther to coordinate access and a basic conditions/entry-point pass.",
+    ]
+    for text in prose:
+        assert redact_sensitive_text(text) == text, text
+        assert contains_sensitive_content(text) is False, text
+
+
+def test_authorization_credentials_are_still_redacted():
+    cases = [
+        "Authorization: Bearer sk1t0ken0value0here0abc123",
+        "authorization: dXNlcjpwYXNzd29yZDEyMzQ1Njc4",
+        "Header was Basic dXNlcjpwYXNzd29yZDEyMw== when it failed.",
+        "retry with bearer 4f7c1b9e2a8d6c0e5b3a9f1d7e2c",
+    ]
+    for text in cases:
+        redacted = redact_sensitive_text(text)
+        assert REDACTION_MARKER in redacted, text
+        assert contains_sensitive_content(text) is True, text

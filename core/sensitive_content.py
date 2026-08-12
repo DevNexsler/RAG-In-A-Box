@@ -39,8 +39,28 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
+        # Explicit header form. The key names the credential, so the value needs
+        # no further shape test.
         "authorization_header",
-        re.compile(r"(?i)\b(?:authorization\s*:\s*)?(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{16,}"),
+        re.compile(
+            r"(?i)\b(?:proxy-)?authorization\s*:\s*"
+            r"(?:bearer|basic)?\s*[A-Za-z0-9._~+/=-]{16,}"
+        ),
+    ),
+    (
+        # Bare "Bearer <token>" / "Basic <token>" written inline in prose. The
+        # value must carry a digit: without that, ordinary English gets redacted
+        # because "/" and "-" are token characters. Live index rows contained
+        # "Can maintenance complete the basic entry-point/conditions" and
+        # "basic bedroom/bathroom" — 47 such matches over 25 documents, every
+        # digit-free match in the corpus and not one of them a credential.
+        # Base64 and hex credentials of any real length carry digits; a
+        # digit-free Basic value is still caught by the header form above.
+        "authorization_header",
+        re.compile(
+            r"(?i)\b(?:bearer|basic)\s+(?=[A-Za-z0-9._~+/=-]*[0-9])"
+            r"[A-Za-z0-9._~+/=-]{16,}"
+        ),
     ),
     (
         "jwt",
