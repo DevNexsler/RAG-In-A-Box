@@ -433,6 +433,31 @@ class IndexRunSupervisor:
         terminal.update(self._read_progress(current.get("run_id")))
         return terminal
 
+    @staticmethod
+    def _completed_progress_is_current(
+        current: dict[str, Any], progress: dict[str, Any]
+    ) -> bool:
+        """Require complete, current-run evidence before inferring success."""
+        if progress.get("phase") != "completed":
+            return False
+        if not all(
+            field in progress
+            for field in ("queued", "processed", "skipped", "last_heartbeat_at")
+        ):
+            return False
+        if progress["processed"] != progress["queued"]:
+            return False
+        if progress["skipped"] > progress["processed"]:
+            return False
+        try:
+            started_at = datetime.fromisoformat(current["started_at"])
+            heartbeat_at = datetime.fromisoformat(progress["last_heartbeat_at"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if started_at.utcoffset() is None or heartbeat_at.utcoffset() is None:
+            return False
+        return heartbeat_at >= started_at
+
     def _reconcile_locked(
         self, state: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
@@ -455,6 +480,23 @@ class IndexRunSupervisor:
                 or self._lease_is_fresh(current)
             ):
                 return state, current, False
+            progress = self._read_progress(current.get("run_id"))
+            if self._completed_progress_is_current(current, progress):
+                terminal = {
+                    **copy.deepcopy(current),
+                    **progress,
+                    "status": "succeeded",
+                    "finished_at": progress["last_heartbeat_at"],
+                    "exit_code": None,
+                    "termination_signal": None,
+                    "terminal_reason": "completed_heartbeat_on_reconcile",
+                }
+                state["current"] = None
+                state["last_attempt"] = terminal
+                state["last_success"] = terminal
+                self._clear_pid_locked(current.get("pid"))
+                self._write_state_locked(state)
+                return state, None, False
             terminal = self._terminal_lost(current, identity_failure)
             state["current"] = None
             state["last_attempt"] = terminal
