@@ -121,9 +121,17 @@ The taxonomy is managed exclusively via MCP tools (`file_taxonomy_add`, `file_ta
 | `enr_suggested_folder` | string | Best folder path suggested by LLM (from taxonomy when available) |
 | `enr_importance` | string | Document importance score (0.0-1.0). LLM-generated or frontmatter override. |
 | `enr_importance_source` | string | Origin of importance value: `"llm"`, `"frontmatter"`, or `"default"` |
+| `content_status` | string | Extraction provenance: `complete` (nothing failed), `partial` (an extractor failed but content was still obtained), `missing` (an extractor failed and none of the document's own content was obtained — e.g. a vision describe timeout, so only EXIF landed) |
+| `content_failure_reasons` | string | Comma-separated extractor failure reasons behind a non-`complete` status (e.g. `ocr_describe_failed`) |
 | `vector` | float[] | Embedding vector (2560-dim for Qwen3, 768-dim for Gemini) |
 
 Metadata fields (`title`, `tags`, `status`, `created`, `description`, `author`, `keywords`, `folder`) are automatically enriched during indexing from YAML frontmatter and file path. LLM enrichment fields (prefixed `enr_`) are extracted by GPT-4.1 Mini via OpenRouter during indexing when `enrichment.enabled` is true. The `enr_` prefix avoids collisions with user frontmatter fields. All metadata is returned in search results and can be used as filters. Dynamic metadata fields from frontmatter (e.g. `priority`, `category`) are automatically promoted to LanceDB columns and appear in search results, facets, and filters. Complex `file_search` filters support `eq`, `ne`, `contains`, `prefix`, `in`, `and`, `or`, and `not` over any safe metadata field name.
+
+A document whose primary content never arrived is still indexed (its EXIF/page
+metadata remains searchable and the degraded ledger retries it), but it is
+recorded as such: `content_status` is `missing`, LLM enrichment is skipped so no
+generic filler is presented as content topics, slim search hits carry the status,
+and the run summary reports `docs_indexed_incomplete` in `index_metadata.json`.
 
 ## Event hooks
 

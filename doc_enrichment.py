@@ -235,6 +235,18 @@ _SCHEMA_PLACEHOLDER_VALUES = {
 }
 _SCHEMA_PLACEHOLDER_VALUES.update({"type1", "type2"})
 
+# Known label variants the LLM alternates between for the same classification,
+# keyed by raw enrichment field. Deduplication is generic (case-insensitive);
+# this only covers spellings that differ by more than case.
+_LABEL_ALIASES: dict[str, dict[str, str]] = {
+    "doc_type": {
+        "img": "image",
+        "images": "image",
+        "photograph": "photo",
+        "msg": "message",
+    },
+}
+
 _CONTEXT_AMBIGUITY_TERMS = (
     "ambiguous",
     "ambiguity",
@@ -396,8 +408,20 @@ def _normalize_list(value: Any) -> str:
     return str(value).strip() if value else ""
 
 
+def _canonical_label(raw_key: str, value: str) -> str:
+    """Map a known label variant to its canonical spelling.
+
+    The LLM emits the same classification under different names run to run
+    (`img` on one pass, `image` on the next), which both splits the taxonomy and
+    makes stored labels differ for an unchanged file.
+    """
+    return _LABEL_ALIASES.get(raw_key, {}).get(value.strip().lower(), value)
+
+
 def _normalize_metadata_list(raw_key: str, value: Any) -> str:
-    """Normalize list-like metadata and drop prompt/schema placeholder values."""
+    """Normalize list-like metadata: drop prompt/schema placeholder values,
+    canonicalize known label variants, and deduplicate case-insensitively
+    (first-seen spelling wins)."""
     if isinstance(value, list):
         values = [str(v).strip() for v in value if str(v).strip()]
     elif isinstance(value, str):
@@ -408,7 +432,17 @@ def _normalize_metadata_list(raw_key: str, value: Any) -> str:
         values = []
 
     values = [item for item in values if not _is_placeholder_value(raw_key, item)]
-    return ", ".join(values)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        item = _canonical_label(raw_key, item)
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return ", ".join(deduped)
 
 
 def _is_placeholder_value(raw_key: str, value: str) -> bool:
