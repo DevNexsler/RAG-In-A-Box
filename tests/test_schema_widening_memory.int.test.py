@@ -19,7 +19,16 @@ PRODUCTION_ROWS = 68_413
 PRODUCTION_VECTOR_DIM = 4_096
 PRODUCTION_METADATA_FIELDS = 102
 PRODUCTION_DATA_FILES = 1_369
-PRODUCTION_HEADROOM_BYTES = int(3.27 * 1024**3)
+# Headroom is `mem_limit` (8 GiB) minus the doc-organizer resident baseline, and
+# that baseline moves: 4.28 GiB (2026-08-08), 6.95 GiB (2026-08-06),
+# 4.727 GiB (2026-08-11), 5.263 GiB (2026-08-12) — all sampled five times with
+# the indexer idle. Budgeting against a single night's baseline is how #0926's
+# check came to pass while the defect was live, so this asserts against the
+# WORST observed baseline (6.95 GiB -> 1.05 GiB of headroom) rather than the
+# most recent one. Measured cost of the bounded writer is ~525 MiB on the host
+# and ~734 MiB inside an 8 GiB container, so a green run here means the widening
+# fits even on production's worst observed day.
+PRODUCTION_HEADROOM_BYTES = int(1.05 * 1024**3)
 NEW_FIELDS = {"content_status", "content_failure_reasons"}
 
 
