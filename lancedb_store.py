@@ -1,5 +1,6 @@
 """LanceDB storage via LlamaIndex's LanceDBVectorStore. Implements our StorageInterface."""
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -337,11 +338,15 @@ def schema_swap_lock(
 ):
     """Cross-process lock held across the two renames that install a new schema.
 
-    Yields True when the lock is held. A non-blocking caller that yields False
+    Yields True when the lock is held. A non-blocking caller that gets False
     knows another process is mid-swap right now, which is what distinguishes a
     live swap from an abandoned one: the kernel drops the lock when the holder
     dies, mtimes cannot tell those apart, and a container can restart faster
     than any age threshold worth using.
+
+    Fails closed. Only lock CONTENTION yields False, and only for a non-blocking
+    caller; every other `flock` error propagates, because a caller that treats
+    "could not lock" as "lock held" would run the critical section unprotected.
     """
     lock_root = Path(index_root) / ".lancedb-write-locks"
     lock_root.mkdir(parents=True, exist_ok=True)
@@ -350,9 +355,11 @@ def schema_swap_lock(
     try:
         try:
             fcntl.flock(lock_file.fileno(), flags)
-        except OSError:
-            yield False
-            return
+        except OSError as exc:
+            if not blocking and exc.errno in (errno.EACCES, errno.EAGAIN):
+                yield False
+                return
+            raise
         try:
             yield True
         finally:
@@ -361,49 +368,56 @@ def schema_swap_lock(
         lock_file.close()
 
 
+def _schema_swap_marker(index_root: str | Path, table_name: str) -> Path:
+    return Path(index_root) / f"{table_name}__schema_swap.json"
+
+
 def restore_interrupted_schema_swap(
     index_root: str | Path, table_name: str = "chunks"
 ) -> bool:
-    """Put the original table back when a metadata widening died mid-swap.
+    """Finish or undo a metadata widening that died around its two renames.
 
-    `_evolve_metadata_schema` installs the widened copy with two renames:
-    `<table>` -> `<table>__schema_backup`, then `<table>__schema_tmp` ->
+    `_evolve_metadata_schema` installs the widened copy with
+    `<table>` -> `<table>__schema_backup` followed by `<table>__schema_tmp` ->
     `<table>`. A process death between them leaves no active table at all, and
-    simply opening the store then serves an uninitialized table — while the next
-    widening drops the backup as stale, which would turn a sub-millisecond crash
-    window into permanent data loss. Restoring the original is always the safe
-    move: the new metadata field is still absent, so the migration just runs
-    again (measured at 8.6 s / 498 MiB on the live table).
+    the next widening then drops the backup as stale — turning a sub-millisecond
+    crash window into permanent data loss.
+
+    Acts only while the swap's own durable marker is present, which is what makes
+    this safe: a backup that outlived a completed swap cannot resurrect rows over
+    a table that was legitimately emptied later, because by then the marker is
+    gone. Never touches an existing active table's data, whatever it reports —
+    an active table that merely fails to read is a corruption case for
+    `open_store_with_recovery`, not something to replace from a backup.
+
+    Restores the ORIGINAL rather than promoting the widened copy: the new field
+    is still absent afterwards, so the migration simply runs again (measured at
+    7.9 s / 534 MB on live-payload data).
     """
     root = Path(index_root)
-    backup_path = root / f"{table_name}__schema_backup.lance"
-    if not backup_path.exists():
+    marker = _schema_swap_marker(root, table_name)
+    if not marker.exists():
         return False
     with schema_swap_lock(root, table_name, blocking=False) as acquired:
         if not acquired:
+            # A swap is between its renames right now; it will clean up itself.
+            return False
+        if not marker.exists():
             return False
         table_path = root / f"{table_name}.lance"
+        backup_path = root / f"{table_name}__schema_backup.lance"
         temp_path = root / f"{table_name}__schema_tmp.lance"
-        if not backup_path.exists():
-            return False
-        backup_rows = _lance_row_count(backup_path)
-        if not backup_rows:
-            return False
-        if table_path.exists():
-            # An empty active table beside a populated backup is the same
-            # accident seen one restart later: the swap died and something then
-            # created a fresh empty table over the gap.
-            if _lance_row_count(table_path):
+        restored = False
+        if not table_path.exists() and backup_path.exists():
+            backup_rows = _lance_row_count(backup_path)
+            if backup_rows is None:
+                logger.error(
+                    "Interrupted metadata schema swap left no active %s.lance and an "
+                    "unreadable %s.lance; leaving both in place for manual recovery",
+                    table_name,
+                    backup_path.stem,
+                )
                 return False
-            logger.error(
-                "Active %s.lance holds no rows while %s.lance holds %d: restoring "
-                "the backup left by an interrupted metadata schema swap",
-                table_name,
-                backup_path.stem,
-                backup_rows,
-            )
-            shutil.rmtree(table_path)
-        else:
             logger.error(
                 "No active %s.lance but %s.lance holds %d rows: restoring the "
                 "backup left by an interrupted metadata schema swap",
@@ -411,10 +425,22 @@ def restore_interrupted_schema_swap(
                 backup_path.stem,
                 backup_rows,
             )
-        shutil.move(str(backup_path), str(table_path))
+            shutil.move(str(backup_path), str(table_path))
+            restored = True
+        elif backup_path.exists():
+            # The second rename landed: the active table is the widened copy and
+            # only the post-swap cleanup was lost.
+            logger.warning(
+                "Removing %s.lance left behind by an interrupted metadata schema "
+                "swap; active %s.lance is intact",
+                backup_path.stem,
+                table_name,
+            )
+            shutil.rmtree(backup_path)
         if temp_path.exists():
             shutil.rmtree(temp_path)
-        return True
+        marker.unlink(missing_ok=True)
+        return restored
 
 
 class LanceDBStore:
@@ -1116,8 +1142,20 @@ class LanceDBStore:
 
             # Held across both renames so a concurrently opening store cannot
             # mistake the gap between them for an abandoned swap and restore the
-            # backup out from under us.
+            # backup out from under us. The marker is what tells a later process
+            # that a swap was in flight at all; without it, leftovers are
+            # indistinguishable from a table that was legitimately emptied.
+            marker = _schema_swap_marker(self.index_root, self.table_name)
             with schema_swap_lock(self.index_root, self.table_name):
+                marker.write_text(
+                    json.dumps(
+                        {
+                            "table": self.table_name,
+                            "pid": os.getpid(),
+                            "new_fields": sorted(new_fields),
+                        }
+                    )
+                )
                 shutil.move(str(table_path), str(backup_path))
                 backup_created = True
                 shutil.move(str(temp_path), str(table_path))
@@ -1134,6 +1172,20 @@ class LanceDBStore:
         finally:
             if temp_path.exists():
                 shutil.rmtree(temp_path)
+            # Last, and only once the table is actually back in place: while the
+            # marker exists another process may still restore, which is exactly
+            # what should happen if this one could not.
+            if table_path.exists():
+                _schema_swap_marker(self.index_root, self.table_name).unlink(
+                    missing_ok=True
+                )
+            else:
+                logger.error(
+                    "Leaving the %s schema-swap marker in place: no active "
+                    "%s.lance after the swap, so recovery must still run",
+                    self.table_name,
+                    self.table_name,
+                )
 
         # Reconnect LanceDBVectorStore to the new table
         self._vs = LanceDBVectorStore(
