@@ -2987,6 +2987,39 @@ def test_health_probe_idle_after_killed_indexer_stays_failed(tmp_path, healthy_d
     assert payload["index_run"]["latest_terminal"]["termination_signal"] == 9
 
 
+def test_health_probe_counterless_reconciled_run_is_not_a_failure(tmp_path, healthy_disk):
+    """A restart without progress evidence must not turn /health red (#1058)."""
+    import json
+
+    active = {
+        "run_id": "86daf65b4ad94b50828d76f13b60adb5",
+        "status": "running",
+        "pid": 919191,
+        "pgid": 919191,
+        "source_name": None,
+        "started_at": "2026-08-12T13:44:00+00:00",
+        "peak_rss_bytes": 99,
+    }
+    (tmp_path / "index_run_state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "current": active,
+                "last_attempt": active,
+                "last_success": None,
+            }
+        )
+    )
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["indexer"] == "idle"
+    assert payload["index_run"]["latest_terminal"]["status"] == "unknown"
+    assert payload["index_run"]["unresolved_failure"] is False
+
+
 def test_file_status_exposes_last_attempt_success_and_terminal_freshness(tmp_path):
     import json
 
