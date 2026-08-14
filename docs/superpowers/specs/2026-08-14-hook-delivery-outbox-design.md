@@ -39,7 +39,7 @@ Each `document.indexed` event gets an immutable UUID `event_id`. Per-attempt tel
 
 - Secrets remain environment-resolved at send time; never persist secret values.
 - Payload content may exist only in index-root outbox storage, which uses existing index-root access controls; delete on accepted delivery.
-- Retry capped at five automatic attempts using exponential delays of 1, 5, 30, 120, and 600 seconds. Then mark terminal `redrive_required`.
+- Five sends total: failures one through four retry after 1, 5, 30, and 120 seconds; fifth failure becomes terminal `redrive_required`.
 - `updated` and `duplicate` are accepted CDS outcomes. `no_match`, `ambiguous`, and `correlation_mismatch` are terminal redrive states; other unexpected semantic outcomes retry until cap.
 - Default generic hooks accept any 2xx unless `accepted_statuses` explicitly narrows contract.
 
