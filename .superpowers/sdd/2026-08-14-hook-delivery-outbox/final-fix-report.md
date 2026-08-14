@@ -69,3 +69,47 @@ node .gitnexus/run.cjs analyze --embeddings
 Result: failed in GitNexus embedding persistence with `Found duplicated primary key
 value :0` while creating `CodeEmbedding`. Code commit is complete; index refresh remains
 blocked by this GitNexus analyzer defect.
+
+## Final review round 2: CDS callback uniqueness
+
+Review found the prior contract used `next()`: it validated only first `cds-callback`,
+allowing a duplicate callback with missing semantic acceptance to evade the test.
+
+Impact call for existing `test_staging_cds_callbacks_require_semantic_acceptance`:
+
+```text
+mcp__gitnexus__impact({
+  repo: "/home/danpark/projects/RAG-in-a-Box/.worktrees/fix-112-hook-outbox",
+  target: "test_staging_cds_callbacks_require_semantic_acceptance",
+  file_path: "tests/test_deployment_config.py", kind: "Function",
+  direction: "upstream", includeTests: true
+})
+```
+
+Result: target unavailable because post-commit embedding index refresh is blocked; no
+HIGH/CRITICAL result returned.
+
+RED used a temporary second `cds-callback` without `accepted_statuses` in
+`config.staging.realmedia.yaml`:
+
+```bash
+pytest tests/test_deployment_config.py::test_staging_cds_callbacks_require_semantic_acceptance -q
+# 1 failed: assert 2 == 1
+```
+
+GREEN removes that temporary fixture. Test now collects all matching hooks, requires
+exactly one CDS callback in each staging config, then requires exact acceptance statuses.
+
+```bash
+pytest tests/test_deployment_config.py::test_staging_cds_callbacks_require_semantic_acceptance -q
+# 1 passed in 0.90s
+
+pytest tests/test_hook_outbox.py tests/hooks/test_dispatcher.py tests/hooks/test_events.py tests/hooks/test_delivery.py tests/test_hook_integration.py tests/test_index_scheduler.py tests/test_targeted_index.py tests/test_deployment_config.py -q
+# 95 passed in 4.12s
+
+ruff check tests/test_deployment_config.py
+# All checks passed!
+
+git diff --check
+# exit 0
+```

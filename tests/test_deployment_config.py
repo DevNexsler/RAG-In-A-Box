@@ -42,9 +42,10 @@ def test_staging_cds_callbacks_require_semantic_acceptance():
     """CDS must not treat its HTTP 200 terminal outcomes as delivery success."""
     for config_path in ("config.staging.yaml", "config.staging.realmedia.yaml"):
         config = yaml.safe_load(Path(config_path).read_text())
-        callback = next(hook for hook in config["event_hooks"]["hooks"] if hook["name"] == "cds-callback")
+        callbacks = [hook for hook in config["event_hooks"]["hooks"] if hook["name"] == "cds-callback"]
 
-        assert callback["accepted_statuses"] == ["updated", "duplicate"]
+        assert len(callbacks) == 1
+        assert callbacks[0]["accepted_statuses"] == ["updated", "duplicate"]
 
 
 def test_docker_compose_raises_doc_organizer_nofile_limit():
