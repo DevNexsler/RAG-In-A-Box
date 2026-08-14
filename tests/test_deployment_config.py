@@ -38,6 +38,15 @@ def test_staging_enrichment_exercises_production_litellm_path():
     assert enrichment["api_key"] == "sim"
 
 
+def test_staging_cds_callbacks_require_semantic_acceptance():
+    """CDS must not treat its HTTP 200 terminal outcomes as delivery success."""
+    for config_path in ("config.staging.yaml", "config.staging.realmedia.yaml"):
+        config = yaml.safe_load(Path(config_path).read_text())
+        callback = next(hook for hook in config["event_hooks"]["hooks"] if hook["name"] == "cds-callback")
+
+        assert callback["accepted_statuses"] == ["updated", "duplicate"]
+
+
 def test_docker_compose_raises_doc_organizer_nofile_limit():
     """Indexer concurrency needs a higher FD limit than Docker's default 1024."""
     compose = yaml.safe_load(Path("docker-compose.yml").read_text())

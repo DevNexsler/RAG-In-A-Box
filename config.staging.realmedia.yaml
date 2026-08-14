@@ -167,6 +167,7 @@ event_hooks:
       type: "http"
       url: "${CDS_HOOK_URL}"
       events: ["document.indexed"]
+      accepted_statuses: ["updated", "duplicate"]
       timeout_seconds: 5
 
 tracing:

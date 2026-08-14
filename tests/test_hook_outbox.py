@@ -1,3 +1,5 @@
+import sqlite3
+
 from core.hook_outbox import HookOutbox
 
 
@@ -101,8 +103,8 @@ def test_retry_uses_bounded_backoff_then_requires_redrive(tmp_path):
     assert outbox.due(limit=1, now=1_000) == []
 
 
-def test_complete_hides_terminal_delivery_and_stale_transition_is_ignored(tmp_path):
-    """Fails if completed or stale deliveries can transition again."""
+def test_complete_deletes_accepted_delivery_and_stale_transition_is_ignored(tmp_path):
+    """Fails if accepted payload remains in outbox storage."""
     outbox = HookOutbox(tmp_path)
     delivery = outbox.enqueue({"event_id": "evt-1"}, {"name": "cds"})
 
@@ -110,4 +112,6 @@ def test_complete_hides_terminal_delivery_and_stale_transition_is_ignored(tmp_pa
 
     assert completed.status == "completed"
     assert outbox.due(limit=1, now=1_000) == []
+    with sqlite3.connect(tmp_path / "hook-outbox.sqlite3") as connection:
+        assert connection.execute("SELECT event_json FROM hook_deliveries WHERE id = ?", (delivery.id,)).fetchone() is None
     assert outbox.retry(delivery, "transport_error", "timeout", now=100) is None

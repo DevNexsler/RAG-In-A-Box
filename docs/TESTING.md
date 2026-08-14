@@ -322,6 +322,7 @@ the sim sink:
 - name: "cds-callback"
   url: "${CDS_HOOK_URL}"     # unset → silently skipped (gate unaffected)
   events: ["document.indexed"]
+  accepted_statuses: ["updated", "duplicate"]
 ```
 
 The app resolves `${CDS_HOOK_URL}` from the container env at delivery time (a
@@ -336,9 +337,9 @@ docker compose -f docker-compose.staging.yml -f docker-compose.staging.cds.yml u
 # indexing any doc now POSTs document.indexed {doc_id, rel_path, metadata} to :8095
 ```
 
-The payload is unchanged (`doc_id` + `rel_path` + sanitized `metadata`,
-including `enr_*` enrichment fields) — the same event the sim sink and prod's
-comm-data-store hook already consume.
+The payload keeps `doc_id`, `rel_path`, and sanitized `metadata` (including
+`enr_*` enrichment fields), and now adds opaque UUID `event_id`. Existing
+consumers retain their fields; CDS uses `event_id` for delivery correlation.
 
 ### Hook callback redrive and disk capacity
 

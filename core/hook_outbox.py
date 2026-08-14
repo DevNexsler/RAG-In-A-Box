@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -187,7 +187,20 @@ class HookOutbox:
         return [self._delivery(row) for row in rows]
 
     def complete(self, delivery: HookDelivery) -> HookDelivery | None:
-        return self._transition(delivery, "completed", delivery.last_outcome, delivery.last_error)
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                DELETE FROM hook_deliveries
+                WHERE id = ? AND revision = ? AND status = 'pending'
+                """,
+                (delivery.id, delivery.revision),
+            )
+            connection.commit()
+        if cursor.rowcount != 1:
+            return None
+        return replace(delivery, status="completed", updated_at=now, revision=delivery.revision + 1)
 
     def retry(
         self,
