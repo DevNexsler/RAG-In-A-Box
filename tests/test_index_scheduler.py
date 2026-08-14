@@ -9,6 +9,7 @@ the interval behavior is tested without threads or real time.
 """
 
 from core.index_scheduler import IndexScheduler
+from unittest.mock import MagicMock
 
 
 def _scheduler(**overrides):
@@ -151,3 +152,25 @@ def test_scheduler_short_drain_runs_index_and_hook_queues(tmp_path, monkeypatch)
         "index_requests": {"status": "empty"},
         "hook_deliveries": {"accepted": 0},
     }
+
+
+def test_scheduler_short_drain_runs_hook_queue_when_index_queue_fails(tmp_path, monkeypatch):
+    from mcp_server import build_index_scheduler
+
+    hook_drain = MagicMock(return_value={"accepted": 1})
+    monkeypatch.setattr(
+        "flow_index_vault.drain_index_queue",
+        lambda path: (_ for _ in ()).throw(RuntimeError("index drain failed")),
+    )
+    monkeypatch.setattr("flow_index_vault.drain_hook_outbox", hook_drain)
+
+    scheduler = build_index_scheduler(
+        {"index_root": str(tmp_path), "scheduler": {"enabled": True}},
+        "test-config.yaml",
+    )
+
+    assert scheduler.tick(0)[0][1] == {
+        "index_requests": {"status": "error", "reason": "drain_failed"},
+        "hook_deliveries": {"accepted": 1},
+    }
+    hook_drain.assert_called_once_with("test-config.yaml")

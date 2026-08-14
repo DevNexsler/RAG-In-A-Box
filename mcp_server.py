@@ -2725,13 +2725,27 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
     sched_cfg = config.get("scheduler", {})
     if not sched_cfg.get("enabled", False):
         return None
+
+    def drain_queues() -> dict:
+        try:
+            index_requests = drain_index_queue(config_path)
+        except Exception:
+            logger.warning("scheduled index request drain failed")
+            index_requests = {"status": "error", "reason": "drain_failed"}
+        try:
+            hook_deliveries = drain_hook_outbox(config_path)
+        except Exception:
+            logger.warning("scheduled hook delivery drain failed")
+            hook_deliveries = {"status": "error", "reason": "drain_failed"}
+        return {
+            "index_requests": index_requests,
+            "hook_deliveries": hook_deliveries,
+        }
+
     return IndexScheduler(
         drain_interval_s=float(sched_cfg.get("drain_interval_s", 60)),
         sweep_interval_s=float(sched_cfg.get("sweep_interval_s", 3600)),
-        drain_fn=lambda: {
-            "index_requests": drain_index_queue(config_path),
-            "hook_deliveries": drain_hook_outbox(config_path),
-        },
+        drain_fn=drain_queues,
         sweep_fn=lambda: _file_index_update_impl(config_path),
         sweep_running_fn=lambda: is_indexer_running(config),
     )
