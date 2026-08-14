@@ -1,4 +1,5 @@
 import json
+from uuid import UUID
 
 from hooks.events import build_document_indexed_event
 
@@ -52,3 +53,18 @@ def test_build_document_indexed_event_drops_internal_metadata_keys():
     )
 
     assert event["metadata"] == {"enr_summary": "safe"}
+
+
+def test_document_indexed_event_has_unique_opaque_event_id():
+    event = build_document_indexed_event(
+        doc_id="documents::000hF",
+        source_name="documents",
+        source_type="img",
+        rel_path="email-attachments/photo@000hF@.jpg",
+        abs_path="/data/documents/email-attachments/photo@000hF@.jpg",
+        text="private",
+        metadata={},
+        chunks=[],
+    )
+
+    assert UUID(event["event_id"]).version == 4

@@ -5,7 +5,17 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True)
+class HookSendResult:
+    accepted: bool
+    outcome: str
+    retryable: bool
+    http_status: int | None = None
+    error: str | None = None
 
 
 def _resolve_url(hook: dict[str, Any]) -> tuple[str, bool]:
@@ -28,27 +38,34 @@ def _resolve_url(hook: dict[str, Any]) -> tuple[str, bool]:
     return raw, False
 
 
-def send_http_event(hook: dict[str, Any], event: dict[str, Any]) -> str | None:
-    """Send one event to one HTTP hook. Return warning text on failure."""
-    name = str(hook.get("name") or "unnamed")
+def send_http_event(hook: dict[str, Any], event: dict[str, Any]) -> HookSendResult:
+    """Send one event to one HTTP hook and return its safe delivery result."""
     url, env_driven = _resolve_url(hook)
     if not url:
         if env_driven:
-            return None  # env-driven callback, env var unset → deliberate no-op
-        return f"hook {name} disabled: missing url"
+            return HookSendResult(True, "disabled", False)
+        return HookSendResult(False, "configuration_error", False, error="missing url")
 
     headers = {"Content-Type": "application/json"}
     secret_env = str(hook.get("secret_env") or "").strip()
     if secret_env:
         secret = os.environ.get(secret_env)
         if not secret:
-            return f"hook {name} disabled: secret env {secret_env} is not set"
+            return HookSendResult(False, "configuration_error", False, error="missing hook secret")
         headers["X-RAG-Hook-Secret"] = secret
 
     try:
         timeout = float(hook.get("timeout_seconds") or 5)
     except (TypeError, ValueError):
-        return f"hook {name} disabled: invalid timeout_seconds {hook.get('timeout_seconds')!r}"
+        return HookSendResult(False, "configuration_error", False, error="invalid timeout")
+
+    configured_statuses = hook.get("accepted_statuses")
+    if configured_statuses is not None:
+        if not isinstance(configured_statuses, list) or not all(isinstance(status, str) and status for status in configured_statuses):
+            return HookSendResult(False, "configuration_error", False, error="invalid accepted statuses")
+        accepted_statuses = set(configured_statuses)
+    else:
+        accepted_statuses = None
 
     try:
         body = json.dumps(event, default=str).encode("utf-8")
@@ -56,7 +73,19 @@ def send_http_event(hook: dict[str, Any], event: dict[str, Any]) -> str | None:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = getattr(response, "status", 0)
             if status < 200 or status >= 300:
-                return f"hook {name} failed: HTTP {status}"
-    except Exception as exc:
-        return f"hook {name} failed: {exc}"
-    return None
+                return HookSendResult(False, "http_error", status >= 500, http_status=status, error="HTTP request failed")
+            if accepted_statuses is None:
+                return HookSendResult(True, "accepted", False, http_status=status)
+            try:
+                response_body = json.loads(response.read().decode("utf-8"))
+            except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+                return HookSendResult(False, "malformed_response", True, http_status=status, error="invalid semantic response")
+    except Exception:
+        return HookSendResult(False, "transport_error", True, error="HTTP request failed")
+
+    outcome = response_body.get("status") if isinstance(response_body, dict) else None
+    if outcome in accepted_statuses:
+        return HookSendResult(True, outcome, False, http_status=status)
+    if outcome in {"no_match", "ambiguous", "correlation_mismatch"}:
+        return HookSendResult(False, outcome, False, http_status=status)
+    return HookSendResult(False, "unexpected_semantic_status", True, http_status=status, error="unexpected semantic response")

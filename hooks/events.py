@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 INTERNAL_METADATA_KEYS = {
     "_node_content",
@@ -37,6 +38,7 @@ def build_document_indexed_event(
     """Build a serializable document.indexed event payload."""
     return {
         "event": "document.indexed",
+        "event_id": str(uuid4()),
         "version": 1,
         "occurred_at": occurred_at or datetime.now(timezone.utc).isoformat(),
         "doc_id": doc_id,

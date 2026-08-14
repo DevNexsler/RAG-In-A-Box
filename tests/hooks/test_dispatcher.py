@@ -2,7 +2,8 @@ import json
 import os
 from unittest.mock import Mock, patch
 
-from hooks.dispatcher import dispatch_event
+from hooks.dispatcher import dispatch_event, matching_hooks
+from hooks.http import HookSendResult
 
 
 def _event():
@@ -33,7 +34,7 @@ def test_dispatch_event_skips_unmatched_events():
 
 
 def test_dispatch_event_posts_json_to_http_hook():
-    sender = Mock(return_value=None)
+    sender = Mock(return_value=HookSendResult(True, "accepted", False))
     config = {"enabled": True, "hooks": [{"name": "h", "type": "http", "url": "http://hook"}]}
 
     warnings = dispatch_event(config, _event(), sender=sender)
@@ -53,11 +54,14 @@ def test_dispatch_event_returns_warning_when_sender_raises():
 
     warnings = dispatch_event(config, _event(), sender=sender)
 
-    assert warnings == ["hook h failed: sender broke"]
+    assert warnings == ["hook h failed: transport_error"]
 
 
 def test_dispatch_event_continues_after_one_hook_fails():
-    sender = Mock(side_effect=["first failed", None])
+    sender = Mock(side_effect=[
+        HookSendResult(False, "transport_error", True),
+        HookSendResult(True, "accepted", False),
+    ])
     config = {
         "enabled": True,
         "hooks": [
@@ -68,7 +72,7 @@ def test_dispatch_event_continues_after_one_hook_fails():
 
     warnings = dispatch_event(config, _event(), sender=sender)
 
-    assert warnings == ["first failed"]
+    assert warnings == ["hook first failed: transport_error"]
     assert sender.call_count == 2
 
 
@@ -95,10 +99,10 @@ def test_send_http_event_sends_json_and_secret_header():
 
     with patch.dict(os.environ, {"HOOK_SECRET": "secret-value"}):
         with patch("urllib.request.urlopen", fake_urlopen):
-            warning = send_http_event(hook, _event())
+            result = send_http_event(hook, _event())
 
     request = request_holder["request"]
-    assert warning is None
+    assert result == HookSendResult(True, "accepted", False, http_status=204)
     assert request.full_url == "http://hook"
     assert request.get_method() == "POST"
     assert request.headers["Content-type"] == "application/json"
@@ -111,37 +115,34 @@ def test_send_http_event_returns_warning_on_failure():
     from hooks.http import send_http_event
 
     with patch("urllib.request.urlopen", side_effect=OSError("boom")):
-        warning = send_http_event({"name": "h", "url": "http://hook"}, _event())
+        result = send_http_event({"name": "h", "url": "http://hook"}, _event())
 
-    assert "hook h failed" in warning
-    assert "boom" in warning
+    assert result == HookSendResult(False, "transport_error", True, error="HTTP request failed")
 
 
 def test_send_http_event_returns_warning_when_secret_missing():
     from hooks.http import send_http_event
 
     with patch.dict(os.environ, {}, clear=True):
-        warning = send_http_event({"name": "h", "url": "http://hook", "secret_env": "MISSING"}, _event())
+        result = send_http_event({"name": "h", "url": "http://hook", "secret_env": "MISSING"}, _event())
 
-    assert warning == "hook h disabled: secret env MISSING is not set"
+    assert result == HookSendResult(False, "configuration_error", False, error="missing hook secret")
 
 
 def test_send_http_event_returns_warning_for_invalid_timeout():
     from hooks.http import send_http_event
 
-    warning = send_http_event({"name": "h", "url": "http://hook", "timeout_seconds": "bad"}, _event())
+    result = send_http_event({"name": "h", "url": "http://hook", "timeout_seconds": "bad"}, _event())
 
-    assert warning == "hook h disabled: invalid timeout_seconds 'bad'"
+    assert result == HookSendResult(False, "configuration_error", False, error="invalid timeout")
 
 
 def test_send_http_event_returns_warning_for_malformed_url():
     from hooks.http import send_http_event
 
-    warning = send_http_event({"name": "h", "url": "://bad"}, _event())
+    result = send_http_event({"name": "h", "url": "://bad"}, _event())
 
-    assert warning is not None
-    assert warning.startswith("hook h failed:")
-    assert "unknown url type" in warning
+    assert result == HookSendResult(False, "transport_error", True, error="HTTP request failed")
 
 
 def test_send_http_event_resolves_env_var_url():
@@ -161,9 +162,9 @@ def test_send_http_event_resolves_env_var_url():
     hook = {"name": "cds-callback", "url": "${CDS_HOOK_URL}"}
     with patch.dict(os.environ, {"CDS_HOOK_URL": "http://host.docker.internal:8095/hooks/doc-indexed"}):
         with patch("urllib.request.urlopen", fake_urlopen):
-            warning = send_http_event(hook, _event())
+            result = send_http_event(hook, _event())
 
-    assert warning is None
+    assert result == HookSendResult(True, "accepted", False, http_status=200)
     assert request_holder["url"] == "http://host.docker.internal:8095/hooks/doc-indexed"
 
 
@@ -180,9 +181,9 @@ def test_send_http_event_env_var_url_unset_is_silent_noop():
 
     with patch.dict(os.environ, {}, clear=True):
         with patch("urllib.request.urlopen", fake_urlopen):
-            warning = send_http_event({"name": "cds-callback", "url": "${CDS_HOOK_URL}"}, _event())
+            result = send_http_event({"name": "cds-callback", "url": "${CDS_HOOK_URL}"}, _event())
 
-    assert warning is None
+    assert result == HookSendResult(True, "disabled", False)
     assert called["n"] == 0
 
 
@@ -190,6 +191,49 @@ def test_send_http_event_literal_empty_url_still_warns():
     """A genuinely missing (non-env) url is still a warning, not a silent skip."""
     from hooks.http import send_http_event
 
-    warning = send_http_event({"name": "h", "url": ""}, _event())
+    result = send_http_event({"name": "h", "url": ""}, _event())
 
-    assert warning == "hook h disabled: missing url"
+    assert result == HookSendResult(False, "configuration_error", False, error="missing url")
+
+
+def test_send_http_event_rejects_cds_no_match_even_with_http_200(monkeypatch):
+    from hooks.http import send_http_event
+
+    class Response:
+        status = 200
+
+        def read(self):
+            return b'{"status":"no_match","detail":"private document text"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("hooks.http.urllib.request.urlopen", lambda *args, **kwargs: Response())
+    result = send_http_event(
+        {"name": "cds", "url": "http://hook", "accepted_statuses": ["updated", "duplicate"]},
+        {"event": "document.indexed", "event_id": "evt-1"},
+    )
+
+    assert result.accepted is False
+    assert result.outcome == "no_match"
+    assert result.retryable is False
+    assert result.error is None
+
+
+def test_matching_hooks_returns_only_valid_matching_http_hooks():
+    config = {
+        "enabled": True,
+        "hooks": [
+            {"name": "match", "type": "http", "url": "http://match", "events": ["document.indexed"]},
+            {"name": "other-event", "type": "http", "url": "http://other", "events": ["other.event"]},
+            {"name": "other-type", "type": "queue", "url": "http://queue"},
+            "not-a-hook",
+        ],
+    }
+
+    assert matching_hooks(config, "document.indexed") == [
+        {"name": "match", "type": "http", "url": "http://match", "events": ["document.indexed"]}
+    ]
