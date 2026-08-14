@@ -1,5 +1,6 @@
 import json
 import os
+from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
 from hooks.dispatcher import dispatch_event, matching_hooks
@@ -237,3 +238,54 @@ def test_matching_hooks_returns_only_valid_matching_http_hooks():
     assert matching_hooks(config, "document.indexed") == [
         {"name": "match", "type": "http", "url": "http://match", "events": ["document.indexed"]}
     ]
+
+
+def test_send_http_event_classifies_http_errors_by_status(monkeypatch):
+    from hooks.http import send_http_event
+
+    def raise_http_error(_request, *, timeout):
+        raise HTTPError("http://hook", 404, "not found", hdrs=None, fp=None)
+
+    monkeypatch.setattr("hooks.http.urllib.request.urlopen", raise_http_error)
+
+    result = send_http_event({"name": "h", "url": "http://hook"}, _event())
+
+    assert result == HookSendResult(False, "http_error", False, http_status=404, error="HTTP request failed")
+
+
+def test_send_http_event_retries_server_http_error(monkeypatch):
+    from hooks.http import send_http_event
+
+    def raise_http_error(_request, *, timeout):
+        raise HTTPError("http://hook", 503, "unavailable", hdrs=None, fp=None)
+
+    monkeypatch.setattr("hooks.http.urllib.request.urlopen", raise_http_error)
+
+    result = send_http_event({"name": "h", "url": "http://hook"}, _event())
+
+    assert result == HookSendResult(False, "http_error", True, http_status=503, error="HTTP request failed")
+
+
+def test_send_http_event_rejects_terminal_status_even_if_configured_accepted(monkeypatch):
+    from hooks.http import send_http_event
+
+    class Response:
+        status = 200
+
+        def read(self):
+            return b'{"status":"no_match"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("hooks.http.urllib.request.urlopen", lambda *args, **kwargs: Response())
+
+    result = send_http_event(
+        {"name": "cds", "url": "http://hook", "accepted_statuses": ["no_match"]},
+        {"event": "document.indexed", "event_id": "evt-1"},
+    )
+
+    assert result == HookSendResult(False, "no_match", False, http_status=200)

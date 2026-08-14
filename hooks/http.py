@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
@@ -80,12 +81,20 @@ def send_http_event(hook: dict[str, Any], event: dict[str, Any]) -> HookSendResu
                 response_body = json.loads(response.read().decode("utf-8"))
             except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
                 return HookSendResult(False, "malformed_response", True, http_status=status, error="invalid semantic response")
+    except urllib.error.HTTPError as exc:
+        return HookSendResult(
+            False,
+            "http_error",
+            exc.code >= 500,
+            http_status=exc.code,
+            error="HTTP request failed",
+        )
     except Exception:
         return HookSendResult(False, "transport_error", True, error="HTTP request failed")
 
     outcome = response_body.get("status") if isinstance(response_body, dict) else None
-    if outcome in accepted_statuses:
-        return HookSendResult(True, outcome, False, http_status=status)
     if outcome in {"no_match", "ambiguous", "correlation_mismatch"}:
         return HookSendResult(False, outcome, False, http_status=status)
+    if outcome in accepted_statuses:
+        return HookSendResult(True, outcome, False, http_status=status)
     return HookSendResult(False, "unexpected_semantic_status", True, http_status=status, error="unexpected semantic response")
