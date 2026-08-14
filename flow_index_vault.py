@@ -113,7 +113,8 @@ from doc_id_store import (
 )
 from core.tracing import get_tracer, setup_tracing
 from memory_observer import MemoryObserver
-from hooks.dispatcher import dispatch_event
+from core.hook_outbox import HookOutbox
+from hooks.delivery import drain_due, queue_event
 from hooks.events import build_document_indexed_event
 from lancedb_store import LanceDBStore, open_store_with_recovery
 
@@ -2596,11 +2597,20 @@ def _process_doc_task(
             metadata=doc_meta,
             chunks=chunks,
         )
-        warnings = dispatch_event(config.get("event_hooks"), event)
-        if warnings:
-            _RUNTIME.setdefault("_warnings", []).extend(warnings)
-            for warning in warnings:
+        try:
+            outbox = HookOutbox(config["index_root"])
+            queue_event(config.get("event_hooks"), event, outbox)
+            outcomes = drain_due(outbox, limit=64, logger=logger)
+            pending = outcomes["retry_pending"]
+            redrive = outcomes["redrive_required"]
+            if pending or redrive:
+                warning = f"hook delivery pending={pending} redrive_required={redrive}"
+                _RUNTIME.setdefault("_warnings", []).append(warning)
                 logger.warning(warning)
+        except Exception:
+            warning = "hook delivery unavailable"
+            _RUNTIME.setdefault("_warnings", []).append(warning)
+            logger.warning(warning)
 
 
 def _bounded_executor_map(
@@ -4445,6 +4455,16 @@ def drain_index_queue(config_path: str = "config.yaml", *, limit: int | None = N
         return {"status": "drained", "drained": len(results)}
     except IndexWriteLockBusy:
         return {"status": "writer_busy", "drained": 0}
+
+
+def drain_hook_outbox(config_path: str = "config.yaml", *, limit: int | None = None) -> dict[str, int]:
+    """Drain durable hook deliveries without changing index-request state."""
+    config = load_config(config_path)
+    event_hooks = config.get("event_hooks") or {}
+    drain_limit = int(limit) if limit is not None else int(
+        event_hooks.get("scheduled_drain_limit", 64)
+    )
+    return drain_due(HookOutbox(config["index_root"]), limit=drain_limit)
 
 
 def index_document_flow(

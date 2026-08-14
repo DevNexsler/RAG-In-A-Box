@@ -2720,7 +2720,7 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
     drain_index_queue for the queue).
     """
     from core.index_scheduler import IndexScheduler
-    from flow_index_vault import drain_index_queue
+    from flow_index_vault import drain_hook_outbox, drain_index_queue
 
     sched_cfg = config.get("scheduler", {})
     if not sched_cfg.get("enabled", False):
@@ -2728,7 +2728,10 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
     return IndexScheduler(
         drain_interval_s=float(sched_cfg.get("drain_interval_s", 60)),
         sweep_interval_s=float(sched_cfg.get("sweep_interval_s", 3600)),
-        drain_fn=lambda: drain_index_queue(config_path),
+        drain_fn=lambda: {
+            "index_requests": drain_index_queue(config_path),
+            "hook_deliveries": drain_hook_outbox(config_path),
+        },
         sweep_fn=lambda: _file_index_update_impl(config_path),
         sweep_running_fn=lambda: is_indexer_running(config),
     )

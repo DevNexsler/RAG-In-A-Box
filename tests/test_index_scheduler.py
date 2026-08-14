@@ -134,3 +134,20 @@ def test_build_scheduler_enabled_uses_config_intervals():
     assert sched is not None
     assert sched.drain_interval_s == 30
     assert sched.sweep_interval_s == 900
+
+
+def test_scheduler_short_drain_runs_index_and_hook_queues(tmp_path, monkeypatch):
+    from mcp_server import build_index_scheduler
+
+    monkeypatch.setattr("flow_index_vault.drain_index_queue", lambda path: {"status": "empty"})
+    monkeypatch.setattr("flow_index_vault.drain_hook_outbox", lambda path: {"accepted": 0}, raising=False)
+
+    scheduler = build_index_scheduler(
+        {"index_root": str(tmp_path), "scheduler": {"enabled": True}},
+        "test-config.yaml",
+    )
+
+    assert scheduler.tick(0)[0][1] == {
+        "index_requests": {"status": "empty"},
+        "hook_deliveries": {"accepted": 0},
+    }

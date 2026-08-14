@@ -375,13 +375,11 @@ def test_index_document_flow_runs_real_process_doc_task_without_prefect_context(
          patch("flow_index_vault.open_store_with_recovery", return_value=store), \
          patch("flow_index_vault.build_embed_provider", return_value=embed), \
          patch("flow_index_vault.build_ocr_provider", return_value=None), \
-         patch("flow_index_vault.build_media_provider", return_value=None), \
-         patch("flow_index_vault.dispatch_event", create=True, return_value=[]) as dispatch:
+         patch("flow_index_vault.build_media_provider", return_value=None):
         result = fiv.index_document_flow(target=str(f), source_name="documents")
 
     assert result["status"] == "indexed"
     store.upsert_nodes.assert_called_once()  # embedded chunks upserted
-    dispatch.assert_called_once()  # document.indexed webhook emitted
 
 
 def test_mcp_file_index_document_impl_wraps_flow():

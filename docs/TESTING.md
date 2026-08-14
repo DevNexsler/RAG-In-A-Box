@@ -340,6 +340,23 @@ The payload is unchanged (`doc_id` + `rel_path` + sanitized `metadata`,
 including `enr_*` enrichment fields) — the same event the sim sink and prod's
 comm-data-store hook already consume.
 
+### Hook callback redrive and disk capacity
+
+`document.indexed` callbacks persist below `index_root` before delivery. A
+callback transport failure remains pending and retries on the scheduler's
+short drain interval. A CDS terminal outcome (`no_match`, `ambiguous`, or
+`correlation_mismatch`) becomes `redrive_required` after its safe outcome is
+logged.
+
+After repairing downstream correlation data, invoke existing
+`file_index_document` MCP tool with document `target`, `source_name`, and
+`force: true`. This creates a new event ID and delivery row.
+
+If index-root disk health reaches its high-water state, reclaim or add
+capacity before redriving. Do not raise the disk threshold or delete
+`hook-outbox.sqlite3` to mask pressure: accepted callbacks remove their own
+rows, while pending and terminal rows are operator evidence.
+
 **Standing seeded corpus (optional).** The gate e2e always starts from an empty
 index, but for manual / CDS testing against a persistent parallel dataset, drop
 files into `staging/fixtures/corpus/` and run `scripts/seed_staging.sh` against a

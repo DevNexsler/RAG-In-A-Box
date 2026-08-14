@@ -4,6 +4,7 @@ import pytest
 from llama_index.core.node_parser import SentenceSplitter
 
 from extractors import ExtractionResult
+from core.hook_outbox import HookOutbox
 from flow_index_vault import _RUNTIME, process_doc_task
 from sources.base import SourceRecord
 
@@ -18,7 +19,13 @@ class _FakeSource:
         return ExtractionResult.from_text(self.text)
 
 
-def _setup_runtime(store, text="OCR text from image"):
+def _setup_runtime(
+    store,
+    text="OCR text from image",
+    *,
+    index_root="/tmp/hook-integration-index",
+    event_hooks=None,
+):
     record = SourceRecord(
         doc_id="000hF",
         source_type="img",
@@ -38,7 +45,10 @@ def _setup_runtime(store, text="OCR text from image"):
             "semantic_splitter": None,
             "semantic_threshold": 0,
             "ocr_provider": None,
-            "config": {"event_hooks": {"enabled": True}},
+            "config": {
+                "index_root": str(index_root),
+                "event_hooks": event_hooks if event_hooks is not None else {"enabled": True},
+            },
             "sources_by_name": {"documents": _FakeSource(text)},
             "source_records_by_ns_doc_id": {"documents::000hF": record},
         }
@@ -58,47 +68,57 @@ def _doc():
     }
 
 
-def test_process_doc_task_dispatches_document_indexed_after_successful_upsert():
+def test_successful_upsert_keeps_failed_callback_for_later_retry(tmp_path, monkeypatch):
     store = MagicMock()
-    _setup_runtime(store)
+    _setup_runtime(
+        store,
+        index_root=tmp_path,
+        event_hooks={"enabled": True, "hooks": [{"name": "cds", "events": ["document.indexed"]}]},
+    )
+    monkeypatch.setattr(
+        "flow_index_vault.drain_due",
+        lambda outbox, **kwargs: {"accepted": 0, "retry_pending": 1, "redrive_required": 0},
+        raising=False,
+    )
 
     with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
-        with patch("flow_index_vault.dispatch_event", create=True, return_value=[]) as dispatch:
-            process_doc_task.fn(_doc())
+        process_doc_task.fn(_doc())
 
     store.upsert_nodes.assert_called_once()
-    dispatch.assert_called_once()
-    event_hooks_config, event = dispatch.call_args.args
-    assert event_hooks_config == {"enabled": True}
-    assert event["event"] == "document.indexed"
-    assert event["doc_id"] == "documents::000hF"
-    assert event["rel_path"] == "email-attachments/gunther/photo@000hF@.jpg"
-    assert event["text"] == "OCR text from image"
-    assert event["chunks"][0]["loc"] == "img:c:0"
+    assert HookOutbox(tmp_path).due(limit=1)[0].event["doc_id"] == "documents::000hF"
 
 
-def test_process_doc_task_records_hook_warnings_without_failing_index():
+def test_process_doc_task_records_safe_hook_outcomes_without_failing_index(tmp_path, monkeypatch):
     store = MagicMock()
     logger = MagicMock()
-    _setup_runtime(store)
+    _setup_runtime(store, index_root=tmp_path)
+    monkeypatch.setattr(
+        "flow_index_vault.drain_due",
+        lambda outbox, **kwargs: {"accepted": 0, "retry_pending": 1, "redrive_required": 0},
+        raising=False,
+    )
 
     with patch("flow_index_vault.get_run_logger", return_value=logger):
-        with patch("flow_index_vault.dispatch_event", create=True, return_value=["hook h failed: boom"]):
-            process_doc_task.fn(_doc())
+        process_doc_task.fn(_doc())
 
     store.upsert_nodes.assert_called_once()
-    assert _RUNTIME["_warnings"] == ["hook h failed: boom"]
-    logger.warning.assert_called_once_with("hook h failed: boom")
+    assert _RUNTIME["_warnings"] == ["hook delivery pending=1 redrive_required=0"]
+    logger.warning.assert_called_once_with("hook delivery pending=1 redrive_required=0")
 
 
-def test_process_doc_task_does_not_dispatch_when_upsert_fails():
+def test_process_doc_task_does_not_queue_when_upsert_fails(tmp_path, monkeypatch):
     store = MagicMock()
     store.upsert_nodes.side_effect = RuntimeError("upsert failed")
-    _setup_runtime(store)
+    _setup_runtime(
+        store,
+        index_root=tmp_path,
+        event_hooks={"enabled": True, "hooks": [{"name": "cds", "events": ["document.indexed"]}]},
+    )
+    queue_event = MagicMock()
+    monkeypatch.setattr("flow_index_vault.queue_event", queue_event, raising=False)
 
     with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
-        with patch("flow_index_vault.dispatch_event", create=True, return_value=[]) as dispatch:
-            with pytest.raises(RuntimeError, match="upsert failed"):
-                process_doc_task.fn(_doc())
+        with pytest.raises(RuntimeError, match="upsert failed"):
+            process_doc_task.fn(_doc())
 
-    dispatch.assert_not_called()
+    queue_event.assert_not_called()
