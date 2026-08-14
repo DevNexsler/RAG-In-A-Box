@@ -41,8 +41,49 @@ def test_outbox_does_not_persist_nested_secret_config(tmp_path):
         {"name": "cds", "headers": {"authorization": "Bearer never-store"}},
     )
 
-    assert delivery.hook == {"name": "cds", "headers": {}}
+    assert delivery.hook == {"name": "cds"}
     assert b"never-store" not in (tmp_path / "hook-outbox.sqlite3").read_bytes()
+
+
+def test_outbox_does_not_persist_header_values(tmp_path):
+    """Fails if an arbitrary header value reaches persisted hook config."""
+    delivery = HookOutbox(tmp_path).enqueue(
+        {"event_id": "evt-1"},
+        {
+            "name": "cds",
+            "url": "http://hook",
+            "headers": {"X-Signature": "header-secret"},
+        },
+    )
+
+    assert delivery.hook == {"name": "cds", "url": "http://hook"}
+    persisted = (tmp_path / "hook-outbox.sqlite3").read_bytes()
+    assert b"header-secret" not in persisted
+
+
+def test_outbox_does_not_persist_nested_secret_env_names(tmp_path, monkeypatch):
+    """Fails if a nested secret environment reference reaches persisted config."""
+    monkeypatch.setenv("NESTED_HOOK_SECRET", "environment-secret")
+    delivery = HookOutbox(tmp_path).enqueue(
+        {"event_id": "evt-1"},
+        {"name": "cds", "auth": {"secret_env": "NESTED_HOOK_SECRET"}},
+    )
+
+    assert delivery.hook == {"name": "cds"}
+    persisted = (tmp_path / "hook-outbox.sqlite3").read_bytes()
+    assert b"environment-secret" not in persisted
+    assert b"NESTED_HOOK_SECRET" not in persisted
+
+
+def test_outbox_persists_generic_error_without_secret_text(tmp_path):
+    """Fails if untrusted error text is persisted after a failed delivery."""
+    outbox = HookOutbox(tmp_path)
+    delivery = outbox.enqueue({"event_id": "evt-1"}, {"name": "cds"})
+
+    retried = outbox.retry(delivery, "transport_error", "runtime-secret", now=100)
+
+    assert retried.last_error == "delivery_error"
+    assert b"runtime-secret" not in (tmp_path / "hook-outbox.sqlite3").read_bytes()
 
 
 def test_retry_uses_bounded_backoff_then_requires_redrive(tmp_path):

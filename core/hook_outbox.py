@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 RETRY_DELAYS_SECONDS = (1, 5, 30, 120)
 _DATABASE_FILENAME = "hook-outbox.sqlite3"
 _TERMINAL_STATUSES = {"completed", "redrive_required"}
+_PERSISTED_HOOK_FIELDS = {
+    "name",
+    "type",
+    "url",
+    "events",
+    "timeout_seconds",
+    "secret_env",
+    "accepted_statuses",
+}
 
 
 @dataclass(frozen=True)
@@ -34,21 +43,34 @@ class HookDelivery:
 
 
 def _sanitize_hook(value: dict[str, Any]) -> dict[str, Any]:
-    """Keep hook config while removing material that could contain a secret."""
-    sensitive = {"secret", "password", "token", "authorization", "api_key", "apikey"}
-
-    def sanitize(item: Any) -> Any:
-        if isinstance(item, dict):
-            return {
-                str(key): sanitize(child)
-                for key, child in item.items()
-                if str(key).casefold() not in sensitive
-            }
-        if isinstance(item, list):
-            return [sanitize(child) for child in item]
-        return item
-
-    return sanitize(value)
+    """Persist only hook delivery settings that cannot carry credentials."""
+    sanitized: dict[str, Any] = {}
+    for key, item in value.items():
+        if key not in _PERSISTED_HOOK_FIELDS:
+            continue
+        if key in {"name", "type"} and isinstance(item, str):
+            sanitized[key] = item
+        elif key == "secret_env" and isinstance(item, str) and item.isidentifier():
+            sanitized[key] = item
+        elif key == "url" and isinstance(item, str):
+            if item.startswith("${") and item.endswith("}") and item[2:-1].isidentifier():
+                sanitized[key] = item
+            else:
+                parsed = urlsplit(item)
+                if (
+                    parsed.scheme in {"http", "https"}
+                    and parsed.netloc
+                    and not parsed.username
+                    and not parsed.password
+                    and not parsed.query
+                    and not parsed.fragment
+                ):
+                    sanitized[key] = item
+        elif key in {"events", "accepted_statuses"} and isinstance(item, list):
+            sanitized[key] = [entry for entry in item if isinstance(entry, str)]
+        elif key == "timeout_seconds" and isinstance(item, (int, float)) and not isinstance(item, bool):
+            sanitized[key] = item
+    return sanitized
 
 
 class HookOutbox:
@@ -116,21 +138,18 @@ class HookOutbox:
         )
 
     @staticmethod
-    def _safe_error(error: object, hook: dict[str, Any]) -> str:
-        text = str(error)
-        secret_env = str(hook.get("secret_env") or "").strip()
-        secret = os.environ.get(secret_env) if secret_env else None
-        if secret:
-            text = text.replace(secret, "[redacted]")
-        return text
+    def _safe_error(error: object) -> str:
+        """Persist no untrusted error text: it can contain a credential."""
+        _ = error
+        return "delivery_error"
 
     def enqueue(self, event: dict[str, Any], hook: dict[str, Any]) -> HookDelivery:
         event_id = str(event.get("event_id") or "").strip()
         hook_name = str(hook.get("name") or "").strip()
         if not event_id or not hook_name:
             raise ValueError("event_id and hook name must not be empty")
-        event_json = json.dumps(event, separators=(",", ":"), default=str)
-        hook_json = json.dumps(_sanitize_hook(hook), separators=(",", ":"), default=str)
+        event_json = json.dumps(event, separators=(",", ":"))
+        hook_json = json.dumps(_sanitize_hook(hook), separators=(",", ":"))
         now = time.time()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -185,7 +204,7 @@ class HookOutbox:
             delivery,
             "pending",
             outcome,
-            self._safe_error(error, delivery.hook),
+            self._safe_error(error),
             attempts=attempt,
             next_attempt_at=base + RETRY_DELAYS_SECONDS[attempt - 1],
         )
@@ -202,7 +221,7 @@ class HookOutbox:
             delivery,
             "redrive_required",
             outcome,
-            self._safe_error(error, delivery.hook),
+            self._safe_error(error),
             attempts=delivery.attempts if attempts is None else attempts,
         )
 
