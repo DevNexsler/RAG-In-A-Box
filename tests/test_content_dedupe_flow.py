@@ -695,6 +695,60 @@ def test_duplicate_callback_uses_alias_identity_and_canonical_payload(runtime, m
     assert body in event["text"]
     assert body in event["chunks"][0]["text"]
     assert event["metadata"]["enr_importance"] == "0.5"
+    assert event["metadata"]["enr_importance_source"] == "default"
+
+
+def test_duplicate_callback_payload_read_failure_does_not_fail_index(runtime, monkeypatch):
+    docs_root, store, registry = runtime
+    body = "Duplicate attachment body."
+    canonical = _make_doc(docs_root, "f/canonical.md", body, "00001")
+    duplicate = _make_doc(docs_root, "f/duplicate.md", body, "00002")
+    _register(registry, canonical)
+    _register(registry, duplicate)
+    fiv.process_doc_task.fn(canonical)
+    monkeypatch.setattr(
+        store,
+        "get_doc_chunks",
+        MagicMock(side_effect=RuntimeError("canonical read unavailable")),
+    )
+
+    fiv.process_doc_task.fn(duplicate)
+
+    assert store.contains_doc_id(canonical["doc_id"])
+    assert not store.contains_doc_id(duplicate["doc_id"])
+
+
+def test_duplicate_callback_orders_canonical_chunks_naturally(runtime):
+    docs_root, store, _ = runtime
+    store.get_doc_chunks = MagicMock(
+        return_value=[
+            SimpleNamespace(
+                loc="p:1:c:0",
+                snippet="first",
+                text="first",
+                title="Canonical",
+                status="active",
+            ),
+            SimpleNamespace(
+                loc="p:10:c:0", snippet="tenth", text="tenth", title="", status=""
+            ),
+            SimpleNamespace(
+                loc="p:2:c:0", snippet="second", text="second", title="", status=""
+            ),
+        ]
+    )
+    duplicate = _make_doc(docs_root, "f/duplicate.pdf", "body", "00002")
+    duplicate["ext"] = "pdf"
+
+    event = fiv._build_duplicate_document_indexed_event(
+        duplicate, "documents::00001"
+    )
+
+    assert [chunk["loc"] for chunk in event["chunks"]] == [
+        "p:1:c:0",
+        "p:2:c:0",
+        "p:10:c:0",
+    ]
 
 
 def test_different_content_both_index(runtime):

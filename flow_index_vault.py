@@ -1830,7 +1830,13 @@ def _build_duplicate_document_indexed_event(
 ) -> dict[str, Any] | None:
     """Build alias callback data from the canonical document's indexed payload."""
     store: LanceDBStore = _RUNTIME["store"]
-    canonical_chunks = store.get_doc_chunks(canonical_doc_id)
+    canonical_chunks = sorted(
+        store.get_doc_chunks(canonical_doc_id),
+        key=lambda chunk: tuple(
+            (1, int(part)) if part.isdigit() else (0, part.lower())
+            for part in re.split(r"(\d+)", str(chunk.loc))
+        ),
+    )
     if not canonical_chunks:
         return None
 
@@ -1850,7 +1856,7 @@ def _build_duplicate_document_indexed_event(
         "status": first_chunk.status or "active",
         "canonical_doc_id": canonical_doc_id,
     }
-    for field in ENRICHMENT_FIELDS:
+    for field in (*ENRICHMENT_FIELDS, "enr_importance_source"):
         value = getattr(first_chunk, field, "")
         if value:
             metadata[field] = value
@@ -2242,17 +2248,25 @@ def _process_doc_task(
                     except Exception as exc:
                         logger.warning("Failed to drop stale duplicate chunks for %s: %s", doc_id, exc)
                     _index_duplicate_delivery_context(doc, canonical_ns)
-                    duplicate_event = _build_duplicate_document_indexed_event(
-                        doc, canonical_ns
-                    )
-                    if duplicate_event is None:
-                        logger.warning(
-                            "Canonical payload unavailable for duplicate callback: %s -> %s",
-                            doc_id,
-                            canonical_ns,
+                    try:
+                        duplicate_event = _build_duplicate_document_indexed_event(
+                            doc, canonical_ns
                         )
+                    except Exception:
+                        warning = "duplicate callback payload unavailable"
+                        _RUNTIME.setdefault("_warnings", []).append(warning)
+                        logger.warning(warning)
                     else:
-                        _dispatch_document_indexed_event(config, duplicate_event, logger)
+                        if duplicate_event is None:
+                            logger.warning(
+                                "Canonical payload unavailable for duplicate callback: %s -> %s",
+                                doc_id,
+                                canonical_ns,
+                            )
+                        else:
+                            _dispatch_document_indexed_event(
+                                config, duplicate_event, logger
+                            )
                     if dedupe_cfg.get("update_canonical_metadata", True):
                         try:
                             refs = registry.duplicate_refs_for_canonical(winner["doc_id"])
