@@ -88,7 +88,7 @@ from core.sensitive_content import (
     sanitize_sensitive_content,
 )
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
-from doc_enrichment import enrich_document, empty_enrichment
+from doc_enrichment import ENRICHMENT_FIELDS, enrich_document, empty_enrichment
 from extractors import (
     Degradation,
     begin_degradation_capture,
@@ -1824,6 +1824,79 @@ def _index_duplicate_delivery_context(
     return True
 
 
+def _build_duplicate_document_indexed_event(
+    doc: dict,
+    canonical_doc_id: str,
+) -> dict[str, Any] | None:
+    """Build alias callback data from the canonical document's indexed payload."""
+    store: LanceDBStore = _RUNTIME["store"]
+    canonical_chunks = store.get_doc_chunks(canonical_doc_id)
+    if not canonical_chunks:
+        return None
+
+    first_chunk = canonical_chunks[0]
+    doc_id = str(doc["doc_id"])
+    rel_path = str(doc.get("rel_path") or doc_id)
+    source_type = canonical_source_type(doc.get("source_type") or doc.get("ext", ""))
+    metadata = {
+        "doc_id": doc_id,
+        "rel_path": rel_path,
+        "source_type": source_type,
+        "source_name": str(doc.get("source_name") or "documents"),
+        "mtime": float(doc.get("mtime") or 0.0),
+        "size": int(doc.get("size") or 0),
+        "title": first_chunk.title or doc_id,
+        "folder": derive_folder(rel_path),
+        "status": first_chunk.status or "active",
+        "canonical_doc_id": canonical_doc_id,
+    }
+    for field in ENRICHMENT_FIELDS:
+        value = getattr(first_chunk, field, "")
+        if value:
+            metadata[field] = value
+
+    chunks = [
+        {
+            "loc": chunk.loc,
+            "snippet": chunk.snippet,
+            "text": chunk.text,
+        }
+        for chunk in canonical_chunks
+    ]
+    return build_document_indexed_event(
+        doc_id=doc_id,
+        source_name=str(doc.get("source_name") or "documents"),
+        source_type=source_type,
+        rel_path=rel_path,
+        abs_path=str(doc.get("abs_path") or ""),
+        text="\n\n".join(chunk.text for chunk in canonical_chunks),
+        metadata=metadata,
+        chunks=chunks,
+    )
+
+
+def _dispatch_document_indexed_event(
+    config: dict,
+    event: dict[str, Any],
+    logger,
+) -> None:
+    """Persist and attempt one callback without failing the index operation."""
+    try:
+        outbox = HookOutbox(config["index_root"])
+        queue_event(config.get("event_hooks"), event, outbox)
+        outcomes = drain_due(outbox, limit=64, logger=logger)
+        pending = outcomes["retry_pending"]
+        redrive = outcomes["redrive_required"]
+        if pending or redrive:
+            warning = f"hook delivery pending={pending} redrive_required={redrive}"
+            _RUNTIME.setdefault("_warnings", []).append(warning)
+            logger.warning(warning)
+    except Exception:
+        warning = "hook delivery unavailable"
+        _RUNTIME.setdefault("_warnings", []).append(warning)
+        logger.warning(warning)
+
+
 def _retry_only_if_transient(task, task_run, state) -> bool:
     """Prefect retry gate: retry only what core.resilience calls transient.
 
@@ -2169,6 +2242,17 @@ def _process_doc_task(
                     except Exception as exc:
                         logger.warning("Failed to drop stale duplicate chunks for %s: %s", doc_id, exc)
                     _index_duplicate_delivery_context(doc, canonical_ns)
+                    duplicate_event = _build_duplicate_document_indexed_event(
+                        doc, canonical_ns
+                    )
+                    if duplicate_event is None:
+                        logger.warning(
+                            "Canonical payload unavailable for duplicate callback: %s -> %s",
+                            doc_id,
+                            canonical_ns,
+                        )
+                    else:
+                        _dispatch_document_indexed_event(config, duplicate_event, logger)
                     if dedupe_cfg.get("update_canonical_metadata", True):
                         try:
                             refs = registry.duplicate_refs_for_canonical(winner["doc_id"])
@@ -2597,20 +2681,7 @@ def _process_doc_task(
             metadata=doc_meta,
             chunks=chunks,
         )
-        try:
-            outbox = HookOutbox(config["index_root"])
-            queue_event(config.get("event_hooks"), event, outbox)
-            outcomes = drain_due(outbox, limit=64, logger=logger)
-            pending = outcomes["retry_pending"]
-            redrive = outcomes["redrive_required"]
-            if pending or redrive:
-                warning = f"hook delivery pending={pending} redrive_required={redrive}"
-                _RUNTIME.setdefault("_warnings", []).append(warning)
-                logger.warning(warning)
-        except Exception:
-            warning = "hook delivery unavailable"
-            _RUNTIME.setdefault("_warnings", []).append(warning)
-            logger.warning(warning)
+        _dispatch_document_indexed_event(config, event, logger)
 
 
 def _bounded_executor_map(

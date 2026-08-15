@@ -19,6 +19,7 @@ import blake3
 from unittest.mock import MagicMock, patch
 
 import flow_index_vault as fiv
+from core.hook_outbox import HookOutbox
 from doc_id_store import DocIDStore
 from lancedb_store import LanceDBStore
 
@@ -648,6 +649,52 @@ def test_duplicate_video_delivery_indexes_context_alias_without_media_extraction
         canonical["doc_id"],
         duplicate["doc_id"],
     }
+
+
+def test_duplicate_callback_uses_alias_identity_and_canonical_payload(runtime, monkeypatch):
+    docs_root, store, registry = runtime
+    body = "Duplicate attachment body with indexed canonical content."
+    canonical = _make_doc(docs_root, "f/canonical.md", body, "00001")
+    duplicate = _make_doc(
+        docs_root,
+        "email-attachments/quo/attachment@00002@.md",
+        body,
+        "00002",
+    )
+    _register(registry, canonical)
+    _register(registry, duplicate)
+    fiv._RUNTIME["config"].update(
+        {
+            "index_root": str(docs_root.parent / "index"),
+            "event_hooks": {
+                "enabled": True,
+                "hooks": [{"name": "cds", "events": ["document.indexed"]}],
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "flow_index_vault.drain_due",
+        lambda outbox, **kwargs: {
+            "accepted": 0,
+            "retry_pending": 1,
+            "redrive_required": 0,
+        },
+    )
+
+    fiv.process_doc_task.fn(canonical)
+    fiv.process_doc_task.fn(duplicate)
+
+    deliveries = HookOutbox(fiv._RUNTIME["config"]["index_root"]).due(limit=4)
+    event = next(
+        delivery.event
+        for delivery in deliveries
+        if delivery.event["doc_id"] == duplicate["doc_id"]
+    )
+    assert event["doc_id"] == duplicate["doc_id"]
+    assert event["rel_path"] == duplicate["rel_path"]
+    assert body in event["text"]
+    assert body in event["chunks"][0]["text"]
+    assert event["metadata"]["enr_importance"] == "0.5"
 
 
 def test_different_content_both_index(runtime):
