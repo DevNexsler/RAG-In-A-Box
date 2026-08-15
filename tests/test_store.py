@@ -912,6 +912,7 @@ def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
                 "items": [{"label": "a", "scores": [1, 2]}],
                 "large_values": ["x"],
                 "vector": [1.0, 2.0, 3.0],
+                "fixed_struct": [{"value": 7}],
             }
         ],
         schema=pa.schema(
@@ -930,6 +931,10 @@ def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
                 ),
                 pa.field("large_values", pa.large_list(pa.string())),
                 pa.field("vector", pa.list_(pa.float32(), 3)),
+                pa.field(
+                    "fixed_struct",
+                    pa.list_(pa.struct([pa.field("value", pa.int32())]), 1),
+                ),
             ]
         ),
     )

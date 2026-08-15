@@ -94,10 +94,20 @@ _SCHEMA_EVOLUTION_RSS_SAFETY_PERCENT = 10
 def _lance_field_ids_by_path(schema: Any) -> dict[tuple[str, ...], int]:
     """Return stable Lance field IDs indexed by their nested field path."""
     field_ids: dict[tuple[str, ...], int] = {}
+    paths_by_id: dict[int, tuple[str, ...]] = {}
 
     def visit(field: Any, parent_path: tuple[str, ...]) -> None:
         path = (*parent_path, field.name())
-        field_ids[path] = field.id()
+        field_id = field.id()
+        if path in field_ids:
+            raise ValueError(f"duplicate Lance field path: {path}")
+        prior_path = paths_by_id.get(field_id)
+        if prior_path is not None:
+            raise ValueError(
+                f"duplicate Lance field ID {field_id}: {prior_path} and {path}"
+            )
+        field_ids[path] = field_id
+        paths_by_id[field_id] = path
         for child in field.children():
             visit(child, path)
 
@@ -117,6 +127,8 @@ def _physical_column_paths(
         if path not in field_ids_by_path:
             raise KeyError(path)
         paths.append(path)
+        if pa.types.is_fixed_size_list(field.type):
+            return
         for index in range(field.type.num_fields):
             child = field.type.field(index)
             child_path = (*path, child.name)
