@@ -91,6 +91,45 @@ _SCHEMA_EVOLUTION_SCAN_ROWS = 256
 _SCHEMA_EVOLUTION_RSS_SAFETY_PERCENT = 10
 
 
+def _lance_field_ids_by_path(schema: Any) -> dict[tuple[str, ...], int]:
+    """Return stable Lance field IDs indexed by their nested field path."""
+    field_ids: dict[tuple[str, ...], int] = {}
+
+    def visit(field: Any, parent_path: tuple[str, ...]) -> None:
+        path = (*parent_path, field.name())
+        field_ids[path] = field.id()
+        for child in field.children():
+            visit(child, path)
+
+    for field in schema.fields():
+        visit(field, ())
+    return field_ids
+
+
+def _physical_column_paths(
+    schema: pa.Schema, field_ids_by_path: dict[tuple[str, ...], int]
+) -> list[tuple[str, ...]]:
+    """Return physical file paths represented by stable Lance field IDs."""
+    paths: list[tuple[str, ...]] = []
+
+    def visit(field: pa.Field, parent_path: tuple[str, ...]) -> None:
+        path = (*parent_path, field.name)
+        if path not in field_ids_by_path:
+            raise KeyError(path)
+        paths.append(path)
+        for index in range(field.type.num_fields):
+            child = field.type.field(index)
+            child_path = (*path, child.name)
+            if child_path in field_ids_by_path:
+                visit(child, path)
+            elif not pa.types.is_fixed_size_list(field.type):
+                raise KeyError(child_path)
+
+    for field in schema:
+        visit(field, ())
+    return paths
+
+
 def _cgroup_memory_limit_bytes(
     memory_max_path: Path | None = None,
     *,
@@ -599,6 +638,7 @@ class LanceDBStore:
         """
         import lance
         from lance import LanceOperation
+        from lance.file import LanceFileReader
         from lance.fragment import FragmentMetadata
 
         dataset_path = self._dataset_path()
@@ -611,6 +651,7 @@ class LanceDBStore:
             logger.warning("Cannot open %s to repair fragments: %s", dataset_path, exc)
             return False
 
+        field_ids_by_path = _lance_field_ids_by_path(dataset.lance_schema)
         repaired = 0
         for fragment in dataset.get_fragments():
             try:
@@ -649,17 +690,31 @@ class LanceDBStore:
                 )
                 continue
             claimed_columns = max(entry["column_indices"]) + 1
-            kept = [
-                (field_id, column_index)
-                for field_id, column_index in zip(
-                    entry["fields"], entry["column_indices"]
+            try:
+                file_schema = LanceFileReader(
+                    str(Path(dataset_path) / "data" / entry["path"])
+                ).metadata().schema
+                physical_paths = _physical_column_paths(file_schema, field_ids_by_path)
+                repaired_fields = [field_ids_by_path[path] for path in physical_paths]
+            except (KeyError, OSError, ValueError) as exc:
+                logger.warning(
+                    "Fragment %s cannot map physical columns to Lance field ids; "
+                    "not repairing: %s",
+                    fragment.fragment_id,
+                    exc,
                 )
-                # -1 marks a struct container, which occupies no column of its
-                # own; it stays so its surviving children keep their parent.
-                if column_index < actual_columns
-            ]
-            entry["fields"] = [field_id for field_id, _ in kept]
-            entry["column_indices"] = [column_index for _, column_index in kept]
+                continue
+            if len(physical_paths) != actual_columns:
+                logger.warning(
+                    "Fragment %s physical schema has %d columns; Lance reported %d; "
+                    "not repairing",
+                    fragment.fragment_id,
+                    len(physical_paths),
+                    actual_columns,
+                )
+                continue
+            entry["fields"] = repaired_fields
+            entry["column_indices"] = list(range(actual_columns))
 
             try:
                 lance.LanceDataset.commit(
