@@ -864,9 +864,11 @@ def _claim_columns_the_file_lacks(index_root: str, table_name: str = "chunks") -
     )
 
 
-def test_store_open_repairs_fragment_that_overclaims_its_columns():
+def test_store_open_repairs_fragment_that_overclaims_its_columns(monkeypatch):
     """#0771: one over-claiming fragment must not make the whole table unreadable."""
     import lance
+
+    monkeypatch.setattr(lance, "__version__", "3.0.0")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "chunks")
@@ -894,6 +896,39 @@ def test_store_open_repairs_fragment_that_overclaims_its_columns():
         # The rows were never damaged, only the claim about them: the columns
         # the file really holds must still carry their values.
         assert rows.column("text").to_pylist() == ["narrow"]
+        metadata = rows.column("metadata").combine_chunks()
+        assert metadata.field("loc").to_pylist() == ["c:0"]
+        assert metadata.field("source_type").to_pylist() == ["md"]
+
+
+def test_store_open_does_not_rewrite_lance4_overclaiming_fragment(monkeypatch):
+    """Lance 4 must leave the Lance 3 manifest repair path untouched."""
+    import lance
+
+    monkeypatch.setattr(lance, "__version__", "4.0.0")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "wide.md", "c:0", "wide", vec, **{f"k{i}": "v" for i in range(20)}
+            )
+        ])
+        store.upsert_nodes([_make_node_with_meta("narrow.md", "c:0", "narrow", vec)])
+
+        _claim_columns_the_file_lacks(tmpdir)
+
+        dataset_path = str(Path(tmpdir) / "chunks.lance")
+        before = lance.dataset(dataset_path)
+        before_version = before.version
+        before_manifest = before.get_fragments()[0].metadata.to_json()
+
+        assert store._try_repair_overclaiming_fragments() is False
+
+        after = lance.dataset(dataset_path)
+        assert after.version == before_version
+        assert after.get_fragments()[0].metadata.to_json() == before_manifest
 
 
 def test_overclaimed_file_column_count_reads_lances_reported_width():
