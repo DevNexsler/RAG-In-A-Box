@@ -894,6 +894,9 @@ def test_store_open_repairs_fragment_that_overclaims_its_columns():
         # The rows were never damaged, only the claim about them: the columns
         # the file really holds must still carry their values.
         assert rows.column("text").to_pylist() == ["narrow"]
+        metadata = rows.column("metadata").combine_chunks()
+        assert metadata.field("loc").to_pylist() == ["c:0"]
+        assert metadata.field("source_type").to_pylist() == ["md"]
 
 
 def test_overclaimed_file_column_count_reads_lances_reported_width():
