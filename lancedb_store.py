@@ -106,16 +106,24 @@ def _lance_field_ids_by_path(schema: Any) -> dict[tuple[str, ...], int]:
     return field_ids
 
 
-def _physical_column_paths(schema: pa.Schema) -> list[tuple[str, ...]]:
-    """Return Lance file columns, retaining struct containers as physical columns."""
+def _physical_column_paths(
+    schema: pa.Schema, field_ids_by_path: dict[tuple[str, ...], int]
+) -> list[tuple[str, ...]]:
+    """Return physical file paths represented by stable Lance field IDs."""
     paths: list[tuple[str, ...]] = []
 
     def visit(field: pa.Field, parent_path: tuple[str, ...]) -> None:
         path = (*parent_path, field.name)
+        if path not in field_ids_by_path:
+            raise KeyError(path)
         paths.append(path)
-        if pa.types.is_struct(field.type):
-            for child in field.type:
+        for index in range(field.type.num_fields):
+            child = field.type.field(index)
+            child_path = (*path, child.name)
+            if child_path in field_ids_by_path:
                 visit(child, path)
+            elif not pa.types.is_fixed_size_list(field.type):
+                raise KeyError(child_path)
 
     for field in schema:
         visit(field, ())
@@ -686,7 +694,7 @@ class LanceDBStore:
                 file_schema = LanceFileReader(
                     str(Path(dataset_path) / "data" / entry["path"])
                 ).metadata().schema
-                physical_paths = _physical_column_paths(file_schema)
+                physical_paths = _physical_column_paths(file_schema, field_ids_by_path)
                 repaired_fields = [field_ids_by_path[path] for path in physical_paths]
             except (KeyError, OSError, ValueError) as exc:
                 logger.warning(

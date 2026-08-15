@@ -899,6 +899,55 @@ def test_store_open_repairs_fragment_that_overclaims_its_columns():
         assert metadata.field("source_type").to_pylist() == ["md"]
 
 
+def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
+    """List children need stable IDs; a fixed-size vector child does not."""
+    import lance
+    from lance.file import LanceFileReader
+    from lancedb_store import _lance_field_ids_by_path, _physical_column_paths
+
+    table = pa.Table.from_pylist(
+        [
+            {
+                "id": "row-1",
+                "items": [{"label": "a", "scores": [1, 2]}],
+                "large_values": ["x"],
+                "vector": [1.0, 2.0, 3.0],
+            }
+        ],
+        schema=pa.schema(
+            [
+                pa.field("id", pa.string()),
+                pa.field(
+                    "items",
+                    pa.list_(
+                        pa.struct(
+                            [
+                                pa.field("label", pa.string()),
+                                pa.field("scores", pa.large_list(pa.int64())),
+                            ]
+                        )
+                    ),
+                ),
+                pa.field("large_values", pa.large_list(pa.string())),
+                pa.field("vector", pa.list_(pa.float32(), 3)),
+            ]
+        ),
+    )
+    dataset_path = tmp_path / "nested-lists.lance"
+    lance.write_dataset(table, str(dataset_path))
+    dataset = lance.dataset(str(dataset_path))
+    entry = dataset.get_fragments()[0].metadata.to_json()["files"][0]
+    file_schema = LanceFileReader(
+        str(dataset_path / "data" / entry["path"])
+    ).metadata().schema
+
+    field_ids = _lance_field_ids_by_path(dataset.lance_schema)
+    assert [
+        field_ids[path]
+        for path in _physical_column_paths(file_schema, field_ids)
+    ] == entry["fields"]
+
+
 def test_overclaimed_file_column_count_reads_lances_reported_width():
     """The repair depends on parsing the real column count out of Lance's error."""
     from lancedb_store import _overclaimed_file_column_count
