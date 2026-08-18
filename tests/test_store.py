@@ -2839,6 +2839,46 @@ def test_tag_expiry_reclaims_pinned_versions_same_run():
         assert pinned_version not in versions
 
 
+def test_index_maintenance_reclaims_orphan_index_directories():
+    """Every `_indices/<uuid>` directory the retained versions cannot reach is
+    reclaimed by the maintenance pass (#1160).
+
+    Each run's index merge writes a whole new index generation and orphans the
+    previous one, but `cleanup_old_versions` never deletes a file newer than
+    the oldest version it retains — and a daily restore-point tag deliberately
+    retains a days-old one. Production held 26 GiB of dead index copies (live
+    index: 43 MiB) because nothing swept them."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
+        store.create_fts_index()
+
+        env = {"LANCE_VERSION_RETENTION_MINUTES": "0", "LANCE_DAILY_RESTORE_POINTS": "7"}
+        for doc_id, text in (("b.md", "cherry"), ("c.md", "durian")):
+            store.upsert_nodes([
+                _make_node_with_meta(doc_id, "c:0", text, vec, source_type="md"),
+            ])
+            with patch.dict("os.environ", env):
+                store.ensure_fts_index()
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        reachable = {
+            str(segment.uuid)
+            for version in dataset.versions()
+            for index in dataset.checkout_version(version["version"]).describe_indices()
+            for segment in index.segments
+        }
+        on_disk = {
+            entry.name
+            for entry in (Path(_lance_path(tmpdir)) / "_indices").iterdir()
+        }
+        assert on_disk == reachable
+        assert len(store.keyword_search("durian", top_k=5)) == 1  # search unharmed
+
+
 def test_keyword_search_recovers_from_stale_store_handle():
     """keyword_search should reopen the table after stale file-handle errors."""
     with tempfile.TemporaryDirectory() as tmpdir:

@@ -81,6 +81,37 @@ from datetime import timedelta
 store._vs.table.optimize(cleanup_older_than=timedelta(0))   # delete ALL superseded
 ```
 
+### Orphan index directories (#1160)
+
+Version pruning is not enough on its own. Each run's index merge writes a whole
+new generation into `chunks.lance/_indices/<uuid>/` and orphans the previous
+one, but `cleanup_old_versions` **never deletes a file newer than the oldest
+version it retains** — and the daily restore-point tags (#3) deliberately
+retain a version `LANCE_DAILY_RESTORE_POINTS - 1` days old. Every orphaned
+generation was therefore pinned for the whole restore-point window: production
+reached **5,774 directories holding 26 GiB** against a 43 MiB live index.
+
+`_prune_orphan_indices` runs right after the post-expiry version prune, when
+the retained set is smallest. It collects the index-segment UUIDs every
+retained version still names and removes the `_indices/<uuid>` directories
+outside that set — the same reclaim Lance would do without its floor. Delta
+indices are separate segments under one index name, so the reachable set is
+collected per *segment*; a directory outside it cannot be opened by any
+version the dataset still has.
+
+Directories written inside the `LANCE_VERSION_RETENTION_MINUTES` band are
+skipped: an index build that has not committed its manifest yet is
+indistinguishable from an orphan, and that band is already sized to outlast
+the longest concurrent index operation. Best-effort, like the version prune.
+
+One-off reclaim on a container that predates this (or after a repair) —
+`--min-age-minutes` keeps a live writer's in-flight build safe:
+
+```bash
+docker exec doc-organizer python -m core.lance_maintenance prune-indices \
+  /data/index/chunks.lance --min-age-minutes 30
+```
+
 ## 3. Daily restore points — logical rollback (#0113)
 
 Pruning would also delete anything you might want to roll back to. Each run
@@ -147,7 +178,7 @@ docker compose start doc-organizer
 |---|---|
 | Bad data written today / botched run, index otherwise fine | Roll back to yesterday's `daily-*` tag (#3) — instant, no downtime |
 | Keyword search stale / `Incremental FTS update failed` in logs | Self-heals via full rebuild; check `/health` `fts_rebuild_failed`. See [[node-content-nesting-fts-overflow]] history |
-| Index disk ballooning | Confirm prune is running (`FTS index optimized` in `indexer.log`); manual reclaim (#2). Check for row bloat (§ #0108 playbook) |
+| Index disk ballooning | Confirm prune is running (`FTS index optimized` in `indexer.log`); manual reclaim (#2). Compare `_indices/` against `data/` — a large `_indices/` is the orphan-generation case (#1160). Check for row bloat (§ #0108 playbook) |
 | `chunks.lance` directory corrupt / missing | Restore from nightly tarball (#4) |
 | A single row is enormous (page decode "offset overflow") | The #0108 repair playbook: identify bloated docs, rewrite in place or delete+reindex, then prune |
 
@@ -160,6 +191,8 @@ docker compose start doc-organizer
   `status: disk_full` (#0232).
 - `indexer.log` — `FTS index optimized (incremental merge)` = healthy;
   `Lance version prune (…): reclaimed N bytes` = the prune is doing real work;
+  `Lance orphan index prune (…): reclaimed N bytes (M index directories)` = dead
+  index generations are being swept (#1160);
   `Incremental FTS update failed … falling back to full rebuild` = the merge
   conflicted/failed that run (self-healed, but investigate if persistent);
   `Daily Lance compaction failed` = non-fatal, retried next run (investigate
@@ -171,7 +204,7 @@ docker compose start doc-organizer
 
 | Var | Default | Effect |
 |---|---|---|
-| `LANCE_VERSION_RETENTION_MINUTES` | 30 | Prune versions older than this each run (#2). 0 = prune all superseded. |
+| `LANCE_VERSION_RETENTION_MINUTES` | 30 | Prune versions older than this each run (#2), and the grace window that protects an uncommitted index build from the orphan-index sweep. 0 = prune all superseded. |
 | `LANCE_DAILY_RESTORE_POINTS` | 7 | Exactly this many `daily-*` restore-point tags kept (#3). 0 = disable tagging and drop existing daily tags. |
 | `DISK_USAGE_MAX_PERCENT` | 90 | `/health` 503s (`disk_full`) when the index filesystem is at/above this used-percent. |
 

@@ -2024,6 +2024,7 @@ class LanceDBStore:
             return
         self._expire_restore_points(table, today)
         self._prune_versions("post-expiry")
+        self._prune_orphan_indices("post-expiry")
         self._tag_latest_restore_point(table, today)
 
     def _compact_data_files_if_due(self, today) -> bool:
@@ -2200,6 +2201,39 @@ class LanceDBStore:
         except Exception as exc:
             logger.warning(
                 "Version prune (%s) failed (%s); dead versions reclaim next run",
+                label,
+                exc,
+            )
+
+    def _prune_orphan_indices(self, label: str) -> None:
+        """Reclaim `_indices/<uuid>` directories no retained version reaches.
+
+        Runs after the post-expiry version prune, when the retained set — and
+        so the set of index generations still reachable — is at its smallest.
+        `cleanup_old_versions` cannot do this itself: it never deletes a file
+        newer than the oldest version it retains, and the daily restore-point
+        tags retain a days-old one, so every index generation superseded
+        inside that window stayed on disk (#1160). Best-effort, like the
+        version prune: failure is logged, never raised (orphans reclaim on a
+        later pass)."""
+        from core.lance_maintenance import prune_orphan_indices
+
+        try:
+            directories, reclaimed = prune_orphan_indices(
+                self._dataset_path(),
+                min_age_seconds=_lance_version_retention_minutes() * 60,
+            )
+            if directories:
+                logger.info(
+                    "Lance orphan index prune (%s): reclaimed %d bytes "
+                    "(%d index directories)",
+                    label,
+                    reclaimed,
+                    directories,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Orphan index prune (%s) failed (%s); orphans reclaim next run",
                 label,
                 exc,
             )
