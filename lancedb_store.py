@@ -2316,6 +2316,7 @@ class LanceDBStore:
         return self._run_read_with_recovery(_op, [])
 
     _RECENT_DOC_FIELDS = (
+        "rel_path",
         "title",
         "source_type",
         "folder",

@@ -3244,9 +3244,10 @@ if HAS_MCP and FastMCP is not None:
 
         Returns a dict:
             - documents: List of document metadata dicts, each with:
-                doc_id, title, source_type, folder, tags (array), status,
-                created, mtime (unix timestamp), mtime_iso (ISO 8601 UTC),
-                size (bytes).
+                doc_id, rel_path (path under documents_root, or the
+                source-local id for non-file sources), title, source_type,
+                folder, tags (array), status, created, mtime (unix timestamp),
+                mtime_iso (ISO 8601 UTC), size (bytes).
             - total: Total number of matching documents (for pagination).
             - offset: The offset used.
             - limit: The limit used.
@@ -3274,6 +3275,8 @@ if HAS_MCP and FastMCP is not None:
 
         Returns a list of document metadata dicts, each containing:
             - doc_id: Document-relative path (e.g., "Archive/notes.md").
+            - rel_path: Path under documents_root (e.g., "Archive/notes.md"),
+              or the source-local id for non-file sources (e.g., "email/msg-3").
             - title, source_type, folder, tags (array), status, created.
             - mtime: Unix timestamp of last modification.
             - mtime_iso: ISO 8601 UTC string (e.g., "2026-02-20T15:30:00+00:00").

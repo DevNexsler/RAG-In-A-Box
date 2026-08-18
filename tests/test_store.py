@@ -1156,6 +1156,27 @@ def test_schema_evolution_list_recent_docs_mixed_metadata():
         assert archive_docs[0]["doc_id"] == "report.pdf"
 
 
+def test_list_recent_docs_projects_rel_path():
+    """A document listing must carry each document's path (#1203).
+
+    ``file_list_documents`` / ``file_recent`` hand these rows straight to
+    callers, and doc_id is an opaque 5-char id — without rel_path a listing
+    cannot be acted on, and any caller filtering documents by path reads an
+    empty string for every row, so its filter never matches.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+
+        store.upsert_nodes([_make_node_with_meta(
+            "documents::0000h", "c:0", "simulated video transcript", vec,
+            source_type="mp4", rel_path="Media/clip.mp4", mtime=100.0,
+        )])
+
+        docs = store.list_recent_docs(limit=10)
+        assert [d.get("rel_path") for d in docs] == ["Media/clip.mp4"]
+
+
 def test_schema_evolution_multiple_new_fields():
     """Multiple new fields added at once should all appear in schema."""
     with tempfile.TemporaryDirectory() as tmpdir:
