@@ -12,6 +12,10 @@ from urllib.parse import urlsplit
 
 
 RETRY_DELAYS_SECONDS = (1, 5, 30, 120)
+# A claimed delivery stops being due for this long. It bounds one send, so it
+# only has to outlast a hook timeout; a drain that dies mid-send releases its
+# delivery again once the lease expires instead of stranding it.
+CLAIM_LEASE_SECONDS = 60
 _DATABASE_FILENAME = "hook-outbox.sqlite3"
 _TERMINAL_STATUSES = {"completed", "redrive_required"}
 _PERSISTED_HOOK_FIELDS = {
@@ -185,6 +189,24 @@ class HookOutbox:
                 (due_at, int(limit)),
             ).fetchall()
         return [self._delivery(row) for row in rows]
+
+    def claim(self, delivery: HookDelivery, *, now: float | None = None) -> HookDelivery | None:
+        """Take exclusive ownership of one due delivery, or None if lost.
+
+        ``due`` is a peek: concurrent drains — one per index worker, plus the
+        scheduler tick — read the same pending rows, so the send itself is what
+        has to be serialized. The first claim moves the row's revision and
+        pushes it out of the due window; every other drain loses the compare
+        and skips the row instead of sending it a second time.
+        """
+        base = time.time() if now is None else float(now)
+        return self._transition(
+            delivery,
+            "pending",
+            delivery.last_outcome,
+            delivery.last_error,
+            next_attempt_at=base + CLAIM_LEASE_SECONDS,
+        )
 
     def complete(self, delivery: HookDelivery) -> HookDelivery | None:
         now = time.time()

@@ -115,3 +115,19 @@ def test_complete_deletes_accepted_delivery_and_stale_transition_is_ignored(tmp_
     with sqlite3.connect(tmp_path / "hook-outbox.sqlite3") as connection:
         assert connection.execute("SELECT event_json FROM hook_deliveries WHERE id = ?", (delivery.id,)).fetchone() is None
     assert outbox.retry(delivery, "transport_error", "timeout", now=100) is None
+
+
+def test_claim_gives_one_drain_exclusive_ownership_of_a_due_delivery(tmp_path):
+    """Fails if two drains that read the same due row can both send it."""
+    outbox = HookOutbox(tmp_path)
+    outbox.enqueue({"event_id": "evt-1"}, {"name": "cds"})
+    first_reader = outbox.due(limit=1)[0]
+    second_reader = outbox.due(limit=1)[0]
+
+    claimed = outbox.claim(first_reader, now=100)
+
+    assert claimed is not None
+    assert outbox.claim(second_reader, now=100) is None
+    assert outbox.due(limit=1, now=159) == []
+    assert outbox.due(limit=1, now=161)[0].id == claimed.id
+    assert outbox.complete(claimed) is not None
