@@ -206,6 +206,15 @@ async def test_download_existing_file(api_client, tmp_docs_root):
 
 
 @pytest.mark.anyio
+async def test_download_nested_file(api_client, tmp_docs_root):
+    """AC-REST-2: The catch-all still serves multi-segment doc_ids."""
+    resp = await api_client.get("/documents/reports/report.pdf")
+
+    assert resp.status_code == 200
+    assert resp.content == (tmp_docs_root / "reports" / "report.pdf").read_bytes()
+
+
+@pytest.mark.anyio
 async def test_download_nonexistent_file(api_client):
     """AC-REST-2: Download a nonexistent file returns 404 with error body."""
     resp = await api_client.get("/documents/does_not_exist.md")
@@ -355,6 +364,26 @@ async def test_list_documents_pagination(api_client, tmp_docs_root):
     assert len(body["files"]) == 2
     assert body["total"] == total
     assert body["offset"] == 1
+
+
+@pytest.mark.anyio
+async def test_list_documents_trailing_slash(api_client):
+    """AC-REST-3: /documents/ lists like /documents instead of hitting download."""
+    resp = await api_client.get("/documents/")
+
+    assert resp.status_code == 200
+    assert resp.json() == (await api_client.get("/documents")).json()
+
+
+@pytest.mark.anyio
+async def test_list_documents_trailing_slash_with_directory(api_client):
+    """AC-REST-3: The documented /documents/?directory=... form lists that subdirectory."""
+    resp = await api_client.get("/documents/?directory=reports&limit=50")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["directory"] == "reports"
+    assert {f["name"] for f in body["files"]} == {"report.pdf"}
 
 
 @pytest.mark.anyio
