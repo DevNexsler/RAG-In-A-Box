@@ -11,6 +11,7 @@ from typing import Any, TypedDict
 import httpx
 
 from core.resilience import CIRCUITS, TransientError
+from core.route_contract import ROUTE_CONTRACTS
 from doc_enrichment import enrichment_response_schema
 from providers.llm.trace_recorder import LLMTraceRecorder
 
@@ -151,6 +152,11 @@ class LiteLLMGenerator:
 
         logger.info("LiteLLMGenerator initialized: %s model=%s", self.base_url, model)
 
+    @property
+    def route(self) -> str:
+        """The alias this generator calls, as an identity a log line can name."""
+        return f"{self.model}@{self.base_url}"
+
     def _build_response_format(self, *, allow_schema: bool = True) -> dict:
         if allow_schema:
             return {
@@ -168,6 +174,15 @@ class LiteLLMGenerator:
         initial = self._request_with_metadata(user_prompt, max_tokens=max_tokens)
         signals = _truncation_signals(
             initial["response"], initial["request"]["payload"]
+        )
+        # The alias is fixed in config; the contract behind it is the provider's
+        # to change. Report what this answer proved about it (#1154).
+        ROUTE_CONTRACTS.observe(
+            self.route,
+            requested_tokens=max_tokens,
+            completion_tokens=signals["completion_tokens"],
+            finish_reason=signals["finish_reason"],
+            backend=initial["response"].get("system_fingerprint"),
         )
         if not signals["truncated"]:
             return initial
