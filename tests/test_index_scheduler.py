@@ -134,3 +134,91 @@ def test_build_scheduler_enabled_uses_config_intervals():
     assert sched is not None
     assert sched.drain_interval_s == 30
     assert sched.sweep_interval_s == 900
+
+
+# --- resume an interrupted run (#1153) ---
+
+
+def test_seed_leaves_the_sweep_due_when_the_previous_run_was_interrupted():
+    """A restart that landed on a live run must resume it, not park its
+    remaining documents for a whole sweep interval (#1153)."""
+    sched, calls = _scheduler(run_was_interrupted_fn=lambda: True)
+    sched.seed(now=1000.0)
+    kinds = [a[0] for a in sched.tick(now=1000.0)]
+    assert "sweep" in kinds
+    assert calls == {"drain": 1, "sweep": 1}
+
+
+def test_seed_still_suppresses_the_boot_sweep_after_a_clean_previous_run():
+    sched, calls = _scheduler(run_was_interrupted_fn=lambda: False)
+    sched.seed(now=1000.0)
+    kinds = [a[0] for a in sched.tick(now=1000.0)]
+    assert "sweep" not in kinds
+    assert calls == {"drain": 1, "sweep": 0}
+
+
+def test_seed_suppresses_the_boot_sweep_when_the_interrupted_check_raises():
+    """An unreadable supervisor state must not turn every boot into a sweep."""
+    def boom() -> bool:
+        raise RuntimeError("state unreadable")
+
+    sched, calls = _scheduler(run_was_interrupted_fn=boom)
+    sched.seed(now=1000.0)
+    assert calls == {"drain": 0, "sweep": 0}
+    kinds = [a[0] for a in sched.tick(now=1000.0)]
+    assert "sweep" not in kinds
+
+
+def test_build_scheduler_resumes_the_sweep_after_an_unresolved_index_failure(tmp_path):
+    """The builder wires the supervisor's terminal state into the boot seed, so
+    a run lost to a container restart is re-queued on the next tick (#1153)."""
+    import mcp_server
+
+    class _Supervisor:
+        def status_summary(self) -> dict:
+            return {"current": None, "unresolved_failure": True}
+
+    sweeps: list[str] = []
+    original = mcp_server._get_index_run_supervisor
+    mcp_server._get_index_run_supervisor = lambda config: _Supervisor()
+    try:
+        scheduler = build_index_scheduler_for_test(mcp_server, tmp_path)
+        scheduler._sweep_fn = lambda: sweeps.append("swept")
+        scheduler._drain_fn = lambda: None
+        scheduler.seed(now=1000.0)
+        scheduler.tick(now=1000.0)
+    finally:
+        mcp_server._get_index_run_supervisor = original
+
+    assert sweeps == ["swept"]
+
+
+def test_build_scheduler_suppresses_the_boot_sweep_after_a_clean_index_run(tmp_path):
+    import mcp_server
+
+    class _Supervisor:
+        def status_summary(self) -> dict:
+            return {"current": None, "unresolved_failure": False}
+
+    sweeps: list[str] = []
+    original = mcp_server._get_index_run_supervisor
+    mcp_server._get_index_run_supervisor = lambda config: _Supervisor()
+    try:
+        scheduler = build_index_scheduler_for_test(mcp_server, tmp_path)
+        scheduler._sweep_fn = lambda: sweeps.append("swept")
+        scheduler._drain_fn = lambda: None
+        scheduler.seed(now=1000.0)
+        scheduler.tick(now=1000.0)
+    finally:
+        mcp_server._get_index_run_supervisor = original
+
+    assert sweeps == []
+
+
+def build_index_scheduler_for_test(mcp_server, tmp_path):
+    scheduler = mcp_server.build_index_scheduler(
+        {"index_root": str(tmp_path), "scheduler": {"enabled": True}},
+        "test-config.yaml",
+    )
+    assert scheduler is not None
+    return scheduler

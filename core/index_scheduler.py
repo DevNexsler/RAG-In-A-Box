@@ -34,6 +34,7 @@ class IndexScheduler:
         drain_fn: Callable[[], Any],
         sweep_fn: Callable[[], Any],
         sweep_running_fn: Callable[[], bool],
+        run_was_interrupted_fn: Callable[[], bool] | None = None,
         log: logging.Logger | None = None,
     ) -> None:
         self.drain_interval_s = drain_interval_s
@@ -41,16 +42,37 @@ class IndexScheduler:
         self._drain_fn = drain_fn
         self._sweep_fn = sweep_fn
         self._sweep_running_fn = sweep_running_fn
+        self._run_was_interrupted_fn = run_was_interrupted_fn or (lambda: False)
         self._log = log or logger
         self._last_drain: float | None = None
         self._last_sweep: float | None = None
         self._stop = threading.Event()
 
+    def _run_was_interrupted(self) -> bool:
+        """True when the previous run ended without completing. Never raises —
+        an unreadable supervisor state must not turn every boot into a sweep."""
+        try:
+            return bool(self._run_was_interrupted_fn())
+        except Exception as exc:
+            self._log.warning("interrupted-run check failed: %s", exc)
+            return False
+
     def seed(self, now: float) -> "IndexScheduler":
         """Suppress an immediate full sweep on boot (it is heavy and would run on
         every container restart). The drain is intentionally left due so a boot
-        backlog clears within one drain interval."""
-        self._last_sweep = now
+        backlog clears within one drain interval.
+
+        Exception: a boot that follows an *interrupted* run leaves the sweep due
+        (#1153). A restart landing on a live run — the container's memory cgroup
+        OOM-killing the server is the observed cause — otherwise parks that run's
+        remaining documents for a whole sweep interval, and /health stays 503 on
+        the unresolved terminal state for just as long. Resuming here re-scans
+        and re-queues only what is still outstanding; documents the dead run
+        already indexed diff out. Boot is also the cheapest moment to sweep: the
+        server process has just restarted, so the container is at its memory
+        floor rather than its ceiling.
+        """
+        self._last_sweep = None if self._run_was_interrupted() else now
         return self
 
     @staticmethod
