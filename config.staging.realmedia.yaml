@@ -131,7 +131,7 @@ enrichment:
   base_url: "https://openrouter.ai/api/v1"   # REAL — live LLM enrichment
   max_input_chars: 20000
   max_output_tokens: 2000
-  concurrency: 1
+  concurrency: 4
 
 search:
   mode: "hybrid"
@@ -145,6 +145,15 @@ search:
     model: "Qwen/Qwen3-Reranker-8B"
     timeout: 30
     base_url: "http://provider-sim:9999"   # sim (reranker not under test in the media path)
+
+dedupe:
+  enabled: true
+  mode: "exact"
+  hash_algo: "blake3"
+  archive_root: "/data/index/duplicates"
+  archive_duplicates: true
+  update_canonical_metadata: true
+  skip_duplicate_indexing: true
 
 lancedb:
   table: "chunks"
