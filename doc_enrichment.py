@@ -188,6 +188,11 @@ _CONTEXT_KEYS_RAW = (
     "context_warning",
 )
 
+# Raw keys without which an enriched row carries no usable metadata. An LLM
+# response that omits them is rejected rather than stored (see
+# missing_required_fields / structured_response_is_usable).
+REQUIRED_ENRICHMENT_FIELDS = ("summary", "doc_type")
+
 # Prefixed field names stored in LanceDB metadata (prevent collision with frontmatter)
 CORE_ENRICHMENT_FIELDS = tuple(f"enr_{k}" for k in _ENRICHMENT_KEYS_RAW)
 ENRICHMENT_FIELDS = tuple(f"enr_{k}" for k in (*_ENRICHMENT_KEYS_RAW, *_CONTEXT_KEYS_RAW))
@@ -470,6 +475,35 @@ def parse_enrichment_response(raw_response: str) -> dict[str, str]:
     return _normalize_enrichment(parsed)
 
 
+def missing_required_fields(enrichment: dict[str, str]) -> list[str]:
+    """Required enrichment fields this normalized enrichment does not carry.
+
+    A row without these is not searchable metadata, so it is written degraded
+    and re-processed on a later run.
+    """
+    return [
+        field
+        for field in REQUIRED_ENRICHMENT_FIELDS
+        if not enrichment.get(f"enr_{field}")
+    ]
+
+
+def structured_response_is_usable(raw_response: str) -> bool:
+    """Whether a raw structured response yields an enrichment we can store.
+
+    This is the authoritative first-pass validity test for an enrichment call:
+    it asks the payload, not the provider's token accounting. Providers bill
+    reasoning into ``usage.completion_tokens`` and stop honoring ``max_tokens``
+    as a ceiling on it, so token counters answer a different question than
+    "did the model deliver the metadata we asked for" (#1097).
+    """
+    try:
+        enrichment = parse_enrichment_response(raw_response)
+    except (ValueError, TypeError):  # json.JSONDecodeError is a ValueError
+        return False
+    return not missing_required_fields(enrichment)
+
+
 def _repair_context_omissions(
     enrichment: dict[str, str],
     primary_text: str,
@@ -692,11 +726,7 @@ def enrich_document(
                 enabled_rules=postprocess_rules,
             )
 
-            missing_required = [
-                field
-                for field in ("summary", "doc_type")
-                if not enrichment.get(f"enr_{field}")
-            ]
+            missing_required = missing_required_fields(enrichment)
             if missing_required:
                 logger.warning(
                     "LLM structured output for '%s' is missing required fields: %s",

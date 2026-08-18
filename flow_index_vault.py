@@ -75,6 +75,7 @@ from attachment_context_refresh import (
     context_text_from_sidecar,
     refresh_document_context,
 )
+from core import enrichment_telemetry
 from core.config import filesystem_source_roots, load_config
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
@@ -2830,6 +2831,35 @@ def index_stats_task(
     )
 
 
+def _enrichment_run_telemetry(degraded_write_count: int) -> dict[str, int]:
+    """This run's structured-enrichment quality, for the summary and metadata.
+
+    Answers in one place what the run cost and what it stored: how often the
+    first structured response was usable, how many second LLM calls that
+    misjudgement or a real truncation forced, and how many documents were
+    written degraded anyway (#1097).
+    """
+    stats = enrichment_telemetry.snapshot()
+    stats["degraded_writes"] = degraded_write_count
+    return stats
+
+
+def _log_enrichment_telemetry(logger, stats: dict[str, int]) -> None:
+    attempts = stats["attempts"]
+    if not attempts:
+        return
+    logger.info(
+        "Enrichment structured output: attempts=%d first_pass_valid=%d (%.1f%%) "
+        "retries=%d recovered=%d degraded_writes=%d",
+        attempts,
+        stats["first_pass_usable"],
+        stats["first_pass_usable"] * 100.0 / attempts,
+        stats["retries"],
+        stats["retries_recovered"],
+        stats["degraded_writes"],
+    )
+
+
 @task
 def write_index_metadata_task(
     index_root: str | Path,
@@ -2837,6 +2867,8 @@ def write_index_metadata_task(
     chunk_count: int | None,
     failed_docs: list[str] | None = None,
     warnings: list[str] | None = None,
+    *,
+    enrichment: dict[str, int] | None = None,
 ) -> None:
     """Write index_metadata.json for file_status (last_run_at, counts, failures, warnings)."""
     import json
@@ -2858,6 +2890,8 @@ def write_index_metadata_task(
         meta["warning_counts"] = dict(sorted(warning_counts.items()))
         meta["enrichment_failed_count"] = warning_counts.get("enrichment_failed", 0)
         meta["warnings"] = warnings[:50]
+    if enrichment and enrichment.get("attempts"):
+        meta["enrichment"] = enrichment
     with open(path, "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -3067,6 +3101,7 @@ def index_vault_flow(
     import time
     logger = get_run_logger()
     _initialize_run_progress()
+    enrichment_telemetry.reset()
     config = _LOCKED_INDEX_CONFIG.get() or load_config(config_path)
     memory_observer = MemoryObserver.from_config(config, logger)
     _RUNTIME["memory_observer"] = memory_observer
@@ -3829,10 +3864,14 @@ def index_vault_flow(
                 dict(reason_counts),
             )
 
+    enrichment_stats = _enrichment_run_telemetry(len(degraded_now))
+    _log_enrichment_telemetry(logger, enrichment_stats)
+
     write_index_metadata_task(
         index_root, doc_count, chunk_count,
         failed_docs or None,
         _RUNTIME.get("_warnings") or None,
+        enrichment=enrichment_stats,
     )
     memory_observer.sample("phase_finish", phase="finalize")
     progress = _run_progress_snapshot()
