@@ -22,6 +22,7 @@ from llama_index.core.vector_stores.utils import node_to_metadata_dict
 from llama_index.vector_stores.lancedb import LanceDBVectorStore
 from llama_index.vector_stores.lancedb.base import TableNotFoundError
 
+from core import lance_session
 from core.storage import SearchHit
 from core.tracing import get_tracer
 from doc_enrichment import CORE_ENRICHMENT_FIELDS
@@ -559,6 +560,10 @@ class LanceDBStore:
             uri=self.index_root,
             table_name=self.table_name,
             mode="create",  # "create" lets LanceDB create the table if missing, or open if exists
+            # Own the connection so its Lance caches live in the process-wide
+            # bounded session; the store rebuilds this repeatedly and LanceDB's
+            # own default would start a fresh unbounded cache each time (#1157).
+            connection=lance_session.connect(self.index_root),
         )
 
     @staticmethod
@@ -741,11 +746,7 @@ class LanceDBStore:
 
     def _reconnect(self) -> None:
         """Reconnect the vector store to the current on-disk table path."""
-        self._vs = LanceDBVectorStore(
-            uri=self.index_root,
-            table_name=self.table_name,
-            mode="create",
-        )
+        self._vs = self._build_vector_store()
         self._ensure_scalar_index()
 
     def _ensure_scalar_index(self) -> None:
@@ -931,8 +932,6 @@ class LanceDBStore:
         Writes cgroup-sized Arrow chunks, reconstructs each metadata struct,
         and atomically replaces the table without whole-table buffering.
         """
-        import lancedb as ldb
-
         table = self._vs.table
         dataset = table.to_lance()
         source_schema = dataset.schema
@@ -1024,7 +1023,7 @@ class LanceDBStore:
                     )
                     pending.append(write_batch.slice(0, midpoint))
 
-        db = ldb.connect(self.index_root)
+        db = lance_session.connect(self.index_root)
         temp_name = f"{self.table_name}__schema_tmp"
         backup_name = f"{self.table_name}__schema_backup"
         temp_path = Path(self.index_root) / f"{temp_name}.lance"
@@ -1188,12 +1187,7 @@ class LanceDBStore:
                 )
 
         # Reconnect LanceDBVectorStore to the new table
-        self._vs = LanceDBVectorStore(
-            uri=self.index_root,
-            table_name=self.table_name,
-            mode="create",
-        )
-        self._ensure_scalar_index()
+        self._reconnect()
         logger.info("Schema evolved: added metadata fields %s", new_fields)
 
     # --- WHERE clause builder ---

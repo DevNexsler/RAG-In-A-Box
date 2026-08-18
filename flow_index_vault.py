@@ -75,6 +75,7 @@ from attachment_context_refresh import (
     context_text_from_sidecar,
     refresh_document_context,
 )
+from core import lance_session
 from core.config import filesystem_source_roots, load_config
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
@@ -3076,6 +3077,9 @@ def index_vault_flow(
     # so it needs its own tracing setup. No-op when tracing is disabled or
     # when this process already set it up (e.g. in-process flow runs).
     setup_tracing(config, "indexer")
+    # Same reason, same subprocess caveat: bound this run's Lance caches so the
+    # run cannot push the shared memory cgroup over its limit (#1157).
+    lance_session.configure_from_config(config)
     index_root = Path(config["index_root"])
     _RUNTIME["index_root"] = index_root
     _write_heartbeat(index_root)  # mark the run alive before the (possibly slow) scan

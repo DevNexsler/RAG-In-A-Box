@@ -163,6 +163,12 @@ search:
 
 lancedb:
   table: "chunks"
+  # Ceiling on the Lance index/metadata caches every connection in the process
+  # shares. LanceDB's own defaults are sized for a dedicated host: unset, the
+  # long-lived server grew into the container's memory cgroup and was
+  # OOM-killed (#1157). Raise on a roomier host to trade RAM for search speed.
+  index_cache_mb: 512
+  metadata_cache_mb: 128
 
 logging:
   level: "WARNING"                        # DEBUG, INFO, WARNING, ERROR

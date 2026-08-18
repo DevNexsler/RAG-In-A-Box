@@ -763,7 +763,11 @@ def test_schema_evolution_create_failure_preserves_existing_table(monkeypatch):
             def create_table(self, *args, **kwargs):
                 return FailingAddTable(self._db.create_table(*args, **kwargs))
 
-        monkeypatch.setattr(lancedb, "connect", lambda uri: FailingCreateDB(real_connect(uri)))
+        monkeypatch.setattr(
+            lancedb,
+            "connect",
+            lambda uri, **kwargs: FailingCreateDB(real_connect(uri, **kwargs)),
+        )
 
         with pytest.raises(RuntimeError, match="chunk add failed"):
             store.upsert_nodes([
