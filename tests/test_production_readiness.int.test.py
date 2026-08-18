@@ -207,7 +207,8 @@ async def test_upload_index_search_download_lifecycle(e2e_system):
     assert resp.status_code == 201
     body = resp.json()
     assert body["uploaded"] is True
-    doc_id = body["doc_id"]
+    # This harness indexes the uploaded file under a doc id equal to its path.
+    doc_id = body["rel_path"]
     assert doc_id == "e2e_test.md"
 
     # Verify file exists on disk

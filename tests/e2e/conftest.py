@@ -161,7 +161,7 @@ async def _build_corpus() -> dict:
                 "/api/upload", files={"file": (name, path.read_bytes())}
             )
             assert resp.status_code == 201, f"upload {name}: {resp.status_code} {resp.text}"
-            uploaded[name] = resp.json()["doc_id"]
+            uploaded[name] = resp.json()["rel_path"]
 
     for name in ("clip.wav", "clip.mp4", "clip.json"):
         _compose_cp_into_documents(FIXTURES / name)

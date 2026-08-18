@@ -199,7 +199,9 @@ curl -X POST http://localhost:7788/api/upload \
   -H "Authorization: Bearer $API_KEY" \
   -F "file=@report.pdf" \
   -F "directory=2-Area/Legal"
-# -> {"uploaded": true, "doc_id": "2-Area/Legal/report.pdf", "size": 84521}
+# -> {"uploaded": true, "rel_path": "2-Area/Legal/report.pdf", "doc_id": "2-Area/Legal/report.pdf", "size": 84521}
+# "rel_path" is the path under documents_root; "doc_id" is a deprecated alias of
+# it (it was never an index doc id) and will be dropped — read "rel_path".
 ```
 
 **Download a file:**
@@ -218,7 +220,7 @@ curl "http://localhost:7788/api/documents/?directory=2-Area&limit=50" \
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/upload` | POST | Upload a file (multipart form: `file` + optional `directory`) |
-| `/api/documents/{doc_id}` | GET | Download a file by path |
+| `/api/documents/{rel_path}` | GET | Download a file by its path under `documents_root` |
 | `/api/documents/` | GET | List files (query params: `directory`, `limit`, `offset`) |
 
 **Constraints:** Max upload 100 MB. Allowed types: `.md`, `.pdf`, `.png`, `.jpg`, `.jpeg`. Path traversal is blocked. After uploading, run `file_index_update` (via MCP) to index the new document.
