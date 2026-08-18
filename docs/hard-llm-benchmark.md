@@ -43,6 +43,25 @@ python3 scripts/enrichment_benchmark.py run \
   --run-id hard-4.1-mini
 ```
 
+Point `--config` at a deployed config to benchmark exactly what production
+enriches with — provider, base URL, and model all come from that file's
+`enrichment:` block, so a LiteLLM/Ollama deployment is benchmarked through the
+LiteLLM proxy rather than through OpenRouter:
+
+```bash
+python3 scripts/enrichment_benchmark.py run \
+  --bench-dir .evals/benchmarks \
+  --task enrichment \
+  --suite hard \
+  --config config.yaml \
+  --run-id hard-production
+```
+
+`--model` overrides the config's model (to bench a candidate through the same
+provider) and is required when no config is given, where the run falls back to
+the OpenRouter provider. Benchmark replays never write to the trace corpus that
+`mine-hard` reads, whatever `enrichment.trace_capture` says.
+
 This replays prompts through the configured model provider and writes run
 artifacts under:
 

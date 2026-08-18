@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+import yaml
 
 from core.benchmarking.runner import run_benchmark
 from doc_enrichment import _CONTEXT_KEYS_RAW, _ENRICHMENT_KEYS_RAW
@@ -11,6 +12,7 @@ from providers.llm.openrouter_llm import (
     _ENRICHMENT_SCHEMA as OPENROUTER_ENRICHMENT_SCHEMA,
     OpenRouterGenerator,
 )
+from scripts.enrichment_benchmark import main as benchmark_main
 
 
 def test_generate_with_metadata_returns_content_usage_and_latency(tmp_path):
@@ -580,3 +582,220 @@ def test_run_benchmark_audit_summary_includes_subscores_and_score_mode(tmp_path)
         "filing_taxonomy": 1.0,
         "summary_quality": 1.0,
     }
+
+
+def test_run_benchmark_replays_through_the_configured_enrichment_provider(tmp_path, monkeypatch):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+    monkeypatch.setenv("LITELLM_API_KEY", "bench-key")
+
+    response_json = {
+        "id": "chatcmpl-123",
+        "choices": [
+            {
+                "message": {
+                    "content": '{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"total_tokens": 42},
+    }
+    request = httpx.Request("POST", "http://litellm.test/v1/chat/completions")
+    response = httpx.Response(200, json=response_json, request=request)
+
+    with patch("providers.llm.litellm_llm.httpx.post", return_value=response) as mock_post:
+        run = run_benchmark(
+            bench_dir=fixture_bench_dir,
+            model="ollama-deepseek-v4-pro",
+            run_id="production-shape",
+            enrichment_config={
+                "provider": "litellm",
+                "model": "openai/gpt-4.1-mini",
+                "base_url": "http://litellm.test/v1",
+            },
+        )
+
+    assert mock_post.call_args.args[0] == "http://litellm.test/v1/chat/completions"
+    # The run's model wins over the config's, so the summary names what was actually scored.
+    assert mock_post.call_args.kwargs["json"]["model"] == "ollama-deepseek-v4-pro"
+    assert run.summary["model"] == "ollama-deepseek-v4-pro"
+    assert run.summary["success_rate"] == 1.0
+
+
+def test_run_benchmark_defaults_to_openrouter_without_enrichment_config(tmp_path, monkeypatch):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "bench-key")
+
+    response_json = {
+        "id": "chatcmpl-123",
+        "choices": [
+            {
+                "message": {
+                    "content": '{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
+                }
+            }
+        ],
+        "usage": {"total_tokens": 42},
+    }
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    response = httpx.Response(200, json=response_json, request=request)
+
+    with patch("providers.llm.openrouter_llm.httpx.post", return_value=response) as mock_post:
+        run = run_benchmark(
+            bench_dir=fixture_bench_dir,
+            model="openai/gpt-4.1-mini",
+            run_id="baseline",
+        )
+
+    assert "openrouter.ai" in mock_post.call_args.args[0]
+    assert run.summary["success_rate"] == 1.0
+
+
+def test_run_benchmark_rejects_a_provider_that_cannot_record_replay_metadata(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+
+    with pytest.raises(ValueError, match="generate_with_metadata"):
+        run_benchmark(
+            bench_dir=fixture_bench_dir,
+            model="qwen3:14b-udq6",
+            run_id="ollama-attempt",
+            enrichment_config={"provider": "ollama", "base_url": "http://ollama.test"},
+        )
+
+
+def test_run_benchmark_reports_an_unbuildable_enrichment_provider(tmp_path):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+
+    with pytest.raises(ValueError, match="not-a-provider"):
+        run_benchmark(
+            bench_dir=fixture_bench_dir,
+            model="ollama-deepseek-v4-pro",
+            run_id="bad-provider",
+            enrichment_config={"provider": "not-a-provider"},
+        )
+
+
+def test_run_benchmark_does_not_write_bench_replays_into_the_trace_corpus(tmp_path, monkeypatch):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+    trace_dir = tmp_path / "llm-traces"
+    monkeypatch.setenv("LITELLM_API_KEY", "bench-key")
+
+    response_json = {
+        "id": "chatcmpl-123",
+        "choices": [
+            {
+                "message": {
+                    "content": '{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"total_tokens": 42},
+    }
+    request = httpx.Request("POST", "http://litellm.test/v1/chat/completions")
+    response = httpx.Response(200, json=response_json, request=request)
+
+    with patch("providers.llm.litellm_llm.httpx.post", return_value=response):
+        run_benchmark(
+            bench_dir=fixture_bench_dir,
+            model="ollama-deepseek-v4-pro",
+            run_id="trace-isolation",
+            enrichment_config={
+                "provider": "litellm",
+                "base_url": "http://litellm.test/v1",
+                "trace_capture": {"enabled": True, "directory": str(trace_dir)},
+            },
+        )
+
+    assert not trace_dir.exists()
+
+
+def _write_bench_config(tmp_path, **enrichment) -> str:
+    documents_root = tmp_path / "documents"
+    documents_root.mkdir()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "index_root": str(tmp_path / "index"),
+                "documents_root": str(documents_root),
+                "enrichment": enrichment,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return str(config_path)
+
+
+def test_benchmark_run_command_benchmarks_the_configured_deployment(tmp_path, monkeypatch, capsys):
+    fixture_bench_dir = tmp_path / "benchmarks"
+    fixture_bench_dir.mkdir(parents=True)
+    _write_case_and_gold(fixture_bench_dir, case_id="case_0001")
+    config_path = _write_bench_config(
+        tmp_path,
+        enabled=False,
+        provider="litellm",
+        model="ollama-deepseek-v4-pro",
+        base_url="http://litellm.test/v1",
+    )
+    monkeypatch.setenv("LITELLM_API_KEY", "bench-key")
+
+    response_json = {
+        "id": "chatcmpl-123",
+        "choices": [
+            {
+                "message": {
+                    "content": '{"summary":"Lease renewal request.","doc_type":["lease"],"entities_people":[],"entities_places":[],"entities_orgs":[],"entities_dates":["2026-03-01"],"topics":["lease renewal"],"keywords":["renewal terms"],"key_facts":["Tenant requested renewal."],"suggested_tags":["lease"],"suggested_folder":"Housing/Leases","importance":0.8}'
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"total_tokens": 42},
+    }
+    request = httpx.Request("POST", "http://litellm.test/v1/chat/completions")
+    response = httpx.Response(200, json=response_json, request=request)
+
+    with patch("providers.llm.litellm_llm.httpx.post", return_value=response) as mock_post:
+        exit_code = benchmark_main(
+            [
+                "run",
+                "--bench-dir",
+                str(fixture_bench_dir),
+                "--config",
+                config_path,
+                "--run-id",
+                "production-shape",
+            ]
+        )
+
+    assert exit_code == 0
+    assert mock_post.call_args.args[0] == "http://litellm.test/v1/chat/completions"
+    assert mock_post.call_args.kwargs["json"]["model"] == "ollama-deepseek-v4-pro"
+    assert "Model: ollama-deepseek-v4-pro" in capsys.readouterr().out
+    summary = json.loads(
+        (fixture_bench_dir / "runs" / "production-shape" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["model"] == "ollama-deepseek-v4-pro"
+
+
+def test_benchmark_run_command_requires_a_model_when_the_config_omits_one(tmp_path):
+    config_path = _write_bench_config(tmp_path, provider="litellm")
+
+    with pytest.raises(SystemExit) as excinfo:
+        benchmark_main(
+            ["run", "--bench-dir", str(tmp_path), "--config", config_path, "--run-id", "no-model"]
+        )
+
+    assert excinfo.value.code == 2

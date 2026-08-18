@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +13,10 @@ from core.benchmarking.scoring import score_audit_case, score_case, score_failed
 from core.benchmarking.tasks import BenchmarkTask, get_task
 from core.enrichment_postprocess import repair_enrichment
 from doc_enrichment import parse_enrichment_response
-from providers.llm.openrouter_llm import OpenRouterGenerator
+from providers.llm import build_llm_provider
+
+
+DEFAULT_BENCH_PROVIDER = "openrouter"
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,7 @@ def run_benchmark(
     suite: str = "standard",
     postprocess_enrichment: bool = False,
     postprocess_rules: Iterable[str] | None = None,
+    enrichment_config: Mapping[str, Any] | None = None,
 ) -> BenchmarkRunResult:
     bench_task = get_task(task)
     bench_path = resolve_bench_path(bench_dir=bench_dir, task=task, suite=suite)
@@ -49,7 +53,9 @@ def run_benchmark(
     if score_mode is None:
         score_mode = bench_task.default_score_mode
     _validate_score_mode(score_mode, score_modes=bench_task.score_modes)
-    client = replay_client or OpenRouterGenerator(model=model)
+    client = replay_client or build_benchmark_client(
+        model=model, enrichment_config=enrichment_config
+    )
     case_ids = sorted(path.stem for path in (bench_path / "cases").glob("case_*.json"))
     if max_cases is not None:
         case_ids = case_ids[:max_cases]
@@ -91,6 +97,44 @@ def run_benchmark(
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     return BenchmarkRunResult(run_dir=run_dir, per_case=results, summary=summary)
+
+
+def build_benchmark_client(
+    *,
+    model: str,
+    enrichment_config: Mapping[str, Any] | None = None,
+) -> Any:
+    """Build the generator a benchmark replays its prompts through.
+
+    The generator comes from the same ``enrichment:`` block production enrichment
+    uses, so a run benchmarks whichever provider is deployed instead of one
+    hard-wired class.  Three keys are owned by the benchmark rather than the config:
+
+    - ``model``: the run is labelled with the model it scored, so the requested model
+      wins over the config's.
+    - ``enabled``: asking for a benchmark is the opt-in; a disabled production
+      enrichment block should not silently produce a client-less run.
+    - ``trace_capture``: replays must never land in the trace corpus ``mine-hard``
+      draws its cases from, or benchmarks become their own future test set.
+    """
+    enrichment = dict(enrichment_config or {})
+    enrichment.setdefault("provider", DEFAULT_BENCH_PROVIDER)
+    enrichment["model"] = model
+    enrichment["enabled"] = True
+    enrichment["trace_capture"] = {"enabled": False}
+
+    provider = enrichment["provider"]
+    client = build_llm_provider({"enrichment": enrichment})
+    if client is None:
+        raise ValueError(
+            f"could not build benchmark provider {provider!r} for model {model!r}"
+        )
+    if not hasattr(client, "generate_with_metadata"):
+        raise ValueError(
+            f"benchmark provider {provider!r} cannot replay cases: "
+            "it does not implement generate_with_metadata"
+        )
+    return client
 
 
 def _run_case(
