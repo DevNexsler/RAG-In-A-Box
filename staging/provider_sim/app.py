@@ -90,6 +90,11 @@ _ENRICHMENT_LIST_KEYS = (
 )
 
 
+# Summary the overshoot_budget fault returns, so a test can tell that answer
+# apart from the one a (wasted) retry would have produced.
+_OVERSHOOT_BUDGET_SUMMARY = "Overshot-budget enrichment marker."
+
+
 def _fake_enrichment(text: str) -> str:
     """Minimal valid enrichment JSON with values derived from the text hash."""
     h = _sha12(text.encode())
@@ -177,6 +182,39 @@ def _fault_response(fault: str) -> Response | None:
                     "prompt_tokens": 12,
                     "completion_tokens": 1,
                     "total_tokens": 13,
+                },
+            }
+        )
+    if fault == "overshoot_budget":
+        # A COMPLETE structured answer that bills more completion tokens than
+        # the request allowed. Production's LiteLLM route bills reasoning
+        # tokens it then strips from the message, so `completion_tokens >
+        # max_tokens` says nothing about truncation — 272 of 274 such
+        # responses were valid enrichment JSON (#1097). The distinctive
+        # summary is how a test tells this answer from the one a retry would
+        # get: keeping it must cost exactly one call.
+        enrichment = json.loads(_fake_enrichment(""))
+        enrichment["summary"] = _OVERSHOOT_BUDGET_SUMMARY
+        return JSONResponse(
+            {
+                "id": "sim-overshoot-budget",
+                "object": "chat.completion",
+                "model": "sim-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(enrichment),
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 12,
+                    # Far above any configured max_output_tokens.
+                    "completion_tokens": 6201,
+                    "total_tokens": 6213,
                 },
             }
         )
@@ -417,7 +455,14 @@ async def admin_reset() -> dict:
     return {"ok": True}
 
 
-_KNOWN_FAULTS = {"429", "timeout", "garbage", "reasoning_only", "hangup"}
+_KNOWN_FAULTS = {
+    "429",
+    "timeout",
+    "garbage",
+    "reasoning_only",
+    "overshoot_budget",
+    "hangup",
+}
 
 
 @app.post("/admin/fault")
