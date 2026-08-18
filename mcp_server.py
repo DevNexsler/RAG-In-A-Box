@@ -2870,13 +2870,15 @@ if HAS_MCP and FastMCP is not None:
 
     mcp = FastMCP("file-index-mcp", json_response=True)
 
-    # --- MCP tool-call tracing -----------------------------------------
-    # Every registered tool emits a server-side `mcp.tool.<name>` span via
-    # ONE generic wrapper composed into mcp.tool() at registration time, so
-    # the tool functions below stay untouched. Only allowlisted scalar args
-    # are recorded as attributes — NEVER full arguments or document text.
+    # --- MCP tool-call tracing + off-loop dispatch ----------------------
+    # Every registered tool emits a server-side `mcp.tool.<name>` span and,
+    # when its body is synchronous, runs in a worker thread — via ONE generic
+    # wrapper composed into mcp.tool() at registration time, so the tool
+    # functions below stay untouched. Only allowlisted scalar args are
+    # recorded as attributes — NEVER full arguments or document text.
     # Downstream spans (e.g. search.hybrid) parent under the tool span
-    # automatically via OTEL context propagation. Spans are no-ops unless
+    # automatically via OTEL context propagation (asyncio.to_thread copies the
+    # calling context, so the span survives the hop). Spans are no-ops unless
     # setup_tracing() ran with tracing.enabled: true.
     _TOOL_SPAN_ARG_ALLOWLIST = ("top_k", "doc_id", "source", "source_name", "return_mode")
     _mcp_tracer = get_tracer("mcp")
@@ -2912,15 +2914,23 @@ if HAS_MCP and FastMCP is not None:
 
             return async_wrapper
 
+        # A synchronous tool body is blocking work (provider HTTP, LanceDB,
+        # extraction). FastMCP calls sync tools inline on the serving event
+        # loop, so one slow call — file_search is routinely 10-20s — starves
+        # every other route in the process, including the unauthenticated
+        # /health probe the image healthcheck polls with a 5s timeout: three
+        # misses flip the container unhealthy while nothing is wrong (#1086).
+        # Handing the body to a worker thread keeps the loop free to answer
+        # liveness while the tool runs.
         @functools.wraps(fn)  # transparent: FastMCP schema generation sees the
-        def wrapper(*args, **kwargs):  # original signature via __wrapped__
+        async def offloaded_wrapper(*args, **kwargs):  # signature via __wrapped__
             with _mcp_tracer.start_as_current_span(
                 f"mcp.tool.{tool_name}",
                 attributes=_span_attributes(args, kwargs),
             ):
-                return fn(*args, **kwargs)
+                return await asyncio.to_thread(fn, *args, **kwargs)
 
-        return wrapper
+        return offloaded_wrapper
 
     _original_mcp_tool = mcp.tool
 
