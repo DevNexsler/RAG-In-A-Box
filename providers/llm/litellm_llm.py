@@ -27,6 +27,19 @@ RETRY_BACKOFF = (5.0, 15.0)
 CONNECT_TIMEOUT_CAP = 10.0
 DEFAULT_BASE_URL = "http://host.docker.internal:4000/v1"
 
+# Every ``reasoning_effort`` an OpenAI-compatible gateway we speak to accepts.
+# A gateway answers anything outside its own set with an HTTP 400, so a typo in
+# config has to fail when the provider is built rather than on every document.
+# ollama.com takes none|low|medium|high|max and only "none" actually disables
+# reasoning (knowledge/runbooks/ollama-cloud-reasoning-truncation.md); OpenAI
+# adds "minimal".
+REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "max"})
+
+# Enrichment keeps only the JSON body, so the recovery attempt buys no
+# reasoning at all: it is the one lever that frees completion budget for the
+# answer when reasoning has eaten it.
+RECOVERY_REASONING_EFFORT = "none"
+
 _ENRICHMENT_SCHEMA = {
     "name": "enrichment",
     "strict": True,
@@ -125,8 +138,15 @@ class LiteLLMGenerator:
         timeout: float = 600.0,
         trace_capture: dict | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> None:
+        if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(
+                "enrichment.reasoning_effort must be one of "
+                f"{sorted(REASONING_EFFORTS)}, got {reasoning_effort!r}"
+            )
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.base_url = base_url.rstrip("/")
         self.api_key = (
             api_key
@@ -165,27 +185,42 @@ class LiteLLMGenerator:
     def generate_with_metadata(
         self, user_prompt: str, max_tokens: int = 512
     ) -> LiteLLMReplayMetadata:
-        initial = self._request_with_metadata(user_prompt, max_tokens=max_tokens)
+        initial = self._request_with_metadata(
+            user_prompt,
+            max_tokens=max_tokens,
+            reasoning_effort=self.reasoning_effort,
+        )
         signals = _truncation_signals(
             initial["response"], initial["request"]["payload"]
         )
         if not signals["truncated"]:
             return initial
 
+        # Disabling reasoning is the only lever that frees completion budget for
+        # the JSON.  Pulling it twice buys nothing: a retry with the parameters
+        # that just failed burns exactly the same way (#0260).
+        recoverable = self.reasoning_effort != RECOVERY_REASONING_EFFORT
         logger.warning(
             "LiteLLM structured response was truncated or empty "
             "(completion_tokens=%s, reasoning_chars=%s, empty=%s, "
-            "finish_reason=%s); retrying "
-            "once with reasoning disabled.",
+            "finish_reason=%s); %s",
             signals["completion_tokens"],
             signals["reasoning_output_length"],
             signals["empty_content"],
             signals["finish_reason"],
+            "retrying once with reasoning disabled."
+            if recoverable
+            else "reasoning is already disabled, not retrying.",
         )
+        if not recoverable:
+            raise TransientError(
+                "LiteLLM structured response was truncated or empty with "
+                "reasoning already disabled"
+            )
         recovered = self._request_with_metadata(
             user_prompt,
             max_tokens=max_tokens,
-            reasoning_effort="none",
+            reasoning_effort=RECOVERY_REASONING_EFFORT,
         )
         recovery_signals = _truncation_signals(
             recovered["response"], recovered["request"]["payload"]

@@ -66,6 +66,7 @@ def build_llm_provider(config: dict) -> LLMGenerator | None:
                 timeout=enrichment_cfg.get("timeout", 600.0),
                 trace_capture=enrichment_cfg.get("trace_capture", {}),
                 temperature=enrichment_cfg.get("temperature", 0.0),
+                reasoning_effort=enrichment_cfg.get("reasoning_effort"),
             )
         except Exception as exc:
             logger.warning(
