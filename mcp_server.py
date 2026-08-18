@@ -2198,7 +2198,7 @@ def _file_get_chunk_impl(doc_id: str, loc: str) -> dict:
         return _error(
             "invalid_parameter",
             "doc_id must not be empty.",
-            "Provide the document-relative file path (e.g., 'Projects/recipe.md'). "
+            "Provide the document ID (e.g., 'documents::00abc'), not a file path. "
             "Use file_search or file_list_documents to find valid doc_ids.",
         )
     if not loc or not loc.strip():
@@ -2254,7 +2254,7 @@ def _file_get_doc_chunks_impl(doc_id: str) -> list[dict] | dict:
         return _error(
             "invalid_parameter",
             "doc_id must not be empty.",
-            "Provide the document-relative file path (e.g., 'Projects/recipe.md'). "
+            "Provide the document ID (e.g., 'documents::00abc'), not a file path. "
             "Use file_search or file_list_documents to find valid doc_ids.",
         )
 
@@ -3187,8 +3187,8 @@ if HAS_MCP and FastMCP is not None:
         Use this after file_search to get the complete text of a result.
 
         Args:
-            doc_id: Persistent 5-char base-62 document ID, exactly as returned
-                by file_search (e.g., "00001").
+            doc_id: Document ID, exactly as returned by file_search
+                (e.g., "documents::00abc"). Opaque, not a file path.
             loc: Chunk locator, exactly as returned by file_search
                 (e.g., "c:0" for chunk 0, "p:3:c:1" for page 3 chunk 1).
 
@@ -3211,7 +3211,8 @@ if HAS_MCP and FastMCP is not None:
         reading an entire document or understanding its structure.
 
         Args:
-            doc_id: Document-relative file path (e.g., "Projects/recipe.md").
+            doc_id: Document ID, exactly as returned by file_search
+                (e.g., "documents::00abc"). Opaque, not a file path.
                 Use file_search or file_list_documents to find valid doc_ids.
 
         Returns a list of chunk dicts, each containing:
@@ -3273,7 +3274,10 @@ if HAS_MCP and FastMCP is not None:
             folder: Filter by top-level folder name (e.g., "Projects").
 
         Returns a list of document metadata dicts, each containing:
-            - doc_id: Document-relative path (e.g., "Archive/notes.md").
+            - doc_id: Opaque document ID, namespaced by source as
+              "<source_name>::<id>" (e.g., "documents::00abc"). Pass it back to
+              other tools verbatim; it is not a file path — path-based browsing
+              uses the rel_path metadata field.
             - title, source_type, folder, tags (array), status, created.
             - mtime: Unix timestamp of last modification.
             - mtime_iso: ISO 8601 UTC string (e.g., "2026-02-20T15:30:00+00:00").
