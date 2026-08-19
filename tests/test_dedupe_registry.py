@@ -874,3 +874,124 @@ def test_update_dedupe_identity_canonical_does_not_mutate_other_hash_algo_row(tm
         ("documents::00001", "canonical", None, "blake3"),
         ("documents::00002", "canonical", None, "sha256"),
     ]
+
+
+def _cohort_of_two(tmp_path, size=123, content_hash=b"\x07" * 32):
+    """A registry holding one two-member exact-content cohort."""
+    store = DocIDStore(tmp_path / "doc_registry.db")
+    store.register("documents::00001", "a.pdf", source_name="documents")
+    store.register("documents::00002", "b.pdf", source_name="documents")
+    for doc_id in ("documents::00001", "documents::00002"):
+        store.claim_canonical_by_exact_hash(
+            doc_id, size, content_hash, hash_algo="blake3"
+        )
+    return store
+
+
+def _reset_rows(store: DocIDStore) -> list[tuple]:
+    return store._conn.execute(
+        "SELECT doc_id, cohort_key FROM dedupe_cohort_resets ORDER BY doc_id"
+    ).fetchall()
+
+
+def test_cohort_reset_at_unchanged_state_is_not_repeated(tmp_path):
+    store = _cohort_of_two(tmp_path)
+
+    with store.reset_exact_hash_cohort_transaction(
+        "documents::00002", skip_repeat_at_same_state=True
+    ) as affected:
+        assert affected == ["documents::00001", "documents::00002"]
+    assert len(_reset_rows(store)) == 2
+
+    # Re-election re-forms the same cohort over the same bytes: the second
+    # reset would change nothing, so it must not happen.
+    for doc_id in ("documents::00001", "documents::00002"):
+        store.claim_canonical_by_exact_hash(
+            doc_id, 123, b"\x07" * 32, hash_algo="blake3"
+        )
+    with store.reset_exact_hash_cohort_transaction(
+        "documents::00002", skip_repeat_at_same_state=True
+    ) as affected:
+        assert affected is None
+    assert store.find_canonical_by_exact_hash(123, b"\x07" * 32, "blake3") is not None
+
+
+def test_cohort_reset_repeats_once_its_members_move(tmp_path):
+    store = _cohort_of_two(tmp_path)
+    with store.reset_exact_hash_cohort_transaction(
+        "documents::00002", skip_repeat_at_same_state=True
+    ) as affected:
+        assert len(affected) == 2
+
+    store.register("documents::00003", "c.pdf", source_name="documents")
+    for doc_id in ("documents::00001", "documents::00002", "documents::00003"):
+        store.claim_canonical_by_exact_hash(
+            doc_id, 123, b"\x07" * 32, hash_algo="blake3"
+        )
+
+    with store.reset_exact_hash_cohort_transaction(
+        "documents::00003", skip_repeat_at_same_state=True
+    ) as affected:
+        assert affected == [
+            "documents::00001",
+            "documents::00002",
+            "documents::00003",
+        ]
+    assert len(_reset_rows(store)) == 3
+
+
+def test_cohort_reset_record_is_dropped_when_the_cohort_resolves(tmp_path):
+    store = _cohort_of_two(tmp_path)
+    with store.reset_exact_hash_cohort_transaction(
+        "documents::00002", skip_repeat_at_same_state=True
+    ):
+        pass
+
+    store.clear_cohort_reset(123, b"\x07" * 32, "blake3")
+    assert _reset_rows(store) == []
+
+    # A canonical that is lost again after the cohort healed still reopens.
+    for doc_id in ("documents::00001", "documents::00002"):
+        store.claim_canonical_by_exact_hash(
+            doc_id, 123, b"\x07" * 32, hash_algo="blake3"
+        )
+    with store.reset_exact_hash_cohort_transaction(
+        "documents::00002", skip_repeat_at_same_state=True
+    ) as affected:
+        assert len(affected) == 2
+
+
+def test_cohort_reset_record_leaves_with_its_registry_row(tmp_path):
+    store = _cohort_of_two(tmp_path)
+    with store.reset_exact_hash_cohort_transaction(
+        "documents::00002", skip_repeat_at_same_state=True
+    ):
+        pass
+
+    store.delete("documents::00001")
+    assert [row[0] for row in _reset_rows(store)] == ["documents::00002"]
+
+
+def test_cohort_reset_record_holds_one_row_per_document(tmp_path):
+    store = _cohort_of_two(tmp_path)
+    with store.reset_exact_hash_cohort_transaction(
+        "documents::00002", skip_repeat_at_same_state=True
+    ):
+        pass
+
+    # The same documents re-identified under different bytes replace their own
+    # rows instead of accumulating one per identity they ever held.
+    latest_hash = b"\x09" * 32
+    for content_hash in (b"\x08" * 32, latest_hash):
+        for doc_id in ("documents::00001", "documents::00002"):
+            store.claim_canonical_by_exact_hash(
+                doc_id, 123, content_hash, hash_algo="blake3"
+            )
+        with store.reset_exact_hash_cohort_transaction(
+            "documents::00002", skip_repeat_at_same_state=True
+        ):
+            pass
+
+    rows = _reset_rows(store)
+    assert [row[0] for row in rows] == ["documents::00001", "documents::00002"]
+    assert {row[1] for row in rows} == {"blake3:123:" + latest_hash.hex()}
