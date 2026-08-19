@@ -10,7 +10,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 
 import pytest
@@ -48,6 +48,7 @@ def runtime(tmp_path):
         "embed_provider": _MockEmbed(),
         "splitter": SentenceSplitter(chunk_size=512, chunk_overlap=20),
         "config": {
+            "index_root": str(tmp_path / "index"),
             "dedupe": {
                 "enabled": True,
                 "skip_duplicate_indexing": True,
@@ -748,3 +749,60 @@ def test_edited_canonical_matching_other_canonical_becomes_duplicate(runtime):
     assert rows["00001"]["dedupe_status"] == "duplicate"
     assert rows["00001"]["canonical_doc_id"] == "00003"
     assert rows["00003"]["dedupe_status"] == "canonical"
+
+
+def _persist_run_skip_ledger(index_root: Path) -> None:
+    """Merge the run's skip decisions into the ledger, as index_vault_flow does
+    at the end of every run, and reset the per-run accumulators."""
+    fiv._save_skip_ledger(
+        index_root,
+        fiv._merge_skip_ledger(
+            fiv._load_skip_ledger(index_root),
+            fiv._RUNTIME.get("skip_now", {}),
+            fiv._RUNTIME.get("skip_clean", set()),
+        ),
+    )
+    fiv._RUNTIME["skip_now"] = {}
+    fiv._RUNTIME["skip_clean"] = set()
+
+
+def test_skip_only_cohort_converges_after_one_pass(runtime, tmp_path):
+    """Two members that both extract no text must settle in a single pass.
+
+    Neither member ever reaches LanceDB — they are intentional
+    `no_text_extracted` skips — so "canonical is absent from LanceDB" is not
+    evidence that the canonical was lost. Reopening the cohort on it hands
+    canonical status back and forth between the two members on every retry
+    cycle, forever, while both runs report Completed (#1252).
+    """
+    docs_root, store, registry = runtime
+    index_root = tmp_path / "index"
+    fiv._RUNTIME["degraded_lock"] = Lock()
+    fiv._RUNTIME["skip_now"] = {}
+    fiv._RUNTIME["skip_clean"] = set()
+    logger = fiv._get_logger()
+
+    blank = "   \n\n\t\n   "
+    a = _make_doc(docs_root, "quo/_indexes/one.md", blank, "001X6")
+    b = _make_doc(docs_root, "quo/_indexes/two.md", blank, "001X7")
+    _register(registry, a)
+    _register(registry, b)
+
+    fiv._process_docs([a, b])
+    _persist_run_skip_ledger(index_root)
+
+    # Both are ledgered as skipped, so the second pass is the bounded retry
+    # that comes due 24-48h later — it must not re-elect a canonical.
+    logger.warning.reset_mock()
+    fiv._process_docs([b, a])
+    _persist_run_skip_ledger(index_root)
+
+    warnings = [str(call) for call in logger.warning.call_args_list]
+    assert not [w for w in warnings if "reopening cohort" in w], warnings
+    assert not [w for w in warnings if "dup-metadata update failed" in w], warnings
+    assert store.list_doc_ids() == []
+    assert [ref["doc_id"] for ref in registry.duplicate_refs_for_canonical("001X6")] == [
+        "001X7"
+    ], "canonical must stay put instead of ping-ponging between the members"
+    ledger = fiv._load_skip_ledger(index_root)["docs"]
+    assert set(ledger) == {"documents::001X6", "documents::001X7"}
