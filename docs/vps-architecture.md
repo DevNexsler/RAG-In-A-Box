@@ -123,7 +123,7 @@ storage_options:
 |------|--------|---------|
 | **`api_server.py`** | Done | Starlette REST app mounted alongside MCP in `server.py` |
 | `POST /api/upload` | Done | Multipart file upload with directory param, path traversal protection |
-| `GET /api/documents/{path}` | Done | Download file by doc_id path |
+| `GET /api/documents/{path}` | Done | Download file by its path under `documents_root` — the route parameter is a path, not an index `doc_id` |
 | `GET /api/documents/` | Done | List files with pagination (limit/offset) |
 | `POST /api/sync` | TODO | Trigger `file_index_update` (re-scan documents_root) |
 | `GET /api/search` | TODO | REST wrapper around `file_search` for non-MCP clients |
