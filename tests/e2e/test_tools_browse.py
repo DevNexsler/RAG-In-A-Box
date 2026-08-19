@@ -43,6 +43,23 @@ async def test_recent_newest_first(indexed_corpus, mcp_session):
         assert d.get("doc_id") and d.get("mtime_iso"), d
 
 
+async def test_list_and_recent_report_document_size(indexed_corpus, mcp_session):
+    """Both browse tools advertise size (bytes); the projection must carry it."""
+    listing = await mcp_session.call_tool_json("file_list_documents", {"limit": 100})
+    assert not listing.get("error"), listing
+    recent = await mcp_session.call_tool_json("file_recent", {"limit": 100})
+    assert isinstance(recent, list) and recent, recent
+
+    for docs in (listing["documents"], recent):
+        for d in docs:
+            assert isinstance(d.get("size"), int) and d["size"] > 0, d
+
+    # Same document, same size from either tool.
+    sizes_by_id = {d["doc_id"]: d["size"] for d in listing["documents"]}
+    for d in recent:
+        assert d["size"] == sizes_by_id[d["doc_id"]], (d, sizes_by_id)
+
+
 async def test_facets_cover_both_sources(indexed_corpus, mcp_session):
     facets = await mcp_session.call_tool_json("file_facets", {})
     assert not facets.get("error"), facets

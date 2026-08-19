@@ -2315,7 +2315,12 @@ class LanceDBStore:
 
         return self._run_read_with_recovery(_op, [])
 
+    # Doc-level fields projected by list_recent_docs. Every chunk of a doc
+    # carries the same values, so the MAX() that collapses the GROUP BY leaves
+    # them unchanged — `size` stays the file's byte size, never a chunk length
+    # or a sum. (`mtime` is selected separately: it drives the ORDER BY.)
     _RECENT_DOC_FIELDS = (
+        "size",
         "title",
         "source_type",
         "folder",

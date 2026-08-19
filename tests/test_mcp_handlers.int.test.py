@@ -261,6 +261,69 @@ def test_recent_returns_sorted_by_mtime(wired_mcp):
 
 
 # ===================================================================
+# TEST: document-level size projection
+# ===================================================================
+
+# A file size that matches neither chunk's length nor their sum, so a
+# per-chunk or summed projection is distinguishable from the file's size.
+_MULTI_CHUNK_FILE_SIZE = 4096
+
+
+@pytest.fixture
+def multi_chunk_wired_mcp():
+    """Wire mcp_server to a store holding one two-chunk document.
+
+    Both chunks carry the document's file size in metadata.size, exactly as
+    process_doc_task writes it, so the doc-level projection must report that
+    size rather than a chunk length or the sum across chunks.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        embed = MockEmbedProvider()
+
+        now = time.time()
+        store.upsert_nodes([
+            _make_node(
+                "notes/long_note.md", "c:0", "first half",
+                [1.0] + [0.0] * 767,
+                folder="notes", title="Long Note",
+                mtime=now, size=_MULTI_CHUNK_FILE_SIZE,
+            ),
+            _make_node(
+                "notes/long_note.md", "c:1", "second half",
+                [1.0] + [0.0] * 767,
+                folder="notes", title="Long Note",
+                mtime=now, size=_MULTI_CHUNK_FILE_SIZE,
+            ),
+        ])
+
+        config = {"index_root": tmpdir, "documents_root": tmpdir, "search": {}}
+        original_cache = mcp_server._cache
+        mcp_server._cache = (store, embed, config)
+        yield store
+        mcp_server._cache = original_cache
+
+
+def test_list_documents_returns_file_size(multi_chunk_wired_mcp):
+    """file_list_documents advertises size (bytes) — it must project it."""
+    result = mcp_server._file_list_documents_impl(offset=0, limit=10)
+
+    assert "error" not in result
+    docs = result["documents"]
+    assert len(docs) == 1
+    assert docs[0]["size"] == _MULTI_CHUNK_FILE_SIZE
+
+
+def test_recent_returns_file_size(multi_chunk_wired_mcp):
+    """file_recent advertises the same size field over the same projection."""
+    docs = mcp_server._file_recent_impl(limit=10)
+
+    assert isinstance(docs, list)
+    assert len(docs) == 1
+    assert docs[0]["size"] == _MULTI_CHUNK_FILE_SIZE
+
+
+# ===================================================================
 # TEST: source_name filter parameter
 # ===================================================================
 
