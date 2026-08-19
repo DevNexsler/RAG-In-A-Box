@@ -134,3 +134,49 @@ def test_build_scheduler_enabled_uses_config_intervals():
     assert sched is not None
     assert sched.drain_interval_s == 30
     assert sched.sweep_interval_s == 900
+
+
+# --- daily Lance compaction (#1254) ---
+
+
+def test_compaction_runs_on_its_own_interval():
+    """The daily data compaction forks a full-memory worker, so it may not ride
+    the drain's 60s cadence; it gets its own long interval and, unlike the
+    sweep, is deliberately left due at boot — a just-started container is the
+    idlest window there is."""
+    compactions = []
+    sched, _ = _scheduler(
+        compact_interval_s=3600,
+        compact_fn=lambda: compactions.append("compact") or {"status": "compacted"},
+    )
+    sched.seed(now=1000.0)
+
+    assert any(k == "compact" for k, _ in sched.tick(now=1000.0))
+    assert not any(k == "compact" for k, _ in sched.tick(now=1000.0 + 3599))
+    assert any(k == "compact" for k, _ in sched.tick(now=1000.0 + 3600))
+    assert compactions == ["compact", "compact"]
+
+
+def test_compaction_is_off_without_a_job():
+    sched, _ = _scheduler()
+    assert not any(k == "compact" for k, _ in sched.tick(now=5.0))
+
+
+def test_compaction_error_is_captured_not_raised():
+    def boom():
+        raise RuntimeError("worker died")
+
+    sched, _ = _scheduler(compact_interval_s=3600, compact_fn=boom)
+    actions = sched.tick(now=5.0)
+    assert any(k == "compact_error" for k, _ in actions)
+
+
+def test_build_scheduler_enabled_wires_the_compaction_job():
+    from mcp_server import build_index_scheduler
+
+    sched = build_index_scheduler({
+        "index_root": "/tmp/x",
+        "scheduler": {"enabled": True, "compact_interval_s": 1800},
+    })
+    assert sched is not None
+    assert sched.compact_interval_s == 1800

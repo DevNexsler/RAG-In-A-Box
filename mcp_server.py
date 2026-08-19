@@ -2715,12 +2715,13 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
 
     Off by default (config-gated) so hermetic test/e2e stacks are unaffected;
     prod enables it via the ``scheduler`` config block. Drains the durable queue
-    on a short interval and spawns the guarded full sweep on a long one, reusing
-    the exact vetted mechanisms (_file_index_update_impl for the sweep,
-    drain_index_queue for the queue).
+    on a short interval, spawns the guarded full sweep on a long one, and offers
+    the daily Lance compaction its idle window on a long one, reusing the exact
+    vetted mechanisms (_file_index_update_impl for the sweep, drain_index_queue
+    for the queue, compact_index_if_idle for the compaction).
     """
     from core.index_scheduler import IndexScheduler
-    from flow_index_vault import drain_index_queue
+    from flow_index_vault import compact_index_if_idle, drain_index_queue
 
     sched_cfg = config.get("scheduler", {})
     if not sched_cfg.get("enabled", False):
@@ -2728,9 +2729,11 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
     return IndexScheduler(
         drain_interval_s=float(sched_cfg.get("drain_interval_s", 60)),
         sweep_interval_s=float(sched_cfg.get("sweep_interval_s", 3600)),
+        compact_interval_s=float(sched_cfg.get("compact_interval_s", 3600)),
         drain_fn=lambda: drain_index_queue(config_path),
         sweep_fn=lambda: _file_index_update_impl(config_path),
         sweep_running_fn=lambda: is_indexer_running(config),
+        compact_fn=lambda: compact_index_if_idle(config_path),
     )
 
 

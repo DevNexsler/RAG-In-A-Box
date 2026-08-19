@@ -89,6 +89,36 @@ _SCHEMA_EVOLUTION_MAX_ROW_DIVISOR = 8
 _SCHEMA_EVOLUTION_MAX_WRITE_CHUNK_DIVISOR = 64
 _SCHEMA_EVOLUTION_SCAN_ROWS = 256
 _SCHEMA_EVOLUTION_RSS_SAFETY_PERCENT = 10
+# Headroom a maintenance worker must leave the rest of its cgroup, and how often
+# that is checked while the worker runs (#1254).
+_WORKER_MEMORY_RESERVE_PERCENT = 15
+_WORKER_MEMORY_POLL_SECONDS = 0.25
+
+
+def _cgroup_v2_dirs(
+    *,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+) -> list[Path]:
+    """This process's cgroup-v2 directory, then each ancestor up to the root."""
+    relative_cgroup = Path("/")
+    try:
+        for line in proc_cgroup_path.read_text().splitlines():
+            hierarchy, controllers, cgroup_path = line.split(":", 2)
+            if hierarchy == "0" and not controllers:
+                relative_cgroup = Path(cgroup_path)
+                break
+    except (OSError, ValueError):
+        pass
+
+    dirs: list[Path] = []
+    current = cgroup_root / str(relative_cgroup).removeprefix("/")
+    while current == cgroup_root or current.is_relative_to(cgroup_root):
+        dirs.append(current)
+        if current == cgroup_root:
+            break
+        current = current.parent
+    return dirs
 
 
 def _cgroup_memory_limit_bytes(
@@ -101,24 +131,12 @@ def _cgroup_memory_limit_bytes(
     if memory_max_path is not None:
         candidates = [memory_max_path]
     else:
-        relative_cgroup = Path("/")
-        try:
-            for line in proc_cgroup_path.read_text().splitlines():
-                hierarchy, controllers, cgroup_path = line.split(":", 2)
-                if hierarchy == "0" and not controllers:
-                    relative_cgroup = Path(cgroup_path)
-                    break
-        except (OSError, ValueError):
-            pass
-
-        leaf = cgroup_root / str(relative_cgroup).removeprefix("/")
-        candidates = []
-        current = leaf
-        while current == cgroup_root or current.is_relative_to(cgroup_root):
-            candidates.append(current / "memory.max")
-            if current == cgroup_root:
-                break
-            current = current.parent
+        candidates = [
+            directory / "memory.max"
+            for directory in _cgroup_v2_dirs(
+                cgroup_root=cgroup_root, proc_cgroup_path=proc_cgroup_path
+            )
+        ]
 
     finite_limits: list[int] = []
     for candidate in candidates:
@@ -144,6 +162,125 @@ def _cgroup_memory_limit_bytes(
     if physical_memory <= 0:
         raise RuntimeError("Cannot determine memory limit for metadata schema evolution")
     return physical_memory
+
+
+def _cgroup_memory_anon_bytes(
+    memory_stat_path: Path | None = None,
+    *,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+) -> int | None:
+    """Anonymous bytes charged to this process's cgroup, or None if unreadable.
+
+    ``memory.current`` also counts page cache, which the kernel reclaims long
+    before it OOM-kills anything. Anonymous memory is the part that genuinely
+    has to fit under ``memory.max``, so it is what a spawn guard must watch.
+    """
+    if memory_stat_path is not None:
+        candidates = [memory_stat_path]
+    else:
+        candidates = [
+            directory / "memory.stat"
+            for directory in _cgroup_v2_dirs(
+                cgroup_root=cgroup_root, proc_cgroup_path=proc_cgroup_path
+            )
+        ]
+
+    for candidate in candidates:
+        try:
+            for line in candidate.read_text().splitlines():
+                key, _, value = line.partition(" ")
+                if key == "anon":
+                    return int(value)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _run_worker_under_memory_ceiling(command: list[str], *, label: str) -> None:
+    """Run a maintenance worker, killing it before its cgroup runs out of memory.
+
+    Such a worker is a second full-memory Python inside the container's memory
+    cgroup, alongside the long-lived server and any index run in flight. When
+    that cgroup reaches ``memory.max`` the kernel OOM-kills the fattest task in
+    it, which is never reliably the worker: on 2026-08-14 and 2026-08-19 it
+    picked the server, the container restarted, and the index run in flight died
+    with it — 51 of 55 queued documents on 08-19 (#1254). Watching the cgroup
+    and killing the worker first inverts that, because a dead worker only defers
+    its own job to the next idle window.
+
+    Raises MemoryError when the ceiling stopped the worker, RuntimeError when the
+    worker failed on its own.
+    """
+    limit_bytes = _cgroup_memory_limit_bytes()
+    ceiling_bytes = limit_bytes * (100 - _WORKER_MEMORY_RESERVE_PERCENT) // 100
+    finished = threading.Event()
+    tripped_at: list[int] = []
+
+    worker = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        text=True,
+    )
+
+    def _watch_cgroup() -> None:
+        while not finished.wait(_WORKER_MEMORY_POLL_SECONDS):
+            anon_bytes = _cgroup_memory_anon_bytes()
+            # Unreadable accounting (bare host, cgroup v1) is a missing ceiling,
+            # not a reason to stop compacting.
+            if anon_bytes is None or anon_bytes < ceiling_bytes:
+                continue
+            tripped_at.append(anon_bytes)
+            worker.kill()
+            return
+
+    watcher = threading.Thread(
+        target=_watch_cgroup, name="worker-memory-ceiling", daemon=True
+    )
+    watcher.start()
+    try:
+        stdout, stderr = worker.communicate()
+    finally:
+        finished.set()
+        watcher.join(timeout=1)
+
+    if tripped_at:
+        raise MemoryError(
+            f"{label} killed at {tripped_at[0]} bytes of cgroup anonymous memory "
+            f"(ceiling {ceiling_bytes} of {limit_bytes})"
+        )
+    if worker.returncode != 0:
+        detail = (stderr or stdout or f"exit code {worker.returncode}").strip()
+        raise RuntimeError(f"{label} failed: {detail}")
+
+
+def compaction_marker_path(index_root: str | Path, table_name: str) -> Path:
+    # Lives NEXT TO the .lance directory, not inside it — Lance owns that tree
+    # and cleanup may remove files it does not recognize.
+    return Path(index_root) / f"{table_name}.lance{_COMPACTION_MARKER_SUFFIX}"
+
+
+def compaction_is_due(index_root: str | Path, table_name: str, today) -> bool:
+    """True when the day's data compaction has not been recorded yet.
+
+    Module-level so the idle-window driver can check the cadence without paying
+    for a table handle, the way drain_index_queue peeks at the request queue.
+    """
+    from datetime import date
+
+    try:
+        recorded = compaction_marker_path(index_root, table_name).read_text().strip()
+        return date.fromisoformat(recorded) < today
+    except (OSError, ValueError):
+        # Missing or unreadable marker: compact now and rewrite it.
+        return True
+
+
+def _compaction_worker_command(dataset_path: str) -> list[str]:
+    """Argv of the short-lived Lance data-compaction worker."""
+    return [sys.executable, "-m", "core.lance_maintenance", "compact", dataset_path]
 
 
 class _SchemaEvolutionRWLock:
@@ -1936,13 +2073,16 @@ class LanceDBStore:
         table.create_fts_index(text_key, use_tantivy=False, replace=True)
         logger.info("FTS index created/rebuilt on column %r", text_key)
 
-    def ensure_fts_index(self, *, compact_data: bool = True) -> None:
+    def ensure_fts_index(self) -> None:
         """Make sure the native FTS index exists and is optimized.
 
         Creates the index if missing; otherwise merges newly written rows into
         the existing index via optimize(). Unindexed rows are still searchable
         before the merge, so this is a performance step, not a correctness one.
         Raises on failure so the caller can track the error.
+
+        Index-only work: it never forks the data-compaction worker, which is the
+        idle window's job (see compact_data_files_if_due).
         """
         table = self._vs.table
         text_key = getattr(self._vs, "text_key", "text")
@@ -1951,72 +2091,52 @@ class LanceDBStore:
             for idx in table.list_indices()
         )
         if not has_fts:
-            if compact_data:
-                self.prepare_indexing_maintenance()
-                table = self._vs.table
             table.create_fts_index(text_key, use_tantivy=False)
             logger.info("FTS index created on column %r", text_key)
             from datetime import date
 
             self._finish_index_maintenance(table, date.today())
             return
-        self._optimize_and_prune(table, compact_data=compact_data)
+        self._optimize_and_prune(table)
         logger.info("FTS index optimized (incremental merge)")
 
-    def prepare_indexing_maintenance(self) -> bool:
-        """Run due data compaction before a memory-heavy indexing phase.
+    def prepare_indexing_maintenance(self) -> None:
+        """Reclaim superseded versions before a memory-heavy indexing phase.
 
         Flows that will process documents call this against an existing table
-        before allocating document-processing state. Finalization can then
-        merge index deltas and refresh restore points without overlapping the
-        daily full-table rewrite with that state.
+        before allocating document-processing state, so the reclaim happens
+        while the run is still cheap.
+
+        Daily data compaction deliberately does NOT happen here: it forks a
+        second full-memory worker into the container's memory cgroup, and inline
+        in a live index run that is what drove the cgroup to its ceiling and
+        cost the run (#1254).
         """
-        from datetime import date
-
         self._prune_versions("pre-maintenance")
-        return self._compact_data_files_if_due(date.today())
 
-    def _optimize_and_prune(self, table, *, compact_data: bool = True) -> None:
+    def _optimize_and_prune(self, table) -> None:
         """Merge index deltas, refresh restore points, and prune old versions.
 
-        ``compact_data`` preserves the all-in-one behavior for ordinary callers.
-        Indexing flows that already attempted pre-processing maintenance disable
-        it here so a failed compaction is not retried while processing state is
-        still resident.
+        This is the every-run half of Lance maintenance: it only merges newly
+        written rows into the search indices (optimize_indices — no data
+        rewrite). Rewriting data files is the once-a-day half, and it belongs to
+        compact_data_files_if_due, which the idle window drives.
 
-        Full data compaction rewrites every fragment, and each
-        retained daily restore-point tag pins the superseded fragments until
-        that tag expires — running it every ~15-minute indexing cycle held a
-        full rewrite of the table per cycle per tag on disk and grew a ~5 GB
-        table to 350+ GB of dead files (#0232). Compaction is therefore
-        bounded to once per calendar day, tracked by a plain-text marker
-        outside the dataset (atomic replace; survives restarts without
-        pinning any Lance version). Every other run only merges newly written
-        rows into the search indices (optimize_indices — no data rewrite).
-
-        Ordering matters: prune -> compact/merge -> tag today -> expire tags
-        -> prune. The first prune frees headroom before any rewrite; the
-        second reclaims versions unpinned by tag expiry in the same run.
-        The prunes run via dataset-level cleanup_old_versions with
+        Ordering matters: merge -> tag today -> expire tags -> prune. The prune
+        runs via dataset-level cleanup_old_versions with
         error_if_tagged_old_versions=False so tagged restore points are
         skipped, not errors (and delete_unverified stays False — Lance's
         in-flight-write protection is only overridden in stopped-service
         repair, never routinely).
 
-        Compaction, tagging, and pruning are housekeeping: failures are logged,
-        never raised. A failed compaction leaves the marker unwritten for a
-        later run. Only the index-delta merge propagates, letting the flow fall
-        back to a full FTS rebuild.
+        Tagging and pruning are housekeeping: failures are logged, never raised.
+        Only the index-delta merge propagates, letting the flow fall back to a
+        full FTS rebuild.
         """
         from datetime import date
 
-        today = date.today()
-        if compact_data:
-            self._prune_versions("pre-maintenance")
-            self._compact_data_files_if_due(today)
-
         self._merge_index_deltas()
-        self._finish_index_maintenance(table, today)
+        self._finish_index_maintenance(table, date.today())
 
     def _finish_index_maintenance(self, table, today) -> None:
         """Stage a safe tag, expire/prune, then retag exact latest."""
@@ -2026,14 +2146,36 @@ class LanceDBStore:
         self._prune_versions("post-expiry")
         self._tag_latest_restore_point(table, today)
 
-    def _compact_data_files_if_due(self, today) -> bool:
-        """Best-effort daily data compaction with durable success cadence."""
+    def compact_data_files_if_due(self, today) -> bool:
+        """Best-effort daily data compaction with durable success cadence.
+
+        Full data compaction rewrites every fragment, and each retained daily
+        restore-point tag pins the superseded fragments until that tag expires —
+        running it every ~15-minute indexing cycle held a full rewrite of the
+        table per cycle per tag on disk and grew a ~5 GB table to 350+ GB of
+        dead files (#0232). It is therefore bounded to once per calendar day,
+        tracked by a plain-text marker outside the dataset (atomic replace;
+        survives restarts without pinning any Lance version).
+
+        Call this only from an idle window, never from inside an index run: the
+        rewrite runs in a forked full-memory worker, and co-residency with a
+        live run is what drove the container's memory cgroup to its ceiling on
+        2026-08-14 and 2026-08-19 (#1254). flow_index_vault.compact_index_if_idle
+        is the caller that owns that window.
+
+        The pre-compaction prune frees headroom before the rewrite; the tag
+        refresh in _finish_index_maintenance reclaims what tag expiry unpins.
+        Failures are logged, never raised, and leave the marker unwritten so a
+        later idle window retries.
+        """
         if not self._compaction_due(today):
             return False
 
         import lance
 
         from core.resilience import call_with_retry
+
+        self._prune_versions("pre-compaction")
 
         try:
             pre_compaction_version = lance.dataset(self._dataset_path()).version
@@ -2101,48 +2243,22 @@ class LanceDBStore:
         return len(fragments)
 
     def _compact_data_files(self) -> None:
-        """Compact in a worker whose native allocations are released on exit."""
+        """Compact in a worker whose native allocations are released on exit,
+        and which the container's memory cgroup can afford."""
         with self._measure_memory("lance_daily_compaction"):
-            command = [
-                sys.executable,
-                "-m",
-                "core.lance_maintenance",
-                "compact",
-                self._dataset_path(),
-            ]
-            try:
-                subprocess.run(
-                    command,
-                    check=True,
-                    capture_output=True,
-                    close_fds=True,
-                    text=True,
-                )
-            except subprocess.CalledProcessError as exc:
-                detail = (exc.stderr or exc.stdout or str(exc)).strip()
-                raise RuntimeError(
-                    f"Lance compaction worker failed: {detail}"
-                ) from exc
+            _run_worker_under_memory_ceiling(
+                _compaction_worker_command(self._dataset_path()),
+                label="Lance compaction worker",
+            )
 
     def _dataset_path(self) -> str:
         return str(Path(self.index_root) / f"{self.table_name}.lance")
 
     def _compaction_marker_path(self) -> Path:
-        # Lives NEXT TO the .lance directory, not inside it — Lance owns that
-        # tree and cleanup may remove files it does not recognize.
-        return Path(self.index_root) / (
-            f"{self.table_name}.lance{_COMPACTION_MARKER_SUFFIX}"
-        )
+        return compaction_marker_path(self.index_root, self.table_name)
 
     def _compaction_due(self, today) -> bool:
-        from datetime import date
-
-        try:
-            recorded = self._compaction_marker_path().read_text().strip()
-            return date.fromisoformat(recorded) < today
-        except (OSError, ValueError):
-            # Missing or unreadable marker: compact now and rewrite it.
-            return True
+        return compaction_is_due(self.index_root, self.table_name, today)
 
     def _record_compaction(self, today) -> None:
         """Write-then-rename so a crash mid-write cannot corrupt the marker."""
