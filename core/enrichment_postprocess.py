@@ -99,6 +99,27 @@ _GENERIC_DOC_TYPES = {
 }
 _DEFAULT_RULES = {"importance", "doc_type", "key_facts"}
 
+# Compounds the enrichment model spells both as one word and as two. #1251's
+# separator fold cannot reconcile these — they differ in word count, not in
+# punctuation — so `followup` and `follow_up` stay two buckets no single LIKE
+# filter value reaches (#1330). The canonical form is the multi-word spelling:
+# it is what the term reads as in English, it keeps the boundaries a tokenizer
+# and a published facet need, and deleting separators instead would leave
+# unreadable values like `rentalinquiry`. Add a compound here, not a whole label
+# — the fold applies wherever the compound appears, so `leasing_followup` and
+# the next prefix nobody has seen yet are both covered by one entry.
+_DOC_TYPE_COMPOUNDS = (
+    "follow_up",
+    "health_check",
+    "pay_stub",
+    "section_8",
+    "w_9",
+)
+_COMPOUND_SEGMENTS = {
+    compound.replace("_", ""): tuple(compound.split("_")) for compound in _DOC_TYPE_COMPOUNDS
+}
+_COMPOUND_MAX_WORDS = max(len(words) for words in _COMPOUND_SEGMENTS.values())
+
 
 def canonicalize_doc_type(value: str) -> str:
     """Fold an ``enr_doc_type`` field to its canonical spelling.
@@ -108,7 +129,10 @@ def canonicalize_doc_type(value: str) -> str:
     concept into several unreachable buckets (#1251, recurrence of #0233).
     Each comma-separated label is lowercased and every run of ``-``, ``_`` or
     space becomes a single ``_``; duplicates created by the fold collapse and
-    the model's ordering is preserved.
+    the model's ordering is preserved. Words that spell one of
+    ``_DOC_TYPE_COMPOUNDS`` are then re-segmented to that compound's canonical
+    form, which closes the word-segmentation variants the separator fold leaves
+    behind (``followup`` -> ``follow_up``, #1330).
     """
     canonical: list[str] = []
     seen: set[str] = set()
@@ -121,7 +145,32 @@ def canonicalize_doc_type(value: str) -> str:
 
 
 def _canonical_label(label: str) -> str:
-    return _LABEL_SEPARATOR_RE.sub("_", label.strip().lower()).strip("_")
+    label = _LABEL_SEPARATOR_RE.sub("_", label.strip().lower()).strip("_")
+    if not label:
+        return label
+    return "_".join(_resegment_words(label.split("_")))
+
+
+def _resegment_words(words: list[str]) -> list[str]:
+    """Rewrite each run of words spelling a known compound to its canonical form.
+
+    Longest run first, so a compound is matched whether the model wrote it joined
+    (``followup``) or already split (``follow``, ``up``); words outside the
+    vocabulary are left exactly as they are.
+    """
+    segmented: list[str] = []
+    start = 0
+    while start < len(words):
+        for end in range(min(start + _COMPOUND_MAX_WORDS, len(words)), start, -1):
+            canonical = _COMPOUND_SEGMENTS.get("".join(words[start:end]))
+            if canonical is not None:
+                segmented.extend(canonical)
+                start = end
+                break
+        else:
+            segmented.append(words[start])
+            start += 1
+    return segmented
 
 
 def repair_enrichment(
