@@ -92,12 +92,22 @@ _SCHEMA_EVOLUTION_RSS_SAFETY_PERCENT = 10
 
 
 def _lance_field_ids_by_path(schema: Any) -> dict[tuple[str, ...], int]:
-    """Return stable Lance field IDs indexed by their nested field path."""
+    """Map each current Lance schema field path to its stable field ID."""
     field_ids: dict[tuple[str, ...], int] = {}
+    paths_by_id: dict[int, tuple[str, ...]] = {}
 
     def visit(field: Any, parent_path: tuple[str, ...]) -> None:
         path = (*parent_path, field.name())
-        field_ids[path] = field.id()
+        field_id = field.id()
+        if path in field_ids:
+            raise ValueError(f"duplicate Lance field path: {path}")
+        prior_path = paths_by_id.get(field_id)
+        if prior_path is not None:
+            raise ValueError(
+                f"duplicate Lance field ID {field_id}: {prior_path} and {path}"
+            )
+        field_ids[path] = field_id
+        paths_by_id[field_id] = path
         for child in field.children():
             visit(child, path)
 
@@ -109,7 +119,7 @@ def _lance_field_ids_by_path(schema: Any) -> dict[tuple[str, ...], int]:
 def _physical_column_paths(
     schema: pa.Schema, field_ids_by_path: dict[tuple[str, ...], int]
 ) -> list[tuple[str, ...]]:
-    """Return physical file paths represented by stable Lance field IDs."""
+    """List physical file columns as nested Lance-schema field paths."""
     paths: list[tuple[str, ...]] = []
 
     def visit(field: pa.Field, parent_path: tuple[str, ...]) -> None:
@@ -117,13 +127,12 @@ def _physical_column_paths(
         if path not in field_ids_by_path:
             raise KeyError(path)
         paths.append(path)
+        # Fixed-size lists store their child in the parent's physical column;
+        # descending would invent an extra manifest column.
+        if pa.types.is_fixed_size_list(field.type):
+            return
         for index in range(field.type.num_fields):
-            child = field.type.field(index)
-            child_path = (*path, child.name)
-            if child_path in field_ids_by_path:
-                visit(child, path)
-            elif not pa.types.is_fixed_size_list(field.type):
-                raise KeyError(child_path)
+            visit(field.type.field(index), path)
 
     for field in schema:
         visit(field, ())

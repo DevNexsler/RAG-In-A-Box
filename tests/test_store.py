@@ -899,8 +899,8 @@ def test_store_open_repairs_fragment_that_overclaims_its_columns():
         assert metadata.field("source_type").to_pylist() == ["md"]
 
 
-def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
-    """List children need stable IDs; a fixed-size vector child does not."""
+def test_physical_column_paths_match_lance_manifest_for_nested_fixed_size_lists(tmp_path):
+    """Repair must retain Lance IDs, not substitute physical column ordinals."""
     import lance
     from lance.file import LanceFileReader
     from lancedb_store import _lance_field_ids_by_path, _physical_column_paths
@@ -912,6 +912,7 @@ def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
                 "items": [{"label": "a", "scores": [1, 2]}],
                 "large_values": ["x"],
                 "vector": [1.0, 2.0, 3.0],
+                "fixed_struct": [{"value": 7}],
             }
         ],
         schema=pa.schema(
@@ -930,6 +931,10 @@ def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
                 ),
                 pa.field("large_values", pa.large_list(pa.string())),
                 pa.field("vector", pa.list_(pa.float32(), 3)),
+                pa.field(
+                    "fixed_struct",
+                    pa.list_(pa.struct([pa.field("value", pa.int32())]), 1),
+                ),
             ]
         ),
     )
