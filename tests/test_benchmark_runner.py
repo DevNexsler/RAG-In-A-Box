@@ -456,7 +456,7 @@ def test_run_benchmark_can_score_repaired_enrichment(tmp_path):
         postprocess_enrichment=True,
     )
 
-    assert "payment notice" in repaired_run.per_case[0]["normalized_output"]["enr_doc_type"]
+    assert "payment_notice" in repaired_run.per_case[0]["normalized_output"]["enr_doc_type"]
     assert repaired_run.summary["postprocess_enrichment"] is True
     assert repaired_run.summary["average_total_score"] > raw_run.summary["average_total_score"]
 

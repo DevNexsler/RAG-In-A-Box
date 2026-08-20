@@ -41,7 +41,7 @@ def test_doc_type_adds_stable_classification_without_dropping_model_values():
 
     doc_types = {item.strip() for item in repaired["enr_doc_type"].split(",")}
     assert "email" in doc_types
-    assert "rental inquiry" in doc_types
+    assert "rental_inquiry" in doc_types
 
 
 def test_key_facts_drop_unsupported_generic_items_and_add_source_evidence():

@@ -5,6 +5,7 @@ Unit tests mock the LLM generator.  Integration test uses the real MiniMax M2.5 
 
 import json
 import logging
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -132,6 +133,19 @@ class TestNormalizeEnrichment:
         facts = json.loads(result["enr_key_facts"])
         assert "Foundation type: spread footings" in facts
 
+    def test_doc_type_folds_separator_and_case_variants(self):
+        """#1251: enr_doc_type is a filter key, so its spelling must be canonical."""
+        raw = {
+            "doc_type": [
+                "Property Showing",
+                "property-showing",
+                "property_showing",
+                "Follow-Up",
+            ]
+        }
+        result = _normalize_enrichment(raw)
+        assert result["enr_doc_type"] == "property_showing, follow_up"
+
     def test_missing_fields_default_to_empty(self):
         result = _normalize_enrichment({"summary": "Hello"})
         assert result["enr_summary"] == "Hello"
@@ -249,6 +263,40 @@ class TestEnrichDocument:
         assert "finance" in result["enr_suggested_tags"]
         assert result["enr_suggested_folder"] == "Financial/"
         gen.generate.assert_called_once()
+
+    def test_new_rows_carry_no_separator_variant_clusters(self):
+        """#1251 acceptance: separator/case variants leave no cluster behind.
+
+        The ticket's index-wide scan buckets labels by
+        ``re.sub(r"[-_ ]", "", s.lower())`` and reports a cluster whenever one
+        bucket holds more than one spelling. Enriching one concept under every
+        separator and case spelling the model has been seen to emit must
+        therefore write exactly one value per bucket. (Word-segmentation
+        differences such as ``follow_up`` vs ``followup`` land in the same
+        bucket but are a different defect — see the ticket.)
+        """
+        spellings = [
+            "Property Showing",
+            "property-showing",
+            "property_showing",
+            "rental inquiry",
+            "Rental-Inquiry",
+            "rental_inquiry",
+        ]
+        written = set()
+        for spelling in spellings:
+            gen = self._make_generator(
+                json.dumps({"summary": "A viewing was booked.", "doc_type": [spelling]})
+            )
+            result = enrich_document("Viewing booked for the unit.", "Viewing", "email", gen)
+            written.add(result["enr_doc_type"])
+
+        clusters: dict[str, set[str]] = {}
+        for label in written:
+            clusters.setdefault(re.sub(r"[-_ ]", "", label.lower()), set()).add(label)
+
+        assert [bucket for bucket, labels in clusters.items() if len(labels) > 1] == []
+        assert written == {"property_showing", "rental_inquiry"}
 
     def test_postprocess_flag_repairs_importance(self):
         llm_response = json.dumps({

@@ -5,6 +5,7 @@ import re
 from collections.abc import Iterable
 
 _TOKEN_RE = re.compile(r"[a-z0-9$,.#/-]+", re.IGNORECASE)
+_LABEL_SEPARATOR_RE = re.compile(r"[-_ ]+")
 _DATE_RE = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b")
 _MONEY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d{2})?")
 
@@ -99,6 +100,30 @@ _GENERIC_DOC_TYPES = {
 _DEFAULT_RULES = {"importance", "doc_type", "key_facts"}
 
 
+def canonicalize_doc_type(value: str) -> str:
+    """Fold an ``enr_doc_type`` field to its canonical spelling.
+
+    ``enr_doc_type`` is a published filter key (``file_search``/``file_facets``)
+    matched with LIKE, so a separator or case difference silently splits one
+    concept into several unreachable buckets (#1251, recurrence of #0233).
+    Each comma-separated label is lowercased and every run of ``-``, ``_`` or
+    space becomes a single ``_``; duplicates created by the fold collapse and
+    the model's ordering is preserved.
+    """
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for label in _csv_values(value):
+        label = _canonical_label(label)
+        if label and label not in seen:
+            canonical.append(label)
+            seen.add(label)
+    return ", ".join(canonical)
+
+
+def _canonical_label(label: str) -> str:
+    return _LABEL_SEPARATOR_RE.sub("_", label.strip().lower()).strip("_")
+
+
 def repair_enrichment(
     enrichment: dict[str, str],
     *,
@@ -168,18 +193,19 @@ def _metadata_corpus(enrichment: dict[str, str]) -> str:
 
 
 def _repair_doc_type(*, current: str, corpus_lower: str) -> str:
-    values = _csv_values(current)
-    lowered = {value.lower() for value in values}
-    if values and any(value.lower() not in _GENERIC_DOC_TYPES for value in values):
+    values = _csv_values(canonicalize_doc_type(current))
+    existing = set(values)
+    if values and any(value not in _GENERIC_DOC_TYPES for value in values):
         return ", ".join(values[:5])
 
     inferred: list[str] = []
-    inferred_lowered: set[str] = set()
+    inferred_seen: set[str] = set()
 
     def add(value: str) -> None:
-        if value not in lowered and value not in inferred_lowered:
+        value = _canonical_label(value)
+        if value not in existing and value not in inferred_seen:
             inferred.append(value)
-            inferred_lowered.add(value)
+            inferred_seen.add(value)
 
     if _has_any(corpus_lower, _LEGAL_TERMS):
         add("legal notice")
