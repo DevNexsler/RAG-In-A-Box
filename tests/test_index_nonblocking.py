@@ -145,6 +145,17 @@ def test_index_update_rejects_concurrent_runs(tmp_path, monkeypatch):
     )
     assert dummy.stdout is not None
     assert dummy.stdout.readline() == "ready\n"
+
+    # The child's userspace-ready signal alone is insufficient: this test
+    # publishes its PID to code that identifies indexers through /proc.  Wait
+    # for that exact observation before exposing the PID, so scheduler load
+    # cannot reopen the gap between the test fixture and production predicate.
+    identity_deadline = time.monotonic() + 5
+    while not mcp_server._pid_is_indexer(dummy.pid):
+        if time.monotonic() >= identity_deadline:
+            pytest.fail("dummy indexer never became identifiable through /proc")
+        time.sleep(0.01)
+
     pid_file = tmp_path / "indexer.pid"
     pid_file.write_text(str(dummy.pid))
 
