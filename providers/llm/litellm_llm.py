@@ -36,12 +36,10 @@ Evidence-quality rules:
 - For a brief message, keep the summary and key facts close to its actual
   wording and stated purpose.
 - For suggested_tags, use concise evidence-grounded terms only.
-- For suggested_folder, use a stable two-level filing path. First segment must
-  be one of Communications, Finance, Housing, Legal, Operations, or General;
-  second segment must be a plain document subject. Never use Inbox, Admin,
-  Customer Support, Audit Logs, dates, years, product brands, urgency, or
-  speculative issue labels. When an Available Folders taxonomy is supplied,
-  use one exact path from it instead.
+- For suggested_folder, use a concise, stable filing path grounded in the
+  document. Do not synthesize operational inbox, state, organization, or date
+  hierarchies from the document. When an Available Folders taxonomy is
+  supplied, use one exact path from it instead.
 """
 
 MAX_RETRIES = 2

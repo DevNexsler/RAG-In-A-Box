@@ -112,7 +112,9 @@ def test_qwen_bulk_uses_json_object_non_thinking_sampling():
     assert "exactly one JSON object" in payload["messages"][0]["content"]
     assert "every required enrichment field" in payload["messages"][0]["content"]
     assert "one atomic fact per item" in payload["messages"][0]["content"]
-    assert "stable two-level filing path" in payload["messages"][0]["content"]
+    assert "Available Folders taxonomy" in payload["messages"][0]["content"]
+    assert "use one exact path from it instead" in payload["messages"][0]["content"]
+    assert "Communications, Finance, Housing, Legal" not in payload["messages"][0]["content"]
 
 
 @pytest.mark.parametrize(
