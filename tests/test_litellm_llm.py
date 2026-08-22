@@ -102,15 +102,17 @@ def test_qwen_bulk_uses_json_object_non_thinking_sampling():
     assert json.loads(result)["summary"] == "ok"
     payload = post.call_args.kwargs["json"]
     assert payload["response_format"] == {"type": "json_object"}
-    assert payload["temperature"] == 0.7
+    assert payload["temperature"] == 0.4
     assert payload["top_p"] == 0.8
-    assert payload["presence_penalty"] == 1.5
+    assert payload["presence_penalty"] == 0.5
     assert payload["extra_body"] == {
         "top_k": 20,
         "chat_template_kwargs": {"enable_thinking": False},
     }
     assert "exactly one JSON object" in payload["messages"][0]["content"]
     assert "every required enrichment field" in payload["messages"][0]["content"]
+    assert "one atomic fact per item" in payload["messages"][0]["content"]
+    assert "stable two-level filing path" in payload["messages"][0]["content"]
 
 
 @pytest.mark.parametrize(

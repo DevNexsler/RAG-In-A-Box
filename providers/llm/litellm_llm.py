@@ -24,6 +24,26 @@ _SYSTEM_PROMPT = (
     "or any text outside the JSON object."
 )
 
+_QWEN_BULK_QUALITY_INSTRUCTIONS = """
+Evidence-quality rules:
+- Ground every value in the primary document. Do not infer urgency, disputes,
+  compliance, system states, or application-specific labels not stated in it.
+- For doc_type, use plain-language document genres with spaces; do not use
+  internal, database, or application labels.
+- For key_facts, emit one atomic fact per item. Preserve each explicit person,
+  action, amount, date, address, warning, and requested next step. Do not
+  merge or omit material facts.
+- For a brief message, keep the summary and key facts close to its actual
+  wording and stated purpose.
+- For suggested_tags, use concise evidence-grounded terms only.
+- For suggested_folder, use a stable two-level filing path. First segment must
+  be one of Communications, Finance, Housing, Legal, Operations, or General;
+  second segment must be a plain document subject. Never use Inbox, Admin,
+  Customer Support, Audit Logs, dates, years, product brands, urgency, or
+  speculative issue labels. When an Available Folders taxonomy is supplied,
+  use one exact path from it instead.
+"""
+
 MAX_RETRIES = 2
 RETRY_BACKOFF = (5.0, 15.0)
 CONNECT_TIMEOUT_CAP = 10.0
@@ -44,14 +64,15 @@ def _enrichment_request_policy(model: str, temperature: float) -> dict[str, Any]
         return {
             "payload": {
                 "response_format": {"type": "json_object"},
-                "temperature": 0.7,
+                "temperature": 0.4,
                 "top_p": 0.8,
-                "presence_penalty": 1.5,
+                "presence_penalty": 0.5,
                 "extra_body": {
                     "top_k": 20,
                     "chat_template_kwargs": {"enable_thinking": False},
                 },
             },
+            "system_prompt": _SYSTEM_PROMPT + _QWEN_BULK_QUALITY_INSTRUCTIONS,
             "validate_structured_json": True,
             "retry_without_reasoning": False,
         }
@@ -63,6 +84,7 @@ def _enrichment_request_policy(model: str, temperature: float) -> dict[str, Any]
             },
             "temperature": temperature,
         },
+        "system_prompt": _SYSTEM_PROMPT,
         "validate_structured_json": False,
         "retry_without_reasoning": True,
     }
@@ -248,7 +270,7 @@ class LiteLLMGenerator:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": self._request_policy["system_prompt"]},
                 {"role": "user", "content": user_prompt},
             ],
             "max_tokens": max_tokens,
