@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import time
@@ -18,8 +19,9 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
     "You are a document metadata extractor. You analyze document text and "
-    "return structured metadata as valid JSON. Never include explanations, "
-    "markdown fences, or any text outside the JSON object."
+    "return exactly one JSON object containing every required enrichment field "
+    "requested in the user prompt. Never include explanations, markdown fences, "
+    "or any text outside the JSON object."
 )
 
 MAX_RETRIES = 2
@@ -32,6 +34,50 @@ _ENRICHMENT_SCHEMA = {
     "strict": True,
     "schema": enrichment_response_schema(),
 }
+
+_REQUIRED_ENRICHMENT_FIELDS = ("summary", "doc_type")
+
+
+def _enrichment_request_policy(model: str, temperature: float) -> dict[str, Any]:
+    """Return one centralized request policy for an enrichment model."""
+    if model.casefold() == "qwen-bulk":
+        return {
+            "payload": {
+                "response_format": {"type": "json_object"},
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "presence_penalty": 1.5,
+                "extra_body": {
+                    "top_k": 20,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            },
+            "validate_structured_json": True,
+            "retry_without_reasoning": False,
+        }
+    return {
+        "payload": {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": _ENRICHMENT_SCHEMA,
+            },
+            "temperature": temperature,
+        },
+        "validate_structured_json": False,
+        "retry_without_reasoning": True,
+    }
+
+
+def _validate_enrichment_content(content: str) -> None:
+    """Reject malformed JSON and missing core enrichment fields before return."""
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict):
+        raise ValueError("structured response must be a JSON object")
+    missing = [field for field in _REQUIRED_ENRICHMENT_FIELDS if not parsed.get(field)]
+    if missing:
+        raise ValueError(
+            "structured response missing required fields: " + ", ".join(missing)
+        )
 
 
 def _is_response_format_rejection(response: httpx.Response) -> bool:
@@ -135,6 +181,7 @@ class LiteLLMGenerator:
         )
         self.timeout = timeout
         self.temperature = temperature
+        self._request_policy = _enrichment_request_policy(model, temperature)
         trace_capture = trace_capture or {}
         self.trace_recorder = LLMTraceRecorder(
             provider="litellm",
@@ -151,14 +198,6 @@ class LiteLLMGenerator:
 
         logger.info("LiteLLMGenerator initialized: %s model=%s", self.base_url, model)
 
-    def _build_response_format(self, *, allow_schema: bool = True) -> dict:
-        if allow_schema:
-            return {
-                "type": "json_schema",
-                "json_schema": _ENRICHMENT_SCHEMA,
-            }
-        return {"type": "json_object"}
-
     def generate(self, user_prompt: str, max_tokens: int = 512) -> str:
         return self.generate_with_metadata(user_prompt, max_tokens=max_tokens)["content"]
 
@@ -172,20 +211,21 @@ class LiteLLMGenerator:
         if not signals["truncated"]:
             return initial
 
+        retry_without_reasoning = self._request_policy["retry_without_reasoning"]
         logger.warning(
             "LiteLLM structured response was truncated or empty "
             "(completion_tokens=%s, reasoning_chars=%s, empty=%s, "
-            "finish_reason=%s); retrying "
-            "once with reasoning disabled.",
+            "finish_reason=%s); retrying%s.",
             signals["completion_tokens"],
             signals["reasoning_output_length"],
             signals["empty_content"],
             signals["finish_reason"],
+            " once with reasoning disabled" if retry_without_reasoning else "",
         )
         recovered = self._request_with_metadata(
             user_prompt,
             max_tokens=max_tokens,
-            reasoning_effort="none",
+            reasoning_effort="none" if retry_without_reasoning else None,
         )
         recovery_signals = _truncation_signals(
             recovered["response"], recovered["request"]["payload"]
@@ -205,16 +245,15 @@ class LiteLLMGenerator:
         reasoning_effort: str | None = None,
     ) -> LiteLLMReplayMetadata:
         request_timeout = self._build_request_timeout()
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             "max_tokens": max_tokens,
-            "temperature": self.temperature,
-            "response_format": self._build_response_format(),
         }
+        payload.update(copy.deepcopy(self._request_policy["payload"]))
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
         headers = {
@@ -260,6 +299,23 @@ class LiteLLMGenerator:
                 )
                 raw_content = data["choices"][0]["message"].get("content")
                 content = raw_content.strip() if isinstance(raw_content, str) else ""
+                if self._request_policy["validate_structured_json"]:
+                    try:
+                        _validate_enrichment_content(content)
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        last_exc = TransientError(
+                            f"LiteLLM structured response validation failed: {exc}"
+                        )
+                        if attempt == MAX_RETRIES - 1:
+                            break
+                        backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                        logger.warning(
+                            "LiteLLM structured response failed validation; "
+                            "retrying in %.0fs...",
+                            backoff,
+                        )
+                        time.sleep(backoff)
+                        continue
                 return {
                     "content": content,
                     "request": copy.deepcopy(trace_request),
@@ -291,9 +347,7 @@ class LiteLLMGenerator:
                         "retrying with json_object.",
                         self.model,
                     )
-                    payload["response_format"] = self._build_response_format(
-                        allow_schema=False
-                    )
+                    payload["response_format"] = {"type": "json_object"}
                     continue
                 if status == 429 or 500 <= status < 600:
                     last_exc = exc
