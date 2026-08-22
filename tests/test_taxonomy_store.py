@@ -253,6 +253,29 @@ class TestFormatForPrompt:
     def test_format_empty_store(self, store):
         assert store.format_for_prompt() == ""
 
+    def test_document_prompt_uses_semantic_and_frequent_candidates_with_cap(self, store):
+        def semantic_embed(text: str) -> list[float]:
+            return [1.0, 0.0] if "lease" in text.lower() else [0.0, 1.0]
+
+        semantic_store = TaxonomyStore(
+            str(store.index_root), table_name="semantic-taxonomy", embed_fn=semantic_embed
+        )
+        semantic_store.add("folder", "Housing/Lease/", "Housing lease agreements and rent payments")
+        semantic_store.add("folder", "Archive/", "Historical records", usage_count=99)
+        semantic_store.add("folder", "Misc/", "Miscellaneous notes")
+
+        text = semantic_store.format_for_prompt(
+            query="tenant lease payment",
+            semantic_limit=1,
+            frequent_limit=1,
+            max_chars=500,
+        )
+
+        assert "Housing/Lease/" in text
+        assert "Archive/" in text
+        assert "Misc/" not in text
+        assert len(text) <= 500
+
 
 # ---------------------------------------------------------------------------
 # Count
@@ -419,3 +442,5 @@ class TestFolderSync:
         assert "email-attachments/" in names
         assert "email-attachments/joycelyn-smith/" in names
         assert "email-attachments/joycelyn-smith/2026-04/" not in names
+        folder = store.get("folder:1-Projects/Alpha/")
+        assert "1-Projects/Alpha/" in folder["description"]

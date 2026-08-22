@@ -412,7 +412,15 @@ class TaxonomyStore:
 
     # --- Enrichment helper ---
 
-    def format_for_prompt(self, kind: str | None = None) -> str:
+    def format_for_prompt(
+        self,
+        kind: str | None = None,
+        *,
+        query: str = "",
+        semantic_limit: int = 80,
+        frequent_limit: int = 40,
+        max_chars: int | None = None,
+    ) -> str:
         """Render active entries as compact text for LLM prompt injection.
 
         Returns a string block like:
@@ -423,11 +431,13 @@ class TaxonomyStore:
             ## Available Folders
             - 0-AI/: AI collaboration hub
         """
+        self._ensure_table()
         if self._table is None:
             return ""
 
         kinds = [kind] if kind else ["tag", "folder", "doc_type"]
         sections: list[str] = []
+        used_chars = 0
 
         kind_labels = {"tag": "Tags", "folder": "Folders", "doc_type": "Document Types"}
 
@@ -435,14 +445,40 @@ class TaxonomyStore:
             entries = self.list_by_kind(k, status="active")
             if not entries:
                 continue
+            if query.strip():
+                selected: list[dict] = []
+                selected_ids: set[str] = set()
+                try:
+                    semantic = self.search(query, kind=k, top_k=semantic_limit)
+                except Exception as exc:
+                    logger.warning("Taxonomy semantic prompt selection failed: %s", exc)
+                    semantic = []
+                frequent = sorted(
+                    entries,
+                    key=lambda entry: (-int(entry.get("usage_count", 0)), entry["name"]),
+                )[:frequent_limit]
+                for entry in [*semantic, *frequent]:
+                    if entry.get("status") != "active" or entry["id"] in selected_ids:
+                        continue
+                    selected.append(entry)
+                    selected_ids.add(entry["id"])
+                entries = selected
             lines = [f"## Available {kind_labels.get(k, k.title() + 's')}"]
             for e in sorted(entries, key=lambda x: x["name"]):
                 desc = e.get("description", "")
                 if desc:
-                    lines.append(f"- {e['name']}: {desc[:80]}")
+                    line = f"- {e['name']}: {desc[:80]}"
                 else:
-                    lines.append(f"- {e['name']}")
-            sections.append("\n".join(lines))
+                    line = f"- {e['name']}"
+                separator = 2 if sections else 0
+                if max_chars is not None and used_chars + separator + len("\n".join(lines)) + 1 + len(line) > max_chars:
+                    break
+                lines.append(line)
+            if len(lines) == 1:
+                continue
+            section = "\n".join(lines)
+            used_chars += (2 if sections else 0) + len(section)
+            sections.append(section)
 
         return "\n\n".join(sections)
 

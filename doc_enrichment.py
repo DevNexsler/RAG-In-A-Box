@@ -657,7 +657,10 @@ def enrich_document(
         taxonomy_block = ""
         if taxonomy_store is not None:
             try:
-                raw_block = taxonomy_store.format_for_prompt()
+                raw_block = taxonomy_store.format_for_prompt(
+                    query=f"{title}\n{truncated}",
+                    max_chars=96000,
+                )
                 if raw_block:
                     taxonomy_block = f"\n{_TAXONOMY_INSTRUCTION}\n{raw_block}\n"
             except Exception as exc:

@@ -390,6 +390,10 @@ class TestEnrichDocument:
         call_args = gen.generate.call_args[0][0]
         assert "## Available Tags" in call_args
         assert "work: Work stuff" in call_args
+        mock_taxonomy.format_for_prompt.assert_called_once_with(
+            query="doc.md\nSome text",
+            max_chars=96000,
+        )
 
     def test_taxonomy_usage_writes_can_be_disabled_for_index_workers(self):
         """Concurrent index workers should read taxonomy for prompts without writing usage."""

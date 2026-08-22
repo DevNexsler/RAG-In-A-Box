@@ -74,13 +74,17 @@ def sync_folder_taxonomy_from_filesystem(
     existing = 0
     for folder_path in sorted(set(folder_paths)):
         entry_id = f"folder:{folder_path}"
-        if store.get(entry_id) is not None:
+        existing_entry = store.get(entry_id)
+        description = f"Filesystem folder path: {folder_path}"
+        if existing_entry is not None:
             existing += 1
+            if existing_entry.get("description") == "Folder path discovered from filesystem structure":
+                store.update(entry_id, description=description)
             continue
         store.add(
             "folder",
             folder_path,
-            "Folder path discovered from filesystem structure",
+            description,
             contents_type="mixed",
             ai_managed=0,
             created_by="indexer",
