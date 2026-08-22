@@ -167,6 +167,15 @@ def test_parse_enrichment_response_handles_fenced_json():
     assert parsed["enr_importance"] == "0.7"
 
 
+def test_parse_enrichment_response_defaults_missing_optional_context_fields():
+    result = parse_enrichment_response('{"summary":"ok","doc_type":["email"]}')
+
+    assert result["enr_summary"] == "ok"
+    assert result["enr_doc_type"] == "email"
+    assert result["enr_entities_people"] == ""
+    assert result["enr_context_warning"] == ""
+
+
 def test_parse_context_enrichment_fields():
     parsed = parse_enrichment_response(
         """

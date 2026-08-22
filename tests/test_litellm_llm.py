@@ -85,6 +85,64 @@ def test_litellm_generator_uses_configurable_openai_compatible_endpoint(tmp_path
     assert "secret-key" not in json.dumps(rows[0])
 
 
+def test_qwen_bulk_uses_json_object_non_thinking_sampling():
+    response = _completion_response(
+        '{"summary":"ok","doc_type":["email"]}',
+        completion_tokens=12,
+    )
+
+    with patch("providers.llm.litellm_llm.httpx.post", return_value=response) as post:
+        generator = LiteLLMGenerator(
+            model="qwen-bulk",
+            base_url="http://litellm.local/v1",
+            api_key="secret-key",
+        )
+        result = generator.generate("hello world", max_tokens=16384)
+
+    assert json.loads(result)["summary"] == "ok"
+    payload = post.call_args.kwargs["json"]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["temperature"] == 0.4
+    assert payload["top_p"] == 0.8
+    assert payload["presence_penalty"] == 0.5
+    assert payload["extra_body"] == {
+        "top_k": 20,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    assert "exactly one JSON object" in payload["messages"][0]["content"]
+    assert "every required enrichment field" in payload["messages"][0]["content"]
+    assert "one atomic fact per item" in payload["messages"][0]["content"]
+    assert "stable two-level filing path" in payload["messages"][0]["content"]
+
+
+@pytest.mark.parametrize(
+    "invalid_content",
+    ["not json", '{"summary":"missing doc type"}'],
+)
+def test_qwen_bulk_retries_invalid_structured_response(invalid_content):
+    invalid = _completion_response(invalid_content, completion_tokens=20)
+    recovered = _completion_response(
+        '{"summary":"Recovered","doc_type":["email"]}',
+        completion_tokens=12,
+    )
+
+    with patch(
+        "providers.llm.litellm_llm.httpx.post",
+        side_effect=[invalid, recovered],
+    ) as post:
+        generator = LiteLLMGenerator(
+            model="qwen-bulk",
+            base_url="http://litellm.local/v1",
+            api_key="secret-key",
+        )
+        result = generator.generate("large email", max_tokens=16384)
+
+    assert json.loads(result)["summary"] == "Recovered"
+    assert post.call_count == 2
+    for call in post.call_args_list:
+        assert call.kwargs["json"]["response_format"] == {"type": "json_object"}
+
+
 def test_build_llm_provider_supports_litellm(monkeypatch):
     monkeypatch.setenv("LITELLM_MASTER_KEY", "secret-key")
     generator = build_llm_provider(
