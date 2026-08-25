@@ -21,7 +21,7 @@ import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from core.enrichment_postprocess import repair_enrichment
+from core.enrichment_postprocess import canonicalize_doc_type, repair_enrichment
 from core.resilience import is_transient
 from core.tracing import get_tracer
 
@@ -443,6 +443,12 @@ def _normalize_enrichment(raw: dict[str, Any]) -> dict[str, str]:
             "context_warning",
         ):
             result[enr_key] = str(value).strip()
+        elif raw_key == "doc_type":
+            # Canonical spelling keeps the published enr_doc_type filter whole:
+            # LIKE matching cannot bridge separator variants of one concept (#1251).
+            result[enr_key] = canonicalize_doc_type(
+                _normalize_metadata_list(raw_key, value)
+            )
         elif raw_key in ("key_facts", "context_key_facts"):
             if isinstance(value, list):
                 result[enr_key] = json.dumps(
