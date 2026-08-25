@@ -96,7 +96,7 @@ async def api_client_with_auth(tmp_docs_root):
 
 @pytest.mark.anyio
 async def test_upload_valid_md_file(api_client, tmp_docs_root):
-    """AC-REST-1: Upload a valid .md file returns 201 with correct doc_id and size."""
+    """AC-REST-1: Upload a valid .md file returns 201 with correct rel_path and size."""
     file_content = b"# My Upload\n\nNew content here."
     files = {"file": ("upload_test.md", file_content, "text/markdown")}
 
@@ -105,7 +105,7 @@ async def test_upload_valid_md_file(api_client, tmp_docs_root):
     assert resp.status_code == 201
     body = resp.json()
     assert body["uploaded"] is True
-    assert body["doc_id"] == "upload_test.md"
+    assert body["rel_path"] == "upload_test.md"
     assert body["size"] == len(file_content)
 
     # File actually exists on disk
@@ -181,12 +181,48 @@ async def test_upload_to_subdirectory(api_client, tmp_docs_root):
 
     assert resp.status_code == 201
     body = resp.json()
-    assert "subfolder/" in body["doc_id"] or body["doc_id"] == "subfolder/note.md"
+    assert "subfolder/" in body["rel_path"] or body["rel_path"] == "subfolder/note.md"
 
     # File on disk in subfolder
     on_disk = tmp_docs_root / "subfolder" / "note.md"
     assert on_disk.exists()
     assert on_disk.read_bytes() == file_content
+
+
+@pytest.mark.anyio
+async def test_upload_response_names_the_path_rel_path(api_client):
+    """#1230: the upload response addresses the file by ``rel_path``.
+
+    The value has always been a documents_root-relative path, never an index
+    ``doc_id`` (those are minted by DocIDStore and namespaced per source, e.g.
+    ``documents::00001``), so the canonical key is ``rel_path`` and ``doc_id``
+    survives only as a deprecated alias carrying the same value.
+    """
+    files = {"file": ("naming.md", b"# Naming\n", "text/markdown")}
+
+    resp = await api_client.post("/upload", files=files)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["rel_path"] == "naming.md"
+    assert body["doc_id"] == body["rel_path"], "deprecated alias must mirror rel_path"
+
+
+@pytest.mark.anyio
+async def test_upload_rel_path_downloads_verbatim(api_client):
+    """#1230: the upload response's rel_path is exactly what download takes."""
+    file_content = b"# Round Trip\n\nUploaded then fetched back."
+    files = {"file": ("trip.md", file_content, "text/markdown")}
+
+    upload = await api_client.post("/upload", files=files, data={"directory": "subfolder"})
+    assert upload.status_code == 201
+    rel_path = upload.json()["rel_path"]
+    assert rel_path == "subfolder/trip.md"
+
+    resp = await api_client.get(f"/documents/{rel_path}")
+
+    assert resp.status_code == 200
+    assert resp.content == file_content
 
 
 # ===================================================================
