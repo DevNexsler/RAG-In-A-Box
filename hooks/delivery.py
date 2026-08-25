@@ -26,10 +26,20 @@ def drain_due(
     logger: logging.Logger | None = None,
     now: float | None = None,
 ) -> dict[str, int]:
-    """Send due deliveries and persist their accepted, retry, or redrive state."""
+    """Send due deliveries and persist their accepted, retry, or redrive state.
+
+    Each delivery is claimed before it is sent, so drains that overlap — one
+    per index worker, plus the scheduler tick — never send the same event to
+    the same hook twice.
+    """
     log = logger or logging.getLogger(__name__)
     counts = {"accepted": 0, "retry_pending": 0, "redrive_required": 0}
-    for delivery in outbox.due(limit=limit, now=now):
+    for pending in outbox.due(limit=limit, now=now):
+        delivery = outbox.claim(pending, now=now)
+        if delivery is None:
+            # Another drain already owns this delivery and is sending it.
+            log.debug("hook delivery skipped event_id=%s: claimed elsewhere", pending.event_id)
+            continue
         try:
             result = sender(delivery.hook, delivery.event)
         except Exception:

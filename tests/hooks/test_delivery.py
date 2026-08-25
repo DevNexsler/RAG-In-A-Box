@@ -90,3 +90,25 @@ def test_retryable_failures_redrive_after_five_sends(tmp_path, monkeypatch):
         "redrive_required": 1,
     }
     assert outbox.due(limit=1, now=1_000) == []
+
+
+def test_overlapping_drains_send_one_delivery_once(tmp_path):
+    """Fails if a drain sends a delivery another drain already has in flight."""
+    from hooks.delivery import drain_due
+
+    outbox = HookOutbox(tmp_path)
+    outbox.enqueue({"event_id": "evt-1", "doc_id": "documents::a"}, {"name": "cds"})
+    sent: list[str] = []
+
+    def sender(hook, event):
+        sent.append(event["event_id"])
+        if len(sent) == 1:
+            # A second drainer (another index worker, or the scheduler tick)
+            # starts while this send is still in flight.
+            drain_due(HookOutbox(tmp_path), limit=64, sender=sender)
+        return HookSendResult(True, "accepted", False, 200)
+
+    result = drain_due(outbox, limit=64, sender=sender)
+
+    assert sent == ["evt-1"]
+    assert result == {"accepted": 1, "retry_pending": 0, "redrive_required": 0}

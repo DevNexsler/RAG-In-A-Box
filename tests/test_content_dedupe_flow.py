@@ -9,8 +9,9 @@ index metadata and sidecar.
 import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import flow_index_vault as fiv
 from core.hook_outbox import HookOutbox
 from doc_id_store import DocIDStore
+from hooks.delivery import drain_due
 from lancedb_store import LanceDBStore
 
 
@@ -696,6 +698,75 @@ def test_duplicate_callback_uses_alias_identity_and_canonical_payload(runtime, m
     assert body in event["chunks"][0]["text"]
     assert event["metadata"]["enr_importance"] == "0.5"
     assert event["metadata"]["enr_importance_source"] == "default"
+
+
+def test_duplicate_callback_delivers_one_request_per_event_id(runtime):
+    """Fails if a dedup-skipped document's callback reaches the hook target twice.
+
+    Every document dispatch drains the whole due outbox, so a second drainer
+    that starts while a send is still in flight sends the same delivery again.
+    Counted at the receiver on purpose: an accepted delivery row is deleted, so
+    the extra POST leaves nothing behind in the outbox to assert on.
+    """
+    docs_root, store, registry = runtime
+    body = "Duplicate attachment body with indexed canonical content."
+    canonical = _make_doc(docs_root, "f/canonical.md", body, "00001")
+    duplicate = _make_doc(
+        docs_root,
+        "email-attachments/quo/attachment@00002@.md",
+        body,
+        "00002",
+    )
+    _register(registry, canonical)
+    _register(registry, duplicate)
+    index_root = str(docs_root.parent / "index")
+    received: list[str] = []
+    overlapped = Event()
+
+    class _Sink(BaseHTTPRequestHandler):
+        def do_POST(self):
+            event = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            received.append(event["event_id"])
+            if event["doc_id"] == duplicate["doc_id"] and not overlapped.is_set():
+                overlapped.set()
+                # A second drainer — another index worker, or the scheduler
+                # tick — runs while this delivery is still in flight.
+                drain_due(HookOutbox(index_root), limit=64)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "updated"}')
+
+        def log_message(self, *args):
+            """Keep the sink out of the test log."""
+
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), _Sink)
+    Thread(target=sink.serve_forever, daemon=True).start()
+    fiv._RUNTIME["config"].update(
+        {
+            "index_root": index_root,
+            "event_hooks": {
+                "enabled": True,
+                "hooks": [
+                    {
+                        "name": "cds",
+                        "events": ["document.indexed"],
+                        "url": f"http://127.0.0.1:{sink.server_address[1]}/hook",
+                    }
+                ],
+            },
+        }
+    )
+    try:
+        fiv.process_doc_task.fn(canonical)
+        fiv.process_doc_task.fn(duplicate)
+    finally:
+        sink.shutdown()
+        sink.server_close()
+
+    assert overlapped.is_set()
+    assert sorted(received) == sorted(set(received))
+    assert len(received) == 2  # canonical document + duplicate alias, once each
 
 
 def test_duplicate_callback_payload_read_failure_does_not_fail_index(runtime, monkeypatch):
