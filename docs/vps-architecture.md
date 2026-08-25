@@ -78,7 +78,7 @@ lancedb:
   read_consistency_interval_seconds: 5
 ```
 
-Both `lancedb_store.py` and `taxonomy_store.py` call `lancedb.connect(index_root)` — S3 URIs work transparently. The only code addition needed is passing `storage_options` and `read_consistency_interval` from config to the `lancedb.connect()` calls.
+Both `lancedb_store.py` and `taxonomy_store.py` connect through `core.lance_session.connect(index_root)` — S3 URIs work transparently. The only code addition needed is passing `storage_options` and `read_consistency_interval` from config to that one helper, which is already where the shared, size-bounded `lancedb.Session` is applied.
 
 #### Document Storage Abstraction (when S3 is needed)
 
