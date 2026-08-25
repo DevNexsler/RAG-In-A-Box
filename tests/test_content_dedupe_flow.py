@@ -849,3 +849,57 @@ def test_edited_canonical_matching_other_canonical_becomes_duplicate(runtime):
     assert rows["00001"]["dedupe_status"] == "duplicate"
     assert rows["00001"]["canonical_doc_id"] == "00003"
     assert rows["00003"]["dedupe_status"] == "canonical"
+
+
+def test_cohort_whose_members_never_index_resets_at_most_once(runtime):
+    """A cohort reset that changes nothing must not repeat every run (#1258).
+
+    Both members hold real content but land no index rows — here because the
+    upsert is a no-op, in production because processing fails terminally
+    without a skip-ledger entry. Absence alone keeps looking like a lost
+    canonical, so every pass reopened the cohort, re-elected the other member
+    and found it absent again. The reset is bounded by the state it ran at:
+    same members, same bytes, no second reset — and the member whose reset is
+    suppressed is still indexed rather than skipped as a duplicate of a
+    canonical that holds no rows (#0426).
+    """
+    docs_root, store, registry = runtime
+    body = "content whose members never land index rows"
+    a = _make_doc(docs_root, "f/a.md", body, "00001")
+    b = _make_doc(docs_root, "g/b.md", body, "00002")
+    _register(registry, a)
+    _register(registry, b)
+
+    raw = Path(a["abs_path"]).read_bytes()
+    digest = blake3.blake3(raw).digest()
+    registry.claim_canonical_by_exact_hash(
+        "00001", len(raw), digest, hash_algo="blake3"
+    )
+    registry.claim_canonical_by_exact_hash(
+        "00002", len(raw), digest, hash_algo="blake3"
+    )
+
+    resets = []
+    original_reset = fiv._reset_invalid_dedupe_cohort
+
+    def counting_reset(*args, **kwargs):
+        affected = original_reset(*args, **kwargs)
+        if affected:
+            resets.append(list(affected))
+        return affected
+
+    indexed_doc_ids = []
+
+    def recording_upsert(nodes):
+        indexed_doc_ids.extend({n.metadata["doc_id"] for n in nodes})
+
+    with (
+        patch.object(fiv, "_reset_invalid_dedupe_cohort", counting_reset),
+        patch.object(store, "upsert_nodes", side_effect=recording_upsert),
+    ):
+        for _ in range(3):
+            fiv.process_doc_task.fn(a)
+            fiv.process_doc_task.fn(b)
+
+    assert len(resets) == 1, f"cohort reset repeated: {resets}"
+    assert indexed_doc_ids.count("documents::00002") == 3

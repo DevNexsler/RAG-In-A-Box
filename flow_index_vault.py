@@ -2022,8 +2022,19 @@ def _reset_invalid_dedupe_cohort(
     bare_id: str,
     source_name: str,
     logger,
-) -> list[str]:
-    with registry.reset_exact_hash_cohort_transaction(bare_id) as affected:
+    *,
+    skip_repeat_at_same_state: bool = False,
+) -> list[str] | None:
+    """Dissolve this document's exact-content cohort; return its members.
+
+    ``skip_repeat_at_same_state`` returns ``None`` without touching anything
+    when this cohort was already reset at these members and these bytes — the
+    reset would change nothing, so repeating it once per retry cycle is a loop,
+    not a repair (#1258).
+    """
+    with registry.reset_exact_hash_cohort_transaction(
+        bare_id, skip_repeat_at_same_state=skip_repeat_at_same_state
+    ) as affected:
         if affected:
             namespaced_ids = [f"{source_name}::{doc_id}" for doc_id in affected]
             store.delete_by_doc_ids(namespaced_ids)
@@ -2190,6 +2201,7 @@ def _process_doc_task(
             and os.path.isfile(abs_path_str)
         ):
             winner = None
+            elect_canonical = True
             try:
                 import blake3 as _blake3
 
@@ -2204,6 +2216,10 @@ def _process_doc_task(
                 if winner is not None and winner.get("doc_id") != bare_id:
                     canonical_ns = f"{source_name}::{winner['doc_id']}"
                     if store.contains_doc_id(canonical_ns):
+                        # The cohort holds content again, so any earlier reset
+                        # of it no longer describes the present state: forget
+                        # it, or a later genuine loss could not reopen (#1258).
+                        registry.clear_cohort_reset(len(raw_bytes), digest, "blake3")
                         _run_identity_op_with_stranded_cohort_recovery(
                             lambda: registry.update_dedupe_identity(
                                 bare_id,
@@ -2221,11 +2237,24 @@ def _process_doc_task(
                             "Dedupe canonical %s is absent from LanceDB; reopening cohort",
                             canonical_ns,
                         )
-                        _reset_invalid_dedupe_cohort(
-                            registry, store, bare_id, source_name, logger
-                        )
+                        if _reset_invalid_dedupe_cohort(
+                            registry, store, bare_id, source_name, logger,
+                            skip_repeat_at_same_state=True,
+                        ) is None:
+                            # This cohort was already reopened at these members
+                            # and these bytes and the canonical is still empty.
+                            # Re-electing would hand the content back to the
+                            # same absent canonical, so leave the registry alone
+                            # and index this copy instead of skipping it (#0426).
+                            logger.warning(
+                                "Cohort of %s was already reopened at this state — "
+                                "indexing %s directly instead of repeating the reset",
+                                canonical_ns,
+                                doc_id,
+                            )
+                            elect_canonical = False
                         winner = None
-                if winner is None:
+                if winner is None and elect_canonical:
                     winner = _run_identity_op_with_stranded_cohort_recovery(
                         lambda: registry.claim_canonical_by_exact_hash(
                             bare_id,
