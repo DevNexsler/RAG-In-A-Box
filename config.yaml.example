@@ -197,7 +197,15 @@ event_hooks:
 #         # rows — which never populate messages.direction — still get one.
 #         query: |
 #           SELECT m.source, m.source_message_id, m.sent_at, m.updated_at,
-#                  m.body AS _text,
+#                  CASE
+#                    WHEN NULLIF(BTRIM(COALESCE(m.subject, '')), '') IS NULL
+#                      THEN m.body
+#                    WHEN NULLIF(BTRIM(COALESCE(m.body, '')), '') IS NULL
+#                      THEN 'Subject: ' || BTRIM(m.subject)
+#                    ELSE 'Subject: ' || BTRIM(m.subject)
+#                      || E'\n\nBody:\n' || m.body
+#                  END AS _text,
+#                  m.subject,
 #                  c.source_channel_id, c.name AS channel_name,
 #                  p.display_name AS sender,
 #                  COALESCE(
@@ -211,12 +219,16 @@ event_hooks:
 #           LEFT JOIN channels c ON c.id = m.channel_id
 #           LEFT JOIN participants p ON p.id = m.sender_participant_id
 #           LEFT JOIN raw_events r ON r.id = m.raw_event_id
-#           WHERE m.body IS NOT NULL AND m.body <> ''
+#           WHERE (
+#               NULLIF(BTRIM(COALESCE(m.subject, '')), '') IS NOT NULL
+#               OR NULLIF(BTRIM(COALESCE(m.body, '')), '') IS NOT NULL
+#             )
+#             AND m.canonical_message_id IS NULL
 #         id_template: "{source}/{source_message_id}"
 #         text_column: _text
 #         text_normalizer: zoho_cliq_mentions
 #         mtime_column: updated_at
-#         metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, sent_at, direction]
+#         metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, subject, sent_at, direction]
 #
 # communication_context:
 #   enabled: true

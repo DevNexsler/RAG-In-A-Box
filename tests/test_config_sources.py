@@ -141,5 +141,49 @@ def test_project_comm_messages_config_example_exports_source_channel_id():
     assert "c.name AS channel_name" in config_example
     assert (
         "metadata_columns: [source, source_message_id, source_channel_id, "
-        "channel_name, sender, sent_at, direction]"
+        "channel_name, sender, subject, sent_at, direction]"
     ) in config_example
+
+
+def test_project_comm_messages_config_example_indexes_subject_and_body():
+    uncommented = Path("config.yaml.example").read_text().replace("# ", "")
+    config_example = " ".join(uncommented.split())
+
+    assert (
+        "CASE "
+        "WHEN NULLIF(BTRIM(COALESCE(m.subject, '')), '') IS NULL THEN m.body "
+        "WHEN NULLIF(BTRIM(COALESCE(m.body, '')), '') IS NULL "
+        "THEN 'Subject: ' || BTRIM(m.subject) "
+        "ELSE 'Subject: ' || BTRIM(m.subject) "
+        "|| E'\\n\\nBody:\\n' || m.body "
+        "END AS _text"
+    ) in config_example
+    assert (
+        "WHERE ( "
+        "NULLIF(BTRIM(COALESCE(m.subject, '')), '') IS NOT NULL "
+        "OR NULLIF(BTRIM(COALESCE(m.body, '')), '') IS NOT NULL "
+        ") AND m.canonical_message_id IS NULL"
+    ) in config_example
+
+
+@pytest.mark.parametrize(
+    "config_path", ["config.staging.yaml", "config.staging.realmedia.yaml"]
+)
+def test_staging_comm_messages_index_subject_and_body(config_path):
+    config = yaml.safe_load(Path(config_path).read_text())
+    postgres_source = next(
+        source for source in config["sources"] if source["type"] == "postgres"
+    )
+    message_table = next(
+        table
+        for table in postgres_source["tables"]
+        if table["source_type"] == "pg_message"
+    )
+    query = " ".join(message_table["query"].split())
+
+    assert "WHEN NULLIF(BTRIM(COALESCE(subject, '')), '') IS NULL THEN body" in query
+    assert "THEN 'Subject: ' || BTRIM(subject)" in query
+    assert "E'\\n\\nBody:\\n' || body" in query
+    assert "NULLIF(BTRIM(COALESCE(subject, '')), '') IS NOT NULL" in query
+    assert "NULLIF(BTRIM(COALESCE(body, '')), '') IS NOT NULL" in query
+    assert "subject" in message_table["metadata_columns"]
