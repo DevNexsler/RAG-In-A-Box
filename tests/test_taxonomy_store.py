@@ -410,7 +410,7 @@ class TestStaleConnectionRecovery:
                 created_rows.append(data)
                 return FakeTable()
 
-        monkeypatch.setattr("taxonomy_store.ldb.connect", lambda path: FakeDB())
+        monkeypatch.setattr("taxonomy_store.lance_session.connect", lambda path: FakeDB())
 
         store = TaxonomyStore(str(tmp_path), table_name="taxonomy", embed_fn=_fake_embed)
         assert store.count() == 0

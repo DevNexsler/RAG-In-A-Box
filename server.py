@@ -19,6 +19,7 @@ rather than silently leaking orphan servers.
 
 import os
 
+from core import lance_session
 from core.config import load_config
 from core.logging_setup import configure_logging_from_config
 from core.tracing import setup_tracing
@@ -39,6 +40,11 @@ def main() -> None:
 
     # No-op unless config has tracing.enabled: true; never raises.
     setup_tracing(config, "doc-organizer")
+
+    # Bound the Lance caches this long-lived process accumulates. Without it
+    # LanceDB sizes its caches for a dedicated host and the server grows into
+    # the container's memory cgroup until the OOM-killer takes it down (#1157).
+    lance_session.configure_from_config(config)
 
     host = config.get("mcp", {}).get("host", "0.0.0.0")
     port = int(os.environ.get("PORT", config.get("mcp", {}).get("port", 7788)))

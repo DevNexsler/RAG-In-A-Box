@@ -19,11 +19,25 @@ from core.benchmarking.cases import (
 from core.benchmarking.mining import materialize_hard_suite
 from core.benchmarking.reporting import write_reports
 from core.benchmarking.runner import run_benchmark
+from core.config import load_config
 
 
 def _add_task_suite_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task", default="enrichment")
     parser.add_argument("--suite", default="standard")
+
+
+def _add_provider_args(parser: argparse.ArgumentParser) -> None:
+    """Register the flags that select which deployed provider a run replays through."""
+    parser.add_argument(
+        "--config",
+        help="config file whose enrichment: block selects the provider to benchmark "
+        "(default: the OpenRouter provider)",
+    )
+    parser.add_argument(
+        "--model",
+        help="model to benchmark (default: the enrichment.model of --config)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd = subparsers.add_parser("run")
     run_cmd.add_argument("--bench-dir", default=".evals/benchmarks")
     _add_task_suite_args(run_cmd)
-    run_cmd.add_argument("--model", required=True)
+    _add_provider_args(run_cmd)
     run_cmd.add_argument("--run-id", required=True)
     run_cmd.add_argument("--max-cases", type=int)
     run_cmd.add_argument("--postprocess-enrichment", action="store_true")
@@ -67,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit_run_cmd = subparsers.add_parser("audit-run")
     audit_run_cmd.add_argument("--bench-dir", default=".evals/benchmarks/audit")
-    audit_run_cmd.add_argument("--model", required=True)
+    _add_provider_args(audit_run_cmd)
     audit_run_cmd.add_argument("--run-id", required=True)
     audit_run_cmd.add_argument("--max-cases", type=int)
     audit_run_cmd.add_argument("--postprocess-enrichment", action="store_true")
@@ -133,35 +147,39 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
+        model, enrichment_config = _resolve_provider(args, parser=parser)
         _print_run(
             run_benchmark(
                 bench_dir=args.bench_dir,
                 task=args.task,
                 suite=args.suite,
-                model=args.model,
+                model=model,
                 run_id=args.run_id,
                 max_cases=args.max_cases,
                 postprocess_enrichment=args.postprocess_enrichment,
                 postprocess_rules=args.postprocess_rules,
+                enrichment_config=enrichment_config,
             ),
             run_id=args.run_id,
-            model=args.model,
+            model=model,
         )
         return 0
 
     if args.command == "audit-run":
+        model, enrichment_config = _resolve_provider(args, parser=parser)
         _print_run(
             run_benchmark(
                 bench_dir=args.bench_dir,
-                model=args.model,
+                model=model,
                 run_id=args.run_id,
                 max_cases=args.max_cases,
                 score_mode="audit",
                 postprocess_enrichment=args.postprocess_enrichment,
                 postprocess_rules=args.postprocess_rules,
+                enrichment_config=enrichment_config,
             ),
             run_id=args.run_id,
-            model=args.model,
+            model=model,
         )
         return 0
 
@@ -191,6 +209,26 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.error(f"Unsupported command: {args.command}")
     return 2
+
+
+def _resolve_provider(
+    args: argparse.Namespace,
+    *,
+    parser: argparse.ArgumentParser,
+) -> tuple[str, dict | None]:
+    """Resolve which model to score and which enrichment block to build it from.
+
+    Passing a deployed config makes "benchmark exactly what is deployed" a single
+    flag: the provider, base URL, and model all come from the same block the
+    indexer enriches with.
+    """
+    enrichment_config = None
+    if args.config:
+        enrichment_config = dict(load_config(args.config).get("enrichment") or {})
+    model = args.model or (enrichment_config or {}).get("model")
+    if not model:
+        parser.error("--model is required unless --config sets enrichment.model")
+    return model, enrichment_config
 
 
 def _print_case(*, bench_dir: str, case_id: str, label_source: str = "baseline_assisted") -> None:

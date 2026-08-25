@@ -96,7 +96,7 @@ async def api_client_with_auth(tmp_docs_root):
 
 @pytest.mark.anyio
 async def test_upload_valid_md_file(api_client, tmp_docs_root):
-    """AC-REST-1: Upload a valid .md file returns 201 with correct doc_id and size."""
+    """AC-REST-1: Upload a valid .md file returns 201 with correct rel_path and size."""
     file_content = b"# My Upload\n\nNew content here."
     files = {"file": ("upload_test.md", file_content, "text/markdown")}
 
@@ -105,7 +105,7 @@ async def test_upload_valid_md_file(api_client, tmp_docs_root):
     assert resp.status_code == 201
     body = resp.json()
     assert body["uploaded"] is True
-    assert body["doc_id"] == "upload_test.md"
+    assert body["rel_path"] == "upload_test.md"
     assert body["size"] == len(file_content)
 
     # File actually exists on disk
@@ -181,12 +181,48 @@ async def test_upload_to_subdirectory(api_client, tmp_docs_root):
 
     assert resp.status_code == 201
     body = resp.json()
-    assert "subfolder/" in body["doc_id"] or body["doc_id"] == "subfolder/note.md"
+    assert "subfolder/" in body["rel_path"] or body["rel_path"] == "subfolder/note.md"
 
     # File on disk in subfolder
     on_disk = tmp_docs_root / "subfolder" / "note.md"
     assert on_disk.exists()
     assert on_disk.read_bytes() == file_content
+
+
+@pytest.mark.anyio
+async def test_upload_response_names_the_path_rel_path(api_client):
+    """#1230: the upload response addresses the file by ``rel_path``.
+
+    The value has always been a documents_root-relative path, never an index
+    ``doc_id`` (those are minted by DocIDStore and namespaced per source, e.g.
+    ``documents::00001``), so the canonical key is ``rel_path`` and ``doc_id``
+    survives only as a deprecated alias carrying the same value.
+    """
+    files = {"file": ("naming.md", b"# Naming\n", "text/markdown")}
+
+    resp = await api_client.post("/upload", files=files)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["rel_path"] == "naming.md"
+    assert body["doc_id"] == body["rel_path"], "deprecated alias must mirror rel_path"
+
+
+@pytest.mark.anyio
+async def test_upload_rel_path_downloads_verbatim(api_client):
+    """#1230: the upload response's rel_path is exactly what download takes."""
+    file_content = b"# Round Trip\n\nUploaded then fetched back."
+    files = {"file": ("trip.md", file_content, "text/markdown")}
+
+    upload = await api_client.post("/upload", files=files, data={"directory": "subfolder"})
+    assert upload.status_code == 201
+    rel_path = upload.json()["rel_path"]
+    assert rel_path == "subfolder/trip.md"
+
+    resp = await api_client.get(f"/documents/{rel_path}")
+
+    assert resp.status_code == 200
+    assert resp.content == file_content
 
 
 # ===================================================================
@@ -203,6 +239,15 @@ async def test_download_existing_file(api_client, tmp_docs_root):
 
     assert resp.status_code == 200
     assert resp.text == expected_content
+
+
+@pytest.mark.anyio
+async def test_download_nested_file(api_client, tmp_docs_root):
+    """AC-REST-2: The catch-all still serves multi-segment doc_ids."""
+    resp = await api_client.get("/documents/reports/report.pdf")
+
+    assert resp.status_code == 200
+    assert resp.content == (tmp_docs_root / "reports" / "report.pdf").read_bytes()
 
 
 @pytest.mark.anyio
@@ -358,6 +403,26 @@ async def test_list_documents_pagination(api_client, tmp_docs_root):
 
 
 @pytest.mark.anyio
+async def test_list_documents_trailing_slash(api_client):
+    """AC-REST-3: /documents/ lists like /documents instead of hitting download."""
+    resp = await api_client.get("/documents/")
+
+    assert resp.status_code == 200
+    assert resp.json() == (await api_client.get("/documents")).json()
+
+
+@pytest.mark.anyio
+async def test_list_documents_trailing_slash_with_directory(api_client):
+    """AC-REST-3: The documented /documents/?directory=... form lists that subdirectory."""
+    resp = await api_client.get("/documents/?directory=reports&limit=50")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["directory"] == "reports"
+    assert {f["name"] for f in body["files"]} == {"report.pdf"}
+
+
+@pytest.mark.anyio
 async def test_search_post_returns_mcp_search_results(api_client, monkeypatch):
     """AC-REST-5: POST /search forwards JSON body to file_search implementation."""
     calls = []
@@ -405,3 +470,55 @@ async def test_search_post_returns_mcp_search_results(api_client, monkeypatch):
             "filter": None,
         }
     ]
+
+
+async def _post_search(client):
+    return await client.post("/search", json={"query": "neural"})
+
+
+@pytest.mark.anyio
+async def test_search_post_does_not_block_the_serving_loop(api_client, monkeypatch):
+    """A slow /search must leave the loop free for the liveness route (#1086).
+
+    /api/search is the REST twin of the file_search MCP tool and runs the same
+    blocking implementation (embed → LanceDB → rerank, routinely 10-20s in
+    production). Called inline on the serving event loop it starves every other
+    route — including the unauthenticated /health probe the container
+    healthcheck polls with a 5s timeout — so it must be dispatched to a thread.
+    """
+    import threading
+    import time
+
+    import anyio
+
+    search_started = threading.Event()
+    release_search = threading.Event()
+    probe_bound_s = 1.0
+    search_block_s = 3.0
+
+    def blocking_search(**_kwargs):
+        search_started.set()
+        release_search.wait(timeout=search_block_s)  # bounded: never hang the suite
+        return {"results": [], "diagnostics": {}}
+
+    monkeypatch.setattr(mcp_server, "_file_search_impl", blocking_search)
+
+    try:
+        # Measured from before the search starts: a probe timed only after the
+        # blocking call returned would look fast even on a loop starved
+        # throughout it.
+        started_at = time.monotonic()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(_post_search, api_client)
+            assert await anyio.to_thread.run_sync(search_started.wait, search_block_s)
+            resp = await api_client.get("/documents")
+            elapsed = time.monotonic() - started_at
+            release_search.set()
+    finally:
+        release_search.set()
+
+    assert resp.status_code == 200
+    assert elapsed < probe_bound_s, (
+        f"a sibling request waited {elapsed:.1f}s behind a blocking /search "
+        "— the serving event loop was starved"
+    )

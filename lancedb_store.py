@@ -22,6 +22,7 @@ from llama_index.core.vector_stores.utils import node_to_metadata_dict
 from llama_index.vector_stores.lancedb import LanceDBVectorStore
 from llama_index.vector_stores.lancedb.base import TableNotFoundError
 
+from core import lance_session
 from core.storage import SearchHit
 from core.tracing import get_tracer
 from doc_enrichment import CORE_ENRICHMENT_FIELDS
@@ -598,6 +599,10 @@ class LanceDBStore:
             uri=self.index_root,
             table_name=self.table_name,
             mode="create",  # "create" lets LanceDB create the table if missing, or open if exists
+            # Own the connection so its Lance caches live in the process-wide
+            # bounded session; the store rebuilds this repeatedly and LanceDB's
+            # own default would start a fresh unbounded cache each time (#1157).
+            connection=lance_session.connect(self.index_root),
         )
 
     @staticmethod
@@ -796,11 +801,7 @@ class LanceDBStore:
 
     def _reconnect(self) -> None:
         """Reconnect the vector store to the current on-disk table path."""
-        self._vs = LanceDBVectorStore(
-            uri=self.index_root,
-            table_name=self.table_name,
-            mode="create",
-        )
+        self._vs = self._build_vector_store()
         self._ensure_scalar_index()
 
     def _ensure_scalar_index(self) -> None:
@@ -986,8 +987,6 @@ class LanceDBStore:
         Writes cgroup-sized Arrow chunks, reconstructs each metadata struct,
         and atomically replaces the table without whole-table buffering.
         """
-        import lancedb as ldb
-
         table = self._vs.table
         dataset = table.to_lance()
         source_schema = dataset.schema
@@ -1079,7 +1078,7 @@ class LanceDBStore:
                     )
                     pending.append(write_batch.slice(0, midpoint))
 
-        db = ldb.connect(self.index_root)
+        db = lance_session.connect(self.index_root)
         temp_name = f"{self.table_name}__schema_tmp"
         backup_name = f"{self.table_name}__schema_backup"
         temp_path = Path(self.index_root) / f"{temp_name}.lance"
@@ -1243,12 +1242,7 @@ class LanceDBStore:
                 )
 
         # Reconnect LanceDBVectorStore to the new table
-        self._vs = LanceDBVectorStore(
-            uri=self.index_root,
-            table_name=self.table_name,
-            mode="create",
-        )
-        self._ensure_scalar_index()
+        self._reconnect()
         logger.info("Schema evolved: added metadata fields %s", new_fields)
 
     # --- WHERE clause builder ---
@@ -2079,6 +2073,7 @@ class LanceDBStore:
             return
         self._expire_restore_points(table, today)
         self._prune_versions("post-expiry")
+        self._prune_orphan_indices("post-expiry")
         self._tag_latest_restore_point(table, today)
 
     def compact_data_files_if_due(self, today) -> bool:
@@ -2259,6 +2254,39 @@ class LanceDBStore:
                 exc,
             )
 
+    def _prune_orphan_indices(self, label: str) -> None:
+        """Reclaim `_indices/<uuid>` directories no retained version reaches.
+
+        Runs after the post-expiry version prune, when the retained set — and
+        so the set of index generations still reachable — is at its smallest.
+        `cleanup_old_versions` cannot do this itself: it never deletes a file
+        newer than the oldest version it retains, and the daily restore-point
+        tags retain a days-old one, so every index generation superseded
+        inside that window stayed on disk (#1160). Best-effort, like the
+        version prune: failure is logged, never raised (orphans reclaim on a
+        later pass)."""
+        from core.lance_maintenance import prune_orphan_indices
+
+        try:
+            directories, reclaimed = prune_orphan_indices(
+                self._dataset_path(),
+                min_age_seconds=_lance_version_retention_minutes() * 60,
+            )
+            if directories:
+                logger.info(
+                    "Lance orphan index prune (%s): reclaimed %d bytes "
+                    "(%d index directories)",
+                    label,
+                    reclaimed,
+                    directories,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Orphan index prune (%s) failed (%s); orphans reclaim next run",
+                label,
+                exc,
+            )
+
     def _manage_restore_points(self, table, today) -> None:
         """Keep exactly N daily version tags (today plus N-1 prior days) as
         logical restore points.
@@ -2370,7 +2398,13 @@ class LanceDBStore:
 
         return self._run_read_with_recovery(_op, [])
 
+    # Doc-level fields projected by list_recent_docs. Every chunk of a doc
+    # carries the same values, so the MAX() that collapses the GROUP BY leaves
+    # them unchanged — `size` stays the file's byte size, never a chunk length
+    # or a sum. (`mtime` is selected separately: it drives the ORDER BY.)
     _RECENT_DOC_FIELDS = (
+        "rel_path",
+        "size",
         "title",
         "source_type",
         "folder",

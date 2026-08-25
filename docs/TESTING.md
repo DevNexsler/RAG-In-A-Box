@@ -110,6 +110,27 @@ immediately instead of flapping.
    `sor_query.resolve_sor_dsn()` looks it up by that exact name. Rename
    it and every `file_sor_*` tool silently loses its DSN.
 
+### Where staging deliberately differs from production
+
+Every gate-relevant behaviour is config-gated somewhere, so a value that
+drifts below production's silently deletes a branch from this tier — the
+whole exact-content dedupe path was dead here until #1188 because
+`dedupe:` was simply absent. Anything left below prod is a memory-cap
+concession to the container's 4 GiB `mem_limit`, and belongs in this
+table so the gap is known rather than assumed covered:
+
+| Setting | Prod | Staging | Why |
+|---|---|---|---|
+| `enrichment.concurrency` | 4 | **4** | matches prod — this is the document worker pool, and the races prod hits (overlapping dispatch, the fast dedup-skip path) are invisible at 1. Measured peak container RSS across the whole e2e tier at 4: **~0.8 GiB of the 4 GiB cap** |
+| `embeddings.concurrency` | 2 | 2 | matches prod; keeps the concurrent-batching path exercised |
+| `ocr.concurrency` | 2 | 1 | below prod — concurrent page OCR is the tier's largest transient allocation |
+| `embeddings.batch_size` | 64 | 8 | below prod — a 64-input batch holds 64 embeddings plus their source text |
+| `dedupe.*` | on | on | production's block verbatim (`config.staging.yaml`, `config.staging.realmedia.yaml`) |
+
+`tests/e2e/test_dedupe.py` fails if `enrichment.concurrency` drops back
+to 1: `_process_docs` logs its worker count only above one, so the
+absence of that line is the signal that the shape is gone.
+
 ## Traceability
 
 - **Span JSONL** (`core/tracing.py`): OTEL SDK with a JSONL file

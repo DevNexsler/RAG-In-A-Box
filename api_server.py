@@ -112,29 +112,39 @@ async def upload(request: Request) -> JSONResponse:
 
     target_path.write_bytes(content)
 
-    doc_id = str(target_path.relative_to(docs_root)).replace("\\", "/")
-    logger.info("Uploaded: %s (%d bytes)", doc_id, len(content))
+    rel_path = str(target_path.relative_to(docs_root)).replace("\\", "/")
+    logger.info("Uploaded: %s (%d bytes)", rel_path, len(content))
 
-    return JSONResponse({"uploaded": True, "doc_id": doc_id, "size": len(content)}, status_code=201)
+    # "doc_id" is a deprecated alias of "rel_path": this value has always been a
+    # documents_root-relative path, never an index doc id (DocIDStore mints those
+    # and flow_index_vault namespaces them per source, e.g. "documents::00001").
+    # Kept so existing clients keep working; scheduled for removal in #1232.
+    return JSONResponse(
+        {"uploaded": True, "rel_path": rel_path, "doc_id": rel_path, "size": len(content)},
+        status_code=201,
+    )
 
 
 async def download(request: Request) -> FileResponse | JSONResponse:
-    """Download a file by doc_id (path relative to documents_root).
+    """Download a file by its documents_root-relative path.
 
-    GET /api/documents/{doc_id:path}
+    GET /api/documents/{rel_path:path}
+
+    The path parameter is a filesystem path under documents_root — the index's
+    ``rel_path`` field — not an index ``doc_id``.
     """
     docs_root: Path = request.app.state.documents_root
 
-    doc_id = request.path_params.get("doc_id", "")
-    if not doc_id:
-        return _api_error("missing_doc_id", "doc_id path parameter required")
+    rel_path = request.path_params.get("rel_path", "")
+    if not rel_path:
+        return _api_error("missing_rel_path", "rel_path path parameter required")
 
-    file_path = _safe_subpath(docs_root, doc_id)
+    file_path = _safe_subpath(docs_root, rel_path)
     if file_path is None:
         return _api_error("invalid_path", "Path escapes documents root")
 
     if not file_path.is_file():
-        return _api_error("not_found", f"File not found: {doc_id}", 404)
+        return _api_error("not_found", f"File not found: {rel_path}", 404)
 
     return FileResponse(file_path, filename=file_path.name)
 
@@ -235,9 +245,14 @@ async def search(request: Request) -> JSONResponse:
     if not isinstance(payload, dict):
         return _api_error("invalid_request", "JSON body must be an object")
 
+    from starlette.concurrency import run_in_threadpool
+
     from mcp_server import _file_search_impl
 
-    result = _file_search_impl(**_search_kwargs(payload))
+    # Blocking work (embed → LanceDB → rerank) must not run on the serving
+    # event loop: it starves every other route, including the unauthenticated
+    # /health probe the container healthcheck polls with a 5s timeout (#1086).
+    result = await run_in_threadpool(_file_search_impl, **_search_kwargs(payload))
     status_code = 400 if isinstance(result, dict) and result.get("error") else 200
     return JSONResponse(result, status_code=status_code)
 
@@ -301,13 +316,17 @@ def build_api_app(documents_root: Path) -> Starlette:
     Args:
         documents_root: Path to the documents directory (injected, not re-loaded per request).
     """
+    # Starlette dispatches on the first matching route, and a ``:path``
+    # convertor compiles to ``(?P<rel_path>.*)`` — which also matches the empty
+    # remainder. So every exact route under /documents/ must be registered
+    # before the catch-all download route, or it is shadowed by it.
     routes = [
         Route("/upload", upload, methods=["POST"]),
         Route("/search", search, methods=["POST"]),
         Route("/index/document", index_document, methods=["POST"]),
-        Route("/documents/{doc_id:path}", download, methods=["GET"]),
-        Route("/documents/", list_documents, methods=["GET"]),
         Route("/documents", list_documents, methods=["GET"]),
+        Route("/documents/", list_documents, methods=["GET"]),
+        Route("/documents/{rel_path:path}", download, methods=["GET"]),
     ]
     app = Starlette(routes=routes)
     app.state.documents_root = Path(documents_root)

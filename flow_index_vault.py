@@ -47,7 +47,7 @@ from contextvars import ContextVar, copy_context
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from prefect import flow, task
 from prefect.logging import get_run_logger
@@ -75,12 +75,13 @@ from attachment_context_refresh import (
     context_text_from_sidecar,
     refresh_document_context,
 )
+from core import enrichment_telemetry, lance_session
 from core.config import filesystem_source_roots, load_config
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
 from core.dedupe import compute_file_identity
-from core.resilience import is_transient
+from core.resilience import CircuitOpenError, is_transient
 from core.skip_policy import actionable_skip_docs, is_permanent_skip_entry
 from core.sensitive_content import (
     redact_sensitive_text,
@@ -900,6 +901,7 @@ def _refresh_repaired_sidecar_docs(
                 context_text,
             ):
                 changed += 1
+                _record_index_write(1)
         except Exception as exc:
             failed += 1
             logger.warning(
@@ -968,6 +970,11 @@ def _initialize_run_progress() -> None:
         "queued": None,
         "processed": 0,
         "skipped": 0,
+        # Written work, counted at the store write seam — never derived from the
+        # queue, which counts documents *examined* (#1173).
+        "indexed_docs": 0,
+        "indexed_chunks": 0,
+        "skip_reasons": {},
     }
 
 
@@ -984,16 +991,44 @@ def _update_run_progress(**updates: Any) -> None:
                 progress[field] = value
 
 
-def _advance_run_progress(*, skipped: bool) -> None:
-    """Record one fully attempted queue item."""
+def _advance_run_progress(*, skip_reasons: Sequence[str] = ()) -> None:
+    """Record one fully attempted queue item and why it was skipped, if it was.
+
+    Reasons aggregate on their prefix ("duplicate_of:<id>" -> "duplicate_of"),
+    matching the skip ledger summary, so the run report can say what the skips
+    were without a line per document.
+    """
     lock = _RUNTIME.get("run_progress_lock")
     progress = _RUNTIME.get("run_progress")
     if lock is None or not isinstance(progress, dict):
         return
     with lock:
         progress["processed"] = int(progress.get("processed") or 0) + 1
-        if skipped:
+        if skip_reasons:
             progress["skipped"] = int(progress.get("skipped") or 0) + 1
+            counts = progress.setdefault("skip_reasons", {})
+            for reason in skip_reasons:
+                key = str(reason).split(":", 1)[0]
+                counts[key] = int(counts.get(key, 0)) + 1
+
+
+def _record_index_write(chunk_count: int) -> None:
+    """Record one document actually written to the index.
+
+    Called at the store write seam — the same place the "Inserted/Upserted N
+    chunks" line is emitted — so the run's throughput number counts writes.
+    Deriving it from the queue instead reported work for runs that skipped
+    every document they examined (#1173).
+    """
+    lock = _RUNTIME.get("run_progress_lock")
+    progress = _RUNTIME.get("run_progress")
+    if lock is None or not isinstance(progress, dict):
+        return
+    with lock:
+        progress["indexed_docs"] = int(progress.get("indexed_docs") or 0) + 1
+        progress["indexed_chunks"] = (
+            int(progress.get("indexed_chunks") or 0) + int(chunk_count)
+        )
 
 
 def _run_progress_snapshot() -> dict[str, Any]:
@@ -1002,7 +1037,9 @@ def _run_progress_snapshot() -> dict[str, Any]:
     if lock is None or not isinstance(progress, dict):
         return {}
     with lock:
-        return dict(progress)
+        # Deep-copy the nested reason counts: the snapshot is serialized (and
+        # read) outside the lock, while worker threads keep advancing it.
+        return {**progress, "skip_reasons": dict(progress.get("skip_reasons") or {})}
 
 
 def _write_heartbeat(index_root) -> None:
@@ -1032,17 +1069,24 @@ def _log_run_completion(
     queued: int,
     processed: int,
     skipped: int,
+    indexed_docs: int,
+    indexed_chunks: int,
     elapsed_seconds: float,
     actionable_skips: dict[str, list[str]] | None = None,
 ) -> None:
+    # `completion` is queue drain: a skipped document counts as processed, so
+    # 100% is reachable with zero work done. The indexed counts ride on the same
+    # line so the percentage can never be read alone as "work happened" (#1173).
     completion = 100.0 if queued == 0 else processed * 100.0 / queued
     logger.info(
         "Index run completion: run_id=%s queued=%d processed=%d skipped=%d "
-        "elapsed=%.1fs completion=%.1f%%",
+        "indexed_docs=%d indexed_chunks=%d elapsed=%.1fs completion=%.1f%%",
         run_id,
         queued,
         processed,
         skipped,
+        indexed_docs,
+        indexed_chunks,
         elapsed_seconds,
         completion,
     )
@@ -1816,6 +1860,7 @@ def _index_duplicate_delivery_context(
     )
     node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
     store.upsert_nodes([node])
+    _record_index_write(1)
     logger.info(
         "Indexed duplicate delivery context alias %s -> %s",
         doc_id,
@@ -1909,12 +1954,14 @@ def _retry_only_if_transient(task, task_run, state) -> bool:
     A deterministic failure — an embed 400 on an invalid input, a corrupt file —
     cannot succeed on an immediate retry. Retrying one anyway doubles the wasted
     OCR + enrichment + embed work before the doc is skipped regardless (#0569),
-    while a provider blip (5xx/timeout) is exactly what the retry is for.
+    while a provider blip (5xx/timeout) is exactly what the retry is for. An open
+    circuit is transient across index runs but cannot recover during Prefect's
+    immediate retry, so it must wait for the circuit cooldown instead.
     """
     try:
         state.result(raise_on_failure=True)
     except Exception as exc:  # noqa: BLE001 — classify, don't handle
-        return is_transient(exc)
+        return is_transient(exc) and not isinstance(exc, CircuitOpenError)
     return False
 
 
@@ -2014,14 +2061,60 @@ def _provider_error_artifact(raw_bytes: bytes, ext: str) -> tuple[str, bool] | N
     return reason, transient
 
 
+def _canonical_is_intentionally_unindexed(canonical_ns_doc_id: str) -> bool:
+    """Whether a canonical missing from LanceDB was deliberately never indexed.
+
+    Absence from the table only means the canonical was *lost* if the document
+    was supposed to be there. A doc that extracts no text (or is oversized, or
+    corrupt) is skipped by design and is legitimately absent forever, so the
+    skip ledger — not the table — is what distinguishes "lost" from "never
+    indexed on purpose" (#1252). Without that distinction a cohort whose
+    members are all intentional skips reopens on every retry cycle: each pass
+    finds the current canonical absent, dissolves the cohort, elects the other
+    member, and is skipped again in turn.
+
+    This run's decisions count too: a canonical skipped a few documents ago is
+    only in ``skip_now`` until the end-of-run merge persists it, and a cohort
+    reset drops its members' ledger entries, so a ledger-only test would still
+    ping-pong on the very first pass. Change keys are deliberately not compared
+    — a canonical whose bytes moved is re-evaluated by the diff on its own, and
+    is handled by the stranded-cohort path, not by reopening here.
+
+    A canonical that becomes indexable later (its file changed, OCR came back)
+    is picked up by the skip ledger's own bounded retry, which re-attempts it
+    and drops its entry once it lands content. Re-electing the cohort is not
+    what recovers that case, so leaving the cohort alone costs nothing.
+    """
+    with _RUNTIME.get("degraded_lock") or nullcontext():
+        if canonical_ns_doc_id in (_RUNTIME.get("skip_now") or {}):
+            return True
+    # index_root is read from config because it is the one source both the full
+    # flow and the targeted single-doc path populate.
+    index_root = (_RUNTIME.get("config") or {}).get("index_root")
+    if not index_root:
+        return False
+    return canonical_ns_doc_id in _load_skip_ledger(Path(index_root)).get("docs", {})
+
+
 def _reset_invalid_dedupe_cohort(
     registry: DocIDStore,
     store: LanceDBStore,
     bare_id: str,
     source_name: str,
     logger,
-) -> list[str]:
-    with registry.reset_exact_hash_cohort_transaction(bare_id) as affected:
+    *,
+    skip_repeat_at_same_state: bool = False,
+) -> list[str] | None:
+    """Dissolve this document's exact-content cohort; return its members.
+
+    ``skip_repeat_at_same_state`` returns ``None`` without touching anything
+    when this cohort was already reset at these members and these bytes — the
+    reset would change nothing, so repeating it once per retry cycle is a loop,
+    not a repair (#1258).
+    """
+    with registry.reset_exact_hash_cohort_transaction(
+        bare_id, skip_repeat_at_same_state=skip_repeat_at_same_state
+    ) as affected:
         if affected:
             namespaced_ids = [f"{source_name}::{doc_id}" for doc_id in affected]
             store.delete_by_doc_ids(namespaced_ids)
@@ -2188,6 +2281,7 @@ def _process_doc_task(
             and os.path.isfile(abs_path_str)
         ):
             winner = None
+            elect_canonical = True
             try:
                 import blake3 as _blake3
 
@@ -2201,7 +2295,15 @@ def _process_doc_task(
                 )
                 if winner is not None and winner.get("doc_id") != bare_id:
                     canonical_ns = f"{source_name}::{winner['doc_id']}"
-                    if store.contains_doc_id(canonical_ns):
+                    canonical_has_content = store.contains_doc_id(canonical_ns)
+                    if canonical_has_content or _canonical_is_intentionally_unindexed(
+                        canonical_ns
+                    ):
+                        if canonical_has_content:
+                            # The cohort holds content again, so any earlier reset
+                            # of it no longer describes the present state: forget
+                            # it, or a later genuine loss could not reopen (#1258).
+                            registry.clear_cohort_reset(len(raw_bytes), digest, "blake3")
                         _run_identity_op_with_stranded_cohort_recovery(
                             lambda: registry.update_dedupe_identity(
                                 bare_id,
@@ -2219,11 +2321,24 @@ def _process_doc_task(
                             "Dedupe canonical %s is absent from LanceDB; reopening cohort",
                             canonical_ns,
                         )
-                        _reset_invalid_dedupe_cohort(
-                            registry, store, bare_id, source_name, logger
-                        )
+                        if _reset_invalid_dedupe_cohort(
+                            registry, store, bare_id, source_name, logger,
+                            skip_repeat_at_same_state=True,
+                        ) is None:
+                            # This cohort was already reopened at these members
+                            # and these bytes and the canonical is still empty.
+                            # Re-electing would hand the content back to the
+                            # same absent canonical, so leave the registry alone
+                            # and index this copy instead of skipping it (#0426).
+                            logger.warning(
+                                "Cohort of %s was already reopened at this state — "
+                                "indexing %s directly instead of repeating the reset",
+                                canonical_ns,
+                                doc_id,
+                            )
+                            elect_canonical = False
                         winner = None
-                if winner is None:
+                if winner is None and elect_canonical:
                     winner = _run_identity_op_with_stranded_cohort_recovery(
                         lambda: registry.claim_canonical_by_exact_hash(
                             bare_id,
@@ -2267,7 +2382,12 @@ def _process_doc_task(
                             _dispatch_document_indexed_event(
                                 config, duplicate_event, logger
                             )
-                    if dedupe_cfg.get("update_canonical_metadata", True):
+                    # A canonical that was intentionally skipped holds no chunks
+                    # to carry the provenance; asking for the rewrite would only
+                    # raise (and warn) on every pass.
+                    if dedupe_cfg.get(
+                        "update_canonical_metadata", True
+                    ) and store.contains_doc_id(canonical_ns):
                         try:
                             refs = registry.duplicate_refs_for_canonical(winner["doc_id"])
                             store.update_canonical_duplicate_metadata(canonical_ns, refs)
@@ -2675,6 +2795,7 @@ def _process_doc_task(
             store.upsert_nodes(nodes)
             write_mode = "Upserted"
         logger.info(f"{write_mode} {len(nodes)} chunks: {doc_id}")
+        _record_index_write(len(nodes))
 
         chunks = []
         for node in nodes:
@@ -2770,7 +2891,7 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
         if observer is not None:
             observer.sample("doc_start", phase="process", doc_id=doc["doc_id"])
         outcome = "ok"
-        skipped_outcome = False
+        skip_reasons: list[str] = []
         # Heartbeat: a worker picking up a doc means the indexer is progressing.
         # When all workers are stuck (a freeze) this stops, and /health flips to 503.
         _write_heartbeat(_RUNTIME.get("index_root"))
@@ -2792,7 +2913,7 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
             process_doc_task(doc)
             reasons = collect_degradations()
             skips = collect_skips()
-            skipped_outcome = bool(skips)
+            skip_reasons = list(skips)
             lock = _RUNTIME.get("degraded_lock")
             if lock is not None:
                 with lock:
@@ -2815,15 +2936,32 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
             return None
         except Exception as exc:
             outcome = "failed"
-            logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
-            if not is_transient(exc):
+            transient = is_transient(exc)
+            lock = _RUNTIME.get("degraded_lock")
+            if transient:
+                logger.warning(
+                    "Deferring %s after transient processing failure: %s",
+                    doc["doc_id"],
+                    exc,
+                )
+                if lock is not None:
+                    with lock:
+                        doc_id = doc["doc_id"]
+                        _RUNTIME.setdefault("degraded_now", {})[doc_id] = [
+                            Degradation(
+                                f"processing_failed:{type(exc).__name__}",
+                                transient=True,
+                            )
+                        ]
+                        _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
+            else:
+                logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
                 # Terminal failure (deterministic 400, corrupt source): re-running
                 # it produces the same failure, so quarantine it with the file's
                 # change key exactly like a permanent skip. Without this the doc
                 # is re-fetched, re-OCR'd, re-enriched and re-embedded on every
                 # run, forever (#0569) — the skip ledger's bounded retry turns
                 # that into one attempt per day until the content changes.
-                lock = _RUNTIME.get("degraded_lock")
                 if lock is not None:
                     with lock:
                         doc_id = doc["doc_id"]
@@ -2853,7 +2991,7 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
                     doc_id=doc["doc_id"],
                     outcome=outcome,
                 )
-            _advance_run_progress(skipped=skipped_outcome)
+            _advance_run_progress(skip_reasons=skip_reasons)
             _write_heartbeat(_RUNTIME.get("index_root"))
 
     if concurrency <= 1 or len(docs) <= 1:
@@ -2912,16 +3050,58 @@ def delete_docs_task(doc_ids: list[str]) -> None:
 
 @task
 def index_stats_task(
-    to_add_count: int,
+    progress: Mapping[str, Any],
     to_delete_count: int,
     run_seconds: float | None = None,
 ) -> None:
-    """Log counts and optional duration."""
+    """Log what the run wrote, what it skipped and why, and optional duration.
+
+    `progress` is a run progress snapshot: its indexed counts come from the
+    store write seam, so a run that examined a queue but wrote nothing reports
+    zero here. The predecessor of this line reported the queue length, which
+    made "22 documents indexed" and "22 documents skipped" identical (#1173).
+    """
     logger = get_run_logger()
+    skip_reasons = dict(progress.get("skip_reasons") or {})
+    message = (
+        f"Index stats: indexed_docs={int(progress.get('indexed_docs') or 0)}, "
+        f"indexed_chunks={int(progress.get('indexed_chunks') or 0)}, "
+        f"skipped={int(progress.get('skipped') or 0)}"
+    )
+    if skip_reasons:
+        message += f" {dict(sorted(skip_reasons.items()))}"
+    message += f", deleted={to_delete_count}"
+    if run_seconds is not None:
+        message += f", seconds={run_seconds:.1f}"
+    logger.info(message)
+
+
+def _enrichment_run_telemetry(degraded_write_count: int) -> dict[str, int]:
+    """This run's structured-enrichment quality, for the summary and metadata.
+
+    Answers in one place what the run cost and what it stored: how often the
+    first structured response was usable, how many second LLM calls that
+    misjudgement or a real truncation forced, and how many documents were
+    written degraded anyway (#1097).
+    """
+    stats = enrichment_telemetry.snapshot()
+    stats["degraded_writes"] = degraded_write_count
+    return stats
+
+
+def _log_enrichment_telemetry(logger, stats: dict[str, int]) -> None:
+    attempts = stats["attempts"]
+    if not attempts:
+        return
     logger.info(
-        f"Index stats: added/updated={to_add_count}, deleted={to_delete_count}, "
-        f"seconds={run_seconds:.1f}" if run_seconds else
-        f"Index stats: added/updated={to_add_count}, deleted={to_delete_count}"
+        "Enrichment structured output: attempts=%d first_pass_valid=%d (%.1f%%) "
+        "retries=%d recovered=%d degraded_writes=%d",
+        attempts,
+        stats["first_pass_usable"],
+        stats["first_pass_usable"] * 100.0 / attempts,
+        stats["retries"],
+        stats["retries_recovered"],
+        stats["degraded_writes"],
     )
 
 
@@ -2932,6 +3112,8 @@ def write_index_metadata_task(
     chunk_count: int | None,
     failed_docs: list[str] | None = None,
     warnings: list[str] | None = None,
+    *,
+    enrichment: dict[str, int] | None = None,
 ) -> None:
     """Write index_metadata.json for file_status (last_run_at, counts, failures, warnings)."""
     import json
@@ -2953,6 +3135,8 @@ def write_index_metadata_task(
         meta["warning_counts"] = dict(sorted(warning_counts.items()))
         meta["enrichment_failed_count"] = warning_counts.get("enrichment_failed", 0)
         meta["warnings"] = warnings[:50]
+    if enrichment and enrichment.get("attempts"):
+        meta["enrichment"] = enrichment
     with open(path, "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -3162,6 +3346,7 @@ def index_vault_flow(
     import time
     logger = get_run_logger()
     _initialize_run_progress()
+    enrichment_telemetry.reset()
     config = _LOCKED_INDEX_CONFIG.get() or load_config(config_path)
     memory_observer = MemoryObserver.from_config(config, logger)
     _RUNTIME["memory_observer"] = memory_observer
@@ -3171,6 +3356,9 @@ def index_vault_flow(
     # so it needs its own tracing setup. No-op when tracing is disabled or
     # when this process already set it up (e.g. in-process flow runs).
     setup_tracing(config, "indexer")
+    # Same reason, same subprocess caveat: bound this run's Lance caches so the
+    # run cannot push the shared memory cgroup over its limit (#1157).
+    lance_session.configure_from_config(config)
     index_root = Path(config["index_root"])
     _RUNTIME["index_root"] = index_root
     _write_heartbeat(index_root)  # mark the run alive before the (possibly slow) scan
@@ -3810,11 +3998,7 @@ def index_vault_flow(
     _write_heartbeat(index_root)  # FTS/promote done — still progressing, not frozen
 
     run_seconds = time.perf_counter() - t0
-    index_stats_task(
-        len(to_add_or_update) + context_refresh_changed,
-        len(to_delete),
-        run_seconds,
-    )
+    index_stats_task(_run_progress_snapshot(), len(to_delete), run_seconds)
 
     # Read final counts — auto-recover if table is corrupt
     try:
@@ -3924,10 +4108,14 @@ def index_vault_flow(
                 dict(reason_counts),
             )
 
+    enrichment_stats = _enrichment_run_telemetry(len(degraded_now))
+    _log_enrichment_telemetry(logger, enrichment_stats)
+
     write_index_metadata_task(
         index_root, doc_count, chunk_count,
         failed_docs or None,
         _RUNTIME.get("_warnings") or None,
+        enrichment=enrichment_stats,
     )
     memory_observer.sample("phase_finish", phase="finalize")
     progress = _run_progress_snapshot()
@@ -3937,6 +4125,8 @@ def index_vault_flow(
         queued=int(progress.get("queued") or 0),
         processed=int(progress.get("processed") or 0),
         skipped=int(progress.get("skipped") or 0),
+        indexed_docs=int(progress.get("indexed_docs") or 0),
+        indexed_chunks=int(progress.get("indexed_chunks") or 0),
         elapsed_seconds=run_seconds,
         actionable_skips=actionable_skip_docs(_load_skip_ledger(index_root)),
     )

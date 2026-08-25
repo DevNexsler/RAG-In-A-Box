@@ -103,6 +103,7 @@ def populated_store():
                 [1.0] + [0.0] * 767,
                 source_type="md", folder="recipes", tags="recipe,korean",
                 title="Bibimbap Recipe", mtime=now - 100,
+                rel_path="recipes/bibimbap.md",
             ),
             _make_node(
                 "reports/q4_report.pdf", "c:0",
@@ -110,6 +111,7 @@ def populated_store():
                 [0.0] + [1.0] + [0.0] * 766,
                 source_type="pdf", folder="reports", tags="finance,report",
                 title="Q4 2025 Report", mtime=now - 200,
+                rel_path="reports/q4_report.pdf",
             ),
             _make_node(
                 "notes/ml_notes.md", "c:0",
@@ -117,6 +119,7 @@ def populated_store():
                 [0.0, 0.0] + [1.0] + [0.0] * 765,
                 source_type="md", folder="notes", tags="ml,ai",
                 title="ML Notes", mtime=now,
+                rel_path="notes/ml_notes.md",
             ),
         ]
         store.upsert_nodes(nodes)
@@ -207,10 +210,16 @@ def test_list_documents_from_real_store(wired_mcp):
     docs = result["documents"]
     assert len(docs) >= 3  # We stored 3 documents
 
-    # Each doc should have doc_id and mtime_iso (added by _enrich_doc_list)
+    # Each doc should have doc_id, its path, and mtime_iso (added by
+    # _enrich_doc_list). rel_path is what makes a listing actionable — doc_id
+    # is an opaque id, so callers filtering documents by path depend on it
+    # reaching this projection (#1203).
     for doc in docs:
         assert "doc_id" in doc
         assert "mtime_iso" in doc
+    assert {doc["rel_path"] for doc in docs} == {
+        "recipes/bibimbap.md", "reports/q4_report.pdf", "notes/ml_notes.md",
+    }
 
 
 def test_facets_from_real_store(wired_mcp):
@@ -258,6 +267,69 @@ def test_recent_returns_sorted_by_mtime(wired_mcp):
     mtimes = [d.get("mtime", 0) for d in result if d.get("mtime")]
     for i in range(len(mtimes) - 1):
         assert mtimes[i] >= mtimes[i + 1], "Documents not sorted by mtime descending"
+
+
+# ===================================================================
+# TEST: document-level size projection
+# ===================================================================
+
+# A file size that matches neither chunk's length nor their sum, so a
+# per-chunk or summed projection is distinguishable from the file's size.
+_MULTI_CHUNK_FILE_SIZE = 4096
+
+
+@pytest.fixture
+def multi_chunk_wired_mcp():
+    """Wire mcp_server to a store holding one two-chunk document.
+
+    Both chunks carry the document's file size in metadata.size, exactly as
+    process_doc_task writes it, so the doc-level projection must report that
+    size rather than a chunk length or the sum across chunks.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        embed = MockEmbedProvider()
+
+        now = time.time()
+        store.upsert_nodes([
+            _make_node(
+                "notes/long_note.md", "c:0", "first half",
+                [1.0] + [0.0] * 767,
+                folder="notes", title="Long Note",
+                mtime=now, size=_MULTI_CHUNK_FILE_SIZE,
+            ),
+            _make_node(
+                "notes/long_note.md", "c:1", "second half",
+                [1.0] + [0.0] * 767,
+                folder="notes", title="Long Note",
+                mtime=now, size=_MULTI_CHUNK_FILE_SIZE,
+            ),
+        ])
+
+        config = {"index_root": tmpdir, "documents_root": tmpdir, "search": {}}
+        original_cache = mcp_server._cache
+        mcp_server._cache = (store, embed, config)
+        yield store
+        mcp_server._cache = original_cache
+
+
+def test_list_documents_returns_file_size(multi_chunk_wired_mcp):
+    """file_list_documents advertises size (bytes) — it must project it."""
+    result = mcp_server._file_list_documents_impl(offset=0, limit=10)
+
+    assert "error" not in result
+    docs = result["documents"]
+    assert len(docs) == 1
+    assert docs[0]["size"] == _MULTI_CHUNK_FILE_SIZE
+
+
+def test_recent_returns_file_size(multi_chunk_wired_mcp):
+    """file_recent advertises the same size field over the same projection."""
+    docs = mcp_server._file_recent_impl(limit=10)
+
+    assert isinstance(docs, list)
+    assert len(docs) == 1
+    assert docs[0]["size"] == _MULTI_CHUNK_FILE_SIZE
 
 
 # ===================================================================

@@ -77,12 +77,20 @@ async def test_video_sidecar_context_is_embedded_retrievable_and_audited(
     after_query = "marmalade budget"
     media_query = "video"
     fingerprint_key = os.environ["E2E_QUERY_FINGERPRINT_KEY"].encode()
+    # PRESENCE, not rank. The hermetic stack's provider-sim derives embeddings
+    # from sha256 of the input, so similarity ordering is noise — a top-10 window
+    # only held the video while the corpus was small, and #1188's dedupe cohorts
+    # (3 x 2 copies on top of the 12-document base corpus) crowded it out
+    # intermittently. What this test is actually for is that the video's
+    # before/after sidecar context is embedded and retrievable at all; the
+    # `before_embedded` / `after_embedded` assertions below are what prove it.
+    top_k = 50
     before_results = _hits(await mcp_session.call_tool_json(
-        "file_search", {"query": before_query, "top_k": 10}))
+        "file_search", {"query": before_query, "top_k": top_k}))
     after_results = _hits(await mcp_session.call_tool_json(
-        "file_search", {"query": after_query, "top_k": 10}))
+        "file_search", {"query": after_query, "top_k": top_k}))
     media_results = _hits(await mcp_session.call_tool_json(
-        "file_search", {"query": media_query, "top_k": 10}))
+        "file_search", {"query": media_query, "top_k": top_k}))
     before_video = next((
         hit for hit in before_results
         if "clip" in hit.get("rel_path", "") and hit.get("rel_path", "").endswith(".mp4")
@@ -109,7 +117,13 @@ async def test_video_sidecar_context_is_embedded_retrievable_and_audited(
     assert after_embedded, stored[:2000]
 
     listing = await mcp_session.call_tool_json("file_list_documents", {"limit": 100})
-    indexed_paths = [doc.get("rel_path", "") for doc in listing.get("documents", [])]
+    indexed_paths = [doc.get("rel_path") or "" for doc in listing.get("documents", [])]
+    # Positive control: the listing must actually carry the video's own path, or
+    # the sidecar filter below matches nothing because the paths are all empty
+    # and the check passes without ever running (#1203).
+    assert any(
+        "clip" in path and path.endswith(".mp4") for path in indexed_paths
+    ), indexed_paths
     sidecar_not_indexed = not any(
         "clip" in path and path.endswith(".json") for path in indexed_paths
     )

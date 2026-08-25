@@ -14,8 +14,9 @@ import time
 from pathlib import Path
 from typing import Callable
 
-import lancedb as ldb
 import pyarrow as pa
+
+from core import lance_session
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ class TaxonomyStore:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
         self.embed_fn = embed_fn
-        self._db = ldb.connect(self.index_root)
+        self._db = lance_session.connect(self.index_root)
         self._table = self._open_or_create()
 
     def _open_or_create(self):

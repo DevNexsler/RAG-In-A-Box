@@ -3,6 +3,7 @@
 No external services needed. Uses mocks and direct function calls."""
 
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -88,6 +89,118 @@ async def test_file_index_document_dispatches_via_to_thread():
         "source_name": "documents",
         "force": True,
     }
+
+
+@pytest.mark.anyio
+async def test_sync_tool_call_does_not_block_liveness_probe():
+    """A slow SYNC tool must leave the event loop free for /health (#1086).
+
+    FastMCP runs a sync tool function inline on the serving event loop, so a
+    tool that blocks on provider I/O (file_search: embed → LanceDB → rerank,
+    routinely 10-20s in production) makes the unauthenticated /health route
+    unanswerable for that whole time. Three missed probes past the image
+    healthcheck's 5s urlopen timeout flip the container unhealthy while
+    nothing is actually wrong. Registration must dispatch sync tools to a
+    worker thread.
+    """
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tool_started = threading.Event()
+    release_tool = threading.Event()
+    # Well under the healthcheck's 5s: the bound being asserted is "the loop
+    # stays responsive", not "the tool is fast".
+    probe_bound_s = 1.0
+    tool_block_s = 3.0
+
+    def blocking_impl(*_args, **_kwargs):
+        tool_started.set()
+        release_tool.wait(timeout=tool_block_s)  # bounded: never hang the suite
+        return {"results": [], "diagnostics": {}}
+
+    with patch("mcp_server._file_search_impl", new=blocking_impl):
+        try:
+            async with anyio.create_task_group() as tasks:
+                # The deadline covers the tool call itself: a probe measured
+                # only after the blocking tool returned would pass even when
+                # the loop was starved for the whole call.
+                with anyio.fail_after(probe_bound_s):
+                    tasks.start_soon(
+                        mcp_server.mcp.call_tool, "file_search", {"query": "lease"}
+                    )
+                    assert await anyio.to_thread.run_sync(tool_started.wait, tool_block_s)
+                    payload, status_code = await mcp_server._run_health_probe(
+                        lambda _config: ({"status": "ok"}, 200), {}
+                    )
+                release_tool.set()
+        finally:
+            release_tool.set()
+
+    assert status_code == 200
+    assert payload == {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# doc_id documentation contract
+# ---------------------------------------------------------------------------
+
+# doc_id stopped being a path when it became a persistent identifier: DocIDStore
+# mints a 5-char base-62 id and the indexing flow namespaces it per source
+# ("documents::00abc"). The path lives in the separate rel_path field. The stale
+# "document-relative path" wording was copy-pasted between neighbouring tools,
+# so guard the whole published surface, not one tool.
+_DOC_ID_AS_PATH_RE = re.compile(
+    r"\bdoc_id\b[^\n]*\brelative\b[^\n]*\bpath\b", re.IGNORECASE
+)
+
+
+@pytest.mark.anyio
+async def test_no_tool_describes_doc_id_as_a_path():
+    """No published tool description may document doc_id as a relative path."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tools = await mcp_server.mcp.list_tools()
+    offenders = [
+        tool.name
+        for tool in tools
+        if _DOC_ID_AS_PATH_RE.search(tool.description or "")
+    ]
+
+    assert offenders == [], (
+        f"tools documenting doc_id as a path: {offenders} — doc_id is a "
+        "source-namespaced persistent ID; rel_path holds the path"
+    )
+
+
+@pytest.mark.anyio
+async def test_file_recent_documents_doc_id_as_namespaced_id():
+    """file_recent must describe the doc_id it returns and point at rel_path."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tools = await mcp_server.mcp.list_tools()
+    description = next(t for t in tools if t.name == "file_recent").description or ""
+
+    assert "source_name" in description and "::" in description
+    assert "rel_path" in description
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: mcp_server._file_get_chunk_impl("", "c:0"),
+        lambda: mcp_server._file_get_doc_chunks_impl(""),
+    ],
+    ids=["file_get_chunk", "file_get_doc_chunks"],
+)
+def test_empty_doc_id_error_does_not_describe_doc_id_as_a_path(call):
+    """The invalid_parameter hint must not tell callers to pass a path."""
+    err = call()
+
+    assert err["code"] == "invalid_parameter"
+    hint = f"{err['message']} {err['fix']}"
+    assert not _DOC_ID_AS_PATH_RE.search(hint), hint
 
 
 # ---------------------------------------------------------------------------
@@ -2985,6 +3098,39 @@ def test_health_probe_idle_after_killed_indexer_stays_failed(tmp_path, healthy_d
     assert payload["indexer"] == "idle"
     assert payload["index_run"]["unresolved_failure"] is True
     assert payload["index_run"]["latest_terminal"]["termination_signal"] == 9
+
+
+def test_health_probe_counterless_reconciled_run_is_not_a_failure(tmp_path, healthy_disk):
+    """A restart without progress evidence must not turn /health red (#1058)."""
+    import json
+
+    active = {
+        "run_id": "86daf65b4ad94b50828d76f13b60adb5",
+        "status": "running",
+        "pid": 919191,
+        "pgid": 919191,
+        "source_name": None,
+        "started_at": "2026-08-12T13:44:00+00:00",
+        "peak_rss_bytes": 99,
+    }
+    (tmp_path / "index_run_state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "current": active,
+                "last_attempt": active,
+                "last_success": None,
+            }
+        )
+    )
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["indexer"] == "idle"
+    assert payload["index_run"]["latest_terminal"]["status"] == "unknown"
+    assert payload["index_run"]["unresolved_failure"] is False
 
 
 def test_file_status_exposes_last_attempt_success_and_terminal_freshness(tmp_path):

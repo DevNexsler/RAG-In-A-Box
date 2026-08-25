@@ -133,16 +133,20 @@ def test_completion_summary_names_queue_progress_and_elapsed():
         queued=10,
         processed=10,
         skipped=2,
+        indexed_docs=8,
+        indexed_chunks=31,
         elapsed_seconds=12.5,
     )
 
     logger.info.assert_called_once_with(
         "Index run completion: run_id=%s queued=%d processed=%d skipped=%d "
-        "elapsed=%.1fs completion=%.1f%%",
+        "indexed_docs=%d indexed_chunks=%d elapsed=%.1fs completion=%.1f%%",
         "run-complete",
         10,
         10,
         2,
+        8,
+        31,
         12.5,
         100.0,
     )
@@ -157,6 +161,8 @@ def test_completion_summary_surfaces_actionable_skip_ids():
         queued=0,
         processed=0,
         skipped=0,
+        indexed_docs=0,
+        indexed_chunks=0,
         elapsed_seconds=1.0,
         actionable_skips={
             "corrupt_mangled_binary": ["documents::001sp", "documents::001su"]

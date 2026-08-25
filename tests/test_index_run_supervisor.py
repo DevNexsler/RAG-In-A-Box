@@ -467,6 +467,16 @@ def test_startup_reconciles_dead_active_run_to_lost_terminal_state(tmp_path):
         )
     )
     (tmp_path / "indexer.pid").write_text("919191")
+    (tmp_path / "indexer.heartbeat").write_text(
+        json.dumps(
+            {
+                "run_id": "run-dead",
+                "queued": 10,
+                "processed": 1,
+                "skipped": 0,
+            }
+        )
+    )
 
     from index_run_supervisor import IndexRunSupervisor
 
@@ -483,6 +493,44 @@ def test_startup_reconciles_dead_active_run_to_lost_terminal_state(tmp_path):
     assert state["last_attempt"]["terminal_reason"] == "process_missing_on_reconcile"
     assert state["last_attempt"]["finished_at"]
     assert not (tmp_path / "indexer.pid").exists()
+
+
+def test_startup_reconciles_counterless_missing_run_as_nonblocking_unknown(tmp_path):
+    """No progress evidence means a missing process has an unknown outcome (#1058)."""
+    active = {
+        "run_id": "86daf65b4ad94b50828d76f13b60adb5",
+        "status": "running",
+        "pid": 919191,
+        "pgid": 919191,
+        "source_name": None,
+        "started_at": "2026-08-12T13:44:00+00:00",
+        "peak_rss_bytes": 99,
+    }
+    (tmp_path / "index_run_state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "current": active,
+                "last_attempt": active,
+                "last_success": None,
+            }
+        )
+    )
+
+    from index_run_supervisor import IndexRunSupervisor
+
+    supervisor = IndexRunSupervisor(
+        tmp_path,
+        pid_alive=lambda _pid: False,
+        process_matches=lambda _pid: True,
+        monitor_interval=0.01,
+    )
+    summary = supervisor.status_summary()
+
+    assert summary["current"] is None
+    assert summary["last_attempt"]["status"] == "unknown"
+    assert summary["last_attempt"]["terminal_reason"] == "process_missing_on_reconcile"
+    assert summary["unresolved_failure"] is False
 
 
 def test_shutdown_terminates_process_group_and_records_terminal_signal(tmp_path):

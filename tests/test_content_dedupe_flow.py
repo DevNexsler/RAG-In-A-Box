@@ -9,8 +9,9 @@ index metadata and sidecar.
 import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import flow_index_vault as fiv
 from core.hook_outbox import HookOutbox
 from doc_id_store import DocIDStore
+from hooks.delivery import drain_due
 from lancedb_store import LanceDBStore
 
 
@@ -49,6 +51,7 @@ def runtime(tmp_path):
         "embed_provider": _MockEmbed(),
         "splitter": SentenceSplitter(chunk_size=512, chunk_overlap=20),
         "config": {
+            "index_root": str(tmp_path / "index"),
             "dedupe": {
                 "enabled": True,
                 "skip_duplicate_indexing": True,
@@ -698,6 +701,75 @@ def test_duplicate_callback_uses_alias_identity_and_canonical_payload(runtime, m
     assert event["metadata"]["enr_importance_source"] == "default"
 
 
+def test_duplicate_callback_delivers_one_request_per_event_id(runtime):
+    """Fails if a dedup-skipped document's callback reaches the hook target twice.
+
+    Every document dispatch drains the whole due outbox, so a second drainer
+    that starts while a send is still in flight sends the same delivery again.
+    Counted at the receiver on purpose: an accepted delivery row is deleted, so
+    the extra POST leaves nothing behind in the outbox to assert on.
+    """
+    docs_root, store, registry = runtime
+    body = "Duplicate attachment body with indexed canonical content."
+    canonical = _make_doc(docs_root, "f/canonical.md", body, "00001")
+    duplicate = _make_doc(
+        docs_root,
+        "email-attachments/quo/attachment@00002@.md",
+        body,
+        "00002",
+    )
+    _register(registry, canonical)
+    _register(registry, duplicate)
+    index_root = str(docs_root.parent / "index")
+    received: list[str] = []
+    overlapped = Event()
+
+    class _Sink(BaseHTTPRequestHandler):
+        def do_POST(self):
+            event = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            received.append(event["event_id"])
+            if event["doc_id"] == duplicate["doc_id"] and not overlapped.is_set():
+                overlapped.set()
+                # A second drainer — another index worker, or the scheduler
+                # tick — runs while this delivery is still in flight.
+                drain_due(HookOutbox(index_root), limit=64)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "updated"}')
+
+        def log_message(self, *args):
+            """Keep the sink out of the test log."""
+
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), _Sink)
+    Thread(target=sink.serve_forever, daemon=True).start()
+    fiv._RUNTIME["config"].update(
+        {
+            "index_root": index_root,
+            "event_hooks": {
+                "enabled": True,
+                "hooks": [
+                    {
+                        "name": "cds",
+                        "events": ["document.indexed"],
+                        "url": f"http://127.0.0.1:{sink.server_address[1]}/hook",
+                    }
+                ],
+            },
+        }
+    )
+    try:
+        fiv.process_doc_task.fn(canonical)
+        fiv.process_doc_task.fn(duplicate)
+    finally:
+        sink.shutdown()
+        sink.server_close()
+
+    assert overlapped.is_set()
+    assert sorted(received) == sorted(set(received))
+    assert len(received) == 2  # canonical document + duplicate alias, once each
+
+
 def test_duplicate_callback_payload_read_failure_does_not_fail_index(runtime, monkeypatch):
     docs_root, store, registry = runtime
     body = "Duplicate attachment body."
@@ -849,3 +921,114 @@ def test_edited_canonical_matching_other_canonical_becomes_duplicate(runtime):
     assert rows["00001"]["dedupe_status"] == "duplicate"
     assert rows["00001"]["canonical_doc_id"] == "00003"
     assert rows["00003"]["dedupe_status"] == "canonical"
+
+
+def test_cohort_whose_members_never_index_resets_at_most_once(runtime):
+    """A cohort reset that changes nothing must not repeat every run (#1258).
+
+    Both members hold real content but land no index rows — here because the
+    upsert is a no-op, in production because processing fails terminally
+    without a skip-ledger entry. Absence alone keeps looking like a lost
+    canonical, so every pass reopened the cohort, re-elected the other member
+    and found it absent again. The reset is bounded by the state it ran at:
+    same members, same bytes, no second reset — and the member whose reset is
+    suppressed is still indexed rather than skipped as a duplicate of a
+    canonical that holds no rows (#0426).
+    """
+    docs_root, store, registry = runtime
+    body = "content whose members never land index rows"
+    a = _make_doc(docs_root, "f/a.md", body, "00001")
+    b = _make_doc(docs_root, "g/b.md", body, "00002")
+    _register(registry, a)
+    _register(registry, b)
+
+    raw = Path(a["abs_path"]).read_bytes()
+    digest = blake3.blake3(raw).digest()
+    registry.claim_canonical_by_exact_hash(
+        "00001", len(raw), digest, hash_algo="blake3"
+    )
+    registry.claim_canonical_by_exact_hash(
+        "00002", len(raw), digest, hash_algo="blake3"
+    )
+
+    resets = []
+    original_reset = fiv._reset_invalid_dedupe_cohort
+
+    def counting_reset(*args, **kwargs):
+        affected = original_reset(*args, **kwargs)
+        if affected:
+            resets.append(list(affected))
+        return affected
+
+    indexed_doc_ids = []
+
+    def recording_upsert(nodes):
+        indexed_doc_ids.extend({n.metadata["doc_id"] for n in nodes})
+
+    with (
+        patch.object(fiv, "_reset_invalid_dedupe_cohort", counting_reset),
+        patch.object(store, "upsert_nodes", side_effect=recording_upsert),
+    ):
+        for _ in range(3):
+            fiv.process_doc_task.fn(a)
+            fiv.process_doc_task.fn(b)
+
+    assert len(resets) == 1, f"cohort reset repeated: {resets}"
+    assert indexed_doc_ids.count("documents::00002") == 3
+
+
+def _persist_run_skip_ledger(index_root: Path) -> None:
+    """Merge the run's skip decisions into the ledger, as index_vault_flow does
+    at the end of every run, and reset the per-run accumulators."""
+    fiv._save_skip_ledger(
+        index_root,
+        fiv._merge_skip_ledger(
+            fiv._load_skip_ledger(index_root),
+            fiv._RUNTIME.get("skip_now", {}),
+            fiv._RUNTIME.get("skip_clean", set()),
+        ),
+    )
+    fiv._RUNTIME["skip_now"] = {}
+    fiv._RUNTIME["skip_clean"] = set()
+
+
+def test_skip_only_cohort_converges_after_one_pass(runtime, tmp_path):
+    """Two members that both extract no text must settle in a single pass.
+
+    Neither member ever reaches LanceDB — they are intentional
+    `no_text_extracted` skips — so "canonical is absent from LanceDB" is not
+    evidence that the canonical was lost. Reopening the cohort on it hands
+    canonical status back and forth between the two members on every retry
+    cycle, forever, while both runs report Completed (#1252).
+    """
+    docs_root, store, registry = runtime
+    index_root = tmp_path / "index"
+    fiv._RUNTIME["degraded_lock"] = Lock()
+    fiv._RUNTIME["skip_now"] = {}
+    fiv._RUNTIME["skip_clean"] = set()
+    logger = fiv._get_logger()
+
+    blank = "   \n\n\t\n   "
+    a = _make_doc(docs_root, "quo/_indexes/one.md", blank, "001X6")
+    b = _make_doc(docs_root, "quo/_indexes/two.md", blank, "001X7")
+    _register(registry, a)
+    _register(registry, b)
+
+    fiv._process_docs([a, b])
+    _persist_run_skip_ledger(index_root)
+
+    # Both are ledgered as skipped, so the second pass is the bounded retry
+    # that comes due 24-48h later — it must not re-elect a canonical.
+    logger.warning.reset_mock()
+    fiv._process_docs([b, a])
+    _persist_run_skip_ledger(index_root)
+
+    warnings = [str(call) for call in logger.warning.call_args_list]
+    assert not [w for w in warnings if "reopening cohort" in w], warnings
+    assert not [w for w in warnings if "dup-metadata update failed" in w], warnings
+    assert store.list_doc_ids() == []
+    assert [ref["doc_id"] for ref in registry.duplicate_refs_for_canonical("001X6")] == [
+        "001X7"
+    ], "canonical must stay put instead of ping-ponging between the members"
+    ledger = fiv._load_skip_ledger(index_root)["docs"]
+    assert set(ledger) == {"documents::001X6", "documents::001X7"}

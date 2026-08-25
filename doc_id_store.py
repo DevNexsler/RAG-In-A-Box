@@ -83,6 +83,16 @@ def inject_id_into_filename(filename: str, doc_id: str) -> str:
     return f"{stem}@{doc_id}@{ext}"
 
 
+def _cohort_key(size_bytes: int, content_hash: bytes, hash_algo: str) -> str:
+    """Stable identifier for one exact-content cohort.
+
+    A cohort is defined by the identity its members share, so the identity is
+    the key: members come and go, but the same bytes always name the same
+    cohort — including after a reset dissolves and re-election re-forms it.
+    """
+    return f"{hash_algo}:{size_bytes}:{content_hash.hex()}"
+
+
 class StrandedCohortError(ValueError):
     """An exact-hash identity change would strand a canonical's duplicate cohort.
 
@@ -197,6 +207,23 @@ class DocIDStore:
                 last_path    TEXT NOT NULL DEFAULT ''
             )
         """)
+        # State an exact-content cohort was last dissolved at, one row per
+        # member. It bounds absence-triggered resets: re-electing the same
+        # members over the same bytes cannot change the outcome, so the reset
+        # must not repeat once per retry cycle forever (#1258).
+        # Keyed by doc_id — a document belongs to one cohort at a time, so the
+        # table holds at most one row per registry row and dies with it.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS dedupe_cohort_resets (
+                doc_id     TEXT PRIMARY KEY,
+                cohort_key TEXT NOT NULL,
+                reset_at   REAL NOT NULL
+            )
+        """)
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dedupe_cohort_resets_key "
+            "ON dedupe_cohort_resets(cohort_key)"
+        )
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_doc_registry_size_hash "
             "ON doc_registry(size_bytes, content_hash)"
@@ -392,6 +419,10 @@ class DocIDStore:
                 if row is not None:
                     stored_key = bare
             self._conn.execute("DELETE FROM doc_registry WHERE doc_id = ?", (stored_key,))
+            # A cohort-reset record describes registry rows; it leaves with them.
+            self._conn.execute(
+                "DELETE FROM dedupe_cohort_resets WHERE doc_id = ?", (stored_key,)
+            )
             if row:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO retired_ids (doc_id, retired_at, last_path) "
@@ -719,13 +750,25 @@ class DocIDStore:
             return affected
 
     @contextmanager
-    def reset_exact_hash_cohort_transaction(self, doc_id: str):
+    def reset_exact_hash_cohort_transaction(
+        self, doc_id: str, *, skip_repeat_at_same_state: bool = False
+    ):
         """Yield cohort IDs, then reset that exact identity on clean exit.
 
         The write transaction stays open while the caller removes external
         index rows. An external-delete failure rolls back registry state; other
         writers cannot move the document into a different cohort between the
         read and the identity reset.
+
+        Every performed reset records the state it ran at — the cohort's
+        content identity and its member IDs. With ``skip_repeat_at_same_state``
+        a reset asked for at an unchanged state is not performed at all and
+        ``None`` is yielded instead of the member list: dissolving the same
+        members over the same bytes again would only re-elect the same
+        canonical, so the caller must break the cycle rather than repeat it
+        (#1258). Callers whose reset is triggered by new evidence about the
+        document itself (changed bytes, a provider-error artifact) leave the
+        flag off — their reset is productive by construction.
         """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -757,6 +800,14 @@ class DocIDStore:
                     identity,
                 ).fetchall()
                 affected = [row[0] for row in rows]
+                cohort_key = _cohort_key(*identity)
+                if (
+                    skip_repeat_at_same_state
+                    and self._cohort_reset_members(cohort_key) == set(affected)
+                ):
+                    yield None
+                    self._conn.commit()
+                    return
                 yield affected
                 cursor = self._conn.execute(
                     """
@@ -778,10 +829,58 @@ class DocIDStore:
                     raise RuntimeError(
                         "exact-hash cohort changed during identity reset"
                     )
+                self._record_cohort_reset(cohort_key, affected)
                 self._conn.commit()
             except BaseException:
                 self._conn.rollback()
                 raise
+
+    def _cohort_reset_members(self, cohort_key: str) -> set[str]:
+        """Members recorded by the last reset of this cohort (lock held)."""
+        return {
+            row[0]
+            for row in self._conn.execute(
+                "SELECT doc_id FROM dedupe_cohort_resets WHERE cohort_key = ?",
+                (cohort_key,),
+            )
+        }
+
+    def _record_cohort_reset(self, cohort_key: str, members: list[str]) -> None:
+        """Replace this cohort's reset record with the state just reset (lock held).
+
+        Both sides are replaced so the record is exactly the cohort as it was:
+        rows for members that have since left it, and rows these members held
+        under a previous identity, are dropped.
+        """
+        now = time.time()
+        self._conn.execute(
+            "DELETE FROM dedupe_cohort_resets WHERE cohort_key = ?", (cohort_key,)
+        )
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO dedupe_cohort_resets "
+            "(doc_id, cohort_key, reset_at) VALUES (?, ?, ?)",
+            [(member, cohort_key, now) for member in members],
+        )
+
+    def clear_cohort_reset(
+        self, size_bytes: int, content_hash: bytes, hash_algo: str
+    ) -> None:
+        """Forget that this cohort was reset — it has resolved.
+
+        Called when a canonical is observed holding index rows again: the state
+        that made a repeat reset pointless is gone, so a later genuine loss of
+        that canonical must be able to reopen the cohort (#0426).
+        """
+        cohort_key = _cohort_key(size_bytes, content_hash, hash_algo)
+        with self._lock:
+            # Read first: every healthy duplicate passes through here, and a
+            # bare DELETE would open (and fsync) a write transaction each time.
+            if not self._cohort_reset_members(cohort_key):
+                return
+            self._conn.execute(
+                "DELETE FROM dedupe_cohort_resets WHERE cohort_key = ?", (cohort_key,)
+            )
+            self._conn.commit()
 
     def claim_canonical_by_exact_hash(
         self,

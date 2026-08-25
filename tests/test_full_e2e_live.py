@@ -359,9 +359,10 @@ async def test_upload_index_search_download_with_real_providers(live_system):
     assert resp.status_code == 201, f"Upload failed: {resp.status_code} {resp.text}"
     upload_data = resp.json()
     assert upload_data["uploaded"] is True
-    assert "doc_id" in upload_data
+    assert "rel_path" in upload_data
     assert upload_data["size"] > 0
-    uploaded_doc_id = upload_data["doc_id"]
+    # This harness indexes the uploaded file under a doc id equal to its path.
+    uploaded_doc_id = upload_data["rel_path"]
 
     # Verify file exists on disk
     uploaded_path = Path(docs_root) / uploaded_doc_id

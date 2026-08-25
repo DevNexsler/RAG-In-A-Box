@@ -335,6 +335,14 @@ class IndexRunSupervisor:
             progress["last_heartbeat_at"] = payload["updated_at"]
         return progress
 
+    def _has_foreign_heartbeat(self, run_id: object) -> bool:
+        """Keep an active state with another run's heartbeat fail-closed."""
+        try:
+            payload = json.loads((self.index_root / "indexer.heartbeat").read_text())
+        except (OSError, ValueError, TypeError):
+            return False
+        return isinstance(payload, dict) and payload.get("run_id") not in {None, run_id}
+
     @staticmethod
     def _progress_text(attempt: dict[str, Any]) -> str:
         def value(field: str) -> object:
@@ -433,6 +441,12 @@ class IndexRunSupervisor:
         terminal.update(self._read_progress(current.get("run_id")))
         return terminal
 
+    def _terminal_unknown(self, current: dict[str, Any], reason: str) -> dict[str, Any]:
+        """Record a disappeared run with no child progress evidence (#1058)."""
+        terminal = self._terminal_lost(current, reason)
+        terminal["status"] = "unknown"
+        return terminal
+
     @staticmethod
     def _completed_progress_is_current(
         current: dict[str, Any], progress: dict[str, Any]
@@ -497,7 +511,14 @@ class IndexRunSupervisor:
                 self._clear_pid_locked(current.get("pid"))
                 self._write_state_locked(state)
                 return state, None, False
-            terminal = self._terminal_lost(current, identity_failure)
+            if (
+                identity_failure == "process_missing_on_reconcile"
+                and not progress
+                and not self._has_foreign_heartbeat(current.get("run_id"))
+            ):
+                terminal = self._terminal_unknown(current, identity_failure)
+            else:
+                terminal = self._terminal_lost(current, identity_failure)
             state["current"] = None
             state["last_attempt"] = terminal
             self._clear_pid_locked(current.get("pid"))

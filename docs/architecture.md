@@ -91,7 +91,8 @@ The taxonomy is managed exclusively via MCP tools (`file_taxonomy_add`, `file_ta
 | Field | Type | Description |
 |-------|------|-------------|
 | `chunk_uid` | string | Unique ID: `doc_id::loc` |
-| `doc_id` | string | Path-relative to documents root (e.g. `Projects/notes.md`) |
+| `doc_id` | string | Minted document id, `<source_name>::<5-char base-62 id>` (e.g. `documents::0a3Zq`) — an identifier, not a path; see `rel_path` |
+| `rel_path` | string | Document path under the documents root (e.g. `Projects/notes.md`); non-file sources store their source-local key here |
 | `loc` | string | Location within doc (`c:0`, `p:2:c:1`, `img:c:0`) |
 | `text` | string | Contextual header + extracted text (header aids search retrieval) |
 | `snippet` | string | First ~200 chars of raw text (without header) for clean display |

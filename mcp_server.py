@@ -2198,7 +2198,7 @@ def _file_get_chunk_impl(doc_id: str, loc: str) -> dict:
         return _error(
             "invalid_parameter",
             "doc_id must not be empty.",
-            "Provide the document-relative file path (e.g., 'Projects/recipe.md'). "
+            "Provide the document ID (e.g., 'documents::00abc'), not a file path. "
             "Use file_search or file_list_documents to find valid doc_ids.",
         )
     if not loc or not loc.strip():
@@ -2254,7 +2254,7 @@ def _file_get_doc_chunks_impl(doc_id: str) -> list[dict] | dict:
         return _error(
             "invalid_parameter",
             "doc_id must not be empty.",
-            "Provide the document-relative file path (e.g., 'Projects/recipe.md'). "
+            "Provide the document ID (e.g., 'documents::00abc'), not a file path. "
             "Use file_search or file_list_documents to find valid doc_ids.",
         )
 
@@ -2710,6 +2710,17 @@ def is_indexer_running(config: dict) -> bool:
     return bool(running)
 
 
+def index_run_was_interrupted(config: dict) -> bool:
+    """True when the newest terminal index run did not succeed and no later run
+    superseded it — i.e. a run that was interrupted rather than finished.
+
+    This is the same unresolved-failure state ``/health`` reports as 503, read
+    here so the scheduler can resume the interrupted sweep at boot instead of
+    parking its remaining documents for a whole sweep interval (#1153).
+    """
+    return bool(_get_index_run_supervisor(config).status_summary()["unresolved_failure"])
+
+
 def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
     """Construct the in-process index scheduler, or None when disabled.
 
@@ -2748,6 +2759,7 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
         drain_fn=drain_queues,
         sweep_fn=lambda: _file_index_update_impl(config_path),
         sweep_running_fn=lambda: is_indexer_running(config),
+        run_was_interrupted_fn=lambda: index_run_was_interrupted(config),
     )
 
 
@@ -2887,13 +2899,15 @@ if HAS_MCP and FastMCP is not None:
 
     mcp = FastMCP("file-index-mcp", json_response=True)
 
-    # --- MCP tool-call tracing -----------------------------------------
-    # Every registered tool emits a server-side `mcp.tool.<name>` span via
-    # ONE generic wrapper composed into mcp.tool() at registration time, so
-    # the tool functions below stay untouched. Only allowlisted scalar args
-    # are recorded as attributes — NEVER full arguments or document text.
+    # --- MCP tool-call tracing + off-loop dispatch ----------------------
+    # Every registered tool emits a server-side `mcp.tool.<name>` span and,
+    # when its body is synchronous, runs in a worker thread — via ONE generic
+    # wrapper composed into mcp.tool() at registration time, so the tool
+    # functions below stay untouched. Only allowlisted scalar args are
+    # recorded as attributes — NEVER full arguments or document text.
     # Downstream spans (e.g. search.hybrid) parent under the tool span
-    # automatically via OTEL context propagation. Spans are no-ops unless
+    # automatically via OTEL context propagation (asyncio.to_thread copies the
+    # calling context, so the span survives the hop). Spans are no-ops unless
     # setup_tracing() ran with tracing.enabled: true.
     _TOOL_SPAN_ARG_ALLOWLIST = ("top_k", "doc_id", "source", "source_name", "return_mode")
     _mcp_tracer = get_tracer("mcp")
@@ -2929,15 +2943,23 @@ if HAS_MCP and FastMCP is not None:
 
             return async_wrapper
 
+        # A synchronous tool body is blocking work (provider HTTP, LanceDB,
+        # extraction). FastMCP calls sync tools inline on the serving event
+        # loop, so one slow call — file_search is routinely 10-20s — starves
+        # every other route in the process, including the unauthenticated
+        # /health probe the image healthcheck polls with a 5s timeout: three
+        # misses flip the container unhealthy while nothing is wrong (#1086).
+        # Handing the body to a worker thread keeps the loop free to answer
+        # liveness while the tool runs.
         @functools.wraps(fn)  # transparent: FastMCP schema generation sees the
-        def wrapper(*args, **kwargs):  # original signature via __wrapped__
+        async def offloaded_wrapper(*args, **kwargs):  # signature via __wrapped__
             with _mcp_tracer.start_as_current_span(
                 f"mcp.tool.{tool_name}",
                 attributes=_span_attributes(args, kwargs),
             ):
-                return fn(*args, **kwargs)
+                return await asyncio.to_thread(fn, *args, **kwargs)
 
-        return wrapper
+        return offloaded_wrapper
 
     _original_mcp_tool = mcp.tool
 
@@ -3204,8 +3226,8 @@ if HAS_MCP and FastMCP is not None:
         Use this after file_search to get the complete text of a result.
 
         Args:
-            doc_id: Persistent 5-char base-62 document ID, exactly as returned
-                by file_search (e.g., "00001").
+            doc_id: Document ID, exactly as returned by file_search
+                (e.g., "documents::00abc"). Opaque, not a file path.
             loc: Chunk locator, exactly as returned by file_search
                 (e.g., "c:0" for chunk 0, "p:3:c:1" for page 3 chunk 1).
 
@@ -3228,7 +3250,8 @@ if HAS_MCP and FastMCP is not None:
         reading an entire document or understanding its structure.
 
         Args:
-            doc_id: Document-relative file path (e.g., "Projects/recipe.md").
+            doc_id: Document ID, exactly as returned by file_search
+                (e.g., "documents::00abc"). Opaque, not a file path.
                 Use file_search or file_list_documents to find valid doc_ids.
 
         Returns a list of chunk dicts, each containing:
@@ -3261,9 +3284,10 @@ if HAS_MCP and FastMCP is not None:
 
         Returns a dict:
             - documents: List of document metadata dicts, each with:
-                doc_id, title, source_type, folder, tags (array), status,
-                created, mtime (unix timestamp), mtime_iso (ISO 8601 UTC),
-                size (bytes).
+                doc_id, rel_path (path under documents_root, or the
+                source-local id for non-file sources), title, source_type,
+                folder, tags (array), status, created, mtime (unix timestamp),
+                mtime_iso (ISO 8601 UTC), size (bytes).
             - total: Total number of matching documents (for pagination).
             - offset: The offset used.
             - limit: The limit used.
@@ -3290,7 +3314,12 @@ if HAS_MCP and FastMCP is not None:
             folder: Filter by top-level folder name (e.g., "Projects").
 
         Returns a list of document metadata dicts, each containing:
-            - doc_id: Document-relative path (e.g., "Archive/notes.md").
+            - doc_id: Opaque document ID, namespaced by source as
+              "<source_name>::<id>" (e.g., "documents::00abc"). Pass it back to
+              other tools verbatim; it is not a file path — path-based browsing
+              uses the rel_path metadata field.
+            - rel_path: Path under documents_root (e.g., "Archive/notes.md"),
+              or the source-local id for non-file sources (e.g., "email/msg-3").
             - title, source_type, folder, tags (array), status, created.
             - mtime: Unix timestamp of last modification.
             - mtime_iso: ISO 8601 UTC string (e.g., "2026-02-20T15:30:00+00:00").
