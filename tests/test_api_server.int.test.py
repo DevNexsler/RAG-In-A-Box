@@ -434,3 +434,55 @@ async def test_search_post_returns_mcp_search_results(api_client, monkeypatch):
             "filter": None,
         }
     ]
+
+
+async def _post_search(client):
+    return await client.post("/search", json={"query": "neural"})
+
+
+@pytest.mark.anyio
+async def test_search_post_does_not_block_the_serving_loop(api_client, monkeypatch):
+    """A slow /search must leave the loop free for the liveness route (#1086).
+
+    /api/search is the REST twin of the file_search MCP tool and runs the same
+    blocking implementation (embed → LanceDB → rerank, routinely 10-20s in
+    production). Called inline on the serving event loop it starves every other
+    route — including the unauthenticated /health probe the container
+    healthcheck polls with a 5s timeout — so it must be dispatched to a thread.
+    """
+    import threading
+    import time
+
+    import anyio
+
+    search_started = threading.Event()
+    release_search = threading.Event()
+    probe_bound_s = 1.0
+    search_block_s = 3.0
+
+    def blocking_search(**_kwargs):
+        search_started.set()
+        release_search.wait(timeout=search_block_s)  # bounded: never hang the suite
+        return {"results": [], "diagnostics": {}}
+
+    monkeypatch.setattr(mcp_server, "_file_search_impl", blocking_search)
+
+    try:
+        # Measured from before the search starts: a probe timed only after the
+        # blocking call returned would look fast even on a loop starved
+        # throughout it.
+        started_at = time.monotonic()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(_post_search, api_client)
+            assert await anyio.to_thread.run_sync(search_started.wait, search_block_s)
+            resp = await api_client.get("/documents")
+            elapsed = time.monotonic() - started_at
+            release_search.set()
+    finally:
+        release_search.set()
+
+    assert resp.status_code == 200
+    assert elapsed < probe_bound_s, (
+        f"a sibling request waited {elapsed:.1f}s behind a blocking /search "
+        "— the serving event loop was starved"
+    )

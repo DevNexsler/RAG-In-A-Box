@@ -235,9 +235,14 @@ async def search(request: Request) -> JSONResponse:
     if not isinstance(payload, dict):
         return _api_error("invalid_request", "JSON body must be an object")
 
+    from starlette.concurrency import run_in_threadpool
+
     from mcp_server import _file_search_impl
 
-    result = _file_search_impl(**_search_kwargs(payload))
+    # Blocking work (embed → LanceDB → rerank) must not run on the serving
+    # event loop: it starves every other route, including the unauthenticated
+    # /health probe the container healthcheck polls with a 5s timeout (#1086).
+    result = await run_in_threadpool(_file_search_impl, **_search_kwargs(payload))
     status_code = 400 if isinstance(result, dict) and result.get("error") else 200
     return JSONResponse(result, status_code=status_code)
 

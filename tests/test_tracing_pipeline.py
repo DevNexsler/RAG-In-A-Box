@@ -352,14 +352,17 @@ def test_enrich_document_emits_enrich_span(span_dir):
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_tool_call_emits_span(span_dir):
+@pytest.mark.anyio
+async def test_mcp_tool_call_emits_span(span_dir):
     import mcp_server
 
     if not mcp_server.HAS_MCP:
         pytest.skip("mcp package not installed")
 
+    # Registered tools are awaitable: a sync body is dispatched to a worker
+    # thread so a slow tool cannot starve the liveness route (#1086).
     with patch("mcp_server._file_taxonomy_list_impl", return_value=[]):
-        mcp_server.file_taxonomy_list(kind="tag", status="active")
+        await mcp_server.file_taxonomy_list(kind="tag", status="active")
 
     shutdown_tracing()
     spans = _read_spans(span_dir)
@@ -373,14 +376,15 @@ def test_mcp_tool_call_emits_span(span_dir):
     assert "status" not in span["attributes"]
 
 
-def test_mcp_tool_span_records_only_allowlisted_scalar_args(span_dir):
+@pytest.mark.anyio
+async def test_mcp_tool_span_records_only_allowlisted_scalar_args(span_dir):
     import mcp_server
 
     if not mcp_server.HAS_MCP:
         pytest.skip("mcp package not installed")
 
     with patch("mcp_server._file_search_impl", return_value={"results": []}):
-        mcp_server.file_search(
+        await mcp_server.file_search(
             query="private user text", top_k=5, source_name="documents"
         )
 
@@ -397,11 +401,13 @@ def test_mcp_tool_span_records_only_allowlisted_scalar_args(span_dir):
     )
 
 
-def test_mcp_file_search_tool_span_parents_search_hybrid(tmp_path, span_dir):
+@pytest.mark.anyio
+async def test_mcp_file_search_tool_span_parents_search_hybrid(tmp_path, span_dir):
     """The linkage Task 9's server-side coverage check leans on: the
     downstream search.hybrid span must parent under mcp.tool.file_search via
     OTEL context propagation — asserted against the REAL registered tool
-    wrapper and the REAL hybrid search over a real store."""
+    wrapper and the REAL hybrid search over a real store, across the worker
+    thread the sync tool body now runs in (#1086)."""
     import mcp_server
 
     if not mcp_server.HAS_MCP:
@@ -409,7 +415,7 @@ def test_mcp_file_search_tool_span_parents_search_hybrid(tmp_path, span_dir):
 
     store, embed = _index_note(tmp_path)
     with patch("mcp_server._get_deps", return_value=(store, embed, {})):
-        resp = mcp_server.file_search(query="machine learning embedding", top_k=3)
+        resp = await mcp_server.file_search(query="machine learning embedding", top_k=3)
     assert resp.get("results"), resp
 
     shutdown_tracing()

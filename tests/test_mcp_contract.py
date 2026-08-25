@@ -91,6 +91,55 @@ async def test_file_index_document_dispatches_via_to_thread():
     }
 
 
+@pytest.mark.anyio
+async def test_sync_tool_call_does_not_block_liveness_probe():
+    """A slow SYNC tool must leave the event loop free for /health (#1086).
+
+    FastMCP runs a sync tool function inline on the serving event loop, so a
+    tool that blocks on provider I/O (file_search: embed → LanceDB → rerank,
+    routinely 10-20s in production) makes the unauthenticated /health route
+    unanswerable for that whole time. Three missed probes past the image
+    healthcheck's 5s urlopen timeout flip the container unhealthy while
+    nothing is actually wrong. Registration must dispatch sync tools to a
+    worker thread.
+    """
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tool_started = threading.Event()
+    release_tool = threading.Event()
+    # Well under the healthcheck's 5s: the bound being asserted is "the loop
+    # stays responsive", not "the tool is fast".
+    probe_bound_s = 1.0
+    tool_block_s = 3.0
+
+    def blocking_impl(*_args, **_kwargs):
+        tool_started.set()
+        release_tool.wait(timeout=tool_block_s)  # bounded: never hang the suite
+        return {"results": [], "diagnostics": {}}
+
+    with patch("mcp_server._file_search_impl", new=blocking_impl):
+        try:
+            async with anyio.create_task_group() as tasks:
+                # The deadline covers the tool call itself: a probe measured
+                # only after the blocking tool returned would pass even when
+                # the loop was starved for the whole call.
+                with anyio.fail_after(probe_bound_s):
+                    tasks.start_soon(
+                        mcp_server.mcp.call_tool, "file_search", {"query": "lease"}
+                    )
+                    assert await anyio.to_thread.run_sync(tool_started.wait, tool_block_s)
+                    payload, status_code = await mcp_server._run_health_probe(
+                        lambda _config: ({"status": "ok"}, 200), {}
+                    )
+                release_tool.set()
+        finally:
+            release_tool.set()
+
+    assert status_code == 200
+    assert payload == {"status": "ok"}
+
+
 # ---------------------------------------------------------------------------
 # doc_id documentation contract
 # ---------------------------------------------------------------------------
