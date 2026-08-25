@@ -3,6 +3,7 @@
 No external services needed. Uses mocks and direct function calls."""
 
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -88,6 +89,69 @@ async def test_file_index_document_dispatches_via_to_thread():
         "source_name": "documents",
         "force": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# doc_id documentation contract
+# ---------------------------------------------------------------------------
+
+# doc_id stopped being a path when it became a persistent identifier: DocIDStore
+# mints a 5-char base-62 id and the indexing flow namespaces it per source
+# ("documents::00abc"). The path lives in the separate rel_path field. The stale
+# "document-relative path" wording was copy-pasted between neighbouring tools,
+# so guard the whole published surface, not one tool.
+_DOC_ID_AS_PATH_RE = re.compile(
+    r"\bdoc_id\b[^\n]*\brelative\b[^\n]*\bpath\b", re.IGNORECASE
+)
+
+
+@pytest.mark.anyio
+async def test_no_tool_describes_doc_id_as_a_path():
+    """No published tool description may document doc_id as a relative path."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tools = await mcp_server.mcp.list_tools()
+    offenders = [
+        tool.name
+        for tool in tools
+        if _DOC_ID_AS_PATH_RE.search(tool.description or "")
+    ]
+
+    assert offenders == [], (
+        f"tools documenting doc_id as a path: {offenders} — doc_id is a "
+        "source-namespaced persistent ID; rel_path holds the path"
+    )
+
+
+@pytest.mark.anyio
+async def test_file_recent_documents_doc_id_as_namespaced_id():
+    """file_recent must describe the doc_id it returns and point at rel_path."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tools = await mcp_server.mcp.list_tools()
+    description = next(t for t in tools if t.name == "file_recent").description or ""
+
+    assert "source_name" in description and "::" in description
+    assert "rel_path" in description
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: mcp_server._file_get_chunk_impl("", "c:0"),
+        lambda: mcp_server._file_get_doc_chunks_impl(""),
+    ],
+    ids=["file_get_chunk", "file_get_doc_chunks"],
+)
+def test_empty_doc_id_error_does_not_describe_doc_id_as_a_path(call):
+    """The invalid_parameter hint must not tell callers to pass a path."""
+    err = call()
+
+    assert err["code"] == "invalid_parameter"
+    hint = f"{err['message']} {err['fix']}"
+    assert not _DOC_ID_AS_PATH_RE.search(hint), hint
 
 
 # ---------------------------------------------------------------------------
