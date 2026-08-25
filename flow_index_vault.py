@@ -75,7 +75,7 @@ from attachment_context_refresh import (
     context_text_from_sidecar,
     refresh_document_context,
 )
-from core import lance_session
+from core import enrichment_telemetry, lance_session
 from core.config import filesystem_source_roots, load_config
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
@@ -2061,6 +2061,41 @@ def _provider_error_artifact(raw_bytes: bytes, ext: str) -> tuple[str, bool] | N
     return reason, transient
 
 
+def _canonical_is_intentionally_unindexed(canonical_ns_doc_id: str) -> bool:
+    """Whether a canonical missing from LanceDB was deliberately never indexed.
+
+    Absence from the table only means the canonical was *lost* if the document
+    was supposed to be there. A doc that extracts no text (or is oversized, or
+    corrupt) is skipped by design and is legitimately absent forever, so the
+    skip ledger — not the table — is what distinguishes "lost" from "never
+    indexed on purpose" (#1252). Without that distinction a cohort whose
+    members are all intentional skips reopens on every retry cycle: each pass
+    finds the current canonical absent, dissolves the cohort, elects the other
+    member, and is skipped again in turn.
+
+    This run's decisions count too: a canonical skipped a few documents ago is
+    only in ``skip_now`` until the end-of-run merge persists it, and a cohort
+    reset drops its members' ledger entries, so a ledger-only test would still
+    ping-pong on the very first pass. Change keys are deliberately not compared
+    — a canonical whose bytes moved is re-evaluated by the diff on its own, and
+    is handled by the stranded-cohort path, not by reopening here.
+
+    A canonical that becomes indexable later (its file changed, OCR came back)
+    is picked up by the skip ledger's own bounded retry, which re-attempts it
+    and drops its entry once it lands content. Re-electing the cohort is not
+    what recovers that case, so leaving the cohort alone costs nothing.
+    """
+    with _RUNTIME.get("degraded_lock") or nullcontext():
+        if canonical_ns_doc_id in (_RUNTIME.get("skip_now") or {}):
+            return True
+    # index_root is read from config because it is the one source both the full
+    # flow and the targeted single-doc path populate.
+    index_root = (_RUNTIME.get("config") or {}).get("index_root")
+    if not index_root:
+        return False
+    return canonical_ns_doc_id in _load_skip_ledger(Path(index_root)).get("docs", {})
+
+
 def _reset_invalid_dedupe_cohort(
     registry: DocIDStore,
     store: LanceDBStore,
@@ -2260,11 +2295,15 @@ def _process_doc_task(
                 )
                 if winner is not None and winner.get("doc_id") != bare_id:
                     canonical_ns = f"{source_name}::{winner['doc_id']}"
-                    if store.contains_doc_id(canonical_ns):
-                        # The cohort holds content again, so any earlier reset
-                        # of it no longer describes the present state: forget
-                        # it, or a later genuine loss could not reopen (#1258).
-                        registry.clear_cohort_reset(len(raw_bytes), digest, "blake3")
+                    canonical_has_content = store.contains_doc_id(canonical_ns)
+                    if canonical_has_content or _canonical_is_intentionally_unindexed(
+                        canonical_ns
+                    ):
+                        if canonical_has_content:
+                            # The cohort holds content again, so any earlier reset
+                            # of it no longer describes the present state: forget
+                            # it, or a later genuine loss could not reopen (#1258).
+                            registry.clear_cohort_reset(len(raw_bytes), digest, "blake3")
                         _run_identity_op_with_stranded_cohort_recovery(
                             lambda: registry.update_dedupe_identity(
                                 bare_id,
@@ -2343,7 +2382,12 @@ def _process_doc_task(
                             _dispatch_document_indexed_event(
                                 config, duplicate_event, logger
                             )
-                    if dedupe_cfg.get("update_canonical_metadata", True):
+                    # A canonical that was intentionally skipped holds no chunks
+                    # to carry the provenance; asking for the rewrite would only
+                    # raise (and warn) on every pass.
+                    if dedupe_cfg.get(
+                        "update_canonical_metadata", True
+                    ) and store.contains_doc_id(canonical_ns):
                         try:
                             refs = registry.duplicate_refs_for_canonical(winner["doc_id"])
                             store.update_canonical_duplicate_metadata(canonical_ns, refs)
@@ -3032,6 +3076,35 @@ def index_stats_task(
     logger.info(message)
 
 
+def _enrichment_run_telemetry(degraded_write_count: int) -> dict[str, int]:
+    """This run's structured-enrichment quality, for the summary and metadata.
+
+    Answers in one place what the run cost and what it stored: how often the
+    first structured response was usable, how many second LLM calls that
+    misjudgement or a real truncation forced, and how many documents were
+    written degraded anyway (#1097).
+    """
+    stats = enrichment_telemetry.snapshot()
+    stats["degraded_writes"] = degraded_write_count
+    return stats
+
+
+def _log_enrichment_telemetry(logger, stats: dict[str, int]) -> None:
+    attempts = stats["attempts"]
+    if not attempts:
+        return
+    logger.info(
+        "Enrichment structured output: attempts=%d first_pass_valid=%d (%.1f%%) "
+        "retries=%d recovered=%d degraded_writes=%d",
+        attempts,
+        stats["first_pass_usable"],
+        stats["first_pass_usable"] * 100.0 / attempts,
+        stats["retries"],
+        stats["retries_recovered"],
+        stats["degraded_writes"],
+    )
+
+
 @task
 def write_index_metadata_task(
     index_root: str | Path,
@@ -3039,6 +3112,8 @@ def write_index_metadata_task(
     chunk_count: int | None,
     failed_docs: list[str] | None = None,
     warnings: list[str] | None = None,
+    *,
+    enrichment: dict[str, int] | None = None,
 ) -> None:
     """Write index_metadata.json for file_status (last_run_at, counts, failures, warnings)."""
     import json
@@ -3060,6 +3135,8 @@ def write_index_metadata_task(
         meta["warning_counts"] = dict(sorted(warning_counts.items()))
         meta["enrichment_failed_count"] = warning_counts.get("enrichment_failed", 0)
         meta["warnings"] = warnings[:50]
+    if enrichment and enrichment.get("attempts"):
+        meta["enrichment"] = enrichment
     with open(path, "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -3269,6 +3346,7 @@ def index_vault_flow(
     import time
     logger = get_run_logger()
     _initialize_run_progress()
+    enrichment_telemetry.reset()
     config = _LOCKED_INDEX_CONFIG.get() or load_config(config_path)
     memory_observer = MemoryObserver.from_config(config, logger)
     _RUNTIME["memory_observer"] = memory_observer
@@ -4030,10 +4108,14 @@ def index_vault_flow(
                 dict(reason_counts),
             )
 
+    enrichment_stats = _enrichment_run_telemetry(len(degraded_now))
+    _log_enrichment_telemetry(logger, enrichment_stats)
+
     write_index_metadata_task(
         index_root, doc_count, chunk_count,
         failed_docs or None,
         _RUNTIME.get("_warnings") or None,
+        enrichment=enrichment_stats,
     )
     memory_observer.sample("phase_finish", phase="finalize")
     progress = _run_progress_snapshot()

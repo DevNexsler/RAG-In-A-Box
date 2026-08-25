@@ -251,6 +251,39 @@ async def test_reasoning_only_enrichment_retries_with_populated_facets(
 
 @pytest.mark.skipif(
     E2E_REAL,
+    reason="enrichment is live in real mode; simulator usage cannot be armed",
+)
+async def test_budget_overshoot_enrichment_is_kept_without_a_second_call(
+    indexed_corpus,
+    api,
+    mcp_session,
+):
+    """#1097: a complete structured answer that bills more completion tokens
+    than the request allowed is not truncated — the provider bills reasoning it
+    then strips from the message. Keeping it is what makes the second LLM call
+    unnecessary, and the fault's distinctive summary is only reachable from the
+    first response: a retry would overwrite it with the sim's ordinary one."""
+    await _arm_fault("/api/v1/chat/completions", "overshoot_budget", times=1)
+
+    content = b"# Boiler\n\nBoiler service visit booked for Tuesday at the Ashfield site.\n"
+    await _upload_and_index(api, mcp_session, "overshoot-note.md", content)
+
+    payload = await mcp_session.call_tool_json(
+        "file_search", {"query": "boiler service visit", "top_k": 5}
+    )
+    hits = search_hits(payload, "overshoot-note")
+    assert hits, payload["results"]
+    chunk = await mcp_session.call_tool_json(
+        "file_get_chunk", {"doc_id": hits[0]["doc_id"], "loc": hits[0]["loc"]}
+    )
+    assert chunk["enr_doc_type"]
+    assert chunk["enr_summary"] == "Overshot-budget enrichment marker.", (
+        "the first, complete structured response was discarded and re-requested"
+    )
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
     reason="the real embeddings API is the thing being simulated here",
 )
 async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_session):

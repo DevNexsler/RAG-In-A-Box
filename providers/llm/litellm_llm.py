@@ -11,8 +11,13 @@ from typing import Any, TypedDict
 
 import httpx
 
+from core.enrichment_telemetry import (
+    record_structured_attempt,
+    record_structured_retry,
+)
 from core.resilience import CIRCUITS, TransientError
-from doc_enrichment import enrichment_response_schema
+from core.route_contract import ROUTE_CONTRACTS
+from doc_enrichment import enrichment_response_schema, structured_response_is_usable
 from providers.llm.trace_recorder import LLMTraceRecorder
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,19 @@ MAX_RETRIES = 2
 RETRY_BACKOFF = (5.0, 15.0)
 CONNECT_TIMEOUT_CAP = 10.0
 DEFAULT_BASE_URL = "http://host.docker.internal:4000/v1"
+
+# Every ``reasoning_effort`` an OpenAI-compatible gateway we speak to accepts.
+# A gateway answers anything outside its own set with an HTTP 400, so a typo in
+# config has to fail when the provider is built rather than on every document.
+# ollama.com takes none|low|medium|high|max and only "none" actually disables
+# reasoning (knowledge/runbooks/ollama-cloud-reasoning-truncation.md); OpenAI
+# adds "minimal".
+REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "max"})
+
+# Enrichment keeps only the JSON body, so the recovery attempt buys no
+# reasoning at all: it is the one lever that frees completion budget for the
+# answer when reasoning has eaten it.
+RECOVERY_REASONING_EFFORT = "none"
 
 _ENRICHMENT_SCHEMA = {
     "name": "enrichment",
@@ -117,7 +135,12 @@ def _truncation_signals(
     response_payload: dict[str, Any],
     request_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return truncation evidence without trusting a provider's ``stop`` claim."""
+    """Diagnose *why* a response was unusable, without trusting ``stop``.
+
+    These are evidence for the log and for classifying a failed retry, not the
+    usability verdict: that is ``structured_response_is_usable`` on the payload
+    itself.
+    """
     message: dict[str, Any] = {}
     finish_reason = ""
     choices = response_payload.get("choices")
@@ -158,14 +181,20 @@ def _truncation_signals(
         or (isinstance(content, str) and not content.strip())
     )
     reasoning_length = len(reasoning) if isinstance(reasoning, str) else 0
-    truncated = (
+    # A budget that truncates stops generation *at* the budget. Billing above
+    # it proves the budget never bound, so it cannot be what cut the answer
+    # short — this proxy bills reasoning tokens it then strips from the message,
+    # so complete answers routinely report more than they were allowed (#1097).
+    saturated_budget = (
         completion_tokens is not None
         and requested_tokens is not None
         and requested_tokens > 0
-        and completion_tokens >= requested_tokens
-    ) or empty_content or finish_reason == "length"
+        and completion_tokens == requested_tokens
+    )
+    truncated = saturated_budget or empty_content or finish_reason == "length"
     return {
         "completion_tokens": completion_tokens,
+        "requested_tokens": requested_tokens,
         "empty_content": empty_content,
         "finish_reason": finish_reason,
         "reasoning_output_length": reasoning_length,
@@ -191,8 +220,15 @@ class LiteLLMGenerator:
         timeout: float = 600.0,
         trace_capture: dict | None = None,
         temperature: float = 0.0,
+        reasoning_effort: str | None = None,
     ) -> None:
+        if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(
+                "enrichment.reasoning_effort must be one of "
+                f"{sorted(REASONING_EFFORTS)}, got {reasoning_effort!r}"
+            )
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.base_url = base_url.rstrip("/")
         self.api_key = (
             api_key
@@ -218,44 +254,103 @@ class LiteLLMGenerator:
 
         logger.info("LiteLLMGenerator initialized: %s model=%s", self.base_url, model)
 
+    @property
+    def route(self) -> str:
+        """The alias this generator calls, as an identity a log line can name."""
+        return f"{self.model}@{self.base_url}"
+
     def generate(self, user_prompt: str, max_tokens: int = 512) -> str:
         return self.generate_with_metadata(user_prompt, max_tokens=max_tokens)["content"]
 
     def generate_with_metadata(
         self, user_prompt: str, max_tokens: int = 512
     ) -> LiteLLMReplayMetadata:
-        initial = self._request_with_metadata(user_prompt, max_tokens=max_tokens)
+        initial = self._request_with_metadata(
+            user_prompt,
+            max_tokens=max_tokens,
+            reasoning_effort=self.reasoning_effort,
+        )
         signals = _truncation_signals(
             initial["response"], initial["request"]["payload"]
         )
-        if not signals["truncated"]:
+        # The alias is fixed in config; the contract behind it is the provider's
+        # to change. Report what this answer proved about it (#1154).
+        ROUTE_CONTRACTS.observe(
+            self.route,
+            requested_tokens=max_tokens,
+            completion_tokens=signals["completion_tokens"],
+            finish_reason=signals["finish_reason"],
+            backend=initial["response"].get("system_fingerprint"),
+        )
+        first_pass_usable = self._is_usable(initial["content"], signals)
+        record_structured_attempt(first_pass_usable=first_pass_usable)
+        if first_pass_usable:
             return initial
 
         retry_without_reasoning = self._request_policy["retry_without_reasoning"]
+        # Disabling reasoning is the only lever that frees completion budget for
+        # the JSON.  Pulling it twice buys nothing: a retry with the parameters
+        # that just failed burns exactly the same way (#0260).
+        recoverable = self.reasoning_effort != RECOVERY_REASONING_EFFORT
         logger.warning(
-            "LiteLLM structured response was truncated or empty "
-            "(completion_tokens=%s, reasoning_chars=%s, empty=%s, "
-            "finish_reason=%s); retrying%s.",
+            "LiteLLM structured response was not usable "
+            "(completion_tokens=%s/%s, reasoning_chars=%s, empty=%s, "
+            "finish_reason=%s, truncated=%s); %s",
             signals["completion_tokens"],
+            signals["requested_tokens"],
             signals["reasoning_output_length"],
             signals["empty_content"],
             signals["finish_reason"],
-            " once with reasoning disabled" if retry_without_reasoning else "",
+            signals["truncated"],
+            (
+                "retrying once with reasoning disabled."
+                if retry_without_reasoning
+                else "retrying once."
+            )
+            if recoverable
+            else "reasoning is already disabled, not retrying.",
         )
+        if not recoverable:
+            raise TransientError(
+                "LiteLLM structured response was truncated or empty with "
+                "reasoning already disabled"
+            )
         recovered = self._request_with_metadata(
             user_prompt,
             max_tokens=max_tokens,
-            reasoning_effort="none" if retry_without_reasoning else None,
+            reasoning_effort=(
+                RECOVERY_REASONING_EFFORT if retry_without_reasoning else None
+            ),
         )
         recovery_signals = _truncation_signals(
             recovered["response"], recovered["request"]["payload"]
         )
+        recovery_usable = self._is_usable(recovered["content"], recovery_signals)
+        record_structured_retry(usable=recovery_usable)
+        if recovery_usable:
+            return recovered
+
         if recovery_signals["truncated"]:
             raise TransientError(
                 "LiteLLM structured response remained truncated or empty "
                 "after reasoning-disabled retry"
             )
+        # The model answered in full and still withheld required metadata:
+        # that is a fact about this document, not a provider outage. Return it
+        # so the enrichment consumer records a permanent degradation instead of
+        # a transient one the degraded ledger would re-queue forever (#0251).
         return recovered
+
+    @staticmethod
+    def _is_usable(content: str, signals: dict[str, Any]) -> bool:
+        """Whether a structured response is worth keeping.
+
+        The payload decides: it either yields the enrichment fields we asked
+        for or it does not. Truncation evidence only vetoes — a cut-short
+        answer can still salvage-parse with the required fields present while
+        silently dropping every later field.
+        """
+        return not signals["truncated"] and structured_response_is_usable(content)
 
     def _request_with_metadata(
         self,
