@@ -30,16 +30,20 @@ curl -X POST http://localhost:7788/api/search \
   -d '{"query":"deployment procedures","top_k":5}'
 ```
 
-Response shape matches `file_search`:
+Response shape matches `file_search`. `doc_id` is the source-namespaced
+persistent id of the document (stable across renames, and defined for
+non-filesystem sources); the path, when the source has one, is `rel_path`:
 
 ```json
 {
   "results": [
     {
-      "doc_id": "ops/deployment.md",
+      "doc_id": "documents::00001",
+      "rel_path": "ops/deployment.md",
       "loc": "c:0",
       "snippet": "...",
       "score": 0.42,
+      "source_type": "md",
       "title": "Deployment"
     }
   ],
