@@ -263,8 +263,9 @@ def test_litellm_generator_reports_the_route_contract_it_observed(caplog):
     with patch(
         "providers.llm.litellm_llm.httpx.post",
         side_effect=[
+            # #1097 keeps a complete over-budget answer, so the unbounded
+            # contract costs one call here, not two.
             _cloud_overshoot_response(),
-            _recovered_response(),
             _native_capped_response(),
             _recovered_response(),
         ],
