@@ -131,6 +131,15 @@ enrichment:
   # base_url: "http://host.docker.internal:4000/v1"
   # timeout: 600
   # temperature: 0.0
+  # reasoning_effort: "none"              # litellm provider only; unset = leave reasoning to the model
+  #   Reasoning shares the completion budget with the answer, and enrichment keeps only the JSON
+  #   body — so a reasoning blow-up spends max_output_tokens and leaves nothing for the answer.
+  #   The truncated call is then re-sent with reasoning disabled, i.e. paid for twice (#1151: 463
+  #   such retries in Jul-Aug 2026, every one at completion_tokens == max_output_tokens).  Setting
+  #   "none" disables reasoning on the FIRST attempt and removes that class of retry, but it also
+  #   changes the output of the documents that succeed today — measure enrichment quality before
+  #   and after (core/benchmarking) before turning it on.  Only "none" actually disables reasoning
+  #   on ollama.com; low/medium/high/max merely nudge it.
   max_input_chars: 20000                  # head+tail sampling: 10000 chars from start + 10000 from end
   max_output_tokens: 5000
   concurrency: 1                          # docs processed in parallel; 1=serial, 4-8 recommended on paid OpenRouter
