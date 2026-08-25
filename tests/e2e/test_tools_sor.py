@@ -42,7 +42,7 @@ async def test_sor_schema_lists_messages_table(mcp_session):
 
     columns = await mcp_session.call_tool_json("sor_schema", {"table": "messages"})
     assert isinstance(columns, str), columns
-    for col in ("body", "sender", "direction", "sent_at"):
+    for col in ("body", "subject", "sender", "direction", "sent_at"):
         assert col in columns, f"{col!r} missing from schema:\n{columns}"
 
 
@@ -53,9 +53,9 @@ async def test_sor_query_select_returns_seeded_rows(mcp_session):
     })
     assert isinstance(out, str), out
     lines = [line for line in out.strip().splitlines() if line.strip()]
-    # header + 5 seeded fixture rows
+    # header + 6 seeded fixture rows
     data_rows = [line for line in lines if "\t" in line][1:]
-    assert len(data_rows) == 5, out
+    assert len(data_rows) == 6, out
     assert "zephyr" in out, out
     assert "Alice Nguyen" in out and "inbound" in out and "outbound" in out
 
@@ -84,6 +84,18 @@ async def test_sor_sweep_indexed_messages_searchable(indexed_corpus, mcp_session
     assert "periwinkle" in (top.get("snippet") or "").lower(), top
     assert top.get("direction") == "inbound", top
     assert top.get("sender") == "Erin Walsh", top
+
+    subject_payload = await mcp_session.call_tool_json(
+        "file_search", {"query": "cobalt courthouse filing", "top_k": 8}
+    )
+    assert not subject_payload.get("error"), subject_payload
+    subject_hits = [
+        result
+        for result in subject_payload["results"]
+        if result.get("doc_id") == "sor::email/msg-006"
+    ]
+    assert subject_hits, subject_payload["results"]
+    assert "cobalt courthouse filing" in subject_hits[0]["snippet"].lower()
 
 
 def test_sor_unit_title_reaches_raw_lance_metadata_and_chunk_header(indexed_corpus):

@@ -2029,7 +2029,7 @@ class LanceDBStore:
         from datetime import date
 
         self._prune_versions("pre-maintenance")
-        return self._compact_data_files_if_due(date.today())
+        return self.compact_data_files_if_due(date.today())
 
     def _optimize_and_prune(self, table, *, compact_data: bool = True) -> None:
         """Merge index deltas, refresh restore points, and prune old versions.
@@ -2068,7 +2068,7 @@ class LanceDBStore:
         today = date.today()
         if compact_data:
             self._prune_versions("pre-maintenance")
-            self._compact_data_files_if_due(today)
+            self.compact_data_files_if_due(today)
 
         self._merge_index_deltas()
         self._finish_index_maintenance(table, today)
@@ -2081,7 +2081,7 @@ class LanceDBStore:
         self._prune_versions("post-expiry")
         self._tag_latest_restore_point(table, today)
 
-    def _compact_data_files_if_due(self, today) -> bool:
+    def compact_data_files_if_due(self, today) -> bool:
         """Best-effort daily data compaction with durable success cadence."""
         if not self._compaction_due(today):
             return False

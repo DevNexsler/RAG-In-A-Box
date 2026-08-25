@@ -122,10 +122,10 @@ List available restore points: `store._vs.table.tags.list()`.
 survives the live directory being deleted or corrupted — the case the
 in-dataset tags can't cover.
 
-- Retention: **14 daily + 8 weekly** (Sunday copies promoted to `weekly/`).
-  30 *full* daily copies would be ~150 GB and won't fit the disk, so the long
-  granular tail lives in the cheap in-dataset tags (#3) instead; the tarballs
-  give ~2 months of coarse physical DR.
+- Retention: **3 daily + 4 weekly + 3 monthly**. Sunday copies are promoted to
+  `weekly/`; the first backup in each month's first seven days is promoted to
+  `monthly/`. The granular tail lives in the cheap in-dataset tags (#3), while
+  tarballs provide coarse physical DR without retaining many full daily copies.
 - Excludes the transient shadow table, `*.corrupt`, and logs.
 - Single-disk host: `backups/` is on the same volume as the index, so this
   protects against logical loss of the directory, **not** a disk failure. True

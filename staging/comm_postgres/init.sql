@@ -10,6 +10,7 @@ CREATE TABLE messages (
     channel_name      text,
     sender            text,
     direction         text,
+    subject           text,
     body              text,
     sent_at           timestamptz NOT NULL,
     updated_at        timestamptz NOT NULL
@@ -27,26 +28,29 @@ VALUES
     ('zoho_cliq', '720844989', 'Dan Park'),
     ('zoho_cliq', '918334727', 'Nigel Pine');
 
--- 5 deterministic fixture rows: fixed timestamps, distinct senders/directions,
--- distinctive searchable words in each body.
+-- 6 deterministic fixture rows: fixed timestamps, distinct senders/directions,
+-- distinctive searchable words in bodies plus one subject-only email.
 INSERT INTO messages
-    (source, source_message_id, channel_name, sender, direction, body, sent_at, updated_at)
+    (source, source_message_id, channel_name, sender, direction, subject, body, sent_at, updated_at)
 VALUES
-    ('quo',   'msg-001', 'ops',     'Alice Nguyen', 'inbound',
+    ('quo',   'msg-001', 'ops',     'Alice Nguyen', 'inbound', NULL,
      'The quarterly zephyr report is ready for review, see the attached spreadsheet.',
      '2026-06-01T10:00:00Z', '2026-06-01T10:00:00Z'),
-    ('quo',   'msg-002', 'ops',     'Bob Ramirez',  'outbound',
+    ('quo',   'msg-002', 'ops',     'Bob Ramirez',  'outbound', NULL,
      'Thanks Alice — the marmalade budget line still looks off by 3 percent.',
      '2026-06-01T10:01:00Z', '2026-06-01T10:01:00Z'),
-    ('email', 'msg-003', 'billing', 'Carol Idowu',  'inbound',
+    ('email', 'msg-003', 'billing', 'Carol Idowu',  'inbound', 'Obsidian widget invoice',
      'Invoice 4417 for the obsidian widgets was paid on Friday.',
      '2026-06-01T10:02:00Z', '2026-06-01T10:02:00Z'),
-    ('email', 'msg-004', 'billing', 'Dan Park',     'outbound',
+    ('email', 'msg-004', 'billing', 'Dan Park',     'outbound', 'Re: Obsidian widget invoice',
      'Confirming receipt of invoice 4417; the ledger now reconciles cleanly.',
      '2026-06-01T10:03:00Z', '2026-06-01T10:03:00Z'),
-    ('sms',   'msg-005', 'field',   'Erin Walsh',   'inbound',
+    ('sms',   'msg-005', 'field',   'Erin Walsh',   'inbound', NULL,
      'Crew reached the periwinkle substation, inspection starts at noon.',
-     '2026-06-01T10:04:00Z', '2026-06-01T10:04:00Z');
+     '2026-06-01T10:04:00Z', '2026-06-01T10:04:00Z'),
+    ('email', 'msg-006', 'legal',   'Joycelyn Reed', 'inbound',
+     'Cobalt courthouse filing received', NULL,
+     '2026-06-01T10:05:00Z', '2026-06-01T10:05:00Z');
 
 CREATE TABLE "Buildings" (
     id               integer PRIMARY KEY,

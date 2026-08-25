@@ -11,9 +11,9 @@
 # Excluded: chunks__shadow.lance (transient rebuild table), *.corrupt
 # (already-dead data), indexer logs.
 #
-# Retention: 3 daily backups; Sunday backups are also copied to weekly/ and
-# the 2 newest weeklies are kept (~2 weeks of coarse physical DR). Granular
-# day-by-day rollback for the last 30 days comes from in-dataset Lance version
+# Retention (GFS): 3 daily; Sunday copies go to weekly/ (keep 4); the first
+# backup of each month also goes to monthly/ (keep 3). Granular day-by-day
+# rollback for the last 30 days comes from in-dataset Lance version
 # tags (#0113), which are far cheaper than full tarballs; these independent
 # tarballs cover the "chunks.lance directory is lost/corrupt" case (#0113).
 #
@@ -32,7 +32,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="index-${STAMP}.tar.gz"
 LOG="${BACKUP_DIR}/backup.log"
 
-mkdir -p "${BACKUP_DIR}/weekly"
+mkdir -p "${BACKUP_DIR}/weekly" "${BACKUP_DIR}/monthly"
 
 log() { echo "$(date -Is) $*" >> "${LOG}"; }
 
@@ -60,8 +60,16 @@ if [ "$(date +%u)" = "7" ]; then
   log "weekly copy ${OUT}"
 fi
 
-# Retention: 3 daily, 2 weekly (reduced 2026-07-07: tarballs are ~100G each, disaster-recovery only) (find avoids ls-glob crash when empty)
+# First backup of the month (day ≤ 7) → keep a monthly copy
+if [ "$(date +%-d)" -le 7 ]; then
+  cp "${BACKUP_DIR}/${OUT}" "${BACKUP_DIR}/monthly/${OUT}"
+  log "monthly copy ${OUT}"
+fi
+
+# Retention: 3 daily, 4 weekly, 3 monthly (GFS) (find avoids ls-glob crash when empty)
 find "${BACKUP_DIR}" -maxdepth 1 -name 'index-*.tar.gz' -printf '%T@ %p\n' \
   | sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -f
 find "${BACKUP_DIR}/weekly" -maxdepth 1 -name 'index-*.tar.gz' -printf '%T@ %p\n' \
-  | sort -rn | tail -n +3 | cut -d' ' -f2- | xargs -r rm -f
+  | sort -rn | tail -n +5 | cut -d' ' -f2- | xargs -r rm -f
+find "${BACKUP_DIR}/monthly" -maxdepth 1 -name 'index-*.tar.gz' -printf '%T@ %p\n' \
+  | sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -f

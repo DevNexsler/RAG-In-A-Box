@@ -43,14 +43,24 @@ sources:
         query: |
           SELECT source, source_message_id, channel_name,
                  channel_name AS source_channel_id, sender, direction,
-                 sent_at, updated_at, body AS _text
+                 sent_at, updated_at,
+                 CASE
+                   WHEN NULLIF(BTRIM(COALESCE(subject, '')), '') IS NULL
+                     THEN body
+                   WHEN NULLIF(BTRIM(COALESCE(body, '')), '') IS NULL
+                     THEN 'Subject: ' || BTRIM(subject)
+                   ELSE 'Subject: ' || BTRIM(subject)
+                     || E'\n\nBody:\n' || body
+                 END AS _text,
+                 subject
           FROM messages
-          WHERE body IS NOT NULL AND body <> ''
+          WHERE NULLIF(BTRIM(COALESCE(subject, '')), '') IS NOT NULL
+             OR NULLIF(BTRIM(COALESCE(body, '')), '') IS NOT NULL
         id_template: "{source}/{source_message_id}"
         text_column: _text
         text_normalizer: zoho_cliq_mentions
         mtime_column: updated_at
-        metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, sent_at, direction]
+        metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, subject, sent_at, direction]
 
       - source_type: sor_unit
         query: |
