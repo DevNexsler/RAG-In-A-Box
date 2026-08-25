@@ -137,7 +137,9 @@ enrichment:
   api_key: "sim"
   max_input_chars: 20000
   max_output_tokens: 2000
-  concurrency: 1
+  # Matches prod: this is the document worker pool, so anything below it hides
+  # every concurrent-dispatch race the pipeline can hit in production (#1188).
+  concurrency: 4
 
 search:
   mode: "hybrid"
@@ -151,6 +153,19 @@ search:
     model: "Qwen/Qwen3-Reranker-8B"
     timeout: 30
     base_url: "http://provider-sim:9999"
+
+# Production's block verbatim: without it the whole exact-content dedupe branch
+# in process_doc_task — duplicate detection, the indexing skip, the alias
+# context write, the canonical's duplicate provenance — is dead code in this
+# tier, while it runs on a large share of production documents (#1188).
+dedupe:
+  enabled: true
+  mode: "exact"
+  hash_algo: "blake3"
+  archive_root: "/data/index/duplicates"
+  archive_duplicates: true
+  update_canonical_metadata: true
+  skip_duplicate_indexing: true
 
 lancedb:
   table: "chunks"
