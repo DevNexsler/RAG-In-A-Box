@@ -109,7 +109,13 @@ async def test_video_sidecar_context_is_embedded_retrievable_and_audited(
     assert after_embedded, stored[:2000]
 
     listing = await mcp_session.call_tool_json("file_list_documents", {"limit": 100})
-    indexed_paths = [doc.get("rel_path", "") for doc in listing.get("documents", [])]
+    indexed_paths = [doc.get("rel_path") or "" for doc in listing.get("documents", [])]
+    # Positive control: the listing must actually carry the video's own path, or
+    # the sidecar filter below matches nothing because the paths are all empty
+    # and the check passes without ever running (#1203).
+    assert any(
+        "clip" in path and path.endswith(".mp4") for path in indexed_paths
+    ), indexed_paths
     sidecar_not_indexed = not any(
         "clip" in path and path.endswith(".json") for path in indexed_paths
     )

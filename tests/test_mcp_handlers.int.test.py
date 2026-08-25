@@ -103,6 +103,7 @@ def populated_store():
                 [1.0] + [0.0] * 767,
                 source_type="md", folder="recipes", tags="recipe,korean",
                 title="Bibimbap Recipe", mtime=now - 100,
+                rel_path="recipes/bibimbap.md",
             ),
             _make_node(
                 "reports/q4_report.pdf", "c:0",
@@ -110,6 +111,7 @@ def populated_store():
                 [0.0] + [1.0] + [0.0] * 766,
                 source_type="pdf", folder="reports", tags="finance,report",
                 title="Q4 2025 Report", mtime=now - 200,
+                rel_path="reports/q4_report.pdf",
             ),
             _make_node(
                 "notes/ml_notes.md", "c:0",
@@ -117,6 +119,7 @@ def populated_store():
                 [0.0, 0.0] + [1.0] + [0.0] * 765,
                 source_type="md", folder="notes", tags="ml,ai",
                 title="ML Notes", mtime=now,
+                rel_path="notes/ml_notes.md",
             ),
         ]
         store.upsert_nodes(nodes)
@@ -207,10 +210,16 @@ def test_list_documents_from_real_store(wired_mcp):
     docs = result["documents"]
     assert len(docs) >= 3  # We stored 3 documents
 
-    # Each doc should have doc_id and mtime_iso (added by _enrich_doc_list)
+    # Each doc should have doc_id, its path, and mtime_iso (added by
+    # _enrich_doc_list). rel_path is what makes a listing actionable — doc_id
+    # is an opaque id, so callers filtering documents by path depend on it
+    # reaching this projection (#1203).
     for doc in docs:
         assert "doc_id" in doc
         assert "mtime_iso" in doc
+    assert {doc["rel_path"] for doc in docs} == {
+        "recipes/bibimbap.md", "reports/q4_report.pdf", "notes/ml_notes.md",
+    }
 
 
 def test_facets_from_real_store(wired_mcp):

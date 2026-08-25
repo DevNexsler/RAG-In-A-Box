@@ -2403,6 +2403,7 @@ class LanceDBStore:
     # them unchanged — `size` stays the file's byte size, never a chunk length
     # or a sum. (`mtime` is selected separately: it drives the ORDER BY.)
     _RECENT_DOC_FIELDS = (
+        "rel_path",
         "size",
         "title",
         "source_type",

@@ -2710,6 +2710,17 @@ def is_indexer_running(config: dict) -> bool:
     return bool(running)
 
 
+def index_run_was_interrupted(config: dict) -> bool:
+    """True when the newest terminal index run did not succeed and no later run
+    superseded it — i.e. a run that was interrupted rather than finished.
+
+    This is the same unresolved-failure state ``/health`` reports as 503, read
+    here so the scheduler can resume the interrupted sweep at boot instead of
+    parking its remaining documents for a whole sweep interval (#1153).
+    """
+    return bool(_get_index_run_supervisor(config).status_summary()["unresolved_failure"])
+
+
 def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
     """Construct the in-process index scheduler, or None when disabled.
 
@@ -2748,6 +2759,7 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
         drain_fn=drain_queues,
         sweep_fn=lambda: _file_index_update_impl(config_path),
         sweep_running_fn=lambda: is_indexer_running(config),
+        run_was_interrupted_fn=lambda: index_run_was_interrupted(config),
     )
 
 
@@ -3272,9 +3284,10 @@ if HAS_MCP and FastMCP is not None:
 
         Returns a dict:
             - documents: List of document metadata dicts, each with:
-                doc_id, title, source_type, folder, tags (array), status,
-                created, mtime (unix timestamp), mtime_iso (ISO 8601 UTC),
-                size (bytes).
+                doc_id, rel_path (path under documents_root, or the
+                source-local id for non-file sources), title, source_type,
+                folder, tags (array), status, created, mtime (unix timestamp),
+                mtime_iso (ISO 8601 UTC), size (bytes).
             - total: Total number of matching documents (for pagination).
             - offset: The offset used.
             - limit: The limit used.
@@ -3305,6 +3318,8 @@ if HAS_MCP and FastMCP is not None:
               "<source_name>::<id>" (e.g., "documents::00abc"). Pass it back to
               other tools verbatim; it is not a file path — path-based browsing
               uses the rel_path metadata field.
+            - rel_path: Path under documents_root (e.g., "Archive/notes.md"),
+              or the source-local id for non-file sources (e.g., "email/msg-3").
             - title, source_type, folder, tags (array), status, created.
             - mtime: Unix timestamp of last modification.
             - mtime_iso: ISO 8601 UTC string (e.g., "2026-02-20T15:30:00+00:00").
