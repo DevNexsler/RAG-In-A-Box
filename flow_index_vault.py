@@ -80,7 +80,7 @@ from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
 from core.dedupe import compute_file_identity
-from core.resilience import is_transient
+from core.resilience import CircuitOpenError, is_transient
 from core.skip_policy import actionable_skip_docs, is_permanent_skip_entry
 from core.sensitive_content import (
     redact_sensitive_text,
@@ -1909,12 +1909,14 @@ def _retry_only_if_transient(task, task_run, state) -> bool:
     A deterministic failure — an embed 400 on an invalid input, a corrupt file —
     cannot succeed on an immediate retry. Retrying one anyway doubles the wasted
     OCR + enrichment + embed work before the doc is skipped regardless (#0569),
-    while a provider blip (5xx/timeout) is exactly what the retry is for.
+    while a provider blip (5xx/timeout) is exactly what the retry is for. An open
+    circuit is transient across index runs but cannot recover during Prefect's
+    immediate retry, so it must wait for the circuit cooldown instead.
     """
     try:
         state.result(raise_on_failure=True)
     except Exception as exc:  # noqa: BLE001 — classify, don't handle
-        return is_transient(exc)
+        return is_transient(exc) and not isinstance(exc, CircuitOpenError)
     return False
 
 
@@ -2815,15 +2817,32 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
             return None
         except Exception as exc:
             outcome = "failed"
-            logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
-            if not is_transient(exc):
+            transient = is_transient(exc)
+            lock = _RUNTIME.get("degraded_lock")
+            if transient:
+                logger.warning(
+                    "Deferring %s after transient processing failure: %s",
+                    doc["doc_id"],
+                    exc,
+                )
+                if lock is not None:
+                    with lock:
+                        doc_id = doc["doc_id"]
+                        _RUNTIME.setdefault("degraded_now", {})[doc_id] = [
+                            Degradation(
+                                f"processing_failed:{type(exc).__name__}",
+                                transient=True,
+                            )
+                        ]
+                        _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
+            else:
+                logger.error("Skipping %s after retries exhausted: %s", doc["doc_id"], exc)
                 # Terminal failure (deterministic 400, corrupt source): re-running
                 # it produces the same failure, so quarantine it with the file's
                 # change key exactly like a permanent skip. Without this the doc
                 # is re-fetched, re-OCR'd, re-enriched and re-embedded on every
                 # run, forever (#0569) — the skip ledger's bounded retry turns
                 # that into one attempt per day until the content changes.
-                lock = _RUNTIME.get("degraded_lock")
                 if lock is not None:
                     with lock:
                         doc_id = doc["doc_id"]

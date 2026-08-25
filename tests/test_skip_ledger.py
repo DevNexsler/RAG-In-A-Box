@@ -438,15 +438,24 @@ def test_terminal_failure_is_quarantined_in_the_skip_ledger(monkeypatch):
     assert "documents::000dU" in runtime["degraded_clean"]
 
 
-def test_transient_failure_is_not_quarantined(monkeypatch):
+def test_transient_failure_is_not_quarantined(monkeypatch, caplog):
     # A provider outage is not the doc's fault — it stays out of the skip
-    # ledger so the next run retries it immediately.
+    # ledger and enters the transient degradation lane so retry backoff is
+    # enforced across index runs.
     from core.resilience import TransientError
+    from extractors import Degradation
 
-    runtime, failed = _run_one_failing(monkeypatch, TransientError("upstream 503"))
+    with caplog.at_level("WARNING"):
+        runtime, failed = _run_one_failing(monkeypatch, TransientError("upstream 503"))
 
     assert failed == ["documents::000dU"]
     assert runtime["skip_now"] == {}
+    assert runtime["degraded_now"] == {
+        "documents::000dU": [Degradation("processing_failed:TransientError", True)]
+    }
+    assert runtime["skip_clean"] == {"documents::000dU"}
+    assert "Deferring documents::000dU after transient processing failure" in caplog.text
+    assert "Skipping documents::000dU after retries exhausted" not in caplog.text
 
 
 # --- the Prefect task must not retry a deterministic failure ---
@@ -469,3 +478,9 @@ def test_transient_failure_is_still_retried():
     from core.resilience import TransientError
 
     assert _retry_decision(TransientError("upstream 503")) is True
+
+
+def test_open_circuit_failure_waits_for_next_index_run():
+    from core.resilience import CircuitOpenError
+
+    assert _retry_decision(CircuitOpenError("provider cooling down")) is False
