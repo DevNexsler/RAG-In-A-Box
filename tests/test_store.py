@@ -2411,7 +2411,7 @@ def test_unreadable_compaction_is_restored_and_not_recorded(caplog):
             "_compact_data_files",
             side_effect=lambda: _claim_columns_the_file_lacks(tmpdir, "test_chunks"),
         ):
-            compacted = store._compact_data_files_if_due(date.today())
+            compacted = store.compact_data_files_if_due(date.today())
 
         assert compacted is False
         assert not _compaction_marker(tmpdir).exists()
@@ -2433,7 +2433,7 @@ def test_readable_compaction_probes_each_fragment_before_recording():
         with patch.object(store, "_compaction_due", return_value=True), patch.object(
             store, "_compact_data_files"
         ), patch.object(lance, "dataset", return_value=dataset):
-            compacted = store._compact_data_files_if_due(date.today())
+            compacted = store.compact_data_files_if_due(date.today())
 
         assert compacted is True
         assert _compaction_marker(tmpdir).exists()
