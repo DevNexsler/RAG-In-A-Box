@@ -301,13 +301,17 @@ def build_api_app(documents_root: Path) -> Starlette:
     Args:
         documents_root: Path to the documents directory (injected, not re-loaded per request).
     """
+    # Starlette dispatches on the first matching route, and a ``:path``
+    # convertor compiles to ``(?P<doc_id>.*)`` — which also matches the empty
+    # remainder. So every exact route under /documents/ must be registered
+    # before the catch-all download route, or it is shadowed by it.
     routes = [
         Route("/upload", upload, methods=["POST"]),
         Route("/search", search, methods=["POST"]),
         Route("/index/document", index_document, methods=["POST"]),
-        Route("/documents/{doc_id:path}", download, methods=["GET"]),
-        Route("/documents/", list_documents, methods=["GET"]),
         Route("/documents", list_documents, methods=["GET"]),
+        Route("/documents/", list_documents, methods=["GET"]),
+        Route("/documents/{doc_id:path}", download, methods=["GET"]),
     ]
     app = Starlette(routes=routes)
     app.state.documents_root = Path(documents_root)
