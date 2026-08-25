@@ -47,7 +47,7 @@ from contextvars import ContextVar, copy_context
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from prefect import flow, task
 from prefect.logging import get_run_logger
@@ -900,6 +900,7 @@ def _refresh_repaired_sidecar_docs(
                 context_text,
             ):
                 changed += 1
+                _record_index_write(1)
         except Exception as exc:
             failed += 1
             logger.warning(
@@ -968,6 +969,11 @@ def _initialize_run_progress() -> None:
         "queued": None,
         "processed": 0,
         "skipped": 0,
+        # Written work, counted at the store write seam — never derived from the
+        # queue, which counts documents *examined* (#1173).
+        "indexed_docs": 0,
+        "indexed_chunks": 0,
+        "skip_reasons": {},
     }
 
 
@@ -984,16 +990,44 @@ def _update_run_progress(**updates: Any) -> None:
                 progress[field] = value
 
 
-def _advance_run_progress(*, skipped: bool) -> None:
-    """Record one fully attempted queue item."""
+def _advance_run_progress(*, skip_reasons: Sequence[str] = ()) -> None:
+    """Record one fully attempted queue item and why it was skipped, if it was.
+
+    Reasons aggregate on their prefix ("duplicate_of:<id>" -> "duplicate_of"),
+    matching the skip ledger summary, so the run report can say what the skips
+    were without a line per document.
+    """
     lock = _RUNTIME.get("run_progress_lock")
     progress = _RUNTIME.get("run_progress")
     if lock is None or not isinstance(progress, dict):
         return
     with lock:
         progress["processed"] = int(progress.get("processed") or 0) + 1
-        if skipped:
+        if skip_reasons:
             progress["skipped"] = int(progress.get("skipped") or 0) + 1
+            counts = progress.setdefault("skip_reasons", {})
+            for reason in skip_reasons:
+                key = str(reason).split(":", 1)[0]
+                counts[key] = int(counts.get(key, 0)) + 1
+
+
+def _record_index_write(chunk_count: int) -> None:
+    """Record one document actually written to the index.
+
+    Called at the store write seam — the same place the "Inserted/Upserted N
+    chunks" line is emitted — so the run's throughput number counts writes.
+    Deriving it from the queue instead reported work for runs that skipped
+    every document they examined (#1173).
+    """
+    lock = _RUNTIME.get("run_progress_lock")
+    progress = _RUNTIME.get("run_progress")
+    if lock is None or not isinstance(progress, dict):
+        return
+    with lock:
+        progress["indexed_docs"] = int(progress.get("indexed_docs") or 0) + 1
+        progress["indexed_chunks"] = (
+            int(progress.get("indexed_chunks") or 0) + int(chunk_count)
+        )
 
 
 def _run_progress_snapshot() -> dict[str, Any]:
@@ -1002,7 +1036,9 @@ def _run_progress_snapshot() -> dict[str, Any]:
     if lock is None or not isinstance(progress, dict):
         return {}
     with lock:
-        return dict(progress)
+        # Deep-copy the nested reason counts: the snapshot is serialized (and
+        # read) outside the lock, while worker threads keep advancing it.
+        return {**progress, "skip_reasons": dict(progress.get("skip_reasons") or {})}
 
 
 def _write_heartbeat(index_root) -> None:
@@ -1032,17 +1068,24 @@ def _log_run_completion(
     queued: int,
     processed: int,
     skipped: int,
+    indexed_docs: int,
+    indexed_chunks: int,
     elapsed_seconds: float,
     actionable_skips: dict[str, list[str]] | None = None,
 ) -> None:
+    # `completion` is queue drain: a skipped document counts as processed, so
+    # 100% is reachable with zero work done. The indexed counts ride on the same
+    # line so the percentage can never be read alone as "work happened" (#1173).
     completion = 100.0 if queued == 0 else processed * 100.0 / queued
     logger.info(
         "Index run completion: run_id=%s queued=%d processed=%d skipped=%d "
-        "elapsed=%.1fs completion=%.1f%%",
+        "indexed_docs=%d indexed_chunks=%d elapsed=%.1fs completion=%.1f%%",
         run_id,
         queued,
         processed,
         skipped,
+        indexed_docs,
+        indexed_chunks,
         elapsed_seconds,
         completion,
     )
@@ -1816,6 +1859,7 @@ def _index_duplicate_delivery_context(
     )
     node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
     store.upsert_nodes([node])
+    _record_index_write(1)
     logger.info(
         "Indexed duplicate delivery context alias %s -> %s",
         doc_id,
@@ -2706,6 +2750,7 @@ def _process_doc_task(
             store.upsert_nodes(nodes)
             write_mode = "Upserted"
         logger.info(f"{write_mode} {len(nodes)} chunks: {doc_id}")
+        _record_index_write(len(nodes))
 
         chunks = []
         for node in nodes:
@@ -2801,7 +2846,7 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
         if observer is not None:
             observer.sample("doc_start", phase="process", doc_id=doc["doc_id"])
         outcome = "ok"
-        skipped_outcome = False
+        skip_reasons: list[str] = []
         # Heartbeat: a worker picking up a doc means the indexer is progressing.
         # When all workers are stuck (a freeze) this stops, and /health flips to 503.
         _write_heartbeat(_RUNTIME.get("index_root"))
@@ -2823,7 +2868,7 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
             process_doc_task(doc)
             reasons = collect_degradations()
             skips = collect_skips()
-            skipped_outcome = bool(skips)
+            skip_reasons = list(skips)
             lock = _RUNTIME.get("degraded_lock")
             if lock is not None:
                 with lock:
@@ -2901,7 +2946,7 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
                     doc_id=doc["doc_id"],
                     outcome=outcome,
                 )
-            _advance_run_progress(skipped=skipped_outcome)
+            _advance_run_progress(skip_reasons=skip_reasons)
             _write_heartbeat(_RUNTIME.get("index_root"))
 
     if concurrency <= 1 or len(docs) <= 1:
@@ -2960,17 +3005,30 @@ def delete_docs_task(doc_ids: list[str]) -> None:
 
 @task
 def index_stats_task(
-    to_add_count: int,
+    progress: Mapping[str, Any],
     to_delete_count: int,
     run_seconds: float | None = None,
 ) -> None:
-    """Log counts and optional duration."""
+    """Log what the run wrote, what it skipped and why, and optional duration.
+
+    `progress` is a run progress snapshot: its indexed counts come from the
+    store write seam, so a run that examined a queue but wrote nothing reports
+    zero here. The predecessor of this line reported the queue length, which
+    made "22 documents indexed" and "22 documents skipped" identical (#1173).
+    """
     logger = get_run_logger()
-    logger.info(
-        f"Index stats: added/updated={to_add_count}, deleted={to_delete_count}, "
-        f"seconds={run_seconds:.1f}" if run_seconds else
-        f"Index stats: added/updated={to_add_count}, deleted={to_delete_count}"
+    skip_reasons = dict(progress.get("skip_reasons") or {})
+    message = (
+        f"Index stats: indexed_docs={int(progress.get('indexed_docs') or 0)}, "
+        f"indexed_chunks={int(progress.get('indexed_chunks') or 0)}, "
+        f"skipped={int(progress.get('skipped') or 0)}"
     )
+    if skip_reasons:
+        message += f" {dict(sorted(skip_reasons.items()))}"
+    message += f", deleted={to_delete_count}"
+    if run_seconds is not None:
+        message += f", seconds={run_seconds:.1f}"
+    logger.info(message)
 
 
 @task
@@ -3858,11 +3916,7 @@ def index_vault_flow(
     _write_heartbeat(index_root)  # FTS/promote done — still progressing, not frozen
 
     run_seconds = time.perf_counter() - t0
-    index_stats_task(
-        len(to_add_or_update) + context_refresh_changed,
-        len(to_delete),
-        run_seconds,
-    )
+    index_stats_task(_run_progress_snapshot(), len(to_delete), run_seconds)
 
     # Read final counts — auto-recover if table is corrupt
     try:
@@ -3985,6 +4039,8 @@ def index_vault_flow(
         queued=int(progress.get("queued") or 0),
         processed=int(progress.get("processed") or 0),
         skipped=int(progress.get("skipped") or 0),
+        indexed_docs=int(progress.get("indexed_docs") or 0),
+        indexed_chunks=int(progress.get("indexed_chunks") or 0),
         elapsed_seconds=run_seconds,
         actionable_skips=actionable_skip_docs(_load_skip_ledger(index_root)),
     )
