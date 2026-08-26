@@ -6,9 +6,12 @@ when a fresh request or sweep happened to take the write lock, so a targeted
 force-index could sit for many minutes, and thin/degraded docs never re-enriched
 until someone manually kicked a sweep.
 
-Two jobs, two very different cadences:
+Three jobs, three very different cadences:
   * queue drain  — short interval (~60s): keep targeted requests moving.
   * full sweep   — long interval (~hourly): rescan + re-enrich degraded docs.
+  * compaction   — long interval (~hourly), at most one rewrite per calendar
+    day: the daily Lance data compaction, which forks a full-memory worker and
+    is therefore only safe between runs (#1254).
 
 The scheduling decision lives in the pure, clock-injected ``tick`` so interval
 behavior is testable without threads or real time. ``run_forever`` is the thin
@@ -35,17 +38,22 @@ class IndexScheduler:
         sweep_fn: Callable[[], Any],
         sweep_running_fn: Callable[[], bool],
         run_was_interrupted_fn: Callable[[], bool] | None = None,
+        compact_interval_s: float = 0.0,
+        compact_fn: Callable[[], Any] | None = None,
         log: logging.Logger | None = None,
     ) -> None:
         self.drain_interval_s = drain_interval_s
         self.sweep_interval_s = sweep_interval_s
+        self.compact_interval_s = compact_interval_s if compact_fn else 0.0
         self._drain_fn = drain_fn
         self._sweep_fn = sweep_fn
         self._sweep_running_fn = sweep_running_fn
         self._run_was_interrupted_fn = run_was_interrupted_fn or (lambda: False)
+        self._compact_fn = compact_fn
         self._log = log or logger
         self._last_drain: float | None = None
         self._last_sweep: float | None = None
+        self._last_compact: float | None = None
         self._stop = threading.Event()
 
     def _run_was_interrupted(self) -> bool:
@@ -60,7 +68,9 @@ class IndexScheduler:
     def seed(self, now: float) -> "IndexScheduler":
         """Suppress an immediate full sweep on boot (it is heavy and would run on
         every container restart). The drain is intentionally left due so a boot
-        backlog clears within one drain interval.
+        backlog clears within one drain interval, and so is the compaction: a
+        just-booted container is the idlest window there is, and the daily marker
+        already stops it repeating on a restart loop.
 
         Exception: a boot that follows an *interrupted* run leaves the sweep due
         (#1153). A restart landing on a live run — the container's memory cgroup
@@ -106,6 +116,14 @@ class IndexScheduler:
                     self._log.warning("scheduled sweep failed: %s", exc)
                     actions.append(("sweep_error", str(exc)))
 
+        if self._due(self._last_compact, self.compact_interval_s, now):
+            self._last_compact = now
+            try:
+                actions.append(("compact", self._compact_fn()))
+            except Exception as exc:
+                self._log.warning("scheduled compaction failed: %s", exc)
+                actions.append(("compact_error", str(exc)))
+
         return actions
 
     def stop(self) -> None:
@@ -120,9 +138,10 @@ class IndexScheduler:
     ) -> None:
         self.seed(clock())
         self._log.info(
-            "index scheduler started (drain=%ss, sweep=%ss)",
+            "index scheduler started (drain=%ss, sweep=%ss, compact=%ss)",
             self.drain_interval_s,
             self.sweep_interval_s,
+            self.compact_interval_s,
         )
         while not self._stop.is_set():
             try:

@@ -1515,7 +1515,7 @@ def _changed_doc_diff():
     )
 
 
-def test_existing_changed_store_compacts_before_processing_and_finalizes_without_retry(
+def test_existing_changed_store_prunes_before_processing_and_finalizes_without_retry(
     tmp_path,
 ):
     events: list[str] = []
@@ -1558,10 +1558,10 @@ def test_existing_changed_store_compacts_before_processing_and_finalizes_without
     )
     assert events.index("process") < events.index("delete") < events.index("ensure")
     fake_store.prepare_indexing_maintenance.assert_called_once_with()
-    fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
+    fake_store.ensure_fts_index.assert_called_once_with()
 
 
-def test_fresh_store_skips_precompaction_and_creates_fts_after_processing(tmp_path):
+def test_fresh_store_skips_pre_index_maintenance_and_creates_fts_after_processing(tmp_path):
     events: list[str] = []
     fake_store = MagicMock()
     fake_store.list_doc_ids.return_value = []
@@ -1579,7 +1579,7 @@ def test_fresh_store_skips_precompaction_and_creates_fts_after_processing(tmp_pa
 
     assert events == ["process"]
     fake_store.prepare_indexing_maintenance.assert_not_called()
-    fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
+    fake_store.ensure_fts_index.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -1613,7 +1613,7 @@ def test_flow_derives_storage_write_mode_from_authoritative_snapshot(
     assert captured == [expected_insert_ids]
 
 
-def test_new_source_in_populated_shared_table_still_compacts_before_processing(
+def test_new_source_in_populated_shared_table_still_prunes_before_processing(
     tmp_path,
 ):
     fake_store = MagicMock()
@@ -1631,10 +1631,10 @@ def test_new_source_in_populated_shared_table_still_compacts_before_processing(
     )
 
     fake_store.prepare_indexing_maintenance.assert_called_once_with()
-    fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
+    fake_store.ensure_fts_index.assert_called_once_with()
 
 
-def test_delete_only_run_deletes_before_final_compaction(tmp_path):
+def test_delete_only_run_deletes_before_final_index_maintenance(tmp_path):
     events: list[str] = []
     fake_store = MagicMock()
     fake_store.list_doc_ids.return_value = ["documents::old"]
@@ -1654,7 +1654,7 @@ def test_delete_only_run_deletes_before_final_compaction(tmp_path):
 
     assert events == ["delete", "ensure"]
     fake_store.prepare_indexing_maintenance.assert_not_called()
-    fake_store.ensure_fts_index.assert_called_once_with(compact_data=True)
+    fake_store.ensure_fts_index.assert_called_once_with()
 
 
 def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
@@ -1677,7 +1677,7 @@ def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
 
     meta_mock = _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
 
-    fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
+    fake_store.ensure_fts_index.assert_called_once_with()
     fake_store.create_fts_index.assert_called_once_with()
     warnings = meta_mock.call_args[0][4] or []
     assert any(w.startswith("fts_incremental_update_failed:") for w in warnings)
@@ -1798,7 +1798,7 @@ def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
                                                     with patch("flow_index_vault.write_index_metadata_task"):
                                                         index_vault_flow.fn("dummy.yaml")
 
-    shadow_store.ensure_fts_index.assert_called_once_with(compact_data=False)
+    shadow_store.ensure_fts_index.assert_called_once_with()
     shadow_store.reset_table.assert_called_once_with()
     active_store.promote_table.assert_called_once_with("chunks__shadow")
     delete_mock.assert_not_called()
