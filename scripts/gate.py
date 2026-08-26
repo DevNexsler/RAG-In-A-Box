@@ -95,9 +95,26 @@ def next_tier_allowed(name, results, order=TIERS):
     return False
 
 
+# Publishing on "0" makes Docker pick a free host port; the real binding is read
+# back with `compose port` once the stack is up.
+DYNAMIC_HOST_PORT = "0"
+
+
 def staging_lifecycle_env():
+    """Host-port policy for the staging stack.
+
+    COMPOSE_PROJECT_NAME isolates containers, networks and volumes per caller
+    but NOT host sockets, so concurrent project-scoped runs (the maint
+    dispatcher exports one project per worker) would race for the fixed ports
+    and the loser dies at `up` with "port is already allocated". Those runs
+    therefore let Docker assign the ports. A plain manual run keeps the
+    documented 17788/19999 so docs/TESTING.md's recipes stay true.
+    """
     if os.environ.get("COMPOSE_PROJECT_NAME"):
-        return {"STAGING_APP_PORT": "0", "STAGING_SIM_PORT": "0"}
+        return {
+            "STAGING_APP_PORT": DYNAMIC_HOST_PORT,
+            "STAGING_SIM_PORT": DYNAMIC_HOST_PORT,
+        }
     return {
         "STAGING_APP_PORT": "17788",
         "STAGING_SIM_PORT": "19999",
@@ -204,7 +221,7 @@ def run_compose_tier(tier, run_dir):
     try:
         # up runs INSIDE the try: a partially-started stack must still get `down -v`
         subprocess.run(up, check=True, env=env)
-        if os.environ.get("COMPOSE_PROJECT_NAME"):
+        if lifecycle_env["STAGING_APP_PORT"] == DYNAMIC_HOST_PORT:
             app_port = compose_localhost_port("doc-organizer-staging", 7788, env)
             sim_port = compose_localhost_port("provider-sim", 9999, env)
             env.update({

@@ -76,6 +76,19 @@ fully hermetic — no provider traffic leaves the machine. Three services:
 | `provider-sim` | **19999** → 9999 | one FastAPI app speaking OpenRouter, DeepInfra, DeepSeek-OCR2 and Ollama dialects, plus webhook sink and fault-injection admin |
 | `comm-postgres` | (internal) | throwaway Postgres 16 with deterministic fixtures, PGDATA on tmpfs — every `up` reseeds |
 
+Those host ports are the **defaults**, not fixed bindings: both are published as
+`${STAGING_APP_PORT:-17788}` / `${STAGING_SIM_PORT:-19999}`, so a hand-driven
+`docker compose` can put the stack anywhere. `scripts/gate.py` publishes on
+Docker-assigned ports whenever `COMPOSE_PROJECT_NAME` is set — a compose project
+isolates containers, networks and volumes but not host sockets, so with fixed
+ports two concurrent `make gate` runs (the maint dispatcher exports one project
+per worker) raced and the loser died at `up --wait` with `Bind for
+0.0.0.0:19999 failed: port is already allocated`. The gate reads the real
+bindings back with `docker compose port` after `up` and passes them to the
+host side of the tier as `E2E_BASE_URL` / `E2E_SIM_URL`, which
+`tests/e2e/client.py` and `scripts/check_tool_coverage.py` already honour. A
+manual `make gate` (no project exported) still binds 17788/19999.
+
 Bring it up manually:
 
 ```bash
