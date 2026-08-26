@@ -46,12 +46,12 @@ _OVERCLAIMED_COLUMNS_RE = re.compile(
     r"projection specified the column index \d+ "
     r"but there are only (\d+) columns in the file"
 )
-_STALE_READ_MARKERS = (
-    ".lance/_versions/",
-    ".lance/data/",
-    ".lance/_deletions/",
-    "manifest was not found",
-)
+# A peer writer moves the table under open read handles in bursts — one commit
+# per document, and one whole-directory swap per new metadata sub-field
+# (_evolve_metadata_schema) — so a single reopen can itself be cut off by the
+# next move. Retrying while the table keeps moving is bounded by this; it is a
+# backstop, not a cadence, because the loop stops the moment the table settles.
+_STALE_READ_RECOVERY_ATTEMPTS = 4
 
 _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
 _ENRICHMENT_AUX_FIELDS = ("enr_importance_source",)
@@ -686,6 +686,11 @@ def restore_interrupted_schema_swap(
 class LanceDBStore:
     """Implements StorageInterface using LlamaIndex's LanceDBVectorStore."""
 
+    # Identity of the table the current handle was opened against; see
+    # _table_snapshot. Class-level default so stores built without __init__
+    # (test doubles) still answer the staleness question.
+    _open_table_snapshot: tuple | None = None
+
     def __init__(self, index_root: str | Path, table_name: str = "chunks") -> None:
         self.index_root = str(Path(index_root))
         self.table_name = table_name
@@ -720,6 +725,7 @@ class LanceDBStore:
             self._vs = self._build_vector_store()
             self._ensure_scalar_index()
             self._probe_table_read()
+        self._mark_handle_current()
 
     def set_memory_observer(self, observer: Any | None) -> None:
         """Attach optional index memory instrumentation to storage writes."""
@@ -1023,6 +1029,7 @@ class LanceDBStore:
         """Reconnect the vector store to the current on-disk table path."""
         self._vs = self._build_vector_store()
         self._ensure_scalar_index()
+        self._mark_handle_current()
 
     def _ensure_scalar_index(self) -> None:
         """Create the doc-id BTree once; never replace it on routine opens."""
@@ -1074,16 +1081,40 @@ class LanceDBStore:
             self._reconnect()
             logger.info("Promoted shadow table %r into %r", shadow_table_name, self.table_name)
 
-    @staticmethod
-    def _is_stale_read_error(exc: Exception) -> bool:
-        text = str(exc)
-        text_lower = text.lower()
-        if "not found" not in text_lower:
-            return False
-        return any(marker in text for marker in _STALE_READ_MARKERS)
+    def _table_snapshot(self) -> tuple | None:
+        """Identity of the table currently on disk: which directory, at which version.
+
+        A peer writer that commits bumps the version; one that evolves the
+        metadata schema swaps the whole ``<table>.lance`` directory
+        (``_evolve_metadata_schema``), which changes its inode and deletes the
+        files an already-open handle still points at. Either move is a fact,
+        unlike the wording of the resulting Lance error — which names whichever
+        file the query happened to reach first (``data/``, ``_versions/``,
+        ``_indices/`` …) and so cannot be enumerated ahead of time.
+
+        Recorded by _mark_handle_current whenever the handle is (re)opened or
+        checked out, which is every point at which it is in step with disk.
+        """
+        import lance
+
+        path = Path(self._dataset_path())
+        try:
+            stat = path.stat()
+            return (stat.st_dev, stat.st_ino, lance.dataset(str(path)).version)
+        except Exception:
+            return None
+
+    def _mark_handle_current(self) -> None:
+        """Record that the handle is now in step with the table on disk."""
+        self._open_table_snapshot = self._table_snapshot()
+
+    def _table_moved_under_open_handle(self) -> bool:
+        """True when the table on disk is no longer the one this handle reads."""
+        return self._table_snapshot() != self._open_table_snapshot
 
     def _reopen_vector_store(self) -> None:
         self._vs = self._build_vector_store()
+        self._mark_handle_current()
 
     def _checkout_latest(self) -> None:
         """Refresh an existing Lance table handle without rebuilding the store."""
@@ -1091,21 +1122,39 @@ class LanceDBStore:
             self._vs.table.checkout_latest()
         except TableNotFoundError:
             pass
+        self._mark_handle_current()
 
     def _run_read_with_recovery(self, operation, default_on_missing):
-        try:
-            return operation()
-        except TableNotFoundError:
-            return default_on_missing
-        except Exception as exc:
-            if not self._is_stale_read_error(exc):
-                raise
-            logger.warning("Refreshing LanceDB store after stale/corrupt read: %s", exc)
-            self._reopen_vector_store()
+        """Run a read, reopening for as long as a peer writer keeps moving the table.
+
+        Reads are served from a long-lived handle while the indexer writes, so
+        a read can fail purely because the files that handle points at have been
+        superseded or swapped away. One reopen is not enough: schema evolution
+        arrives in bursts on a new index, and the next swap can land inside the
+        retry (#1656).
+
+        The recovery decision is the table's identity, not the error text: a
+        failure over a table that has *not* moved is a real read failure and
+        must reach the caller, so a genuine retrieval error is never retried
+        into silence.
+        """
+        attempts_left = _STALE_READ_RECOVERY_ATTEMPTS
+        while True:
             try:
                 return operation()
             except TableNotFoundError:
                 return default_on_missing
+            except Exception as exc:
+                attempts_left -= 1
+                if attempts_left <= 0 or not self._table_moved_under_open_handle():
+                    raise
+                logger.warning(
+                    "Refreshing LanceDB store: a peer writer moved %r under an "
+                    "open read handle: %s",
+                    self.table_name,
+                    exc,
+                )
+                self._reopen_vector_store()
 
     @staticmethod
     def _sql_escape(value: str) -> str:
