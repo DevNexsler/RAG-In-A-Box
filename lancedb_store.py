@@ -1985,6 +1985,18 @@ class LanceDBStore:
         table.create_fts_index(text_key, use_tantivy=False, replace=True)
         logger.info("FTS index created/rebuilt on column %r", text_key)
 
+    def rebuild_fts_index(self) -> None:
+        """Rebuild FTS, then run the same cleanup lifecycle as a merge.
+
+        Full rebuild fallbacks also replace native index generations. They must
+        finalize restore points and reclaim orphan directories rather than
+        bypassing the routine index-maintenance path (#1630).
+        """
+        from datetime import date
+
+        self.create_fts_index()
+        self._finish_index_maintenance(self._vs.table, date.today())
+
     def ensure_fts_index(self, *, compact_data: bool = True) -> None:
         """Make sure the native FTS index exists and is optimized.
 

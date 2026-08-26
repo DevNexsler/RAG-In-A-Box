@@ -2095,6 +2095,60 @@ def test_ensure_fts_index_creates_when_missing():
         assert len(hits) == 1
 
 
+def test_full_fts_rebuild_finishes_index_maintenance():
+    """Full rebuilds run orphan cleanup just like incremental merges (#1630)."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana fruit tropical", vec, source_type="md"),
+        ])
+
+        with patch.object(store, "_finish_index_maintenance") as finish:
+            store.rebuild_fts_index()
+
+        finish.assert_called_once_with(store._vs.table, date.today())
+
+
+def test_full_fts_rebuild_reclaims_orphan_index_directories():
+    """A full rebuild finalizes the same safe orphan sweep as an index merge."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md"),
+        ])
+        store.create_fts_index()
+        store.upsert_nodes([
+            _make_node_with_meta("b.md", "c:0", "cherry", vec, source_type="md"),
+        ])
+
+        with patch.dict(
+            "os.environ",
+            {"LANCE_VERSION_RETENTION_MINUTES": "0", "LANCE_DAILY_RESTORE_POINTS": "7"},
+        ):
+            store.rebuild_fts_index()
+
+        dataset_path = _lance_path(tmpdir)
+        dataset = lance.dataset(dataset_path)
+        reachable = {
+            str(segment.uuid)
+            for version in dataset.versions()
+            for index in dataset.checkout_version(version["version"]).describe_indices()
+            for segment in index.segments
+        }
+        on_disk = {
+            entry.name
+            for entry in (Path(dataset_path) / "_indices").iterdir()
+            if entry.is_dir()
+        }
+        assert on_disk == reachable
+
+
 def test_ensure_fts_index_missing_path_tags_exact_latest_without_data_compaction():
     """Creating missing FTS still finalizes restore metadata, without rewrite."""
     from datetime import date
