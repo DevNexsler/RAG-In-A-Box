@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import os
 import time
@@ -71,8 +70,6 @@ _ENRICHMENT_SCHEMA = {
     "schema": enrichment_response_schema(),
 }
 
-_REQUIRED_ENRICHMENT_FIELDS = ("summary", "doc_type")
-
 
 def _enrichment_request_policy(model: str, temperature: float) -> dict[str, Any]:
     """Return one centralized request policy for an enrichment model."""
@@ -89,7 +86,6 @@ def _enrichment_request_policy(model: str, temperature: float) -> dict[str, Any]
                 },
             },
             "system_prompt": _SYSTEM_PROMPT + _QWEN_BULK_QUALITY_INSTRUCTIONS,
-            "validate_structured_json": True,
             "retry_without_reasoning": False,
         }
     return {
@@ -101,21 +97,8 @@ def _enrichment_request_policy(model: str, temperature: float) -> dict[str, Any]
             "temperature": temperature,
         },
         "system_prompt": _SYSTEM_PROMPT,
-        "validate_structured_json": False,
         "retry_without_reasoning": True,
     }
-
-
-def _validate_enrichment_content(content: str) -> None:
-    """Reject malformed JSON and missing core enrichment fields before return."""
-    parsed = json.loads(content)
-    if not isinstance(parsed, dict):
-        raise ValueError("structured response must be a JSON object")
-    missing = [field for field in _REQUIRED_ENRICHMENT_FIELDS if not parsed.get(field)]
-    if missing:
-        raise ValueError(
-            "structured response missing required fields: " + ", ".join(missing)
-        )
 
 
 def _is_response_format_rejection(response: httpx.Response) -> bool:
@@ -414,23 +397,14 @@ class LiteLLMGenerator:
                 )
                 raw_content = data["choices"][0]["message"].get("content")
                 content = raw_content.strip() if isinstance(raw_content, str) else ""
-                if self._request_policy["validate_structured_json"]:
-                    try:
-                        _validate_enrichment_content(content)
-                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                        last_exc = TransientError(
-                            f"LiteLLM structured response validation failed: {exc}"
-                        )
-                        if attempt == MAX_RETRIES - 1:
-                            break
-                        backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                        logger.warning(
-                            "LiteLLM structured response failed validation; "
-                            "retrying in %.0fs...",
-                            backoff,
-                        )
-                        time.sleep(backoff)
-                        continue
+                # Content validity is not judged here. A structured answer
+                # that fails to yield the enrichment fields is evidence about
+                # this attempt, and retrying it inside the request loop throws
+                # that evidence away: only the last response is returned, so
+                # the outer seam scores a rescued document as a clean first
+                # pass and never reports what the discarded answer proved
+                # (#1650). ``generate_with_metadata`` owns the single validity
+                # judgement, its telemetry, and its one recovery request.
                 return {
                     "content": content,
                     "request": copy.deepcopy(trace_request),
