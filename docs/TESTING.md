@@ -56,10 +56,15 @@ always wins over the filename rule:
 
 | Convention | Tier |
 |---|---|
-| `_live` in filename (e.g. `test_extractors_live.py`) | `live` |
 | under `tests/e2e/` or `.e2e.test` in filename | `e2e` |
+| `_live.py` filename suffix (e.g. `test_extractors_live.py`) | `live` |
 | `.int.test.py` suffix (e.g. `test_mcp_handlers.int.test.py`) | `integration` |
 | everything else | `unit` |
+
+The rows are in precedence order: location beats name, so a file under
+`tests/e2e/` stays `e2e` even when its name contains `_live` (that substring
+match once tiered `tests/e2e/test_health_liveness.py` as `live`, and the e2e
+staging-stack probe it dragged in aborted the whole live tier).
 
 So a new test file is a unit test by default; putting it in the right
 place/name is all the wiring a tier needs. Markers are registered in
