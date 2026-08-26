@@ -30,13 +30,15 @@ app = FastAPI(title="provider-sim")
 SINK_EVENTS: list[Any] = []
 ARMED_FAULTS: list[dict[str, Any]] = []  # {route_prefix, fault, times, seconds}
 
-# The embedding model's context window, expressed in characters: a hermetic
-# image can't fetch BPE ranks, so the sim has no tokenizer. The staging config
-# sets embeddings.max_input_tokens far enough below this that any input the
-# client bounded is comfortably under the window whatever its token density,
-# and any unbounded one is far over it — which is what a real provider does
-# with an oversized input: reject the WHOLE batch, deterministically (#0569).
-MAX_EMBED_INPUT_CHARS = 200_000
+# The embeddings route caps ONE input's characters, independently of the
+# model's token window — a hermetic image can't fetch BPE ranks, so the sim has
+# no tokenizer and this is the limit it can enforce faithfully. Measured
+# against openrouter.ai/api/v1/embeddings with qwen/qwen3-embedding-8b on
+# 2026-08-26: 131072 characters accepted, 131073 rejected (#1658). Because
+# ordinary prose runs ~4.9 characters per token, an input bounded only to the
+# model's 40960-token window is still well over this — which is exactly the
+# rejection the staging tier has to be able to reproduce.
+MAX_EMBED_INPUT_CHARS = 131_072
 
 # --------------------------------------------------------------------------
 # Deterministic helpers
@@ -281,19 +283,19 @@ async def embeddings(request: Request):
         inputs = [inputs]
     for text in inputs:
         if len(text) > MAX_EMBED_INPUT_CHARS:
-            # Same shape OpenRouter returns when one input overruns the model's
-            # context window: the WHOLE batch is rejected with a 400, and it
-            # never gets smaller on retry (#0569).
+            # Same shape the real route returns when one input overruns the
+            # character cap: the WHOLE batch is rejected with a 422, and it
+            # never gets smaller on retry (#0569). The "less than" wording is
+            # the upstream's own — it accepts exactly MAX_EMBED_INPUT_CHARS.
             return JSONResponse(
-                status_code=400,
+                status_code=422,
                 content={
                     "error": {
-                        "code": 400,
+                        "code": 422,
                         "message": (
-                            "This model's maximum context length is "
-                            f"{MAX_EMBED_INPUT_CHARS} characters. However, your "
-                            f"prompt contains {len(text)}. Please reduce the "
-                            "length of the input prompt."
+                            "Value error, The input sequence should have less "
+                            f"than {MAX_EMBED_INPUT_CHARS} characters. "
+                            f"Input length: {len(text)}"
                         ),
                     }
                 },

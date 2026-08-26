@@ -38,6 +38,12 @@ def test_staging_enrichment_exercises_production_litellm_path():
     assert enrichment["api_key"] == "sim"
 
 
+def test_staging_embeddings_use_measured_qwen_context_window():
+    config = yaml.safe_load(Path("config.staging.yaml").read_text())
+
+    assert "max_input_tokens" not in config["embeddings"]
+
+
 def test_staging_cds_callbacks_require_semantic_acceptance():
     """CDS must not treat its HTTP 200 terminal outcomes as delivery success."""
     for config_path in ("config.staging.yaml", "config.staging.realmedia.yaml"):

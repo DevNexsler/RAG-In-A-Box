@@ -151,6 +151,29 @@ async def test_embeddings_deterministic_and_normalized(client):
     assert abs(norm - 1.0) < 1e-6, "vectors must be unit-norm"
 
 
+@pytest.mark.anyio
+async def test_embedding_character_cap_matches_openrouter_deepinfra_contract(client):
+    accepted = await client.post(
+        "/api/v1/embeddings", json={"model": "m", "input": ["a" * 131072]}
+    )
+    assert accepted.status_code == 200
+
+    rejected = await client.post(
+        "/api/v1/embeddings",
+        json={"model": "m", "input": ["ok", "a" * 131073]},
+    )
+    assert rejected.status_code == 422
+    assert rejected.json() == {
+        "error": {
+            "code": 422,
+            "message": (
+                "Value error, The input sequence should have less than 131072 "
+                "characters. Input length: 131073"
+            ),
+        }
+    }
+
+
 # ---------------------------------------------------------------------------
 # OpenRouter chat completions — enrichment JSON, plain text, media routing
 # ---------------------------------------------------------------------------

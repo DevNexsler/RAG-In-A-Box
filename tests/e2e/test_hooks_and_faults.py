@@ -292,7 +292,7 @@ async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_
 
     That context block is embedded as ONE un-chunked input. Un-bounded, it
     overruns the model's window and the provider rejects the whole batch with a
-    400 — deterministically, so the doc is re-fetched, re-OCR'd, re-enriched and
+    422 — deterministically, so the doc is re-fetched, re-OCR'd, re-enriched and
     re-embedded on every run and is never searchable. Both prod poison-pill docs
     (laura-sanchez msg693) failed exactly here.
     """
@@ -326,8 +326,9 @@ async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_
                     "sent_at": "2026-06-01T09:59:30Z",
                     "origin_source": "quo",
                     "channel_id": channel,
-                    # Comfortably past the sim's stand-in context window.
-                    "text": "the shipment manifest was revised again. " * 8000,
+                    # 140000 characters / 70001 tokens unbounded. Token bounding
+                    # makes it safely fit the provider's character cap.
+                    "text": "a " * 70000,
                 }
             ],
         },
@@ -355,7 +356,7 @@ async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_
     # random `stem` baked into this doc's text — this assertion failed 2 of 6
     # staging-e2e runs at top_k=5 with no production code change between them.
     # What #0569 is actually about is whether the doc reaches the index at all:
-    # unbounded, its context block 400s and the doc is never written.
+    # unbounded, its context block 422s and the doc is never written.
     payload = await mcp_session.call_tool_json(
         "file_search", {"query": phrase, "top_k": 50})
     assert search_hits(payload, stem), payload["results"]
