@@ -17,6 +17,7 @@ import time
 
 import httpx
 
+from core.resilience import raise_for_status
 from providers.embed.base import EmbedProvider
 from providers.embed.limits import bound_inputs, resolve_max_input_tokens
 
@@ -92,7 +93,7 @@ class BasetenEmbedProvider(EmbedProvider):
                     headers=headers,
                     timeout=self.timeout,
                 )
-                resp.raise_for_status()
+                raise_for_status(resp)  # a permanent 4xx keeps Baseten's reason
                 data = resp.json()
                 results = sorted(data["data"], key=lambda x: x["index"])
                 return [r["embedding"] for r in results]
@@ -106,14 +107,6 @@ class BasetenEmbedProvider(EmbedProvider):
                     type(exc).__name__, exc, backoff,
                 )
                 time.sleep(backoff)
-
-            except httpx.HTTPStatusError as exc:
-                logger.error(
-                    "Baseten embedding API error: %d %s",
-                    exc.response.status_code,
-                    exc.response.text[:500],
-                )
-                raise
 
         raise last_exc  # type: ignore[misc]
 

@@ -37,6 +37,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
+from core.resilience import raise_for_status
 from core.storage import SearchHit
 from core.tracing import get_tracer
 
@@ -334,7 +335,9 @@ class DeepInfraReranker(Reranker):
                 },
                 timeout=self.timeout,
             )
-            resp.raise_for_status()
+            # A permanent 4xx (bad key, retired model) is wrapped below into a
+            # RuntimeError whose text is all the caller gets — keep the reason.
+            raise_for_status(resp)
             data = resp.json()
         except Exception as e:
             raise RuntimeError(f"DeepInfra reranker failed: {e}") from e

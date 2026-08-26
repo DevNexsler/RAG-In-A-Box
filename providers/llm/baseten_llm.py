@@ -17,6 +17,8 @@ import time
 
 import httpx
 
+from core.resilience import raise_for_status
+
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
@@ -93,7 +95,7 @@ class BasetenGenerator:
                     headers=headers,
                     timeout=self.timeout,
                 )
-                resp.raise_for_status()
+                raise_for_status(resp)  # a permanent 4xx keeps Baseten's reason
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
                 return content.strip()
@@ -107,13 +109,5 @@ class BasetenGenerator:
                     type(exc).__name__, exc, backoff,
                 )
                 time.sleep(backoff)
-
-            except httpx.HTTPStatusError as exc:
-                logger.error(
-                    "Baseten enrichment API error: %d %s",
-                    exc.response.status_code,
-                    exc.response.text[:500],
-                )
-                raise
 
         raise last_exc  # type: ignore[misc]

@@ -298,3 +298,26 @@ def test_enriched_message_still_parses_to_its_true_http_status():
     )
     assert mcp_server._http_status_from_log_line(line) == 422
     assert mcp_server._provider_failure_kind(line) is None
+
+
+def test_raise_for_status_reads_a_streamed_body_before_raising():
+    """A streamed response has no body until something reads it, so `.text` raises
+    ResponseNotRead — which is the state every `client.stream(...)` call site is in
+    when the status turns out to be an error (ollama_vision, #1662). There is
+    nothing left to stream on a failure, so the reason has to be read here or it is
+    lost exactly where it is needed most."""
+    # content=iter(...) is what makes this a genuinely streamed body: httpx only
+    # populates `_content` eagerly for a bytes/text response.
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            422, content=iter([b"input too large for this model"])
+        )
+    )
+    with httpx.Client(transport=transport) as client:
+        with client.stream("POST", "http://vision.invalid/api/chat") as resp:
+            with pytest.raises(httpx.ResponseNotRead):
+                resp.text  # the precondition: unread while streaming
+            with pytest.raises(httpx.HTTPStatusError) as caught:
+                raise_for_status(resp)
+
+    assert "input too large for this model" in str(caught.value)

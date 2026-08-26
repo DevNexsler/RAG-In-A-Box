@@ -20,6 +20,7 @@ from core.resilience import (
     TransientError,
     call_with_retry,
     is_transient,
+    raise_for_status,
 )
 
 Encoder = Callable[[Path, str], list]  # (path, prompt) -> OpenAI content parts
@@ -82,7 +83,9 @@ class LiteLLMFallback:
         def _once() -> str:
             resp = httpx.post(f"{self.base_url}/chat/completions",
                               json=payload, headers=headers, timeout=self.timeout)
-            resp.raise_for_status()  # 5xx -> HTTPStatusError -> is_transient True
+            # 5xx -> HTTPStatusError -> is_transient True; a permanent 4xx keeps
+            # its body, which is what names the misconfiguration below (#1662).
+            raise_for_status(resp)
             data = resp.json()
             return (data["choices"][0]["message"]["content"] or "").strip()
 
