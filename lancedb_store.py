@@ -93,12 +93,27 @@ _SCHEMA_EVOLUTION_RSS_SAFETY_PERCENT = 10
 
 
 def _lance_field_ids_by_path(schema: Any) -> dict[tuple[str, ...], int]:
-    """Return stable Lance field IDs indexed by their nested field path."""
+    """Return stable Lance field IDs indexed by their nested field path.
+
+    Both directions of the mapping must be unique or the repair cannot know
+    which column an ID belongs to, so an ambiguous schema raises rather than
+    letting a wrong ID reach a manifest commit (#1436).
+    """
     field_ids: dict[tuple[str, ...], int] = {}
+    paths_by_id: dict[int, tuple[str, ...]] = {}
 
     def visit(field: Any, parent_path: tuple[str, ...]) -> None:
         path = (*parent_path, field.name())
-        field_ids[path] = field.id()
+        field_id = field.id()
+        if path in field_ids:
+            raise ValueError(f"duplicate Lance field path: {path}")
+        prior_path = paths_by_id.get(field_id)
+        if prior_path is not None:
+            raise ValueError(
+                f"duplicate Lance field ID {field_id}: {prior_path} and {path}"
+            )
+        field_ids[path] = field_id
+        paths_by_id[field_id] = path
         for child in field.children():
             visit(child, path)
 
@@ -107,8 +122,47 @@ def _lance_field_ids_by_path(schema: Any) -> dict[tuple[str, ...], int]:
     return field_ids
 
 
+# The newest Lance data file version whose physical-column layout this module
+# has actually been measured against. See _file_columns_include_containers for
+# the two layouts, and _repair_overclaiming_fragments for what happens beyond.
+_MAX_REPAIRABLE_DATA_FILE_VERSION = (2, 1)
+
+
+def _data_file_layout_is_measured(major_version: int, minor_version: int) -> bool:
+    """Whether this module knows the physical-column layout of such a data file.
+
+    Beyond 2.1 the layout is not just "leaves only" any more: a 2.2 struct
+    written with `packed=true` is a single opaque column, so deriving one column
+    per leaf produces the wrong field IDs — and for a packed struct with a
+    single child it produces the wrong IDs at the *right length*, which the
+    repair's column-count check cannot catch.
+    """
+    return (major_version, minor_version) <= _MAX_REPAIRABLE_DATA_FILE_VERSION
+
+
+def _file_columns_include_containers(major_version: int, minor_version: int) -> bool:
+    """Whether a Lance data file at this version gives containers their own column.
+
+    A fragment's manifest lists one stable field ID per *physical* column in its
+    data file, so a repair has to know which schema nodes got a column. Lance
+    changed that in the 2.1 data file: up to and including 2.0 every schema node
+    — struct and list containers as well as leaves — is a column of its own,
+    while from 2.1 on the containers are packed into their children and only the
+    leaves are columns.
+
+    Take the version from the fragment manifest's `file_major_version` /
+    `file_minor_version`, not from `LanceFileReader(...).metadata()`: on Lance 3
+    and 4 the reader reports `0.3` for a file the manifest calls `2.0`, so its
+    numbers cannot be compared against the format version at all.
+    """
+    return (major_version, minor_version) < (2, 1)
+
+
 def _physical_column_paths(
-    schema: pa.Schema, field_ids_by_path: dict[tuple[str, ...], int]
+    schema: pa.Schema,
+    field_ids_by_path: dict[tuple[str, ...], int],
+    *,
+    containers_are_columns: bool = True,
 ) -> list[tuple[str, ...]]:
     """Return physical file paths represented by stable Lance field IDs."""
     paths: list[tuple[str, ...]] = []
@@ -117,14 +171,23 @@ def _physical_column_paths(
         path = (*parent_path, field.name)
         if path not in field_ids_by_path:
             raise KeyError(path)
-        paths.append(path)
-        for index in range(field.type.num_fields):
-            child = field.type.field(index)
-            child_path = (*path, child.name)
-            if child_path in field_ids_by_path:
-                visit(child, path)
-            elif not pa.types.is_fixed_size_list(field.type):
-                raise KeyError(child_path)
+        children: list[pa.Field] = []
+        # A fixed-size list is one physical column under every file version: its
+        # values live in the parent's column, so descending into it would invent
+        # a column the file does not have. Its child may or may not carry a
+        # field ID of its own depending on the element type; either way it is
+        # not a column, so the parent is the leaf here.
+        if not pa.types.is_fixed_size_list(field.type):
+            for index in range(field.type.num_fields):
+                child = field.type.field(index)
+                child_path = (*path, child.name)
+                if child_path not in field_ids_by_path:
+                    raise KeyError(child_path)
+                children.append(child)
+        if containers_are_columns or not children:
+            paths.append(path)
+        for child in children:
+            visit(child, path)
 
     for field in schema:
         visit(field, ())
@@ -695,11 +758,29 @@ class LanceDBStore:
                 )
                 continue
             claimed_columns = max(entry["column_indices"]) + 1
+            file_major = int(entry.get("file_major_version") or 0)
+            file_minor = int(entry.get("file_minor_version") or 0)
+            if not _data_file_layout_is_measured(file_major, file_minor):
+                logger.warning(
+                    "Fragment %s is a Lance data file v%d.%d; this repair is only "
+                    "derived for v%d.%d and older, not repairing",
+                    fragment.fragment_id,
+                    file_major,
+                    file_minor,
+                    *_MAX_REPAIRABLE_DATA_FILE_VERSION,
+                )
+                continue
             try:
                 file_schema = LanceFileReader(
                     str(Path(dataset_path) / "data" / entry["path"])
                 ).metadata().schema
-                physical_paths = _physical_column_paths(file_schema, field_ids_by_path)
+                physical_paths = _physical_column_paths(
+                    file_schema,
+                    field_ids_by_path,
+                    containers_are_columns=_file_columns_include_containers(
+                        file_major, file_minor
+                    ),
+                )
                 repaired_fields = [field_ids_by_path[path] for path in physical_paths]
             except (KeyError, OSError, ValueError) as exc:
                 logger.warning(
@@ -711,11 +792,13 @@ class LanceDBStore:
                 continue
             if len(physical_paths) != actual_columns:
                 logger.warning(
-                    "Fragment %s physical schema has %d columns; Lance reported %d; "
-                    "not repairing",
+                    "Fragment %s physical schema has %d columns; Lance reported %d "
+                    "(data file v%d.%d); not repairing",
                     fragment.fragment_id,
                     len(physical_paths),
                     actual_columns,
+                    file_major,
+                    file_minor,
                 )
                 continue
             entry["fields"] = repaired_fields

@@ -907,7 +907,11 @@ def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
     """List children need stable IDs; a fixed-size vector child does not."""
     import lance
     from lance.file import LanceFileReader
-    from lancedb_store import _lance_field_ids_by_path, _physical_column_paths
+    from lancedb_store import (
+        _file_columns_include_containers,
+        _lance_field_ids_by_path,
+        _physical_column_paths,
+    )
 
     table = pa.Table.from_pylist(
         [
@@ -946,10 +950,195 @@ def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
     ).metadata().schema
 
     field_ids = _lance_field_ids_by_path(dataset.lance_schema)
+    # Lance's own manifest is the ground truth for which schema nodes got a
+    # physical column, and it differs by data file version — so this asserts
+    # against whatever the installed Lance actually wrote.
     assert [
         field_ids[path]
-        for path in _physical_column_paths(file_schema, field_ids)
+        for path in _physical_column_paths(
+            file_schema,
+            field_ids,
+            containers_are_columns=_file_columns_include_containers(
+                entry["file_major_version"], entry["file_minor_version"]
+            ),
+        )
     ] == entry["fields"]
+
+
+def test_lance_file_metadata_version_is_not_the_data_file_version(tmp_path):
+    """The reader's own version numbers are not the format version.
+
+    Lance 3 and 4 report `0.3` from `LanceFileReader(...).metadata()` for a file
+    the fragment manifest calls `2.0`, so a repair that keys the physical-column
+    layout on the reader's numbers silently reads the wrong side of the 2.1
+    change. Only the manifest's version is comparable.
+    """
+    import lance
+    from lance.file import LanceFileReader
+
+    dataset_path = tmp_path / "versions.lance"
+    lance.write_dataset(
+        pa.table({"id": pa.array(["row-1"], pa.string())}), str(dataset_path)
+    )
+    entry = (
+        lance.dataset(str(dataset_path)).get_fragments()[0].metadata.to_json()["files"][0]
+    )
+    reader_metadata = LanceFileReader(
+        str(dataset_path / "data" / entry["path"])
+    ).metadata()
+
+    assert entry["file_major_version"] == 2
+    assert entry["file_minor_version"] in (0, 1)
+    if (reader_metadata.major_version, reader_metadata.minor_version) != (
+        entry["file_major_version"],
+        entry["file_minor_version"],
+    ):
+        # Whenever they disagree it is the reader that is unusable, never the
+        # manifest — a v0.x reader version must not read as "older than 2.1".
+        assert reader_metadata.major_version < 2
+
+
+def test_lance_field_ids_by_path_fails_closed_on_an_ambiguous_schema():
+    """#1436: a duplicate identity must stop the repair, not pick a winner."""
+    from lancedb_store import _lance_field_ids_by_path
+
+    class _Field:
+        def __init__(self, name, field_id, children=()):
+            self._name, self._id, self._children = name, field_id, list(children)
+
+        def name(self):
+            return self._name
+
+        def id(self):
+            return self._id
+
+        def children(self):
+            return self._children
+
+    class _Schema:
+        def __init__(self, fields):
+            self._fields = fields
+
+        def fields(self):
+            return self._fields
+
+    assert _lance_field_ids_by_path(
+        _Schema([_Field("a", 0), _Field("b", 1, [_Field("c", 2)])])
+    ) == {("a",): 0, ("b",): 1, ("b", "c"): 2}
+
+    with pytest.raises(ValueError, match="duplicate Lance field ID 0"):
+        _lance_field_ids_by_path(_Schema([_Field("a", 0), _Field("b", 0)]))
+
+    with pytest.raises(ValueError, match="duplicate Lance field path"):
+        _lance_field_ids_by_path(_Schema([_Field("a", 0), _Field("a", 1)]))
+
+
+def test_repair_declines_a_data_file_newer_than_the_measured_layout():
+    """A 2.2 packed struct is one opaque column, so the leaf rule is wrong there.
+
+    Measured on lance 10.0.0: a struct field written with `packed=true` at
+    `data_storage_version="2.2"` gets manifest `fields=[0, 1]` while the v2.1
+    leaf rule derives `[0, 2, 3]`. With a *single* child it derives `[0, 2]` —
+    the wrong IDs at the right length, which the column-count check in the
+    repair cannot catch. So anything past the layout this module has actually
+    been measured against is declined rather than guessed at.
+    """
+    from lancedb_store import (
+        _MAX_REPAIRABLE_DATA_FILE_VERSION,
+        _data_file_layout_is_measured,
+    )
+
+    assert _MAX_REPAIRABLE_DATA_FILE_VERSION == (2, 1)
+    assert _data_file_layout_is_measured(2, 0) is True
+    assert _data_file_layout_is_measured(2, 1) is True
+    assert _data_file_layout_is_measured(2, 2) is False
+    assert _data_file_layout_is_measured(3, 0) is False
+
+    # ...and the repair actually consults it: with the layout declared
+    # unmeasured, a fragment it would otherwise fix is left alone.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "wide.md", "c:0", "wide", vec, **{f"k{i}": "v" for i in range(20)}
+            )
+        ])
+        store.upsert_nodes([_make_node_with_meta("narrow.md", "c:0", "narrow", vec)])
+        _claim_columns_the_file_lacks(tmpdir)
+
+        assert store._repair_overclaiming_fragments() is True
+
+        _claim_columns_the_file_lacks(tmpdir)
+        with patch("lancedb_store._data_file_layout_is_measured", return_value=False):
+            assert store._repair_overclaiming_fragments() is False
+
+
+def test_file_columns_include_containers_switches_at_the_2_1_data_file():
+    """#1101/#1110/#1436: the layout is keyed on the file version, not the library.
+
+    Production runs Lance 10 (data file v2.1), the deterministic tiers run Lance
+    4 (v2.0), and a repair that assumes either one is wrong on the other.
+    """
+    from lancedb_store import _file_columns_include_containers
+
+    assert _file_columns_include_containers(2, 0) is True
+    assert _file_columns_include_containers(1, 0) is True
+    assert _file_columns_include_containers(2, 1) is False
+    assert _file_columns_include_containers(3, 0) is False
+
+
+def test_physical_column_paths_drop_containers_on_a_2_1_data_file():
+    """Only leaves are columns from v2.1 on; a fixed-size list stays one column.
+
+    The fixed-size-list-of-struct arm cannot be written by Lance 10 at all
+    (`FixedSizeList<Struct> is not enabled by the selected file format`), so it
+    is asserted here against a hand-built schema rather than a real dataset —
+    #139's fixture for it is unrunnable on the deployed stack.
+    """
+    from lancedb_store import _physical_column_paths
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field(
+                "items",
+                pa.list_(pa.struct([pa.field("label", pa.string())])),
+            ),
+            pa.field("vector", pa.list_(pa.float32(), 3)),
+            pa.field(
+                "fixed_struct",
+                pa.list_(pa.struct([pa.field("value", pa.int32())]), 1),
+            ),
+        ]
+    )
+    field_ids = {
+        ("id",): 0,
+        ("items",): 1,
+        ("items", "item"): 2,
+        ("items", "item", "label"): 3,
+        ("vector",): 4,
+        ("fixed_struct",): 5,
+        # Lance 4 mints IDs for a fixed-size list's children but gives them no
+        # column; descending into them is what invented the extra column.
+        ("fixed_struct", "item"): 6,
+        ("fixed_struct", "item", "value"): 7,
+    }
+
+    assert _physical_column_paths(schema, field_ids, containers_are_columns=True) == [
+        ("id",),
+        ("items",),
+        ("items", "item"),
+        ("items", "item", "label"),
+        ("vector",),
+        ("fixed_struct",),
+    ]
+    assert _physical_column_paths(schema, field_ids, containers_are_columns=False) == [
+        ("id",),
+        ("items", "item", "label"),
+        ("vector",),
+        ("fixed_struct",),
+    ]
 
 
 def test_overclaimed_file_column_count_reads_lances_reported_width():
