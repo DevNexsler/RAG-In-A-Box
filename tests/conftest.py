@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -23,6 +24,57 @@ def _isolate_process_global_resilience_state():
     CIRCUITS.reset()
     yield
     CIRCUITS.reset()
+
+
+class RealIndexerLaunchAttempted(BaseException):
+    """A unit test tried to launch the real detached indexer.
+
+    Derived from ``BaseException`` so it travels through the production
+    ``except Exception`` handler in ``IndexRunSupervisor.start`` instead of
+    being recorded as an ordinary launch failure — the test that forgot to
+    substitute a launcher must fail, not quietly observe a failed launch.
+    """
+
+
+def _refuse_real_indexer_launch(*_args, **_kwargs):
+    raise RealIndexerLaunchAttempted(
+        "unit test reached the real detached indexer launcher; pass "
+        "popen_factory= to IndexRunSupervisor or patch subprocess.Popen"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_detached_index_runs(request, monkeypatch):
+    """Keep the unit tier from spawning a real indexer that outlives it (#1663).
+
+    ``IndexRunSupervisor.start`` launches a ``start_new_session`` child that is
+    reparented to init and runs ``index_vault_flow`` against the real config, so
+    it issues live provider calls and keeps spending after the pytest session
+    dies — nothing in the suite reaps it. Tests that exercise that seam already
+    substitute a launcher (``popen_factory=`` or a patched ``subprocess.Popen``);
+    this turns *forgetting* to do so from a silent leak into a loud failure
+    across the whole tier, rather than one call site at a time. Only the unit tier is
+    guarded: the integration tier drives the real launcher on purpose, with
+    bounded commands it reaps itself.
+    """
+    if request.node.get_closest_marker("unit") is None:
+        yield
+        return
+
+    from index_run_supervisor import IndexRunSupervisor
+
+    real_popen = subprocess.Popen
+    original_init = IndexRunSupervisor.__init__
+
+    def guarded_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # Resolved to the genuine Popen means neither a popen_factory nor a
+        # patch was supplied — this supervisor would spawn for real.
+        if self._popen is real_popen:
+            self._popen = _refuse_real_indexer_launch
+
+    monkeypatch.setattr(IndexRunSupervisor, "__init__", guarded_init)
+    yield
 
 
 def pytest_collection_modifyitems(config, items):
