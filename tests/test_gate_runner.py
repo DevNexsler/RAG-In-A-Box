@@ -313,6 +313,56 @@ def test_compose_tiers_propagate_explicit_provider_env(
     assert staging_fingerprint_keys != real_fingerprint_keys
 
 
+def test_compose_tier_uses_project_specific_host_ports_for_all_processes(tmp_path, monkeypatch):
+    compose_file = tmp_path / "compose.yml"
+    compose_file.write_text("services: {}\n")
+    monkeypatch.setattr(gate, "COMPOSE_FILE", compose_file)
+    monkeypatch.setenv("COMPOSE_PROJECT_NAME", "parallel-staging-project")
+    calls = []
+
+    def capture_run(cmd, **kwargs):
+        calls.append((list(cmd), dict(kwargs.get("env") or {})))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(gate.subprocess, "run", capture_run)
+    staging = next(tier for tier in gate.TIERS if tier.name == "staging-e2e")
+
+    assert gate.run_compose_tier(staging, tmp_path / "run") is True
+
+    lifecycle_calls = [
+        (cmd, env)
+        for cmd, env in calls
+        if (
+            cmd[:2] == ["docker", "compose"]
+            or "pytest" in cmd
+            or cmd[1] in {"scripts/check_tool_coverage.py", "scripts/attachment_path_audit.py"}
+        )
+    ]
+    assert lifecycle_calls
+    app_ports = {env["STAGING_APP_PORT"] for _, env in lifecycle_calls}
+    sim_ports = {env["STAGING_SIM_PORT"] for _, env in lifecycle_calls}
+    assert len(app_ports) == len(sim_ports) == 1
+    app_port = next(iter(app_ports))
+    sim_port = next(iter(sim_ports))
+    assert app_port != sim_port
+    assert 1024 <= int(app_port) <= 65535
+    assert 1024 <= int(sim_port) <= 65535
+    for _, env in lifecycle_calls:
+        assert env["E2E_BASE_URL"] == f"http://localhost:{app_port}"
+        assert env["E2E_SIM_URL"] == f"http://localhost:{sim_port}"
+
+
+def test_staging_lifecycle_env_uses_manual_defaults_without_project(monkeypatch):
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
+
+    assert gate.staging_lifecycle_env() == {
+        "STAGING_APP_PORT": "17788",
+        "STAGING_SIM_PORT": "19999",
+        "E2E_BASE_URL": "http://localhost:17788",
+        "E2E_SIM_URL": "http://localhost:19999",
+    }
+
+
 def test_staging_gate_runs_attachment_audit_after_trace_collection(tmp_path, monkeypatch):
     compose_file = tmp_path / "compose.yml"
     compose_file.write_text("services: {}\n")

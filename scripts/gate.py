@@ -5,6 +5,7 @@ Usage: python scripts/gate.py [--fast] [--only TIER] [--run-dir DIR]
 """
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import secrets
@@ -94,6 +95,25 @@ def next_tier_allowed(name, results, order=TIERS):
     return False
 
 
+def staging_lifecycle_env():
+    project_name = os.environ.get("COMPOSE_PROJECT_NAME")
+    if project_name:
+        port_offset = int.from_bytes(
+            hashlib.sha256(project_name.encode()).digest()[:4], "big"
+        ) % 10_000
+        app_port = 20_000 + port_offset
+        sim_port = 30_000 + port_offset
+    else:
+        app_port = 17_788
+        sim_port = 19_999
+    return {
+        "STAGING_APP_PORT": str(app_port),
+        "STAGING_SIM_PORT": str(sim_port),
+        "E2E_BASE_URL": f"http://localhost:{app_port}",
+        "E2E_SIM_URL": f"http://localhost:{sim_port}",
+    }
+
+
 def _run(cmd, run_dir, tier_name, env=None):
     cmd = [part.format(run_dir=run_dir) for part in cmd]
     print(f"  $ {' '.join(cmd)}", flush=True)
@@ -129,24 +149,24 @@ def collect_staging_traces(run_dir, env=None):
         print("WARN: could not collect staging traces", flush=True)
 
 
-def check_tool_coverage(run_dir):
+def check_tool_coverage(run_dir, env=None):
     # Two-sided tool-coverage enforcement (Task 9). Needs the live MCP endpoint
     # for list_tools, so it must run INSIDE the compose window, after
     # collect_staging_traces has copied the span artifacts into run_dir.
     cmd = [sys.executable, "scripts/check_tool_coverage.py", "--run-dir", str(run_dir)]
     print(f"  $ {' '.join(cmd)}", flush=True)
     try:
-        return subprocess.run(cmd).returncode == 0
+        return subprocess.run(cmd, env=env).returncode == 0
     except FileNotFoundError:
         print("FAIL staging-e2e: tool-coverage check could not run", flush=True)
         return False
 
 
-def check_attachment_path(run_dir):
+def check_attachment_path(run_dir, env=None):
     cmd = [sys.executable, "scripts/attachment_path_audit.py", "--run-dir", str(run_dir)]
     print(f"  $ {' '.join(cmd)}", flush=True)
     try:
-        return subprocess.run(cmd).returncode == 0
+        return subprocess.run(cmd, env=env).returncode == 0
     except FileNotFoundError:
         print("FAIL staging-e2e: attachment-path audit could not run", flush=True)
         return False
@@ -170,7 +190,8 @@ def run_compose_tier(tier, run_dir):
         (run_dir / artifact_name).unlink(missing_ok=True)
     # Per-tier compose env (e.g. STAGING_CONFIG for the real-API e2e stage).
     # Applied to up/down/cp alike so the whole lifecycle targets one rendering.
-    env = {**os.environ, **dict(tier.compose_env)}
+    lifecycle_env = staging_lifecycle_env()
+    env = {**os.environ, **dict(tier.compose_env), **lifecycle_env}
     env["E2E_ATTACHMENT_EVIDENCE_FILE"] = str(Path(run_dir).resolve() / "attachment-path-evidence.json")
     env["E2E_QUERY_FINGERPRINT_KEY"] = secrets.token_hex(32)
     up = ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "--build", "--wait"]
@@ -185,13 +206,14 @@ def run_compose_tier(tier, run_dir):
             extra_env={
                 "E2E_ATTACHMENT_EVIDENCE_FILE": env["E2E_ATTACHMENT_EVIDENCE_FILE"],
                 "E2E_QUERY_FINGERPRINT_KEY": env["E2E_QUERY_FINGERPRINT_KEY"],
+                **lifecycle_env,
             },
         )
         collect_staging_traces(run_dir, env=env)
         if ok:
-            ok = check_tool_coverage(run_dir)
+            ok = check_tool_coverage(run_dir, env=env)
         if ok:
-            ok = check_attachment_path(run_dir)
+            ok = check_attachment_path(run_dir, env=env)
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"FAIL {tier.name}: compose up failed: {exc}", flush=True)
     finally:

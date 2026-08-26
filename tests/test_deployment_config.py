@@ -1,5 +1,7 @@
 """Deployment config contract tests."""
 
+import os
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -82,6 +84,25 @@ def test_staging_compose_pins_disk_threshold_off_host_state():
     env = compose["services"]["doc-organizer-staging"]["environment"]
 
     assert env["DISK_USAGE_MAX_PERCENT"] == "100"
+
+
+def test_staging_compose_renders_configurable_host_ports():
+    """Concurrent staging projects need caller-selected host ports."""
+    rendered = subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.staging.yml", "config"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "STAGING_APP_PORT": "18101", "STAGING_SIM_PORT": "20102"},
+    )
+    compose = yaml.safe_load(rendered.stdout)
+
+    app_port = compose["services"]["doc-organizer-staging"]["ports"][0]
+    sim_port = compose["services"]["provider-sim"]["ports"][0]
+    assert app_port["published"] == "18101"
+    assert app_port["target"] == 7788
+    assert sim_port["published"] == "20102"
+    assert sim_port["target"] == 9999
 
 
 def test_compose_disables_prefect_ephemeral_server():
