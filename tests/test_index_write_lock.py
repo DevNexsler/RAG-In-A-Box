@@ -6,6 +6,13 @@ from unittest.mock import patch
 
 import pytest
 
+# Waits here only detect a genuine deadlock, so the bound is generous: a healthy
+# child never reaches it, while host scheduling delay must not be mistaken for a
+# lock failure. It stays finite because the suite configures no global pytest
+# timeout, and an unbounded join would hang every run on the regression this
+# test exists to catch.
+DEADLOCK_JOIN_TIMEOUT = 60
+
 
 def _hold_index_lock(index_root, acquired, release):
     from core.index_write_lock import index_write_lock
@@ -69,8 +76,9 @@ def test_index_write_lock_nested_acquisition_reuses_outer_flock(tmp_path):
     context = multiprocessing.get_context("spawn")
     process = context.Process(target=_take_nested_lock, args=(str(tmp_path),))
     process.start()
-    process.join(3)
     try:
+        process.join(DEADLOCK_JOIN_TIMEOUT)
+        assert not process.is_alive(), "nested index write lock acquisition deadlocked"
         assert process.exitcode == 0
     finally:
         if process.is_alive():
