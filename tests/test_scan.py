@@ -1408,7 +1408,7 @@ def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
                                                     with patch("flow_index_vault.write_index_metadata_task"):
                                                         index_vault_flow.fn("dummy.yaml")
 
-    fake_store.create_fts_index.assert_called_once_with()
+    fake_store.rebuild_fts_index.assert_called_once_with()
 
 
 def _run_flow_with_fts_store(
@@ -1662,7 +1662,7 @@ def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
 
     The Lance-native incremental merge (table.optimize()) panics forever once
     the on-disk inverted index is inconsistent (#0106) — retrying it next run
-    can never succeed, so the flow must fall back to create_fts_index() in the
+    can never succeed, so the flow must fall back to rebuild_fts_index() in the
     same run instead of leaving keyword search silently stale.
     """
     fake_store = MagicMock()
@@ -1678,7 +1678,7 @@ def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
     meta_mock = _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
 
     fake_store.ensure_fts_index.assert_called_once_with(compact_data=False)
-    fake_store.create_fts_index.assert_called_once_with()
+    fake_store.rebuild_fts_index.assert_called_once_with()
     warnings = meta_mock.call_args[0][4] or []
     assert any(w.startswith("fts_incremental_update_failed:") for w in warnings)
     # The rebuild succeeded, so the run must NOT count as an FTS failure.
@@ -1696,11 +1696,11 @@ def test_fts_full_rebuild_fallback_failure_records_warning(tmp_path):
     fake_store.ensure_fts_index.side_effect = RuntimeError(
         "rust future panicked: unknown error"
     )
-    fake_store.create_fts_index.side_effect = RuntimeError("still broken")
+    fake_store.rebuild_fts_index.side_effect = RuntimeError("still broken")
 
     meta_mock = _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
 
-    fake_store.create_fts_index.assert_called_once_with()
+    fake_store.rebuild_fts_index.assert_called_once_with()
     warnings = meta_mock.call_args[0][4] or []
     assert any(w.startswith("fts_rebuild_failed:") for w in warnings)
 
