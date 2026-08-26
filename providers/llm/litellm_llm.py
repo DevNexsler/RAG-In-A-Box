@@ -273,15 +273,6 @@ class LiteLLMGenerator:
         signals = _truncation_signals(
             initial["response"], initial["request"]["payload"]
         )
-        # The alias is fixed in config; the contract behind it is the provider's
-        # to change. Report what this answer proved about it (#1154).
-        ROUTE_CONTRACTS.observe(
-            self.route,
-            requested_tokens=max_tokens,
-            completion_tokens=signals["completion_tokens"],
-            finish_reason=signals["finish_reason"],
-            backend=initial["response"].get("system_fingerprint"),
-        )
         first_pass_usable = self._is_usable(initial["content"], signals)
         record_structured_attempt(first_pass_usable=first_pass_usable)
         if first_pass_usable:
@@ -411,6 +402,20 @@ class LiteLLMGenerator:
                     response=data,
                     success=True,
                     latency_ms=latency_ms,
+                )
+                # The alias is fixed in config; the contract behind it is the
+                # provider's to change. Every answer carries that evidence, so
+                # it is read here rather than off the returned one: an answer a
+                # retry below discards — cut mid-JSON at the budget, or refused
+                # for its response_format — is often the only one that ever
+                # reaches the boundary that proves the contract (#1154, #1629).
+                observed = _truncation_signals(data, attempt_payload)
+                ROUTE_CONTRACTS.observe(
+                    self.route,
+                    requested_tokens=observed["requested_tokens"],
+                    completion_tokens=observed["completion_tokens"],
+                    finish_reason=observed["finish_reason"],
+                    backend=data.get("system_fingerprint"),
                 )
                 raw_content = data["choices"][0]["message"].get("content")
                 content = raw_content.strip() if isinstance(raw_content, str) else ""
