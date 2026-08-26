@@ -117,7 +117,7 @@ from memory_observer import MemoryObserver
 from core.hook_outbox import HookOutbox
 from hooks.delivery import drain_due, queue_event
 from hooks.events import build_document_indexed_event
-from lancedb_store import LanceDBStore, open_store_with_recovery
+from lancedb_store import LanceDBStore, compaction_is_due, open_store_with_recovery
 
 # Lazy tracer: module-level caching is safe, it resolves the provider per call.
 # Spans are no-ops unless setup_tracing() ran with tracing.enabled: true.
@@ -3828,14 +3828,12 @@ def index_vault_flow(
     )
     _write_heartbeat(index_root)
 
-    # A daily full-table compaction can consume several GiB on the production
-    # corpus. Run it before document processing creates its own resident state,
-    # but only for an existing active table. Fresh/shadow tables do not exist
-    # yet; deletion-only runs keep delete -> compaction ordering in finalization.
-    pre_index_maintenance_attempted = bool(
-        docs_to_process and active_table_has_docs and not using_shadow_rebuild
-    )
-    if pre_index_maintenance_attempted:
+    # Reclaim superseded Lance versions before document processing creates its
+    # own resident state, but only for an existing active table — fresh/shadow
+    # tables do not exist yet. The daily full-table compaction is deliberately
+    # NOT part of this: it forks a second full-memory worker, which is safe only
+    # in the idle window between runs (#1254, compact_index_if_idle).
+    if docs_to_process and active_table_has_docs and not using_shadow_rebuild:
         memory_observer.sample("phase_start", phase="pre_index_maintenance")
         _write_heartbeat(index_root)
         try:
@@ -3955,12 +3953,7 @@ def index_vault_flow(
                 store.create_fts_index()
             else:
                 try:
-                    final_compact_data = bool(
-                        active_table_has_docs
-                        and not using_shadow_rebuild
-                        and not pre_index_maintenance_attempted
-                    )
-                    store.ensure_fts_index(compact_data=final_compact_data)
+                    store.ensure_fts_index()
                 except Exception as exc:
                     # A corrupt inverted index fails the incremental merge
                     # deterministically, so retrying next run can never succeed
@@ -4686,6 +4679,52 @@ def _drain_index_requests(
         queue.complete(request)
         results[key] = result
     return results
+
+
+def compact_index_if_idle(config_path: str = "config.yaml") -> dict:
+    """Run the day's Lance data compaction, but only between index runs.
+
+    Compaction forks a second full-memory Python worker into the container's
+    memory cgroup. Inline in a live index run it doubled peak memory and drove
+    that cgroup to its ceiling on 2026-08-14 and 2026-08-19; the kernel killed
+    the fattest task in the cgroup — the long-lived server, not the worker — the
+    container restarted, and the run in flight was lost with it, 51 of 55 queued
+    documents on 08-19 (#1254).
+
+    The idle window is exactly "no writer holds the table", which the write lock
+    every index run already takes answers authoritatively across processes. Held
+    non-blocking, so a busy table defers the compaction to the next tick instead
+    of queueing a fork behind the run. Cheap when there is nothing to do: the
+    cadence marker is read before any table handle is opened.
+    """
+    from datetime import date
+
+    config = load_config(config_path)
+    index_root = Path(config["index_root"])
+    table_name = config.get("lancedb", {}).get("table", "chunks")
+    logger = _get_logger()
+    today = date.today()
+    if not compaction_is_due(index_root, table_name, today):
+        return {"status": "not_due"}
+
+    try:
+        with index_write_lock(index_root, table_name, blocking=False):
+            store = open_store_with_recovery(
+                index_root,
+                table_name,
+                logger_obj=logger,
+                auto_recover=True,
+            )
+            with store.exclusive_writer_session():
+                compacted = store.compact_data_files_if_due(today)
+        return {"status": "compacted" if compacted else "not_due"}
+    except IndexWriteLockBusy:
+        logger.info(
+            "Daily Lance compaction deferred: an index writer holds table %r; "
+            "retrying in the next idle window",
+            table_name,
+        )
+        return {"status": "writer_busy"}
 
 
 def drain_index_queue(config_path: str = "config.yaml", *, limit: int | None = None) -> dict:

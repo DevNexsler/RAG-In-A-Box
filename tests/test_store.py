@@ -4,7 +4,6 @@ import json
 import logging
 
 import multiprocessing
-import subprocess
 import sys
 import tempfile
 import threading
@@ -167,7 +166,7 @@ def test_replace_chunk_text_and_vector_is_atomic_and_refreshes_node_metadata():
         assert store.get_vector("photo.jpg::img:c:0") == pytest.approx([0.2] * 768)
         raw = store._vs.table.search(None).where("id = 'photo.jpg::img:c:0'").limit(1).to_list()[0]
         assert json.loads(raw["metadata"]["_node_content"])["text"] == new_text
-        store.ensure_fts_index(compact_data=False)
+        store.ensure_fts_index()
         assert store.keyword_search("482", top_k=5)[0].doc_id == "photo.jpg"
         assert store.vector_search([0.2] * 768, top_k=1)[0].doc_id == "photo.jpg"
 
@@ -907,7 +906,11 @@ def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
     """List children need stable IDs; a fixed-size vector child does not."""
     import lance
     from lance.file import LanceFileReader
-    from lancedb_store import _lance_field_ids_by_path, _physical_column_paths
+    from lancedb_store import (
+        _file_columns_include_containers,
+        _lance_field_ids_by_path,
+        _physical_column_paths,
+    )
 
     table = pa.Table.from_pylist(
         [
@@ -946,10 +949,195 @@ def test_physical_column_paths_match_lance_manifest_for_nested_lists(tmp_path):
     ).metadata().schema
 
     field_ids = _lance_field_ids_by_path(dataset.lance_schema)
+    # Lance's own manifest is the ground truth for which schema nodes got a
+    # physical column, and it differs by data file version — so this asserts
+    # against whatever the installed Lance actually wrote.
     assert [
         field_ids[path]
-        for path in _physical_column_paths(file_schema, field_ids)
+        for path in _physical_column_paths(
+            file_schema,
+            field_ids,
+            containers_are_columns=_file_columns_include_containers(
+                entry["file_major_version"], entry["file_minor_version"]
+            ),
+        )
     ] == entry["fields"]
+
+
+def test_lance_file_metadata_version_is_not_the_data_file_version(tmp_path):
+    """The reader's own version numbers are not the format version.
+
+    Lance 3 and 4 report `0.3` from `LanceFileReader(...).metadata()` for a file
+    the fragment manifest calls `2.0`, so a repair that keys the physical-column
+    layout on the reader's numbers silently reads the wrong side of the 2.1
+    change. Only the manifest's version is comparable.
+    """
+    import lance
+    from lance.file import LanceFileReader
+
+    dataset_path = tmp_path / "versions.lance"
+    lance.write_dataset(
+        pa.table({"id": pa.array(["row-1"], pa.string())}), str(dataset_path)
+    )
+    entry = (
+        lance.dataset(str(dataset_path)).get_fragments()[0].metadata.to_json()["files"][0]
+    )
+    reader_metadata = LanceFileReader(
+        str(dataset_path / "data" / entry["path"])
+    ).metadata()
+
+    assert entry["file_major_version"] == 2
+    assert entry["file_minor_version"] in (0, 1)
+    if (reader_metadata.major_version, reader_metadata.minor_version) != (
+        entry["file_major_version"],
+        entry["file_minor_version"],
+    ):
+        # Whenever they disagree it is the reader that is unusable, never the
+        # manifest — a v0.x reader version must not read as "older than 2.1".
+        assert reader_metadata.major_version < 2
+
+
+def test_lance_field_ids_by_path_fails_closed_on_an_ambiguous_schema():
+    """#1436: a duplicate identity must stop the repair, not pick a winner."""
+    from lancedb_store import _lance_field_ids_by_path
+
+    class _Field:
+        def __init__(self, name, field_id, children=()):
+            self._name, self._id, self._children = name, field_id, list(children)
+
+        def name(self):
+            return self._name
+
+        def id(self):
+            return self._id
+
+        def children(self):
+            return self._children
+
+    class _Schema:
+        def __init__(self, fields):
+            self._fields = fields
+
+        def fields(self):
+            return self._fields
+
+    assert _lance_field_ids_by_path(
+        _Schema([_Field("a", 0), _Field("b", 1, [_Field("c", 2)])])
+    ) == {("a",): 0, ("b",): 1, ("b", "c"): 2}
+
+    with pytest.raises(ValueError, match="duplicate Lance field ID 0"):
+        _lance_field_ids_by_path(_Schema([_Field("a", 0), _Field("b", 0)]))
+
+    with pytest.raises(ValueError, match="duplicate Lance field path"):
+        _lance_field_ids_by_path(_Schema([_Field("a", 0), _Field("a", 1)]))
+
+
+def test_repair_declines_a_data_file_newer_than_the_measured_layout():
+    """A 2.2 packed struct is one opaque column, so the leaf rule is wrong there.
+
+    Measured on lance 10.0.0: a struct field written with `packed=true` at
+    `data_storage_version="2.2"` gets manifest `fields=[0, 1]` while the v2.1
+    leaf rule derives `[0, 2, 3]`. With a *single* child it derives `[0, 2]` —
+    the wrong IDs at the right length, which the column-count check in the
+    repair cannot catch. So anything past the layout this module has actually
+    been measured against is declined rather than guessed at.
+    """
+    from lancedb_store import (
+        _MAX_REPAIRABLE_DATA_FILE_VERSION,
+        _data_file_layout_is_measured,
+    )
+
+    assert _MAX_REPAIRABLE_DATA_FILE_VERSION == (2, 1)
+    assert _data_file_layout_is_measured(2, 0) is True
+    assert _data_file_layout_is_measured(2, 1) is True
+    assert _data_file_layout_is_measured(2, 2) is False
+    assert _data_file_layout_is_measured(3, 0) is False
+
+    # ...and the repair actually consults it: with the layout declared
+    # unmeasured, a fragment it would otherwise fix is left alone.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([
+            _make_node_with_meta(
+                "wide.md", "c:0", "wide", vec, **{f"k{i}": "v" for i in range(20)}
+            )
+        ])
+        store.upsert_nodes([_make_node_with_meta("narrow.md", "c:0", "narrow", vec)])
+        _claim_columns_the_file_lacks(tmpdir)
+
+        assert store._repair_overclaiming_fragments() is True
+
+        _claim_columns_the_file_lacks(tmpdir)
+        with patch("lancedb_store._data_file_layout_is_measured", return_value=False):
+            assert store._repair_overclaiming_fragments() is False
+
+
+def test_file_columns_include_containers_switches_at_the_2_1_data_file():
+    """#1101/#1110/#1436: the layout is keyed on the file version, not the library.
+
+    Production runs Lance 10 (data file v2.1), the deterministic tiers run Lance
+    4 (v2.0), and a repair that assumes either one is wrong on the other.
+    """
+    from lancedb_store import _file_columns_include_containers
+
+    assert _file_columns_include_containers(2, 0) is True
+    assert _file_columns_include_containers(1, 0) is True
+    assert _file_columns_include_containers(2, 1) is False
+    assert _file_columns_include_containers(3, 0) is False
+
+
+def test_physical_column_paths_drop_containers_on_a_2_1_data_file():
+    """Only leaves are columns from v2.1 on; a fixed-size list stays one column.
+
+    The fixed-size-list-of-struct arm cannot be written by Lance 10 at all
+    (`FixedSizeList<Struct> is not enabled by the selected file format`), so it
+    is asserted here against a hand-built schema rather than a real dataset —
+    #139's fixture for it is unrunnable on the deployed stack.
+    """
+    from lancedb_store import _physical_column_paths
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field(
+                "items",
+                pa.list_(pa.struct([pa.field("label", pa.string())])),
+            ),
+            pa.field("vector", pa.list_(pa.float32(), 3)),
+            pa.field(
+                "fixed_struct",
+                pa.list_(pa.struct([pa.field("value", pa.int32())]), 1),
+            ),
+        ]
+    )
+    field_ids = {
+        ("id",): 0,
+        ("items",): 1,
+        ("items", "item"): 2,
+        ("items", "item", "label"): 3,
+        ("vector",): 4,
+        ("fixed_struct",): 5,
+        # Lance 4 mints IDs for a fixed-size list's children but gives them no
+        # column; descending into them is what invented the extra column.
+        ("fixed_struct", "item"): 6,
+        ("fixed_struct", "item", "value"): 7,
+    }
+
+    assert _physical_column_paths(schema, field_ids, containers_are_columns=True) == [
+        ("id",),
+        ("items",),
+        ("items", "item"),
+        ("items", "item", "label"),
+        ("vector",),
+        ("fixed_struct",),
+    ]
+    assert _physical_column_paths(schema, field_ids, containers_are_columns=False) == [
+        ("id",),
+        ("items", "item", "label"),
+        ("vector",),
+        ("fixed_struct",),
+    ]
 
 
 def test_overclaimed_file_column_count_reads_lances_reported_width():
@@ -2109,33 +2297,13 @@ def test_ensure_fts_index_missing_path_tags_exact_latest_without_data_compaction
         )
 
         with patch.object(store, "_compact_data_files") as compact:
-            store.ensure_fts_index(compact_data=False)
+            store.ensure_fts_index()
 
         tag = f"daily-{date.today().isoformat()}"
         compact.assert_not_called()
         assert lance.dataset(_lance_path(tmpdir), version=tag).version == (
             lance.dataset(_lance_path(tmpdir)).version
         )
-
-
-def test_ensure_fts_index_missing_path_honors_requested_data_compaction():
-    """Delete-only/all-in-one callers compact before creating missing FTS."""
-    from datetime import date
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        store = LanceDBStore(tmpdir, "test_chunks")
-        vec = [0.0] * 768
-        store.upsert_nodes(
-            [_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")]
-        )
-
-        with patch.object(
-            store, "_compact_data_files", wraps=store._compact_data_files
-        ) as compact:
-            store.ensure_fts_index(compact_data=True)
-
-        compact.assert_called_once_with()
-        assert _compaction_marker(tmpdir).read_text().strip() == date.today().isoformat()
 
 
 def _lance_path(tmpdir: str, table: str = "test_chunks") -> str:
@@ -2377,7 +2545,11 @@ def _fts_unindexed_rows(tmpdir: str) -> int:
     return table.index_stats(name).num_unindexed_rows
 
 
-def test_pre_index_maintenance_orders_prune_compact_marker():
+def test_daily_compaction_orders_prune_compact_marker():
+    """The prune frees headroom before the rewrite, and the cadence marker is
+    only written once the rewrite has been verified."""
+    from datetime import date
+
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
         store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
@@ -2401,13 +2573,94 @@ def test_pre_index_maintenance_orders_prune_compact_marker():
                 side_effect=lambda _day: order.append("marker"),
             ),
         ):
-            store.prepare_indexing_maintenance()
+            store.compact_data_files_if_due(date.today())
 
         assert order == [
-            "prune:pre-maintenance",
+            "prune:pre-compaction",
             "compact",
             "marker",
         ]
+
+
+def test_index_run_maintenance_never_forks_a_compaction_worker():
+    """#1254: daily compaction forks a second full-memory Python worker into the
+    container's memory cgroup. Run inline in a live index run it drove that
+    cgroup to its 8 GiB ceiling twice (2026-08-14, 2026-08-19); the kernel then
+    killed the fattest task in the cgroup — the long-lived server, not the
+    worker — the container restarted, and the index run in flight died with it
+    (51 of 55 documents on 08-19). No index-run maintenance path may fork it.
+    The cadence itself is unchanged; the idle-window entry point owns it."""
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
+        store.create_fts_index()
+
+        with patch.object(store, "_compact_data_files") as worker:
+            store.prepare_indexing_maintenance()
+            store.ensure_fts_index()
+
+        assert worker.call_count == 0
+        assert not _compaction_marker(tmpdir).exists()
+
+        assert store.compact_data_files_if_due(date.today()) is True
+        assert (
+            _compaction_marker(tmpdir).read_text().strip() == date.today().isoformat()
+        )
+
+
+def test_compaction_worker_is_killed_before_the_cgroup_ceiling():
+    """#1254: the worker allocates inside the same memory cgroup as the server
+    and any live index run, and the kernel's OOM killer picks the fattest task
+    in that cgroup — never reliably the worker. Watch the cgroup while the
+    worker runs and kill the worker first: a dead worker only defers compaction
+    to the next idle window, a dead server restarts the container."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        samples = iter([1_000, 9_600])
+
+        with (
+            patch.object(
+                lancedb_store_module,
+                "_compaction_worker_command",
+                return_value=[sys.executable, "-c", "import time; time.sleep(30)"],
+            ),
+            patch.object(
+                lancedb_store_module,
+                "_cgroup_memory_limit_bytes",
+                return_value=10_000,
+            ),
+            patch.object(
+                lancedb_store_module,
+                "_cgroup_memory_anon_bytes",
+                side_effect=lambda: next(samples, 9_600),
+            ),
+            patch.object(
+                lancedb_store_module, "_WORKER_MEMORY_POLL_SECONDS", 0.01
+            ),
+        ):
+            with pytest.raises(MemoryError, match="cgroup"):
+                store._compact_data_files()
+
+
+def test_compaction_worker_runs_unguarded_without_a_readable_cgroup():
+    """No cgroup accounting (bare host, cgroup v1) must not disable compaction —
+    the guard is a ceiling, not a precondition."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+
+        with (
+            patch.object(
+                lancedb_store_module,
+                "_compaction_worker_command",
+                return_value=[sys.executable, "-c", "pass"],
+            ),
+            patch.object(
+                lancedb_store_module, "_cgroup_memory_anon_bytes", return_value=None
+            ),
+        ):
+            store._compact_data_files()
 
 
 def test_unreadable_compaction_is_restored_and_not_recorded(caplog):
@@ -2471,7 +2724,7 @@ def test_data_compaction_runs_binary_copy_in_short_lived_subprocess():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
 
-        with patch("subprocess.run") as run:
+        with patch("lancedb_store._run_worker_under_memory_ceiling") as run:
             store._compact_data_files()
 
         run.assert_called_once_with(
@@ -2482,23 +2735,24 @@ def test_data_compaction_runs_binary_copy_in_short_lived_subprocess():
                 "compact",
                 store._dataset_path(),
             ],
-            check=True,
-            capture_output=True,
-            close_fds=True,
-            text=True,
+            label="Lance compaction worker",
         )
 
 
 def test_data_compaction_surfaces_worker_error_for_retry_classification():
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
-        failure = subprocess.CalledProcessError(
-            1,
-            [sys.executable, "-m", "core.lance_maintenance"],
-            stderr="Retryable commit conflict at version 42",
-        )
 
-        with patch("subprocess.run", side_effect=failure):
+        with patch.object(
+            lancedb_store_module,
+            "_compaction_worker_command",
+            return_value=[
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(sys.stderr.write("
+                "'Retryable commit conflict at version 42') and 1 or 1)",
+            ],
+        ):
             with pytest.raises(RuntimeError, match="Retryable commit conflict"):
                 store._compact_data_files()
 
@@ -2517,13 +2771,17 @@ def test_pre_index_compaction_refreshes_store_for_following_writes():
         store.upsert_nodes(
             [_make_node_with_meta("b.md", "c:0", "quasar", vec, source_type="md")]
         )
-        store.ensure_fts_index(compact_data=False)
+        store.ensure_fts_index()
 
         assert set(store.list_doc_ids()) == {"a.md", "b.md"}
         assert len(store.keyword_search("quasar", top_k=5)) == 1
 
 
-def test_exclusive_pre_index_compaction_refreshes_parent_handle_exactly_once():
+def test_exclusive_compaction_refreshes_parent_handle_exactly_once():
+    """The worker commits a new manifest from its own Lance session, so the
+    idle-window driver's stable handle is refreshed once before it writes."""
+    from datetime import date
+
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
         store.upsert_nodes(
@@ -2534,29 +2792,10 @@ def test_exclusive_pre_index_compaction_refreshes_parent_handle_exactly_once():
             store, "_compact_data_files"
         ), patch.object(store, "_checkout_latest") as checkout:
             with store.exclusive_writer_session():
-                store.prepare_indexing_maintenance()
+                store.compact_data_files_if_due(date.today())
                 store.insert_nodes(
                     [_make_node("new.md", "c:0", "new", [0.2] * 768)]
                 )
-
-        checkout.assert_called_once_with()
-
-
-def test_exclusive_deletion_only_compaction_refreshes_parent_handle_once():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        store = LanceDBStore(tmpdir, "test_chunks")
-        store.upsert_nodes(
-            [_make_node("seed.md", "c:0", "seed", [0.1] * 768)]
-        )
-        store.create_fts_index()
-
-        with patch.object(store, "_compaction_due", return_value=True), patch.object(
-            store, "_compact_data_files"
-        ), patch.object(store, "_checkout_latest") as checkout, patch.object(
-            store, "_merge_index_deltas"
-        ), patch.object(store, "_finish_index_maintenance"):
-            with store.exclusive_writer_session():
-                store.ensure_fts_index(compact_data=True)
 
         checkout.assert_called_once_with()
 
@@ -2594,7 +2833,7 @@ def test_post_index_maintenance_skips_compaction_then_merges_tags_and_prunes():
                 side_effect=lambda _table, _day: (order.append("tag"), True)[1],
             ),
         ):
-            store._optimize_and_prune(table, compact_data=False)
+            store._optimize_and_prune(table)
 
         assert order == [
             "merge",
@@ -2711,6 +2950,10 @@ def test_current_marker_skips_compaction_but_merges_indices():
 
 
 def test_compaction_failure_leaves_marker_absent_and_still_merges_indices():
+    """A failed compaction is housekeeping: it leaves the cadence marker
+    unwritten for the next idle window and never blocks index maintenance."""
+    from datetime import date
+
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
         store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
@@ -2727,6 +2970,7 @@ def test_compaction_failure_leaves_marker_absent_and_still_merges_indices():
             patch.object(store, "_expire_restore_points"),
             patch.object(store, "_tag_latest_restore_point"),
         ):
+            assert store.compact_data_files_if_due(date.today()) is False
             store._optimize_and_prune(table)
 
         assert compact.call_count == 1
@@ -2734,15 +2978,15 @@ def test_compaction_failure_leaves_marker_absent_and_still_merges_indices():
         assert not _compaction_marker(tmpdir).exists()
 
 
-def test_index_merge_failure_after_successful_compaction_keeps_compaction_marker():
+def test_index_merge_failure_skips_the_restore_point_refresh():
+    """The merge is the only propagating step, so a merge failure must not go
+    on to stage or expire restore points on an index it did not update."""
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
         store.upsert_nodes([_make_node("seed.md", "c:0", "seed", [0.1] * 768)])
         table = MagicMock()
         with (
-            patch.object(store, "_compaction_due", return_value=True),
             patch.object(store, "_prune_versions"),
-            patch.object(store, "_compact_data_files"),
             patch.object(
                 store,
                 "_merge_index_deltas",
@@ -2754,13 +2998,12 @@ def test_index_merge_failure_after_successful_compaction_keeps_compaction_marker
             with pytest.raises(RuntimeError, match="index merge failed"):
                 store._optimize_and_prune(table)
 
-        assert _compaction_marker(tmpdir).exists()
         expire.assert_not_called()
         tag.assert_not_called()
 
 
-def test_first_maintenance_run_compacts_and_records_marker():
-    """First daily maintenance compacts data and records durable cadence."""
+def test_first_idle_window_of_the_day_compacts_and_records_marker():
+    """The day's first idle window compacts data and records durable cadence."""
     from datetime import date
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2771,7 +3014,7 @@ def test_first_maintenance_run_compacts_and_records_marker():
         with patch.object(
             store, "_compact_data_files", wraps=store._compact_data_files
         ) as spy:
-            store.ensure_fts_index()
+            store.compact_data_files_if_due(date.today())
 
         assert spy.call_count == 1
         marker = _compaction_marker(tmpdir)
@@ -2780,21 +3023,24 @@ def test_first_maintenance_run_compacts_and_records_marker():
 
 
 def test_maintenance_compacts_at_most_once_per_day():
-    """A second run on the same day must not rewrite data files (per-run
+    """A second idle window on the same day must not rewrite data files (per-run
     compaction × retained restore tags is what grew the index to 350 GB) —
-    but it must still merge newly written rows into the existing FTS index."""
+    while an index run still merges newly written rows into the FTS index."""
+    from datetime import date
+
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
         vec = [0.0] * 768
         store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
         store.create_fts_index()
-        store.ensure_fts_index()  # first run today: compacts + writes marker
+        store.compact_data_files_if_due(date.today())  # first today: writes marker
 
         store.upsert_nodes([_make_node_with_meta("b.md", "c:0", "quasar telescope", vec, source_type="md")])
         with patch.object(
             store, "_compact_data_files", wraps=store._compact_data_files
         ) as spy:
-            store.ensure_fts_index()  # same calendar day: no data rewrite
+            store.compact_data_files_if_due(date.today())  # same day: no rewrite
+            store.ensure_fts_index()
 
         assert spy.call_count == 0                  # data compaction skipped
         assert _fts_unindexed_rows(tmpdir) == 0     # index deltas still merged
@@ -2804,25 +3050,29 @@ def test_maintenance_compacts_at_most_once_per_day():
 def test_maintenance_compacts_again_when_marker_is_stale():
     """A marker from a previous day (or a fresh restart with an old marker)
     makes compaction due again — the marker is the only cadence state."""
+    from datetime import date
+
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
         vec = [0.0] * 768
         store.upsert_nodes([_make_node_with_meta("a.md", "c:0", "banana", vec, source_type="md")])
         store.create_fts_index()
-        store.ensure_fts_index()
+        store.compact_data_files_if_due(date.today())
         _compaction_marker(tmpdir).write_text("2020-01-01")
 
         with patch.object(
             store, "_compact_data_files", wraps=store._compact_data_files
         ) as spy:
-            store.ensure_fts_index()
+            store.compact_data_files_if_due(date.today())
 
         assert spy.call_count == 1
 
 
-def test_compaction_failure_is_non_fatal_and_retried_next_run():
-    """A failed daily compaction must not fail the indexing run and must not
-    record the marker, so the next run retries it."""
+def test_compaction_failure_is_non_fatal_and_retried_next_idle_window():
+    """A failed daily compaction must not raise at its caller and must not
+    record the marker, so the next idle window retries it."""
+    from datetime import date
+
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "test_chunks")
         vec = [0.0] * 768
@@ -2832,12 +3082,12 @@ def test_compaction_failure_is_non_fatal_and_retried_next_run():
         with patch.object(
             store, "_compact_data_files", side_effect=RuntimeError("disk hiccup")
         ):
-            store.ensure_fts_index()  # must not raise
+            store.compact_data_files_if_due(date.today())  # must not raise
 
         assert not _compaction_marker(tmpdir).exists()
         assert len(store.keyword_search("banana", top_k=5)) == 1  # search unharmed
 
-        store.ensure_fts_index()  # next run retries the compaction
+        store.compact_data_files_if_due(date.today())  # next window retries it
         assert _compaction_marker(tmpdir).exists()
 
 

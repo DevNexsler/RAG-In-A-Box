@@ -280,7 +280,7 @@ def main() -> int:
                     counts["failed"] += 1
                     _emit(doc_id=candidate.doc_id, status="failed", error=str(exc))
             if args.apply and counts["changed"]:
-                store.ensure_fts_index(compact_data=False)
+                store.ensure_fts_index()
                 refresh_serving_cache_marker(
                     index_root,
                     changed_count=counts["changed"],
