@@ -5,9 +5,9 @@ Usage: python scripts/gate.py [--fast] [--only TIER] [--run-dir DIR]
 """
 import argparse
 import dataclasses
-import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -96,22 +96,26 @@ def next_tier_allowed(name, results, order=TIERS):
 
 
 def staging_lifecycle_env():
-    project_name = os.environ.get("COMPOSE_PROJECT_NAME")
-    if project_name:
-        port_offset = int.from_bytes(
-            hashlib.sha256(project_name.encode()).digest()[:4], "big"
-        ) % 10_000
-        app_port = 20_000 + port_offset
-        sim_port = 30_000 + port_offset
-    else:
-        app_port = 17_788
-        sim_port = 19_999
+    if os.environ.get("COMPOSE_PROJECT_NAME"):
+        return {"STAGING_APP_PORT": "0", "STAGING_SIM_PORT": "0"}
     return {
-        "STAGING_APP_PORT": str(app_port),
-        "STAGING_SIM_PORT": str(sim_port),
-        "E2E_BASE_URL": f"http://localhost:{app_port}",
-        "E2E_SIM_URL": f"http://localhost:{sim_port}",
+        "STAGING_APP_PORT": "17788",
+        "STAGING_SIM_PORT": "19999",
+        "E2E_BASE_URL": "http://localhost:17788",
+        "E2E_SIM_URL": "http://localhost:19999",
     }
+
+
+def compose_localhost_port(service, container_port, env):
+    cmd = [
+        "docker", "compose", "-f", str(COMPOSE_FILE),
+        "port", service, str(container_port),
+    ]
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+    match = re.fullmatch(r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)\n?", result.stdout)
+    if not match or not 1 <= int(match.group(1)) <= 65535:
+        raise ValueError(f"invalid local host port for {service}: {result.stdout!r}")
+    return match.group(1)
 
 
 def _run(cmd, run_dir, tier_name, env=None):
@@ -200,13 +204,26 @@ def run_compose_tier(tier, run_dir):
     try:
         # up runs INSIDE the try: a partially-started stack must still get `down -v`
         subprocess.run(up, check=True, env=env)
+        if os.environ.get("COMPOSE_PROJECT_NAME"):
+            app_port = compose_localhost_port("doc-organizer-staging", 7788, env)
+            sim_port = compose_localhost_port("provider-sim", 9999, env)
+            env.update({
+                "E2E_BASE_URL": f"http://localhost:{app_port}",
+                "E2E_SIM_URL": f"http://localhost:{sim_port}",
+            })
         ok = run_tier(
             tier,
             run_dir,
             extra_env={
                 "E2E_ATTACHMENT_EVIDENCE_FILE": env["E2E_ATTACHMENT_EVIDENCE_FILE"],
                 "E2E_QUERY_FINGERPRINT_KEY": env["E2E_QUERY_FINGERPRINT_KEY"],
-                **lifecycle_env,
+                **{
+                    key: env[key]
+                    for key in (
+                        "STAGING_APP_PORT", "STAGING_SIM_PORT",
+                        "E2E_BASE_URL", "E2E_SIM_URL",
+                    )
+                },
             },
         )
         collect_staging_traces(run_dir, env=env)
@@ -214,7 +231,7 @@ def run_compose_tier(tier, run_dir):
             ok = check_tool_coverage(run_dir, env=env)
         if ok:
             ok = check_attachment_path(run_dir, env=env)
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as exc:
         print(f"FAIL {tier.name}: compose up failed: {exc}", flush=True)
     finally:
         try:
