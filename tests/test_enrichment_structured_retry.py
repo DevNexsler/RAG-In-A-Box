@@ -13,6 +13,7 @@ is on stored metadata, not on a mock.
 """
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -207,6 +208,47 @@ def test_run_telemetry_reports_validity_retries_and_degraded_writes(runtime):
         "retries_recovered": 1,
         "degraded_writes": 1,
     }
+
+
+def test_qwen_validation_retry_records_unusable_budget_first_pass(runtime, caplog):
+    """A discarded first answer must still reach the telemetry seam.
+
+    qwen-bulk's in-request JSON validation retried a budget-truncated answer
+    inside the request helper and returned only the repaired one. The outer
+    observer then scored the document as a clean first pass and never emitted
+    the ``finish_reason=length`` warning #1151's outcome check counts.
+    """
+    docs_root, store = runtime
+    doc = _write_doc(docs_root)
+    generator = LiteLLMGenerator(
+        model="qwen-bulk",
+        base_url="http://litellm.local/v1",
+        api_key="secret-key",
+    )
+    fiv._RUNTIME["llm_generator"] = generator
+    begin_degradation_capture()
+
+    with caplog.at_level(logging.WARNING, logger="providers.llm.litellm_llm"):
+        with patch(
+            "providers.llm.litellm_llm.httpx.post",
+            side_effect=[
+                _response("", completion_tokens=5000, finish_reason="length"),
+                _response(_enrichment_payload(), completion_tokens=430),
+            ],
+        ) as post:
+            fiv.process_doc_task.fn(doc)
+
+    assert post.call_count == 2
+    assert "LiteLLM structured response was not usable" in caplog.text
+    assert "finish_reason=length" in caplog.text
+    assert fiv._enrichment_run_telemetry(0) == {
+        "attempts": 1,
+        "first_pass_usable": 0,
+        "retries": 1,
+        "retries_recovered": 1,
+        "degraded_writes": 0,
+    }
+    assert _stored_metadata(store, doc["doc_id"])["enr_doc_type"] == "report"
 
 
 def test_run_telemetry_reaches_index_metadata(runtime, tmp_path):
