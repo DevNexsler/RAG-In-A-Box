@@ -18,7 +18,7 @@ services:
   doc-organizer-staging:
     build: .
     mem_limit: 4g
-    ports: ["17788:7788"]
+    ports: ["${STAGING_APP_PORT:-17788}:7788"]
     logging: *staging-logging
     environment:
       # sim default → all-deterministic. The opt-in real-API pass exports a real
@@ -54,7 +54,7 @@ services:
       retries: 20
   provider-sim:
     build: ./staging/provider_sim
-    ports: ["19999:9999"]
+    ports: ["${STAGING_SIM_PORT:-19999}:9999"]
     logging: *staging-logging
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9999/')"]

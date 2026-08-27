@@ -269,6 +269,7 @@ def test_compose_tiers_propagate_explicit_provider_env(
     compose_file = tmp_path / "compose.yml"
     compose_file.write_text("services: {}\n")
     monkeypatch.setattr(gate, "COMPOSE_FILE", compose_file)
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
     monkeypatch.setenv("STAGING_CONFIG", "./hostile-realmedia.yaml")
     monkeypatch.setenv("E2E_REAL", "1")
 
@@ -313,10 +314,79 @@ def test_compose_tiers_propagate_explicit_provider_env(
     assert staging_fingerprint_keys != real_fingerprint_keys
 
 
+def test_staging_lifecycle_env_uses_dynamic_bindings_for_each_project(monkeypatch):
+    monkeypatch.setenv("COMPOSE_PROJECT_NAME", "parallel-staging-project-one")
+    first = gate.staging_lifecycle_env()
+    monkeypatch.setenv("COMPOSE_PROJECT_NAME", "parallel-staging-project-two")
+    second = gate.staging_lifecycle_env()
+
+    assert first == second == {
+        "STAGING_APP_PORT": "0",
+        "STAGING_SIM_PORT": "0",
+    }
+
+
+def test_compose_tier_discovers_dynamic_ports_for_host_processes(tmp_path, monkeypatch):
+    compose_file = tmp_path / "compose.yml"
+    compose_file.write_text("services: {}\n")
+    monkeypatch.setattr(gate, "COMPOSE_FILE", compose_file)
+    monkeypatch.setenv("COMPOSE_PROJECT_NAME", "parallel-staging-project")
+    calls = []
+
+    def capture_run(cmd, **kwargs):
+        calls.append((list(cmd), dict(kwargs.get("env") or {})))
+        if cmd[4:7] == ["port", "doc-organizer-staging", "7788"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="localhost:18101\n")
+        if cmd[4:7] == ["port", "provider-sim", "9999"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="localhost:20102\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(gate.subprocess, "run", capture_run)
+    staging = next(tier for tier in gate.TIERS if tier.name == "staging-e2e")
+
+    assert gate.run_compose_tier(staging, tmp_path / "run") is True
+
+    compose_calls = [
+        (cmd, env)
+        for cmd, env in calls
+        if cmd[:2] == ["docker", "compose"]
+    ]
+    assert compose_calls
+    for _, env in compose_calls:
+        assert env["STAGING_APP_PORT"] == "0"
+        assert env["STAGING_SIM_PORT"] == "0"
+
+    host_processes = [
+        (cmd, env)
+        for cmd, env in calls
+        if (
+            "pytest" in cmd
+            or cmd[4:5] == ["cp"]
+            or cmd[1] in {"scripts/check_tool_coverage.py", "scripts/attachment_path_audit.py"}
+        )
+    ]
+    assert host_processes
+    for _, env in host_processes:
+        assert env["E2E_BASE_URL"] == "http://localhost:18101"
+        assert env["E2E_SIM_URL"] == "http://localhost:20102"
+
+
+def test_staging_lifecycle_env_uses_manual_defaults_without_project(monkeypatch):
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
+
+    assert gate.staging_lifecycle_env() == {
+        "STAGING_APP_PORT": "17788",
+        "STAGING_SIM_PORT": "19999",
+        "E2E_BASE_URL": "http://localhost:17788",
+        "E2E_SIM_URL": "http://localhost:19999",
+    }
+
+
 def test_staging_gate_runs_attachment_audit_after_trace_collection(tmp_path, monkeypatch):
     compose_file = tmp_path / "compose.yml"
     compose_file.write_text("services: {}\n")
     monkeypatch.setattr(gate, "COMPOSE_FILE", compose_file)
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
     monkeypatch.setattr(gate.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0))
     monkeypatch.setattr(gate, "run_tier", lambda *args, **kwargs: True)
     events = []
@@ -333,6 +403,7 @@ def test_compose_tier_clears_prior_trace_and_audit_artifacts_before_start(tmp_pa
     compose_file = tmp_path / "compose.yml"
     compose_file.write_text("services: {}\n")
     monkeypatch.setattr(gate, "COMPOSE_FILE", compose_file)
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
     run_dir = tmp_path / "run"
     traces = run_dir / "traces"
     traces.mkdir(parents=True)
