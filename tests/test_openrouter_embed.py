@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from core.resilience import call_with_retry
-from providers.embed.openrouter_embed import OpenRouterEmbedProvider
+from providers.embed.openrouter_embed import MAX_RETRIES, OpenRouterEmbedProvider
 
 
 class _FakeResponse:
@@ -118,3 +118,58 @@ def test_non_retryable_error_body_raises_immediately():
             _provider()._call_embeddings(["hello"])
 
     assert len(calls) == 1
+
+
+# The body OpenRouter actually returned for the #1655 oversized input. The status
+# line alone ("422 Unprocessable Entity") names none of it.
+OVERSIZED_INPUT_BODY = (
+    '{"error":{"message":"HTTP 422: {\\"error\\":{\\"message\\":\\"Value error, '
+    "The input sequence should have less than 131072 characters. "
+    'Input length: 180439\\"}}"}}'
+)
+
+
+def test_permanent_http_4xx_surfaces_upstream_reason():
+    """#1657: a permanent 4xx skips the doc forever, so it must log why.
+
+    httpx builds HTTPStatusError's message from the status line alone, so before
+    this the only thing reaching indexer.log was "Client error '422 Unprocessable
+    Entity' for url '...'" — diagnosing it meant re-probing the live endpoint.
+    """
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/embeddings")
+    response = httpx.Response(422, text=OVERSIZED_INPUT_BODY, request=request)
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(1)
+        return response
+
+    with patch("providers.embed.openrouter_embed.httpx.post", side_effect=fake_post):
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            _provider()._call_embeddings(["hello"])
+
+    assert "less than 131072 characters" in str(caught.value)
+    assert len(calls) == 1  # permanent: raised straight through, never retried
+
+
+@pytest.mark.parametrize("status_code", [408, 425, 500, 503, 504])
+def test_transient_http_status_is_still_retried(status_code):
+    """The seam: reading the body on a permanent 4xx must not cost the retry
+    ladder on a temporary one — classification stays the shared layer's call."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/embeddings")
+    response = httpx.Response(status_code, text="upstream busy", request=request)
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(1)
+        return response
+
+    with patch("providers.embed.openrouter_embed.httpx.post", side_effect=fake_post):
+        with patch(
+            "providers.embed.openrouter_embed.call_with_retry",
+            new=partial(call_with_retry, sleep=lambda _: None),
+        ):
+            with pytest.raises(httpx.HTTPStatusError):
+                _provider()._call_embeddings(["hello"])
+
+    assert len(calls) == MAX_RETRIES

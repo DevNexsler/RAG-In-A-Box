@@ -15,7 +15,12 @@ import os
 
 import httpx
 
-from core.resilience import RateLimitError, TransientError, call_with_retry
+from core.resilience import (
+    RateLimitError,
+    TransientError,
+    call_with_retry,
+    raise_for_status,
+)
 from providers.embed.base import EmbedProvider
 from providers.embed.limits import bound_inputs, resolve_max_input_tokens
 
@@ -73,7 +78,8 @@ class OpenRouterEmbedProvider(EmbedProvider):
 
     def _call_embeddings(self, texts: list[str]) -> list[list[float]]:
         """Call /v1/embeddings via the shared resilience layer (retries transient
-        5xx/429/timeouts; permanent 4xx raise straight through)."""
+        5xx/429/timeouts; permanent 4xx raise straight through, carrying the
+        upstream reason from the response body)."""
         texts = bound_inputs(
             texts, self.max_input_tokens, label=f"openrouter-embed[{self.model}]",
         )
@@ -89,7 +95,9 @@ class OpenRouterEmbedProvider(EmbedProvider):
                 headers=headers,
                 timeout=self.timeout,
             )
-            resp.raise_for_status()  # 5xx/429 -> HTTPStatusError -> retried by the layer
+            # 5xx/429 -> HTTPStatusError -> retried by the layer; a permanent 4xx
+            # raises straight through carrying OpenRouter's reason (#1657).
+            raise_for_status(resp)
             data = resp.json()
             if "data" not in data:
                 # OpenRouter wraps upstream provider failures (e.g. Nebius 429 quota)

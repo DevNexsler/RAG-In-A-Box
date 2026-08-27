@@ -88,6 +88,58 @@ def is_transient(exc: BaseException) -> bool:
     return False
 
 
+def _response_body(response: httpx.Response) -> str:
+    """The response text, materializing it first if the response was streamed.
+
+    A streamed response has no body until something reads it, so `.text` raises
+    `ResponseNotRead` — which is exactly the state a `client.stream(...)` call site
+    is in when the status turns out to be an error (#1662). There is nothing left
+    to stream on a failure, so reading it costs one small payload and is the only
+    way that call site keeps its reason.
+    """
+    try:
+        return response.text
+    except httpx.ResponseNotRead:
+        response.read()
+        return response.text
+
+
+def raise_for_status(response: httpx.Response) -> None:
+    """`response.raise_for_status()`, but a PERMANENT failure keeps its body.
+
+    httpx builds HTTPStatusError's message from the status line alone, so a
+    permanent rejection reaches the caller's log as `Client error '422
+    Unprocessable Entity' for url '...'` while the provider's actual reason —
+    which input, which limit, which field — sits unread in the response body
+    (#1657). A permanent error is never retried and quarantines the document for
+    good, so that body is the only thing that makes the skip diagnosable; without
+    it, diagnosis means re-probing the live endpoint by hand.
+
+    Transient statuses re-raise untouched: they are about to be retried, so their
+    body is noise until the ladder runs out, and the retry warning already names
+    the status. The enriched error stays an `httpx.HTTPStatusError` carrying the
+    original message as its prefix, so `is_transient`, `except httpx.*` clauses,
+    and the log-derived HTTP status parsing in deep health all still see exactly
+    what they saw before — only the tail is new.
+    """
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if is_transient(exc):
+            raise
+        try:
+            body = collapse(_response_body(exc.response), MAX_ERROR_CHARS)
+        except httpx.StreamError:
+            body = ""  # nothing left to read — the stream is gone
+        if not body:
+            raise
+        raise httpx.HTTPStatusError(
+            f"{exc} — response body: {body}",
+            request=exc.request,
+            response=exc.response,
+        ) from exc
+
+
 # --- Per-endpoint circuit breaker -------------------------------------------
 #
 # A connection-level failure says the provider is gone, not that this document is
