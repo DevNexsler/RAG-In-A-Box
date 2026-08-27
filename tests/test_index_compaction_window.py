@@ -102,7 +102,7 @@ def test_maintenance_defers_while_an_index_writer_holds_the_table(tmp_path):
         assert acquired.wait(5)
         with (
             patch.object(fiv, "load_config", return_value=config),
-            patch.object(fiv, "open_store_with_recovery", return_value=store),
+            patch.object(fiv, "open_store_with_recovery", return_value=store) as open_store,
         ):
             result = fiv.maintain_index_if_idle()
     finally:
@@ -110,6 +110,7 @@ def test_maintenance_defers_while_an_index_writer_holds_the_table(tmp_path):
         holder.join(5)
 
     assert result == {"status": "writer_busy"}
+    open_store.assert_not_called()
     store._finish_index_maintenance.assert_not_called()
 
 
