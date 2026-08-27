@@ -14,7 +14,7 @@ from core.enrichment_telemetry import (
     record_structured_attempt,
     record_structured_retry,
 )
-from core.resilience import CIRCUITS, TransientError
+from core.resilience import CIRCUITS, TransientError, raise_for_status
 from core.route_contract import ROUTE_CONTRACTS
 from doc_enrichment import enrichment_response_schema, structured_response_is_usable
 from providers.llm.trace_recorder import LLMTraceRecorder
@@ -377,7 +377,10 @@ class LiteLLMGenerator:
                         headers=headers,
                         timeout=request_timeout,
                     )
-                    resp.raise_for_status()
+                        # A permanent 4xx keeps LiteLLM's reason: this route is
+                    # never retried past here, so the log line is the only
+                    # account of why the document was skipped (#1657/#1662).
+                raise_for_status(resp)
                 data = resp.json()
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 self.trace_recorder.record(

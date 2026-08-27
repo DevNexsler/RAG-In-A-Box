@@ -33,7 +33,9 @@ from providers.embed.baseten_embed import BasetenEmbedProvider
 from providers.embed.ollama_embed import OllamaEmbedProvider
 from providers.fallback.litellm_fallback import LiteLLMFallback, image_encoder
 from providers.llm.baseten_llm import BasetenGenerator
+from providers.llm.litellm_llm import LiteLLMGenerator
 from providers.llm.ollama_llm import OllamaGenerator
+from providers.llm.openrouter_llm import OpenRouterGenerator
 from providers.media.openrouter_media import OpenRouterMediaProvider
 from providers.ocr.deepseek_ocr2_local import DeepSeekOCR2Local
 from providers.ocr.ollama_vision import OllamaVisionOCR
@@ -196,6 +198,35 @@ def _baseten_llm(monkeypatch) -> BaseException:
     return caught.value
 
 
+def _litellm_llm(monkeypatch) -> BaseException:
+    """providers/llm/litellm_llm.py — the enrichment route.
+
+    This is the call site the 2026-08-27 reconciliation found still discarding
+    the reason in production: `LLM enrichment failed for '<...>':
+    HTTPStatusError: Client error '400 Bad Request' for url
+    'http://host.docker.internal:4000/v1/chat/completions'` on 2026-08-26 06:28
+    and 2026-08-27 02:02, with nothing naming which limit the document broke.
+    """
+    monkeypatch.setattr("providers.llm.litellm_llm.httpx.post", _rejection)
+    monkeypatch.setattr("providers.llm.litellm_llm.time.sleep", lambda _s: None)
+    generator = LiteLLMGenerator(
+        model="qwen-bulk", base_url="http://provider.invalid/v1", api_key="k",
+    )
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        generator.generate("summarize this")
+    return caught.value
+
+
+def _openrouter_llm(monkeypatch) -> BaseException:
+    """providers/llm/openrouter_llm.py — the same shape, same omission."""
+    monkeypatch.setattr("providers.llm.openrouter_llm.httpx.post", _rejection)
+    monkeypatch.setattr("providers.llm.openrouter_llm.time.sleep", lambda _s: None)
+    generator = OpenRouterGenerator(model="openai/gpt-4.1-mini", api_key="k")
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        generator.generate("summarize this")
+    return caught.value
+
+
 MIGRATED_CALL_SITES = {
     "ollama_embed:probe": _ollama_embed_probe,
     "ollama_embed:embeddings": _ollama_embed_call,
@@ -208,6 +239,8 @@ MIGRATED_CALL_SITES = {
     "deepinfra_reranker:rerank": _deepinfra_rerank,
     "baseten_embed:embeddings": _baseten_embed,
     "baseten_llm:generate": _baseten_llm,
+    "litellm_llm:chat": _litellm_llm,
+    "openrouter_llm:chat": _openrouter_llm,
 }
 
 _IMAGE = None  # set by the fixture below; the file-taking providers need a real path
@@ -250,5 +283,8 @@ def test_enriched_message_still_parses_to_its_true_http_status(call_site, monkey
 
 def test_the_table_covers_every_migrated_call_site():
     """Guard the table itself: #1662 migrated nine bare call sites across seven
-    provider modules, plus the two baseten blocks that hand-rolled the same idea."""
-    assert len(MIGRATED_CALL_SITES) == 11
+    provider modules, plus the two baseten blocks that hand-rolled the same idea.
+    The 2026-08-27 reconciliation added the two chat-completions sites #1662 left
+    behind — litellm_llm, which serves enrichment and was observably discarding
+    400 bodies in production, and openrouter_llm, which is the same code shape."""
+    assert len(MIGRATED_CALL_SITES) == 13
