@@ -37,16 +37,32 @@ def normalize_contact(email=None, phone=None, name=None, lead_id=None,
 
 
 def exact_hit(hit: dict, contact: dict) -> bool:
-    hay = " ".join(str(hit.get(k) or "") for k in ("sender", "channel", "snippet")).lower()
-    hay_digits = _DIGITS.sub("", hay)
-    if contact.get("email") and contact["email"] in hay:
+    """True if `hit` carries an exact identifier match for `contact`.
+
+    Matches per-field (sender/channel/snippet individually), never against a
+    concatenated haystack: joining the three fields before extracting digits
+    lets an unrelated digit run in one field (e.g. a partial number in
+    `channel`) butt up against an unrelated digit run in another (e.g. an
+    extension in `snippet`) and accidentally spell out the contact's full
+    phone number across the seam -- a false positive no single field
+    actually contains.
+    """
+    fields = [str(hit.get(k) or "") for k in ("sender", "channel", "snippet")]
+    lowered = [f.lower() for f in fields]
+    digit_fields = [_DIGITS.sub("", f) for f in fields]
+
+    email = contact.get("email")
+    if email and any(email in f for f in lowered):
         return True
-    if contact.get("phone_e164"):
-        digits = _DIGITS.sub("", contact["phone_e164"])
-        if digits and digits in hay_digits:
-            return True
-    if contact.get("name") and contact["name"].lower() in hay:
+
+    phone_digits = _DIGITS.sub("", contact.get("phone_e164") or "")
+    if phone_digits and any(phone_digits in d for d in digit_fields):
         return True
+
+    name = contact.get("name")
+    if name and any(name.lower() in f for f in lowered):
+        return True
+
     return False
 
 
@@ -73,13 +89,21 @@ def derive_flags(contact: dict, cds_result: dict) -> dict:
     return {"our_outbound_after_latest_inbound": False}
 
 
+# Single source of truth for each source's empty/skipped shape -- shared with
+# mcp_server.py (`_CTX_EMPTY_BY_SOURCE = context_builder.EMPTY_BY_SOURCE`) so
+# the two never drift out of sync.
+EMPTY_BY_SOURCE = {
+    "factbook": {"entities": [], "flags": {}},
+    "cds": {"inbound_count_30d": 0, "latest_inbound_at": None,
+            "latest_outbound_at": None, "outbound_evidence": []},
+    "comm": {"hits": []},
+}
+
+
 def build_context(contact: dict, deps: dict) -> dict:
     started = time.monotonic()
     result: dict = {"contact": contact}
-    for source, empty in (("factbook", {"entities": [], "flags": {}}),
-                          ("cds", {"inbound_count_30d": 0, "latest_inbound_at": None,
-                                    "latest_outbound_at": None, "outbound_evidence": []}),
-                          ("comm", {"hits": []})):
+    for source, empty in EMPTY_BY_SOURCE.items():
         try:
             result["comm_context" if source == "comm" else source] = deps[source](contact)
         except Exception as exc:

@@ -51,6 +51,15 @@ URL_ENV_VAR = "FACTBOOK_RPC_URL"
 ATTEMPTS = 3
 BACKOFF: tuple[float, ...] = (0.3, 0.8)
 
+# httpx's own read/connect timeout, independent of core.resilience's retry
+# ladder above: at the old 30s, one hung backplane peer could cost
+# 30s x ATTEMPTS x up to 3 identifiers (email/phone/name) ~= 4.5 minutes for
+# a single context_builder call, and httpx.ReadTimeout alone never trips
+# core.resilience's circuit breaker. factbook-rpc is same-network
+# (mcp-backplane), not a WAN hop, so 8s is generous for a live peer and cuts
+# the hung-peer worst case to well under a minute.
+RPC_TIMEOUT_SECONDS = 8.0
+
 # find_entity_by_attribute's own resolution flags (factbook/server.py, the
 # payload dict built in _tool_find_entity_by_attribute, ~line 4137-4147).
 # resolve_entities carries none of these (_tool_resolve_entities returns
@@ -90,7 +99,7 @@ def _call_tool(name: str, arguments: dict, *, token: str) -> dict:
     }
 
     def _do() -> dict:
-        with httpx.Client(transport=_transport(), timeout=30.0) as client:
+        with httpx.Client(transport=_transport(), timeout=RPC_TIMEOUT_SECONDS) as client:
             resp = client.post(f"{base_url}/mcp", json=payload, headers=headers)
         # 5xx/429/timeouts retried by the layer; a permanent 4xx raises
         # straight through carrying factbook-rpc's own body (#1657 pattern).

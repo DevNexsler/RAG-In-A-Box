@@ -70,6 +70,45 @@ def test_comm_source_caps_at_ten_hits(monkeypatch):
     assert out["hits"][0]["source_id"] == "AC14"
 
 
+def test_comm_source_degraded_backend_is_error(monkeypatch):
+    # A degraded comm_lookup verdict means the search backend itself is
+    # unhealthy -- must not masquerade as a clean "no exact hit" (that would
+    # hide a real index outage behind a falsely reassuring empty result).
+    monkeypatch.setattr(srv, "_comm_lookup_impl", lambda **kw: {
+        "verdict": "not_found", "hits": [], "degraded": True,
+        "note": "Doc-Organizer search is unavailable/degraded; treat as inconclusive.",
+    })
+    out = srv._ctx_comm_source({"email": "a@b.com", "phone_e164": None, "name": None})
+    assert out["status"].startswith("error:")
+    assert out["hits"] == []
+
+
+def test_comm_source_error_passthrough_is_error(monkeypatch):
+    monkeypatch.setattr(srv, "_comm_lookup_impl", lambda **kw: {
+        "error": True, "code": "invalid_parameter", "message": "query must not be empty.",
+    })
+    out = srv._ctx_comm_source({"email": "a@b.com", "phone_e164": None, "name": None})
+    assert out == {"status": "error:query must not be empty.", "hits": []}
+
+
+def test_impl_include_accepts_comm_context_alias(monkeypatch):
+    monkeypatch.setattr(srv, "_ctx_factbook_source", lambda c: {"status": "ok", "entities": [], "flags": {}})
+    monkeypatch.setattr(srv, "_ctx_cds_source", lambda c: {"status": "ok", "inbound_count_30d": 0,
+        "latest_inbound_at": None, "latest_outbound_at": None, "outbound_evidence": []})
+    monkeypatch.setattr(srv, "_ctx_comm_source", lambda c: {"status": "no_exact_hit", "hits": []})
+
+    out = srv._context_builder_impl(email="a@b.com", include=["comm_context"])
+
+    assert out["factbook"]["status"] == "skipped"
+    assert out["cds"]["status"] == "skipped"
+    assert out["comm_context"]["status"] == "no_exact_hit"
+
+
+def test_impl_include_unknown_token_is_error(monkeypatch):
+    out = srv._context_builder_impl(email="a@b.com", include=["bogus"])
+    assert out == {"error": "unknown include value(s): bogus"}
+
+
 def test_impl_include_skips_excluded_sources(monkeypatch):
     called = {"factbook": False, "cds": False}
 

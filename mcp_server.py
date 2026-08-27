@@ -2244,13 +2244,21 @@ def _comm_lookup_impl(
 _ctx_factbook_source = factbook_client.factbook_source
 _ctx_cds_source = cds_live.cds_source
 
-_CTX_EMPTY_BY_SOURCE = {
-    "factbook": {"entities": [], "flags": {}},
-    "cds": {"inbound_count_30d": 0, "latest_inbound_at": None,
-            "latest_outbound_at": None, "outbound_evidence": []},
-    "comm": {"hits": []},
-}
+# Single source of truth lives in context_builder.py (shared with
+# context_builder.build_context's own per-source degrade-loud defaults) so
+# the two shapes never drift out of sync.
+_CTX_EMPTY_BY_SOURCE = ctxb.EMPTY_BY_SOURCE
 _CTX_MAX_COMM_HITS = 10
+
+# `include` accepts the spec vocabulary (factbook/cds/comm_context) and the
+# "comm" shorthand this module also uses internally as the deps-dict key;
+# both spellings map to the same `deps["comm"]` slot.
+_CTX_INCLUDE_TOKENS = {
+    "factbook": "factbook",
+    "cds": "cds",
+    "comm": "comm",
+    "comm_context": "comm",
+}
 
 
 def _ctx_comm_source(contact: dict) -> dict:
@@ -2260,13 +2268,28 @@ def _ctx_comm_source(contact: dict) -> dict:
     filtered down to exact hits (``context_builder.exact_hit`` — comm_lookup
     is fuzzy and a near-neighbor is not evidence), capped at
     ``_CTX_MAX_COMM_HITS`` newest-first. Semantic context only — never proof
-    of handling."""
+    of handling.
+
+    Degrade-loud: an error-passthrough dict (``{"error": True, ...}``) or a
+    degraded verdict (``{"degraded": True, ...}``) from ``_comm_lookup_impl``
+    means the backend itself is unhealthy, not that this contact has no
+    comm history — surfacing that as a clean ``no_exact_hit`` would hide a
+    search-index outage behind an empty (and therefore falsely reassuring)
+    result. Either signal short-circuits to ``status: "error:<detail>"``
+    immediately, before any further identifiers are tried.
+    """
     identifiers = [v for v in (contact.get("email"), contact.get("phone_e164"),
                                contact.get("name")) if v]
     by_id: dict = {}
     order: list = []
     for identifier in identifiers:
         resp = _comm_lookup_impl(query=identifier, limit=5)
+        if resp.get("error"):
+            detail = resp.get("message") or resp.get("code") or "comm_lookup error"
+            return {"status": f"error:{detail}", "hits": []}
+        if resp.get("degraded"):
+            detail = resp.get("note") or "index degraded"
+            return {"status": f"error:{detail}", "hits": []}
         for hit in (resp.get("hits") or []):
             if not ctxb.exact_hit(hit, contact):
                 continue
@@ -2305,7 +2328,10 @@ def _context_builder_impl(
         "comm": _ctx_comm_source,
     }
     if include is not None:
-        included = set(include)
+        unknown = sorted({tok for tok in include if tok not in _CTX_INCLUDE_TOKENS})
+        if unknown:
+            return {"error": f"unknown include value(s): {', '.join(unknown)}"}
+        included = {_CTX_INCLUDE_TOKENS[tok] for tok in include}
         for source in ("factbook", "cds", "comm"):
             if source not in included:
                 empty = _CTX_EMPTY_BY_SOURCE[source]
@@ -3341,9 +3367,11 @@ if HAS_MCP and FastMCP is not None:
                 message from this contact; used to compute
                 our_outbound_after_latest_inbound when CDS itself found no
                 inbound message (e.g. the message predates the 30-day window).
-            include: Optional subset of {"factbook", "cds", "comm"} — sources
-                not listed come back {"status": "skipped", ...} instead of
-                being queried.
+            include: Optional subset of {"factbook", "cds", "comm_context"}
+                ("comm" is also accepted as an alias for "comm_context") —
+                sources not listed come back {"status": "skipped", ...}
+                instead of being queried. Any other token returns
+                {"error": "unknown include value(s): ..."}.
 
         Returns a dict:
             {
@@ -3355,7 +3383,8 @@ if HAS_MCP and FastMCP is not None:
               "elapsed_ms": ...,
             }
 
-        On invalid input (no identifiers at all), returns {"error": "..."}.
+        On invalid input (no identifiers at all, or an unrecognized
+        `include` token), returns {"error": "..."}.
         """
         return _context_builder_impl(
             email=email, phone=phone, name=name, lead_id=lead_id,

@@ -113,6 +113,28 @@ def test_missing_token_degrades_without_network(monkeypatch):
     assert out["entities"] == [] and out["flags"] == {}
 
 
+def test_client_uses_short_same_backplane_timeout(monkeypatch):
+    # factbook-rpc is same-network (mcp-backplane), not a WAN hop -- 30s x 3
+    # retries x up to 3 identifiers could stall one context_builder call
+    # ~4.5 minutes on a hung peer, and ReadTimeout alone never trips the
+    # circuit breaker. 8s keeps the hung-peer worst case well under a minute.
+    assert fc.RPC_TIMEOUT_SECONDS == 8.0
+
+    captured = {}
+    real_client_cls = httpx.Client
+
+    class SpyClient(real_client_cls):
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", SpyClient)
+    monkeypatch.setattr(fc, "_transport",
+                        lambda: transport({"find_entity_by_attribute": HIT}))
+    fc.factbook_source({"email": "a@b.com", "phone_e164": None, "name": None})
+    assert captured.get("timeout") == fc.RPC_TIMEOUT_SECONDS
+
+
 def test_email_hit_stops_before_trying_phone(monkeypatch):
     monkeypatch.setattr(fc, "_transport", lambda: transport(
         {"find_entity_by_attribute": HIT}))

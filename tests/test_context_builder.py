@@ -27,6 +27,17 @@ def test_exact_hit_filters_fuzzy_false_positive():
     assert cb.exact_hit(jess, contact) is True
 
 
+def test_exact_hit_rejects_cross_field_digit_concatenation():
+    # No single field contains the contact's full phone digits, but the OLD
+    # concatenated-haystack implementation joined "channel"'s digits directly
+    # against "snippet"'s digits and spelled out the target number across the
+    # seam ("1484761" + "4094" == "14847614094") -- a false positive no field
+    # actually carries.
+    contact = {"email": None, "phone_e164": "+14847614094", "name": None}
+    hit = {"sender": "Ops Bot", "channel": "+1484761", "snippet": "ext 4094 for billing"}
+    assert cb.exact_hit(hit, contact) is False
+
+
 def test_derived_flag_true_false_unknown():
     contact = {"latest_inbound_at": "2026-08-27T14:00:00Z"}
     ok_after = {"status": "ok", "latest_inbound_at": None, "outbound_evidence":

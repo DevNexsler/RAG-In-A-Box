@@ -31,18 +31,27 @@ import os
 
 import psycopg
 
+from core.logging_setup import MAX_ERROR_CHARS, collapse
+
 CDS_ENV_VAR = "COMM_DATA_STORE_DSN"
 
-INBOUND_SQL = """
+# Predicates are assembled dynamically per-call from these FIXED strings --
+# never by interpolating a value into the SQL text, only the query's own
+# placeholders are ever value-bearing. `coalesce(%s, '')` on an absent
+# identifier used to match rows storing an empty-string column (an
+# email-only contact spuriously matching p.phone = ''), so an identifier
+# that isn't present on the contact contributes no predicate at all.
+_INBOUND_BASE_SQL = """
 select count(*), max(m.sent_at)
 from messages m
 join message_participants mp on mp.message_id = m.id
 join participants p on p.id = mp.participant_id
 where m.direction = 'inbound'
   and m.sent_at > now() - interval '30 days'
-  and (lower(p.email) = coalesce(lower(%s), '')
-       or p.phone = coalesce(%s, '') or p.phone_number = coalesce(%s, ''))
+  and ({predicate})
 """
+_INBOUND_EMAIL_PRED = "lower(p.email) = lower(%s)"
+_INBOUND_PHONE_PRED = "(p.phone = %s or p.phone_number = %s)"
 
 OUTBOUND_ACTIONS_SQL = """
 select created_at, operation,
@@ -89,8 +98,25 @@ def _ts(value):
 
 
 def fetch_inbound_summary(cur, email, phone) -> dict:
-    """Count + latest inbound message from this contact in the last 30 days."""
-    cur.execute(INBOUND_SQL, (email, phone, phone))
+    """Count + latest inbound message from this contact in the last 30 days.
+
+    Only identifiers actually present on the contact get a predicate (see
+    `_INBOUND_BASE_SQL`'s docstring note above) -- an email-only contact
+    never runs the phone predicate at all, so it can't match a row with an
+    empty-string phone/phone_number column.
+    """
+    preds, params = [], []
+    if email:
+        preds.append(_INBOUND_EMAIL_PRED)
+        params.append(email)
+    if phone:
+        preds.append(_INBOUND_PHONE_PRED)
+        params.extend([phone, phone])
+    if not preds:
+        return {"inbound_count_30d": 0, "latest_inbound_at": None}
+
+    sql = _INBOUND_BASE_SQL.format(predicate=" or ".join(preds))
+    cur.execute(sql, tuple(params))
     row = cur.fetchone()
     count, latest = (row[0], row[1]) if row else (0, None)
     return {"inbound_count_30d": count or 0, "latest_inbound_at": _ts(latest)}
@@ -206,7 +232,10 @@ def cds_source(contact: dict) -> dict:
         conn.rollback()  # close the read-only txn cleanly
     except Exception as exc:
         _reset_conn()
-        return {"status": f"error:{exc}", **_EMPTY}
+        # collapse (not bare str(exc)): a DSN-parse or auth failure can echo
+        # credentials into the exception text (same discipline as
+        # factbook_client._call_tool's error path).
+        return {"status": f"error:{collapse(exc, MAX_ERROR_CHARS)}", **_EMPTY}
 
     latest_outbound_at = outbound_evidence[0]["at"] if outbound_evidence else None
     return {

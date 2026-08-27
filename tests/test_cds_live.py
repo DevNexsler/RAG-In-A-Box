@@ -48,6 +48,34 @@ def test_inbound_summary_shape():
                    "latest_inbound_at": ts.isoformat()}
 
 
+def test_inbound_summary_email_only_omits_phone_predicate():
+    # An absent identifier must never contribute a `coalesce(%s, '')`-style
+    # predicate -- that used to spuriously match rows storing an
+    # empty-string p.phone/p.phone_number for an email-only contact.
+    cur = FakeCursor({"message_participants": [(0, None)]})
+    cds_live.fetch_inbound_summary(cur, "a@b.com", None)
+    assert len(cur.executed) == 1
+    sql = cur.executed[0]
+    assert "p.email" in sql
+    assert "p.phone" not in sql and "p.phone_number" not in sql
+
+
+def test_inbound_summary_phone_only_omits_email_predicate():
+    cur = FakeCursor({"message_participants": [(0, None)]})
+    cds_live.fetch_inbound_summary(cur, None, "+15550000000")
+    assert len(cur.executed) == 1
+    sql = cur.executed[0]
+    assert "p.phone" in sql and "p.phone_number" in sql
+    assert "p.email" not in sql
+
+
+def test_inbound_summary_no_identifiers_skips_query():
+    cur = FakeCursor({})
+    out = cds_live.fetch_inbound_summary(cur, None, None)
+    assert out == {"inbound_count_30d": 0, "latest_inbound_at": None}
+    assert cur.executed == []
+
+
 def test_cds_source_degrades_on_connection_error(monkeypatch):
     monkeypatch.setattr(cds_live, "_get_readonly_conn",
                         lambda: (_ for _ in ()).throw(RuntimeError("no dsn")))
