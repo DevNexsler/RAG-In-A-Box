@@ -19,7 +19,10 @@ array (verified 3957/3957 rows), each element shaped like
 ``{"kind": "to"|"cc"|"bcc"|"from", "address": "...", "name": "..."}``. The
 recipient(s) are the elements with ``kind = 'to'``. (``identity_evidence`` is
 present on only ~12% of rows, so it is not a reliable path; ``participants``
-is universal and is what lane 4 below uses.)
+is universal and is what lane 4 below uses.) ``RAW_EMAIL_SQL`` guards with
+``jsonb_typeof(...) = 'array'`` before the lateral unnest so a future
+non-array ``participants`` value on some row is skipped rather than raising
+and degrading the whole ``cds_source`` call.
 """
 
 from __future__ import annotations
@@ -59,11 +62,17 @@ order by m.sent_at desc limit 5
 """
 
 # Recipient path pinned by the Step 1 live probe: participants[] elements with
-# kind='to', matched case-insensitively against the contact's email.
+# kind='to', matched case-insensitively against the contact's email. The
+# jsonb_typeof guard sits on the raw_events JOIN (not the trailing WHERE) so
+# it gates which rows ever reach `jsonb_array_elements` in the LATERAL clause
+# below — a WHERE-only guard would run too late, after a non-array
+# `participants` value had already raised inside the unnest. This keeps a
+# future malformed payload from taking down the whole cds_source call.
 RAW_EMAIL_SQL = """
 select m.sent_at, r.payload->'data'->'object'->>'id'
 from messages m
 join raw_events r on r.id = m.raw_event_id
+  and jsonb_typeof(r.payload->'participants') = 'array'
 cross join lateral jsonb_array_elements(r.payload->'participants') as pt
 where m.direction = 'outbound' and m.source = 'zoho_mail'
   and pt->>'kind' = 'to'
@@ -90,33 +99,37 @@ def fetch_inbound_summary(cur, email, phone) -> dict:
 
 def fetch_outbound_evidence(cur, email, phone, lead_id) -> list[dict]:
     """Our-outbound evidence across every lane we can positively identify,
-    merged newest first. Each item: {"at", "lane", "op"/"ref"}.
+    merged newest first. Every item has the same shape:
+    {"lane", "at", "operation", "ref"}. outbound_actions carries its own
+    `operation` column value; the raw lanes don't have one in their payload,
+    so they're stamped with the operation implied by the lane itself
+    ("quo.sms.send" for raw_quo, "email.send" for raw_email).
     """
     channels = [v for v in (email, phone, lead_id) if v]
     items: list[dict] = []
     seen: set[tuple] = set()
 
-    def _add(at, lane, ref, **extra):
+    def _add(at, lane, operation, ref):
         at_iso = _ts(at)
         key = (at_iso, ref)
         if key in seen:
             return  # same evidence row surfaced by more than one lane
         seen.add(key)
-        items.append({"at": at_iso, "lane": lane, "ref": ref, **extra})
+        items.append({"lane": lane, "at": at_iso, "operation": operation, "ref": ref})
 
     cur.execute(OUTBOUND_ACTIONS_SQL, (channels,))
     for at, operation, ref in cur.fetchall():
-        _add(at, "outbound_actions", ref, op=operation)
+        _add(at, "outbound_actions", operation, ref)
 
     if phone:
         cur.execute(RAW_QUO_SQL, (phone,))
         for at, ref in cur.fetchall():
-            _add(at, "raw_quo", ref)
+            _add(at, "raw_quo", "quo.sms.send", ref)
 
     if email:
         cur.execute(RAW_EMAIL_SQL, (email,))
         for at, ref in cur.fetchall():
-            _add(at, "raw_email", ref)
+            _add(at, "raw_email", "email.send", ref)
 
     items.sort(key=lambda item: item["at"] or "", reverse=True)
     return items

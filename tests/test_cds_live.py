@@ -22,11 +22,22 @@ class FakeCursor:
 def test_outbound_evidence_merges_lanes_newest_first():
     ts1 = dt.datetime(2026, 8, 27, 15, tzinfo=dt.timezone.utc)
     ts2 = dt.datetime(2026, 8, 27, 16, tzinfo=dt.timezone.utc)
+    ts3 = dt.datetime(2026, 8, 27, 17, tzinfo=dt.timezone.utc)
+    # Distinct markers per raw lane (rather than the shared "raw_events" table
+    # name both RAW_QUO_SQL and RAW_EMAIL_SQL join against) so each lane gets
+    # its own canned row and all three lanes are exercised in one call.
     cur = FakeCursor({"outbound_actions": [(ts1, "quo.sms.send", "ref1")],
-                      "raw_events": [(ts2, "ACx")]})
+                      "source = 'quo'": [(ts2, "ACx")],
+                      "source = 'zoho_mail'": [(ts3, "<msg@pfg.io>")]})
     out = cds_live.fetch_outbound_evidence(cur, "a@b.com", "+15550000000", "7")
-    assert out[0]["at"] > out[1]["at"]
-    assert {o["lane"] for o in out} >= {"outbound_actions", "raw_quo"}
+    assert out[0]["at"] > out[1]["at"] > out[2]["at"]
+    by_lane = {o["lane"]: o for o in out}
+    assert set(by_lane) == {"outbound_actions", "raw_quo", "raw_email"}
+    for entry in out:
+        assert set(entry) == {"lane", "at", "operation", "ref"}
+    assert by_lane["outbound_actions"]["operation"] == "quo.sms.send"
+    assert by_lane["raw_quo"]["operation"] == "quo.sms.send"
+    assert by_lane["raw_email"]["operation"] == "email.send"
 
 
 def test_inbound_summary_shape():
