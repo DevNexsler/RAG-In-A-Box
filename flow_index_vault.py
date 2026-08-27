@@ -4857,7 +4857,9 @@ def maintain_index_if_idle(config_path: str = "config.yaml") -> dict:
             )
             with store.exclusive_writer_session():
                 store._finish_index_maintenance(store._vs.table, date.today())
-        return {"status": "maintained"}
+        # The finalizer best-effort skips later work after tag failure, so this
+        # reports only that maintenance was attempted, not guaranteed complete.
+        return {"status": "attempted"}
     except IndexWriteLockBusy:
         logger.info(
             "Lance maintenance deferred: an index writer holds table %r; "

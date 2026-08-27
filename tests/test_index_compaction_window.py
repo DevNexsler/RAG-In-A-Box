@@ -114,7 +114,7 @@ def test_maintenance_defers_while_an_index_writer_holds_the_table(tmp_path):
     store._finish_index_maintenance.assert_not_called()
 
 
-def test_maintenance_finishes_once_when_no_index_writer_holds_the_table(tmp_path):
+def test_maintenance_attempts_once_when_no_index_writer_holds_the_table(tmp_path):
     config = _config(tmp_path / "index")
     store = MagicMock()
     table = object()
@@ -126,5 +126,5 @@ def test_maintenance_finishes_once_when_no_index_writer_holds_the_table(tmp_path
     ):
         result = fiv.maintain_index_if_idle()
 
-    assert result == {"status": "maintained"}
+    assert result == {"status": "attempted"}
     store._finish_index_maintenance.assert_called_once_with(table, date.today())

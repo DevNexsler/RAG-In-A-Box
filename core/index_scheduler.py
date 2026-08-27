@@ -110,6 +110,16 @@ class IndexScheduler:
                 self._log.warning("scheduled drain failed: %s", exc)
                 actions.append(("drain_error", str(exc)))
 
+        # A restarted interrupted sweep is due immediately. Let cheap
+        # maintenance claim boot's idle writer window before that sweep can.
+        if self._due(self._last_maintenance, self.maintenance_interval_s, now):
+            self._last_maintenance = now
+            try:
+                actions.append(("maintenance", self._maintenance_fn()))
+            except Exception as exc:
+                self._log.warning("scheduled maintenance failed: %s", exc)
+                actions.append(("maintenance_error", str(exc)))
+
         if self._due(self._last_sweep, self.sweep_interval_s, now):
             # Advance the clock even when skipping, so a running sweep does not
             # cause a busy-retry on every tick.
@@ -130,14 +140,6 @@ class IndexScheduler:
             except Exception as exc:
                 self._log.warning("scheduled compaction failed: %s", exc)
                 actions.append(("compact_error", str(exc)))
-
-        if self._due(self._last_maintenance, self.maintenance_interval_s, now):
-            self._last_maintenance = now
-            try:
-                actions.append(("maintenance", self._maintenance_fn()))
-            except Exception as exc:
-                self._log.warning("scheduled maintenance failed: %s", exc)
-                actions.append(("maintenance_error", str(exc)))
 
         return actions
 

@@ -189,6 +189,36 @@ def test_seed_leaves_the_sweep_due_when_the_previous_run_was_interrupted():
     assert calls == {"drain": 1, "sweep": 1}
 
 
+def test_interrupted_boot_runs_maintenance_before_sweep_takes_writer_lock():
+    """Boot maintenance owns idle window before resumed sweep claims table."""
+    writer = {"held": False}
+    events = []
+
+    def maintenance_fn():
+        if writer["held"]:
+            return {"status": "writer_busy"}
+        events.append("maintenance")
+        return {"status": "attempted"}
+
+    def sweep_fn():
+        writer["held"] = True
+        events.append("sweep")
+        return {"pid": 1001}
+
+    sched, _ = _scheduler(
+        run_was_interrupted_fn=lambda: True,
+        maintenance_interval_s=3600,
+        maintenance_fn=maintenance_fn,
+        sweep_fn=sweep_fn,
+    )
+
+    sched.seed(now=1000.0)
+    actions = sched.tick(now=1000.0)
+
+    assert events == ["maintenance", "sweep"]
+    assert ("maintenance", {"status": "attempted"}) in actions
+
+
 def test_seed_still_suppresses_the_boot_sweep_after_a_clean_previous_run():
     sched, calls = _scheduler(run_was_interrupted_fn=lambda: False)
     sched.seed(now=1000.0)
