@@ -25,6 +25,9 @@ from lancedb_store import LanceDBStore, open_store_with_recovery
 from index_run_supervisor import IndexRunSupervisor, index_log_paths
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
+import cds_live
+import context_builder as ctxb
+import factbook_client
 import sor_query as sorq
 
 logger = logging.getLogger(__name__)
@@ -2231,6 +2234,125 @@ def _comm_lookup_impl(
     return _comm_lookup_enforce_budget(resp)
 
 
+# ---------------------------------------------------------------------------
+# context_builder: contact dossier (FactBook identity + CDS live evidence +
+# exact-filtered comm_context), see context_builder.py for the pure logic.
+# ---------------------------------------------------------------------------
+
+# Thin module-level aliases so tests can monkeypatch the source deps on this
+# (`mcp_server`) module without reaching into factbook_client/cds_live.
+_ctx_factbook_source = factbook_client.factbook_source
+_ctx_cds_source = cds_live.cds_source
+
+# Single source of truth lives in context_builder.py (shared with
+# context_builder.build_context's own per-source degrade-loud defaults) so
+# the two shapes never drift out of sync.
+_CTX_EMPTY_BY_SOURCE = ctxb.EMPTY_BY_SOURCE
+_CTX_MAX_COMM_HITS = 10
+
+# `include` accepts the spec vocabulary (factbook/cds/comm_context) and the
+# "comm" shorthand this module also uses internally as the deps-dict key;
+# both spellings map to the same `deps["comm"]` slot.
+_CTX_INCLUDE_TOKENS = {
+    "factbook": "factbook",
+    "cds": "cds",
+    "comm": "comm",
+    "comm_context": "comm",
+}
+
+
+def _ctx_comm_source(contact: dict) -> dict:
+    """Injectable ``comm`` dep for ``context_builder.build_context``: one
+    ``_comm_lookup_impl(query=identifier, limit=5)`` call per available
+    contact identifier (email, phone_e164, name), deduped by ``source_id``,
+    filtered down to exact hits (``context_builder.exact_hit`` — comm_lookup
+    is fuzzy and a near-neighbor is not evidence), capped at
+    ``_CTX_MAX_COMM_HITS`` newest-first. Semantic context only — never proof
+    of handling.
+
+    Degrade-loud, but hits still win when there are any: an error-passthrough
+    dict (``{"error": True, ...}``) or a degraded verdict
+    (``{"degraded": True, ...}``) from ``_comm_lookup_impl`` means that ONE
+    identifier's lookup is unhealthy — it does not mean the other
+    identifiers' real exact hits (or even hits carried alongside
+    ``degraded: True`` in the same response) should be thrown away. Hits are
+    accumulated across every identifier regardless of any single response's
+    degraded/error flag; only the first degraded/error detail seen is kept.
+    The overall call reports ``status: "error:<detail>"`` (no hits) if and
+    only if the final accumulated hit list is empty AND at least one
+    identifier degraded/errored — otherwise a non-empty hit list always wins
+    and comes back as ``status: "ok"`` (with the degradation surfaced in an
+    optional ``note``, never silently dropped).
+    """
+    identifiers = [v for v in (contact.get("email"), contact.get("phone_e164"),
+                               contact.get("name")) if v]
+    by_id: dict = {}
+    order: list = []
+    degrade_detail: str | None = None
+    for identifier in identifiers:
+        resp = _comm_lookup_impl(query=identifier, limit=5)
+        if resp.get("error"):
+            if degrade_detail is None:
+                degrade_detail = resp.get("message") or resp.get("code") or "comm_lookup error"
+        elif resp.get("degraded"):
+            if degrade_detail is None:
+                degrade_detail = resp.get("note") or "index degraded"
+        for hit in (resp.get("hits") or []):
+            if not ctxb.exact_hit(hit, contact):
+                continue
+            sid = hit.get("source_id") or id(hit)
+            if sid not in by_id:
+                order.append(sid)
+            by_id[sid] = hit
+    hits = [by_id[sid] for sid in order]
+    hits.sort(key=lambda h: h.get("sent_at") or "", reverse=True)
+    hits = hits[:_CTX_MAX_COMM_HITS]
+
+    if not hits and degrade_detail is not None:
+        return {"status": f"error:{degrade_detail}", "hits": []}
+    result = {"status": "ok" if hits else "no_exact_hit", "hits": hits}
+    if hits and degrade_detail is not None:
+        result["note"] = f"one or more comm_lookup identifiers degraded: {degrade_detail}"
+    return result
+
+
+def _context_builder_impl(
+    email: str | None = None,
+    phone: str | None = None,
+    name: str | None = None,
+    lead_id: str | None = None,
+    latest_inbound_at: str | None = None,
+    include: list[str] | None = None,
+) -> dict:
+    """Deterministic contact dossier. Never raises: invalid input (no
+    identifiers) becomes ``{"error": ...}``; per-source failures degrade
+    loud inside ``context_builder.build_context`` instead of raising."""
+    try:
+        contact = ctxb.normalize_contact(
+            email=email, phone=phone, name=name, lead_id=lead_id,
+            latest_inbound_at=latest_inbound_at,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    deps = {
+        "factbook": _ctx_factbook_source,
+        "cds": _ctx_cds_source,
+        "comm": _ctx_comm_source,
+    }
+    if include is not None:
+        unknown = sorted({tok for tok in include if tok not in _CTX_INCLUDE_TOKENS})
+        if unknown:
+            return {"error": f"unknown include value(s): {', '.join(unknown)}"}
+        included = {_CTX_INCLUDE_TOKENS[tok] for tok in include}
+        for source in ("factbook", "cds", "comm"):
+            if source not in included:
+                empty = _CTX_EMPTY_BY_SOURCE[source]
+                deps[source] = lambda c, empty=empty: {"status": "skipped", **empty}
+
+    return ctxb.build_context(contact, deps)
+
+
 def _file_get_chunk_impl(doc_id: str, loc: str) -> dict:
     if not doc_id or not doc_id.strip():
         return _error(
@@ -3232,6 +3354,54 @@ if HAS_MCP and FastMCP is not None:
             source_type=source_type,
             source_name=source_name,
             sort=sort,
+        )
+
+    @mcp.tool()
+    def context_builder(
+        email: str | None = None,
+        phone: str | None = None,
+        name: str | None = None,
+        lead_id: str | None = None,
+        latest_inbound_at: str | None = None,
+        include: list[str] | None = None,
+    ) -> dict:
+        """Deterministic contact dossier: FactBook identity, exact CDS comm
+        history + our-outbound evidence, exact-filtered comm context, and a
+        derived our_outbound_after_latest_inbound flag. At least one of
+        email/phone/name/lead_id is required. comm_context hits are semantic
+        context only — never proof of handling.
+
+        Args:
+            email: Contact email address.
+            phone: Contact phone number (any format; normalized to E.164).
+            name: Contact display name (used for FactBook + comm fallback).
+            lead_id: TenantCloud lead id.
+            latest_inbound_at: ISO-8601 timestamp of the latest known inbound
+                message from this contact; used to compute
+                our_outbound_after_latest_inbound when CDS itself found no
+                inbound message (e.g. the message predates the 30-day window).
+            include: Optional subset of {"factbook", "cds", "comm_context"}
+                ("comm" is also accepted as an alias for "comm_context") —
+                sources not listed come back {"status": "skipped", ...}
+                instead of being queried. Any other token returns
+                {"error": "unknown include value(s): ..."}.
+
+        Returns a dict:
+            {
+              "contact": {...},           # normalized identifiers
+              "factbook": {...},          # FactBook identity, or error/skipped
+              "cds": {...},               # CDS inbound/outbound evidence, or error/skipped
+              "comm_context": {...},      # exact-filtered semantic hits, or error/skipped
+              "derived": {"our_outbound_after_latest_inbound": true|false|"unknown"},
+              "elapsed_ms": ...,
+            }
+
+        On invalid input (no identifiers at all, or an unrecognized
+        `include` token), returns {"error": "..."}.
+        """
+        return _context_builder_impl(
+            email=email, phone=phone, name=name, lead_id=lead_id,
+            latest_inbound_at=latest_inbound_at, include=include,
         )
 
     @mcp.tool(description=sorq.build_sor_query_description())
