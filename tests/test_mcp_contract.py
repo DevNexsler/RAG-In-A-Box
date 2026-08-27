@@ -2563,8 +2563,8 @@ def test_file_status_health_reranker_disabled():
             mcp_server._cache = old_cache
 
 
-def test_file_status_refreshes_cache_after_lance_manifest_error(tmp_path):
-    """A stale Lance table handle should be reopened once before status fails."""
+def test_file_status_returns_retrieval_failed_without_rebuilding_for_lance_read_error(tmp_path):
+    """A store read error belongs to LanceDBStore recovery, not MCP retry logic."""
     old_cache = mcp_server._cache
     old_signature = getattr(mcp_server, "_cache_index_signature", None)
     old_identity = getattr(mcp_server, "_cache_identity", None)
@@ -2597,10 +2597,8 @@ def test_file_status_refreshes_cache_after_lance_manifest_error(tmp_path):
         ) as build:
             result = mcp_server._file_status_impl()
 
-        assert "error" not in result
-        assert result["doc_count"] == 1
-        assert result["chunk_count"] == 1
-        assert build.call_count == 1
+        assert result["code"] == "retrieval_failed"
+        assert build.call_count == 0
     finally:
         mcp_server._cache = old_cache
         mcp_server._cache_index_signature = old_signature
