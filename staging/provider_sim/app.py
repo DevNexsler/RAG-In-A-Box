@@ -279,7 +279,56 @@ async def embeddings(request: Request):
     inputs = body.get("input", [])
     if isinstance(inputs, str):
         inputs = [inputs]
-    for text in inputs:
+    for i, text in enumerate(inputs):
+        if not text:
+            # The gateway's own request validation, which runs before any
+            # upstream sees the batch: an empty input is rejected outright and
+            # takes the WHOLE batch with it, naming the offending slot
+            # (measured 2026-08-27, zod `too_small`). Because the input never
+            # gains characters, the rejection is permanent (#1687).
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": 400,
+                        "message": json.dumps(
+                            [
+                                {
+                                    "origin": "string",
+                                    "code": "too_small",
+                                    "minimum": 1,
+                                    "inclusive": True,
+                                    "path": ["input", i],
+                                    "message": (
+                                        "Too small: expected string to have "
+                                        ">=1 characters"
+                                    ),
+                                }
+                            ],
+                            indent=2,
+                        ),
+                    }
+                },
+            )
+        if not text.strip():
+            # One layer further in: an input that normalizes to nothing is
+            # rejected by the upstream provider instead. The real route does
+            # this *intermittently* — `[" "]` measured 400/400/200 across three
+            # runs, depending on which provider the gateway picked. The sim
+            # answers deterministically, and rejects: a simulator stricter than
+            # the real route cannot produce a false green, a more permissive
+            # one can (#1658).
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": 400,
+                        "message": (
+                            'HTTP 400: {"detail":"Prompt must not be empty"}'
+                        ),
+                    }
+                },
+            )
         if len(text) > MAX_EMBED_INPUT_CHARS:
             # Same shape OpenRouter returns when one input overruns the model's
             # context window: the WHOLE batch is rejected with a 400, and it
