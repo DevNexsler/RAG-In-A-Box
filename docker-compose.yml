@@ -62,6 +62,11 @@ services:
       # used-percent (#0232), so docker-health surfaces disk pressure
       # before ENOSPC takes the host down.
       - DISK_USAGE_MAX_PERCENT=${DISK_USAGE_MAX_PERCENT:-90}
+      # /health returns 503 (stale_tail) when a source index request has stayed
+      # queued longer than this (#1625). Thousands of successful writes say
+      # nothing about the tail: a long historical drain produces them while
+      # today's attachments wait, and this is the number that shows it.
+      - INDEX_PENDING_MAX_AGE_S=${INDEX_PENDING_MAX_AGE_S:-1800}
       # Disable Prefect's ephemeral-server auto-start (#0325). server.py runs
       # one persistent PrefectServer and exports PREFECT_API_URL, which index
       # subprocesses inherit; with ephemeral off, a missing PREFECT_API_URL
