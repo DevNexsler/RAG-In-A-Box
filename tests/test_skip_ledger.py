@@ -10,6 +10,7 @@ never permanently abandoned). A changed file is re-evaluated immediately.
 
 import threading
 from types import SimpleNamespace
+from unittest import mock
 
 import flow_index_vault as fiv
 from extractors import (
@@ -456,6 +457,27 @@ def test_transient_failure_is_not_quarantined(monkeypatch, caplog):
     assert runtime["skip_clean"] == {"documents::000dU"}
     assert "Deferring documents::000dU after transient processing failure" in caplog.text
     assert "Skipping documents::000dU after retries exhausted" not in caplog.text
+
+
+def test_transient_processing_failures_are_logged_as_deferred():
+    logger = mock.Mock()
+
+    fiv._log_failed_docs(
+        ["documents::transient", "documents::terminal"],
+        {"documents::transient"},
+        logger,
+    )
+
+    logger.info.assert_called_once_with(
+        "Deferred %d docs after transient processing failures: %s",
+        1,
+        ["documents::transient"],
+    )
+    logger.warning.assert_called_once_with(
+        "Failed to process %d docs: %s",
+        1,
+        ["documents::terminal"],
+    )
 
 
 # --- the Prefect task must not retry a deterministic failure ---

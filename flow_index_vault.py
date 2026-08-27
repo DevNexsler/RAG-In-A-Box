@@ -3082,6 +3082,26 @@ def _process_docs(
     return failed_docs
 
 
+def _log_failed_docs(
+    failed_docs: list[str],
+    transient_doc_ids: set[str],
+    logger,
+) -> None:
+    """Log transient deferrals apart from terminal document failures."""
+    transient_failures = [doc_id for doc_id in failed_docs if doc_id in transient_doc_ids]
+    terminal_failures = [doc_id for doc_id in failed_docs if doc_id not in transient_doc_ids]
+    if transient_failures:
+        logger.info(
+            "Deferred %d docs after transient processing failures: %s",
+            len(transient_failures),
+            transient_failures[:20],
+        )
+    if terminal_failures:
+        logger.warning(
+            "Failed to process %d docs: %s", len(terminal_failures), terminal_failures[:20]
+        )
+
+
 @task
 def delete_docs_task(doc_ids: list[str]) -> None:
     """Remove all chunk nodes for the given doc_ids."""
@@ -3932,8 +3952,7 @@ def index_vault_flow(
         failed_count=len(failed_docs),
     )
 
-    if failed_docs:
-        logger.warning("Failed to process %d docs: %s", len(failed_docs), failed_docs[:20])
+    _log_failed_docs(failed_docs, set(_RUNTIME.get("degraded_now", {})), logger)
 
     _flush_taxonomy_usage(taxonomy_store, _RUNTIME.get("taxonomy_usage"), logger)
 
