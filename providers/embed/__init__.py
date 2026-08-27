@@ -31,6 +31,10 @@ def build_embed_provider(config: dict) -> EmbedProvider:
           # Defaults to providers.embed.limits.resolve_max_input_tokens(model);
           # inputs longer than it are truncated instead of 400-ing the batch.
           max_input_tokens: 40960
+          # optional: override the route's per-input character cap, which some
+          # upstreams enforce on top of the token window (openrouter defaults
+          # to 131072 — DeepInfra's). 0 disables the character bound.
+          max_input_chars: 131072
     """
     emb_cfg = config.get("embeddings", {})
     provider = emb_cfg.get("provider", "gemini")
@@ -47,6 +51,7 @@ def build_embed_provider(config: dict) -> EmbedProvider:
             batch_size=emb_cfg.get("batch_size", 64),
             base_url=emb_cfg.get("base_url"),
             max_input_tokens=emb_cfg.get("max_input_tokens"),
+            max_input_chars=emb_cfg.get("max_input_chars"),
         )
 
     if provider == "baseten":

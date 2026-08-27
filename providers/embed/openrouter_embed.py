@@ -38,6 +38,16 @@ RETRY_BACKOFF = (2.0, 5.0, 15.0, 30.0, 60.0)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+# DeepInfra — the upstream OpenRouter routes qwen3-embedding to — caps a single
+# input at 131072 characters *on top of* the model's 40960-token window, and
+# rejects anything longer with a permanent 422 (#1655):
+#     Value error, The input sequence should have less than 131072 characters.
+# The two limits are not interchangeable: ordinary English prose tokenizes at
+# ~4.9 characters per token, so an input bounded only to the token window is
+# still ~180k characters and fails every time. Measured against the live
+# endpoint, 131072 characters is accepted and 131073 is not.
+DEFAULT_MAX_INPUT_CHARS = 131_072
+
 
 class OpenRouterEmbedProvider(EmbedProvider):
     """Embed via OpenRouter's /v1/embeddings endpoint.
@@ -57,6 +67,7 @@ class OpenRouterEmbedProvider(EmbedProvider):
         timeout: float = 120.0,
         base_url: str | None = None,
         max_input_tokens: int | None = None,
+        max_input_chars: int | None = None,
     ):
         self.model = model
         self.model_name = model  # alias for SemanticEmbeddingAdapter compatibility
@@ -66,6 +77,11 @@ class OpenRouterEmbedProvider(EmbedProvider):
         self.timeout = timeout
         self._base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
         self.max_input_tokens = max_input_tokens or resolve_max_input_tokens(model)
+        # Explicit None check, not `or`: 0 is the module's "no bound" value and
+        # has to stay reachable as an escape hatch if the route's cap changes.
+        self.max_input_chars = (
+            DEFAULT_MAX_INPUT_CHARS if max_input_chars is None else max_input_chars
+        )
 
         if not self.api_key:
             raise ValueError(
@@ -81,7 +97,10 @@ class OpenRouterEmbedProvider(EmbedProvider):
         5xx/429/timeouts; permanent 4xx raise straight through, carrying the
         upstream reason from the response body)."""
         texts = bound_inputs(
-            texts, self.max_input_tokens, label=f"openrouter-embed[{self.model}]",
+            texts,
+            self.max_input_tokens,
+            max_input_chars=self.max_input_chars,
+            label=f"openrouter-embed[{self.model}]",
         )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
