@@ -37,6 +37,7 @@ import uuid
 
 import httpx
 
+from core.logging_setup import MAX_ERROR_CHARS, collapse
 from core.resilience import call_with_retry, raise_for_status
 
 DEFAULT_RPC_URL = "http://factbook-rpc:8695"
@@ -158,7 +159,7 @@ def factbook_source(contact: dict) -> dict:
                 token=token,
             )
         except Exception as exc:  # noqa: BLE001 — degrade per identifier
-            errors.append(f"{attribute_key}: {exc}")
+            errors.append(f"{attribute_key}: {collapse(exc, MAX_ERROR_CHARS)}")
             continue
         flags = {k: out.get(k) for k in _FLAG_KEYS}
         entities = out.get("entities") or []
@@ -170,7 +171,7 @@ def factbook_source(contact: dict) -> dict:
         try:
             out = _call_tool("resolve_entities", {"query": name}, token=token)
         except Exception as exc:  # noqa: BLE001 — degrade, keep prior flags
-            errors.append(f"name: {exc}")
+            errors.append(f"name: {collapse(exc, MAX_ERROR_CHARS)}")
         else:
             entities = out.get("entities") or []
             if entities:
