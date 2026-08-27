@@ -91,6 +91,41 @@ def test_comm_source_error_passthrough_is_error(monkeypatch):
     assert out == {"status": "error:query must not be empty.", "hits": []}
 
 
+def test_comm_source_degraded_with_exact_hit_keeps_hit(monkeypatch):
+    # A degraded response can still carry a real hit alongside the degraded
+    # flag (found + degraded shape) -- that hit must not be discarded just
+    # because the same response also signals degradation.
+    contact = {"email": "jess@example.com", "phone_e164": None, "name": None}
+    hit = {"sender": "Jess", "channel": "jess@example.com", "snippet": "call back",
+           "source_id": "AC1", "sent_at": "2026-08-20T00:00:00Z"}
+    monkeypatch.setattr(srv, "_comm_lookup_impl", lambda **kw: {
+        "verdict": "found", "hits": [hit], "degraded": True,
+        "note": "Results are degraded — treat as lower confidence.",
+    })
+    out = srv._ctx_comm_source(contact)
+    assert out["status"] == "ok"
+    assert out["hits"] == [hit]
+
+
+def test_comm_source_partial_degraded_identifier_keeps_other_hits(monkeypatch):
+    # A clean hit from one identifier (email) must survive even when a
+    # DIFFERENT identifier's lookup (phone) comes back degraded/empty.
+    contact = {"email": "jess@example.com", "phone_e164": "+14847614094", "name": None}
+    hit = {"sender": "Jess", "channel": "jess@example.com", "snippet": "call back",
+           "source_id": "AC1", "sent_at": "2026-08-20T00:00:00Z"}
+
+    def fake_lookup(**kw):
+        if kw["query"] == contact["email"]:
+            return {"verdict": "found", "hits": [hit]}
+        return {"verdict": "not_found", "hits": [], "degraded": True,
+                "note": "Doc-Organizer search is unavailable/degraded; treat as inconclusive."}
+
+    monkeypatch.setattr(srv, "_comm_lookup_impl", fake_lookup)
+    out = srv._ctx_comm_source(contact)
+    assert out["status"] == "ok"
+    assert out["hits"] == [hit]
+
+
 def test_impl_include_accepts_comm_context_alias(monkeypatch):
     monkeypatch.setattr(srv, "_ctx_factbook_source", lambda c: {"status": "ok", "entities": [], "flags": {}})
     monkeypatch.setattr(srv, "_ctx_cds_source", lambda c: {"status": "ok", "inbound_count_30d": 0,

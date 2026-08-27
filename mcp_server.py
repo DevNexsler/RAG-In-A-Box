@@ -2270,26 +2270,33 @@ def _ctx_comm_source(contact: dict) -> dict:
     ``_CTX_MAX_COMM_HITS`` newest-first. Semantic context only — never proof
     of handling.
 
-    Degrade-loud: an error-passthrough dict (``{"error": True, ...}``) or a
-    degraded verdict (``{"degraded": True, ...}``) from ``_comm_lookup_impl``
-    means the backend itself is unhealthy, not that this contact has no
-    comm history — surfacing that as a clean ``no_exact_hit`` would hide a
-    search-index outage behind an empty (and therefore falsely reassuring)
-    result. Either signal short-circuits to ``status: "error:<detail>"``
-    immediately, before any further identifiers are tried.
+    Degrade-loud, but hits still win when there are any: an error-passthrough
+    dict (``{"error": True, ...}``) or a degraded verdict
+    (``{"degraded": True, ...}``) from ``_comm_lookup_impl`` means that ONE
+    identifier's lookup is unhealthy — it does not mean the other
+    identifiers' real exact hits (or even hits carried alongside
+    ``degraded: True`` in the same response) should be thrown away. Hits are
+    accumulated across every identifier regardless of any single response's
+    degraded/error flag; only the first degraded/error detail seen is kept.
+    The overall call reports ``status: "error:<detail>"`` (no hits) if and
+    only if the final accumulated hit list is empty AND at least one
+    identifier degraded/errored — otherwise a non-empty hit list always wins
+    and comes back as ``status: "ok"`` (with the degradation surfaced in an
+    optional ``note``, never silently dropped).
     """
     identifiers = [v for v in (contact.get("email"), contact.get("phone_e164"),
                                contact.get("name")) if v]
     by_id: dict = {}
     order: list = []
+    degrade_detail: str | None = None
     for identifier in identifiers:
         resp = _comm_lookup_impl(query=identifier, limit=5)
         if resp.get("error"):
-            detail = resp.get("message") or resp.get("code") or "comm_lookup error"
-            return {"status": f"error:{detail}", "hits": []}
-        if resp.get("degraded"):
-            detail = resp.get("note") or "index degraded"
-            return {"status": f"error:{detail}", "hits": []}
+            if degrade_detail is None:
+                degrade_detail = resp.get("message") or resp.get("code") or "comm_lookup error"
+        elif resp.get("degraded"):
+            if degrade_detail is None:
+                degrade_detail = resp.get("note") or "index degraded"
         for hit in (resp.get("hits") or []):
             if not ctxb.exact_hit(hit, contact):
                 continue
@@ -2300,7 +2307,13 @@ def _ctx_comm_source(contact: dict) -> dict:
     hits = [by_id[sid] for sid in order]
     hits.sort(key=lambda h: h.get("sent_at") or "", reverse=True)
     hits = hits[:_CTX_MAX_COMM_HITS]
-    return {"status": "ok" if hits else "no_exact_hit", "hits": hits}
+
+    if not hits and degrade_detail is not None:
+        return {"status": f"error:{degrade_detail}", "hits": []}
+    result = {"status": "ok" if hits else "no_exact_hit", "hits": hits}
+    if hits and degrade_detail is not None:
+        result["note"] = f"one or more comm_lookup identifiers degraded: {degrade_detail}"
+    return result
 
 
 def _context_builder_impl(
