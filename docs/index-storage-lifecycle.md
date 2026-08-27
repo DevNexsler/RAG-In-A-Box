@@ -189,6 +189,15 @@ docker compose start doc-organizer
   `disk_max_percent` for the index filesystem; at/above
   `DISK_USAGE_MAX_PERCENT` (default 90) the probe returns **503** with
   `status: disk_full` (#0232).
+- `GET /health` → `index_freshness` — tail currency, on every payload.
+  `newest_content_at` / `content_lag_s` are the content time of the newest item
+  the indexer has written (not when it wrote it), `pending_requests` /
+  `oldest_pending_age_s` the queued source work still unserved. Past
+  `INDEX_PENDING_MAX_AGE_S` the probe returns **503** with `status: stale_tail`:
+  newer work is not reaching the index even though tasks keep completing
+  (#1625). It clears itself when the backlog drains. Completed-task counts
+  cannot see this state — a long historical drain emits thousands of genuine
+  successes while today's attachments wait.
 - `indexer.log` — `FTS index optimized (incremental merge)` = healthy;
   `Lance version prune (…): reclaimed N bytes` = the prune is doing real work;
   `Lance orphan index prune (…): reclaimed N bytes (M index directories)` = dead
@@ -207,5 +216,6 @@ docker compose start doc-organizer
 | `LANCE_VERSION_RETENTION_MINUTES` | 30 | Prune versions older than this each run (#2), and the grace window that protects an uncommitted index build from the orphan-index sweep. 0 = prune all superseded. |
 | `LANCE_DAILY_RESTORE_POINTS` | 7 | Exactly this many `daily-*` restore-point tags kept (#3). 0 = disable tagging and drop existing daily tags. |
 | `DISK_USAGE_MAX_PERCENT` | 90 | `/health` 503s (`disk_full`) when the index filesystem is at/above this used-percent. |
+| `INDEX_PENDING_MAX_AGE_S` | 1800 | `/health` 503s (`stale_tail`) when a source index request has been queued longer than this (#1625). |
 
-All three are wired in `docker-compose.yml`.
+All four are wired in `docker-compose.yml`.

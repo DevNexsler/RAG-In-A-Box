@@ -7,9 +7,11 @@ import pytest
 
 from core.logging_setup import DEFAULT_FORMAT, SingleLineFormatter
 from core.resilience import (
+    TRANSIENT_STATUSES,
     TransientError,
     call_with_retry,
     is_transient,
+    raise_for_status,
 )
 
 
@@ -208,3 +210,114 @@ def test_transient_error_forces_retry():
 
     assert call_with_retry(fn, attempts=3, backoff=(0,), sleep=lambda *_: None) == 42
     assert calls["n"] == 2
+
+
+# --- raise_for_status: keep the reason on a permanent rejection (#1657) ------
+
+
+def _response(code, text="", url="https://openrouter.ai/api/v1/embeddings"):
+    return httpx.Response(code, text=text, request=httpx.Request("POST", url))
+
+
+def test_raise_for_status_attaches_the_response_body_to_a_permanent_error():
+    """The reason a permanent 4xx skipped the doc lives in the body, not the
+    status line — and a permanent error is never retried, so this log line is
+    the only account of it anyone gets (#1655 needed a live probe to recover it)."""
+    resp = _response(
+        422,
+        '{"error":{"message":"Value error, The input sequence should have less '
+        'than 131072 characters. Input length: 180439"}}',
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        raise_for_status(resp)
+
+    message = str(caught.value)
+    assert "less than 131072 characters" in message
+    # httpx's own text is the prefix: `except` clauses and the log-derived HTTP
+    # status parsing in deep health keep matching what they matched before.
+    assert "Client error '422 Unprocessable Entity'" in message
+    assert caught.value.response is resp
+    assert not is_transient(caught.value)
+
+
+@pytest.mark.parametrize("code", sorted(TRANSIENT_STATUSES))
+def test_raise_for_status_leaves_a_transient_error_alone(code):
+    """Retryable statuses are about to be retried; their body is noise until the
+    ladder runs out, and they must stay classifiable as transient."""
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        raise_for_status(_response(code, "upstream is busy, try later"))
+
+    assert "upstream is busy" not in str(caught.value)
+    assert is_transient(caught.value)
+
+
+def test_raise_for_status_truncates_and_flattens_an_unbounded_body():
+    """A provider body is untrusted text: one physical line, bounded length (#0546)."""
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        raise_for_status(_response(400, "line one\nline two " + "x" * 5000))
+
+    message = str(caught.value)
+    assert "line one line two" in message
+    assert "\n" not in message.split("response body: ", 1)[1]
+    assert len(message) < 1000
+
+
+def test_raise_for_status_keeps_the_original_error_when_the_body_is_empty():
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        raise_for_status(_response(404))
+
+    assert str(caught.value).endswith(
+        "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404"
+    )
+
+
+def test_raise_for_status_passes_a_success_through():
+    assert raise_for_status(_response(200, "{}")) is None
+
+
+def test_enriched_message_still_parses_to_its_true_http_status():
+    """The enriched line lands in indexer.log, which deep health parses with an
+    ordered tuple of regexes — one of which reads `"code": NNN` out of JSON. A
+    body can therefore carry a *different* number than the status; httpx's own
+    `Client error 'NNN'` text must stay in the message and keep winning, or
+    #0705's carve-out (400/413/422 = one bad document, not a provider outage)
+    silently stops applying."""
+    import mcp_server
+
+    resp = _response(
+        422,
+        '{"error":{"message":"HTTP 500: upstream said 503","code":500}}',
+    )
+    with pytest.raises(httpx.HTTPStatusError) as caught:
+        raise_for_status(resp)
+
+    line = (
+        "2026-08-26 12:00:00,000 ERROR prefect.flow_runs: Skipping "
+        f"comm_messages::zoho_mail/x after retries exhausted: {caught.value}"
+    )
+    assert mcp_server._http_status_from_log_line(line) == 422
+    assert mcp_server._provider_failure_kind(line) is None
+
+
+def test_raise_for_status_reads_a_streamed_body_before_raising():
+    """A streamed response has no body until something reads it, so `.text` raises
+    ResponseNotRead — which is the state every `client.stream(...)` call site is in
+    when the status turns out to be an error (ollama_vision, #1662). There is
+    nothing left to stream on a failure, so the reason has to be read here or it is
+    lost exactly where it is needed most."""
+    # content=iter(...) is what makes this a genuinely streamed body: httpx only
+    # populates `_content` eagerly for a bytes/text response.
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            422, content=iter([b"input too large for this model"])
+        )
+    )
+    with httpx.Client(transport=transport) as client:
+        with client.stream("POST", "http://vision.invalid/api/chat") as resp:
+            with pytest.raises(httpx.ResponseNotRead):
+                resp.text  # the precondition: unread while streaming
+            with pytest.raises(httpx.HTTPStatusError) as caught:
+                raise_for_status(resp)
+
+    assert "input too large for this model" in str(caught.value)

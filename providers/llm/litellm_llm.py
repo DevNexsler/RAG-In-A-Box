@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import os
 import time
@@ -15,7 +14,7 @@ from core.enrichment_telemetry import (
     record_structured_attempt,
     record_structured_retry,
 )
-from core.resilience import CIRCUITS, TransientError
+from core.resilience import CIRCUITS, TransientError, raise_for_status
 from core.route_contract import ROUTE_CONTRACTS
 from doc_enrichment import enrichment_response_schema, structured_response_is_usable
 from providers.llm.trace_recorder import LLMTraceRecorder
@@ -71,8 +70,6 @@ _ENRICHMENT_SCHEMA = {
     "schema": enrichment_response_schema(),
 }
 
-_REQUIRED_ENRICHMENT_FIELDS = ("summary", "doc_type")
-
 
 def _enrichment_request_policy(model: str, temperature: float) -> dict[str, Any]:
     """Return one centralized request policy for an enrichment model."""
@@ -89,7 +86,6 @@ def _enrichment_request_policy(model: str, temperature: float) -> dict[str, Any]
                 },
             },
             "system_prompt": _SYSTEM_PROMPT + _QWEN_BULK_QUALITY_INSTRUCTIONS,
-            "validate_structured_json": True,
             "retry_without_reasoning": False,
         }
     return {
@@ -101,21 +97,8 @@ def _enrichment_request_policy(model: str, temperature: float) -> dict[str, Any]
             "temperature": temperature,
         },
         "system_prompt": _SYSTEM_PROMPT,
-        "validate_structured_json": False,
         "retry_without_reasoning": True,
     }
-
-
-def _validate_enrichment_content(content: str) -> None:
-    """Reject malformed JSON and missing core enrichment fields before return."""
-    parsed = json.loads(content)
-    if not isinstance(parsed, dict):
-        raise ValueError("structured response must be a JSON object")
-    missing = [field for field in _REQUIRED_ENRICHMENT_FIELDS if not parsed.get(field)]
-    if missing:
-        raise ValueError(
-            "structured response missing required fields: " + ", ".join(missing)
-        )
 
 
 def _is_response_format_rejection(response: httpx.Response) -> bool:
@@ -273,15 +256,6 @@ class LiteLLMGenerator:
         signals = _truncation_signals(
             initial["response"], initial["request"]["payload"]
         )
-        # The alias is fixed in config; the contract behind it is the provider's
-        # to change. Report what this answer proved about it (#1154).
-        ROUTE_CONTRACTS.observe(
-            self.route,
-            requested_tokens=max_tokens,
-            completion_tokens=signals["completion_tokens"],
-            finish_reason=signals["finish_reason"],
-            backend=initial["response"].get("system_fingerprint"),
-        )
         first_pass_usable = self._is_usable(initial["content"], signals)
         record_structured_attempt(first_pass_usable=first_pass_usable)
         if first_pass_usable:
@@ -403,7 +377,10 @@ class LiteLLMGenerator:
                         headers=headers,
                         timeout=request_timeout,
                     )
-                    resp.raise_for_status()
+                        # A permanent 4xx keeps LiteLLM's reason: this route is
+                    # never retried past here, so the log line is the only
+                    # account of why the document was skipped (#1657/#1662).
+                raise_for_status(resp)
                 data = resp.json()
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 self.trace_recorder.record(
@@ -412,25 +389,30 @@ class LiteLLMGenerator:
                     success=True,
                     latency_ms=latency_ms,
                 )
+                # The alias is fixed in config; the contract behind it is the
+                # provider's to change. Every answer carries that evidence, so
+                # it is read here rather than off the returned one: an answer a
+                # retry below discards — cut mid-JSON at the budget, or refused
+                # for its response_format — is often the only one that ever
+                # reaches the boundary that proves the contract (#1154, #1629).
+                observed = _truncation_signals(data, attempt_payload)
+                ROUTE_CONTRACTS.observe(
+                    self.route,
+                    requested_tokens=observed["requested_tokens"],
+                    completion_tokens=observed["completion_tokens"],
+                    finish_reason=observed["finish_reason"],
+                    backend=data.get("system_fingerprint"),
+                )
                 raw_content = data["choices"][0]["message"].get("content")
                 content = raw_content.strip() if isinstance(raw_content, str) else ""
-                if self._request_policy["validate_structured_json"]:
-                    try:
-                        _validate_enrichment_content(content)
-                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                        last_exc = TransientError(
-                            f"LiteLLM structured response validation failed: {exc}"
-                        )
-                        if attempt == MAX_RETRIES - 1:
-                            break
-                        backoff = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                        logger.warning(
-                            "LiteLLM structured response failed validation; "
-                            "retrying in %.0fs...",
-                            backoff,
-                        )
-                        time.sleep(backoff)
-                        continue
+                # Content validity is not judged here. A structured answer
+                # that fails to yield the enrichment fields is evidence about
+                # this attempt, and retrying it inside the request loop throws
+                # that evidence away: only the last response is returned, so
+                # the outer seam scores a rescued document as a clean first
+                # pass and never reports what the discarded answer proved
+                # (#1650). ``generate_with_metadata`` owns the single validity
+                # judgement, its telemetry, and its one recovery request.
                 return {
                     "content": content,
                     "request": copy.deepcopy(trace_request),

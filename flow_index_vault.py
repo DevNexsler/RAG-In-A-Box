@@ -77,6 +77,7 @@ from attachment_context_refresh import (
 )
 from core import enrichment_telemetry, lance_session
 from core.config import filesystem_source_roots, load_config
+from core.index_freshness import content_timestamp, record_indexed_content
 from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
@@ -1029,6 +1030,27 @@ def _record_index_write(chunk_count: int) -> None:
         progress["indexed_chunks"] = (
             int(progress.get("indexed_chunks") or 0) + int(chunk_count)
         )
+
+
+def _record_freshness_watermark(doc_meta: Mapping[str, Any], mtime: float | None) -> None:
+    """Stamp the durable freshness watermark for one written document.
+
+    Sits next to _record_index_write because it answers the question the write
+    counters cannot: a run that wrote 2,129 chunks of 2023 mail is indistinguishable
+    from a current tail by count alone (#1625). Best-effort — freshness telemetry
+    must never fail a document that was indexed successfully.
+    """
+    index_root = _RUNTIME.get("index_root")
+    if index_root is None:
+        return
+    try:
+        record_indexed_content(
+            index_root,
+            doc_id=str(doc_meta.get("doc_id", "")),
+            content_at=content_timestamp(doc_meta, mtime=mtime),
+        )
+    except Exception:
+        pass
 
 
 def _run_progress_snapshot() -> dict[str, Any]:
@@ -2796,6 +2818,7 @@ def _process_doc_task(
             write_mode = "Upserted"
         logger.info(f"{write_mode} {len(nodes)} chunks: {doc_id}")
         _record_index_write(len(nodes))
+        _record_freshness_watermark(doc_meta, mtime)
 
         chunks = []
         for node in nodes:
@@ -2865,13 +2888,24 @@ def _bounded_executor_map(
             next_to_yield += 1
 
 
-def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
+def _process_docs(
+    docs: list[dict],
+    concurrency: int = 1,
+    *,
+    checkpoint: Callable[[], Any] | None = None,
+    checkpoint_every: int = 0,
+) -> list[str]:
     """Process a batch of docs. Return list of failed doc_ids.
 
     concurrency=1 is the serial baseline (identical to the pre-refactor loop).
     concurrency>1 uses a ThreadPoolExecutor; exceptions in one worker do not
     affect others. FTS index rebuild is deliberately NOT done here — it is
     invoked exactly once by the flow after all docs have been processed.
+
+    `checkpoint` runs every `checkpoint_every` documents with no worker in
+    flight — the yield point a many-hour run needs to serve work that arrived
+    after it started (#1625). The pool is not torn down between batches, so a
+    checkpoint costs one barrier, not a re-warm.
     """
     logger = _get_logger()
     failed_docs: list[str] = []
@@ -2994,11 +3028,15 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
             _advance_run_progress(skip_reasons=skip_reasons)
             _write_heartbeat(_RUNTIME.get("index_root"))
 
+    batch_size = max(int(checkpoint_every), concurrency) if checkpoint else 0
+
     if concurrency <= 1 or len(docs) <= 1:
-        for doc in docs:
+        for position, doc in enumerate(docs, start=1):
             bad = _run_one(doc)
             if bad is not None:
                 failed_docs.append(bad)
+            if batch_size and position % batch_size == 0:
+                checkpoint()
         if debug_concurrency:
             logger.info(
                 "concurrency-debug summary docs=%d concurrency=%d peak_active=%d failed=%d",
@@ -3018,17 +3056,21 @@ def _process_docs(docs: list[dict], concurrency: int = 1) -> list[str]:
         failed_docs.append(first_bad)
 
     from concurrent.futures import ThreadPoolExecutor
-    from itertools import islice
 
+    remaining = docs[1:]
+    stride = batch_size or max(1, len(remaining))
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        for result in _bounded_executor_map(
-            ex,
-            _run_one,
-            islice(docs, 1, None),
-            max_pending=concurrency,
-        ):
-            if result is not None:
-                failed_docs.append(result)
+        for start in range(0, len(remaining), stride):
+            for result in _bounded_executor_map(
+                ex,
+                _run_one,
+                remaining[start : start + stride],
+                max_pending=concurrency,
+            ):
+                if result is not None:
+                    failed_docs.append(result)
+            if batch_size:
+                checkpoint()
     if debug_concurrency:
         logger.info(
             "concurrency-debug summary docs=%d concurrency=%d peak_active=%d failed=%d",
@@ -3868,7 +3910,21 @@ def index_vault_flow(
     if concurrency > 1:
         logger.info("Processing %d docs with concurrency=%d", len(docs_to_process), concurrency)
     memory_observer.sample("phase_start", phase="process", doc_count=len(docs_to_process))
-    failed_docs = _process_docs(docs_to_process, concurrency=concurrency)
+    queue_cfg = config.get("index_queue", {})
+    failed_docs = _process_docs(
+        docs_to_process,
+        concurrency=concurrency,
+        # A shadow rebuild writes into a table that only exists if the whole
+        # rebuild succeeds, so a request served into it would be lost — and its
+        # queue row already completed — whenever promotion is withheld. Those
+        # runs keep the old behaviour and serve the queue once, on promotion.
+        checkpoint=(
+            None
+            if using_shadow_rebuild
+            else lambda: _service_index_queue(config, table_name)
+        ),
+        checkpoint_every=int(queue_cfg.get("sweep_service_every_docs", 16)),
+    )
     memory_observer.sample(
         "phase_finish",
         phase="process",
@@ -4425,6 +4481,9 @@ def _build_single_doc_runtime(
         {
             "_exclusive_writer_contexts": exclusive_contexts,
             "store": store,
+            # Same key the full flow sets, so the freshness watermark is stamped
+            # from whichever path indexed the document (#1625).
+            "index_root": Path(config["index_root"]),
             "memory_observer": memory_observer,
             "doc_id_store": doc_id_store,
             "embed_provider": embed_provider,
@@ -4679,6 +4738,59 @@ def _drain_index_requests(
         queue.complete(request)
         results[key] = result
     return results
+
+
+def _service_index_queue(config: dict, table_name: str) -> int:
+    """Serve pending targeted requests from inside a long full sweep.
+
+    The sweep holds the table writer lock for its whole run, so every other
+    servicing path is locked out for as long as it lasts: the scheduled
+    ``drain_index_queue`` is non-blocking and can only report ``writer_busy``,
+    and the post-run drain in ``_serialize_index_writer`` runs after the last
+    document. On 2026-08-26 that left 19 newer requests at ``attempts=0`` — the
+    oldest queued 5h28m — while 2,201 historical documents completed inside the
+    same window (#1625). The lock holder is the only thing that *can* serve
+    them, so it does, between document batches.
+
+    Deliberately the same ``_drain_index_requests`` the targeted and scheduled
+    paths use: dedupe, the skip ledger, degraded backoff and transient
+    retry/defer stay identical, and a request served here is bounded by
+    ``index_queue.sweep_service_limit`` so the sweep keeps advancing too.
+
+    Called with no sweep worker in flight. ``_index_document_unlocked`` rebuilds
+    _RUNTIME for its one document, so the sweep's own runtime is saved and
+    restored around it, and a failure here is logged rather than allowed to
+    sink a run that may be hours old.
+    """
+    store = _RUNTIME.get("store")
+    doc_id_store = _RUNTIME.get("doc_id_store")
+    index_root = _RUNTIME.get("index_root")
+    if store is None or doc_id_store is None or index_root is None:
+        return 0
+    saved_runtime = dict(_RUNTIME)
+    try:
+        queue = IndexRequestQueue(index_root)
+        if not queue.pending(table_name, limit=1):
+            return 0
+        results = _drain_index_requests(
+            config,
+            queue,
+            table_name,
+            store,
+            doc_id_store,
+            limit=int(config.get("index_queue", {}).get("sweep_service_limit", 16)),
+        )
+    except Exception:
+        _get_logger().exception("Serving queued index requests mid-sweep failed")
+        return 0
+    finally:
+        _RUNTIME.clear()
+        _RUNTIME.update(saved_runtime)
+    if results:
+        _get_logger().info(
+            "Served %d queued index request(s) during the sweep", len(results)
+        )
+    return len(results)
 
 
 def compact_index_if_idle(config_path: str = "config.yaml") -> dict:

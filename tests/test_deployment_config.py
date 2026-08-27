@@ -1,5 +1,7 @@
 """Deployment config contract tests."""
 
+import os
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -36,6 +38,12 @@ def test_staging_enrichment_exercises_production_litellm_path():
     assert enrichment["provider"] == "litellm"
     assert enrichment["base_url"] == "http://provider-sim:9999/api/v1"
     assert enrichment["api_key"] == "sim"
+
+
+def test_staging_embeddings_use_measured_qwen_context_window():
+    config = yaml.safe_load(Path("config.staging.yaml").read_text())
+
+    assert "max_input_tokens" not in config["embeddings"]
 
 
 def test_staging_cds_callbacks_require_semantic_acceptance():
@@ -82,6 +90,25 @@ def test_staging_compose_pins_disk_threshold_off_host_state():
     env = compose["services"]["doc-organizer-staging"]["environment"]
 
     assert env["DISK_USAGE_MAX_PERCENT"] == "100"
+
+
+def test_staging_compose_renders_configurable_host_ports():
+    """Concurrent staging projects need caller-selected host ports."""
+    rendered = subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.staging.yml", "config"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "STAGING_APP_PORT": "18101", "STAGING_SIM_PORT": "20102"},
+    )
+    compose = yaml.safe_load(rendered.stdout)
+
+    app_port = compose["services"]["doc-organizer-staging"]["ports"][0]
+    sim_port = compose["services"]["provider-sim"]["ports"][0]
+    assert app_port["published"] == "18101"
+    assert app_port["target"] == 7788
+    assert sim_port["published"] == "20102"
+    assert sim_port["target"] == 9999
 
 
 def test_compose_disables_prefect_ephemeral_server():

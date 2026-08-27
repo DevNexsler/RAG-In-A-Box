@@ -13,6 +13,11 @@ taxonomy label, a context-only alias node). The guard therefore lives at the
 provider boundary — the one place that knows which model, and so which limit,
 applies — rather than being re-derived at each call site.
 
+The token window is not the only such limit: a hosted route may also cap the
+*characters* of one input, independently (#1655). `bound_inputs` therefore
+takes both bounds and honours whichever binds first, and each provider
+supplies the caps its own route enforces.
+
 Lengths are measured with the same tokenizer LlamaIndex's SentenceSplitter
 uses for `chunk_size`, so "tokens" means one thing across the pipeline. It is
 an approximation of any given hosted model's own tokenizer, hence the headroom
@@ -73,38 +78,66 @@ def resolve_max_input_tokens(model: str | None) -> int:
 
 
 def bound_inputs(
-    texts: list[str], max_input_tokens: int, *, label: str = "embed",
+    texts: list[str],
+    max_input_tokens: int,
+    *,
+    max_input_chars: int = 0,
+    label: str = "embed",
 ) -> list[str]:
-    """Return `texts` with every input truncated to fit `max_input_tokens`.
+    """Return `texts` with every input truncated to fit the route's limits.
+
+    An input has to satisfy the model's token window *and*, where the route
+    declares one, its per-input character cap — the two are independent bounds,
+    not two spellings of one. Characters per token move with the content
+    (~3.3 for machine-generated headers, ~4.9 for English prose), so bounding
+    on tokens alone leaves inputs that a character-capped upstream rejects
+    with a permanent 4xx (#1655). Pass `max_input_chars=0` for a route that
+    caps only tokens.
 
     One vector per input is part of the EmbedProvider contract, so an oversized
     input is truncated rather than split. Nothing indexed is lost by this in
     practice: the long un-chunked bodies are whole-document or whole-context
     summaries whose text is also indexed through the normal chunked path.
     """
-    if max_input_tokens <= 0:
+    token_limit = (
+        max(1, int(max_input_tokens * TOKENIZER_HEADROOM)) if max_input_tokens > 0 else 0
+    )
+    char_limit = max(0, max_input_chars)
+    if not token_limit and not char_limit:
         return list(texts)
-    limit = max(1, int(max_input_tokens * TOKENIZER_HEADROOM))
 
     bounded: list[str] = []
     for text in texts:
-        # Every token is at least one character, so a text no longer than the
-        # limit in characters cannot exceed it in tokens — skip the tokenizer.
-        if len(text) <= limit:
-            bounded.append(text)
-            continue
-        measured = token_count(text)
-        if measured <= limit:
-            bounded.append(text)
-            continue
-        fitted = _truncate_to_tokens(text, limit)
-        logger.warning(
-            "%s: input of %d tokens exceeds the model's %d-token context — "
-            "truncated to %d tokens (%d of %d chars)",
-            label, measured, max_input_tokens, limit, len(fitted), len(text),
-        )
+        fitted = text
+        if char_limit and len(fitted) > char_limit:
+            fitted = fitted[:char_limit]
+            logger.warning(
+                "%s: input of %d chars exceeds the route's %d-char cap — "
+                "truncated to %d chars",
+                label, len(text), char_limit, len(fitted),
+            )
+        if token_limit:
+            fitted = _bound_to_tokens(fitted, token_limit, max_input_tokens, label)
         bounded.append(fitted)
     return bounded
+
+
+def _bound_to_tokens(text: str, limit: int, window: int, label: str) -> str:
+    """`text` truncated to `limit` tokens; `window` is the model's advertised one."""
+    # Every token is at least one character, so a text no longer than the limit
+    # in characters cannot exceed it in tokens — skip the tokenizer.
+    if len(text) <= limit:
+        return text
+    measured = token_count(text)
+    if measured <= limit:
+        return text
+    fitted = _truncate_to_tokens(text, limit)
+    logger.warning(
+        "%s: input of %d tokens exceeds the model's %d-token context — "
+        "truncated to %d tokens (%d of %d chars)",
+        label, measured, window, limit, len(fitted), len(text),
+    )
+    return fitted
 
 
 def _truncate_to_tokens(text: str, limit: int) -> str:

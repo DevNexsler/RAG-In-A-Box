@@ -6,7 +6,7 @@ from typing import Optional
 
 import httpx
 
-from core.resilience import call_with_retry
+from core.resilience import call_with_retry, raise_for_status
 from providers.ocr.base import OCRProvider
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,9 @@ class DeepSeekOCR2Local(OCRProvider):
                 files={"file": (file_path.name, image_bytes, mime)},
                 timeout=self.timeout,
             )
-            resp.raise_for_status()  # 504/5xx -> HTTPStatusError -> retried by the layer
+            # 504/5xx -> HTTPStatusError -> retried by the layer; a permanent
+            # rejection raises straight through carrying the service's reason.
+            raise_for_status(resp)
             return resp.json().get("text", "")
 
         return call_with_retry(

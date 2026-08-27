@@ -31,6 +31,43 @@ def normalize_target(target: str) -> str:
     return normalized
 
 
+def pending_backlog(index_root: str | Path, table_name: str) -> dict:
+    """Pending depth and the oldest pending request's creation time.
+
+    Read-only and side-effect free on purpose: ``/health`` asks this on every
+    poll, and constructing an ``IndexRequestQueue`` would create and migrate the
+    database as a side effect of a probe. No queue file yet means no backlog.
+    """
+    path = Path(index_root) / _QUEUE_FILENAME
+    empty = {"pending": 0, "oldest_created_at": None}
+    if not path.exists():
+        return empty
+    try:
+        connection = sqlite3.connect(
+            f"file:{path}?mode=ro",
+            uri=True,
+            timeout=_BUSY_TIMEOUT_MS / 1_000,
+        )
+    except sqlite3.Error:
+        return empty
+    try:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS pending, MIN(created_at) AS oldest_created_at
+            FROM index_requests
+            WHERE table_name = ? AND status = 'pending'
+            """,
+            (str(table_name).strip(),),
+        ).fetchone()
+    except sqlite3.Error:
+        return empty
+    finally:
+        connection.close()
+    if row is None:
+        return empty
+    return {"pending": int(row[0] or 0), "oldest_created_at": row[1]}
+
+
 @dataclass(frozen=True)
 class IndexRequest:
     id: int

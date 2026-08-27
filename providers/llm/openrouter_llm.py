@@ -17,6 +17,7 @@ from typing import Any, TypedDict
 
 import httpx
 
+from core.resilience import raise_for_status
 from doc_enrichment import enrichment_response_schema
 from providers.llm.trace_recorder import LLMTraceRecorder
 
@@ -169,7 +170,8 @@ class OpenRouterGenerator:
                     headers=headers,
                     timeout=request_timeout,
                 )
-                resp.raise_for_status()
+                # A permanent 4xx keeps OpenRouter's reason (#1657/#1662).
+                raise_for_status(resp)
                 data = resp.json()
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 self.trace_recorder.record(

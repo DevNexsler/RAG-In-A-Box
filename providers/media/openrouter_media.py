@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 
-from core.resilience import TransientError
+from core.resilience import TransientError, raise_for_status
 from providers.media.base import MediaPolicyError
 
 logger = logging.getLogger(__name__)
@@ -177,7 +177,7 @@ class OpenRouterMediaProvider:
             headers=headers,
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        raise_for_status(response)  # a permanent 4xx keeps OpenRouter's reason
         data = response.json()
         message = data["choices"][0]["message"]
         content_value = message.get("content", "")

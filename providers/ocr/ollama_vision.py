@@ -12,7 +12,7 @@ from typing import Optional
 
 import httpx
 
-from core.resilience import TransientError
+from core.resilience import TransientError, raise_for_status
 from providers.ocr.base import OCRProvider
 
 logger = logging.getLogger(__name__)
@@ -233,7 +233,9 @@ class OllamaVisionOCR(OCRProvider):
             with client.stream(
                 "POST", f"{self.base_url}/api/chat", json=payload
             ) as resp:
-                resp.raise_for_status()
+                # The body is unread while streaming; raise_for_status reads it
+                # on a permanent failure so the reason survives (#1662).
+                raise_for_status(resp)
                 for line in resp.iter_lines():
                     if time.monotonic() > deadline:
                         # Raising exits the context manager, which closes the

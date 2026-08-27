@@ -291,3 +291,80 @@ def test_litellm_generator_reports_the_route_contract_it_observed(caplog):
     ]
     assert len(flip) == 1
     assert "fp_ollama" in flip[0]
+
+
+_TRUNCATED_ENRICHMENT = (
+    '{"summary": "Quarterly maintenance report for the Ashfield site", '
+    '"doc_type": ["report"], "topics": ["maintenance", "boil'
+)
+
+
+def _qwen_budget_cut_response(completion_tokens: int = 16384) -> httpx.Response:
+    """The qwen-bulk shape: generation stopped at the budget, mid-JSON.
+
+    Captured 2026-08-26 in
+    ``.evals/llm-traces/2026-08-26-litellm-qwen-bulk.jsonl`` — sixteen answers
+    over three days ended exactly on the 16,384-token budget, and the cut JSON
+    fails the structured-JSON validation this route runs inside the request.
+    """
+    request = httpx.Request("POST", "http://litellm.local/v1/chat/completions")
+    return httpx.Response(
+        200,
+        json={
+            "id": "chatcmpl-4d9",
+            "model": "qwen-bulk",
+            "system_fingerprint": "vllm-0.27.2rc1.dev77+gac7509e2b-3c9ef796",
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": _TRUNCATED_ENRICHMENT},
+                }
+            ],
+            "usage": {"prompt_tokens": 9004, "completion_tokens": completion_tokens},
+        },
+        request=request,
+    )
+
+
+def _qwen_recovered_response() -> httpx.Response:
+    request = httpx.Request("POST", "http://litellm.local/v1/chat/completions")
+    return httpx.Response(
+        200,
+        json={
+            "id": "chatcmpl-4da",
+            "model": "qwen-bulk",
+            "system_fingerprint": "vllm-0.27.2rc1.dev77+gac7509e2b-3c9ef796",
+            "choices": [
+                {"finish_reason": "stop", "message": {"content": _VALID_ENRICHMENT}}
+            ],
+            "usage": {"prompt_tokens": 9004, "completion_tokens": 812},
+        },
+        request=request,
+    )
+
+
+def test_a_boundary_answer_the_request_retry_discards_is_still_observed(caplog):
+    """#1629: the answer that proves the contract is the one that gets retried.
+
+    A route that validates structured JSON inside the request loop never
+    returns its budget-truncated answers, so observing only the returned
+    response leaves the contract permanently unproven — the same silence
+    #1154 was built to break.
+    """
+    with patch(
+        "providers.llm.litellm_llm.httpx.post",
+        side_effect=[_qwen_budget_cut_response(), _qwen_recovered_response()],
+    ), patch("providers.llm.litellm_llm.time.sleep", return_value=None):
+        generator = LiteLLMGenerator(
+            model="qwen-bulk",
+            base_url="http://litellm.local/v1",
+            api_key="secret-key",
+        )
+        with caplog.at_level(logging.INFO, logger="core.route_contract"):
+            generator.generate("a large email thread", max_tokens=16384)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        BUDGET_ENFORCED in message and "qwen-bulk" in message for message in messages
+    ), messages
+    assert any("vllm-0.27.2rc1.dev77+gac7509e2b-3c9ef796" in m for m in messages)

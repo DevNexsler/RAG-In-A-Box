@@ -252,12 +252,23 @@ def test_index_update_ignores_zombie_pid_file(tmp_path, monkeypatch):
     pid_file = tmp_path / "indexer.pid"
     pid_file.write_text(str(zombie.pid))
 
+    class DummyProc:
+        pid = 424246
+
+        def poll(self):
+            return None
+
     try:
-        result = mcp_server._file_index_update_impl("config.yaml")
+        with patch("subprocess.Popen", return_value=DummyProc()):
+            result = mcp_server._file_index_update_impl("config.yaml")
+
         assert result.get("status") == "started", (
             f"Expected zombie PID to be ignored, got {result!r}"
         )
-        assert "pid" in result
+        assert result.get("pid") == 424246
+        assert pid_file.read_text() == "424246", (
+            "Zombie PID must be replaced with the newly supervised indexer PID"
+        )
     finally:
         zombie.wait()
         pid_file.unlink(missing_ok=True)
@@ -331,4 +342,27 @@ finally:
 
     assert not pid_file.exists(), (
         "PID file should be cleaned up by the subprocess even after an error"
+    )
+
+
+def test_unit_tier_refuses_to_launch_the_real_indexer(tmp_path):
+    """The tier-wide guard, not each call site, is what stops the leak (#1663).
+
+    A unit test that forgets to substitute a launcher must fail loudly instead of
+    detaching an `index_vault_flow` child that outlives the pytest session and
+    keeps issuing live provider calls."""
+    import sys
+
+    from index_run_supervisor import IndexRunSupervisor
+
+    supervisor = IndexRunSupervisor(tmp_path, monitor_interval=0.01)
+
+    with pytest.raises(BaseException, match="real detached indexer launcher"):
+        supervisor.start(
+            [sys.executable, "-c", "pass"],
+            log_path=tmp_path / "indexer.log",
+        )
+
+    assert not (tmp_path / "indexer.pid").exists(), (
+        "A refused launch must not leave a supervised PID behind"
     )

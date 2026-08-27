@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.config import filesystem_source_roots, load_config
+from core import index_freshness
 from core.artifacts import is_communication_sidecar
 from core.logging_setup import configure_logging_from_config
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
@@ -162,16 +163,6 @@ def _pid_is_indexer(pid: int) -> bool:
     return "index_vault_flow" in cmdline or "flow_index_vault" in cmdline
 
 
-def _looks_like_lance_stale_read(exc: Exception) -> bool:
-    """Return True for Lance read errors that can be fixed by reopening the table."""
-    message = str(exc).lower()
-    return (
-        "manifest was not found" in message
-        or "invalid range 0..0" in message
-        or "lanceerror(io)" in message
-    )
-
-
 def _resolve_indexer_pid(pid_file: Path) -> tuple[bool, int | None]:
     """Return whether the pid file points to a live indexer process.
 
@@ -267,6 +258,39 @@ def _disk_usage_max_percent() -> float:
     return val
 
 
+def _pending_request_max_age_s() -> float:
+    """Freshness SLO for queued source work (env-tunable via
+    INDEX_PENDING_MAX_AGE_S). Junk or out-of-range values fall back to the
+    default instead of silently disabling the check."""
+    raw = os.environ.get("INDEX_PENDING_MAX_AGE_S")
+    if raw is None:
+        return index_freshness.DEFAULT_MAX_PENDING_AGE_S
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return index_freshness.DEFAULT_MAX_PENDING_AGE_S
+    if val <= 0:
+        return index_freshness.DEFAULT_MAX_PENDING_AGE_S
+    return val
+
+
+def _index_freshness(config: dict, index_root: Path) -> dict:
+    """Tail currency and queued-request backlog, carried on every /health payload.
+
+    Completed-task counts cannot see a stale tail: a long historical drain
+    reports thousands of successful writes while newer source work waits
+    unserved (#1625). Empty dict when the freshness state can't be read
+    (telemetry must never break the probe)."""
+    try:
+        return index_freshness.freshness_summary(
+            index_root,
+            config.get("lancedb", {}).get("table", "chunks"),
+            max_pending_age_s=_pending_request_max_age_s(),
+        )
+    except Exception:
+        return {}
+
+
 def _index_disk_usage(index_root: Path) -> dict:
     """Disk telemetry for the filesystem backing the index, carried on every
     /health payload so operators see pressure trending, not just the 503.
@@ -297,14 +321,16 @@ def _health_probe(config: dict) -> tuple[dict, int]:
     503 is reserved for states that need operator attention: an indexer that
     is running but frozen (stale heartbeat — a freeze logs nothing, so this
     probe is the only thing that can catch it), a latest terminal index failure
-    with no newer success, an FTS index whose last rebuild failed (keyword
-    search silently going stale, #0106), and an index filesystem at/above its
-    high-water mark (#0232). Disk telemetry rides on every payload; when
-    several conditions hold at once, the most urgent one (disk) names the
-    status but the others keep their fields.
+    with no newer success, source work that has stayed queued past the freshness
+    SLO (a stale tail behind a long historical drain, #1625), an FTS index whose
+    last rebuild failed (keyword search silently going stale, #0106), and an
+    index filesystem at/above its high-water mark (#0232). Disk and freshness
+    telemetry ride on every payload; when several conditions hold at once, the
+    most urgent one (disk) names the status but the others keep their fields.
     """
     index_root = Path(config["index_root"])
     disk = _index_disk_usage(index_root)
+    freshness = _index_freshness(config, index_root)
     index_run = _get_index_run_supervisor(config).status_summary()
     current_run = index_run.get("current")
     if isinstance(current_run, dict):
@@ -318,6 +344,8 @@ def _health_probe(config: dict) -> tuple[dict, int]:
         "index_run": index_run,
     }
     payload.update(disk)
+    if freshness:
+        payload["index_freshness"] = freshness
     if running:
         hb = index_root / "indexer.heartbeat"
         max_age = float(os.environ.get("INDEXER_HEARTBEAT_MAX_AGE", "1800"))
@@ -347,6 +375,7 @@ def _health_probe(config: dict) -> tuple[dict, int]:
                     "max_age_s": max_age,
                     "detail": "indexer running but not progressing (frozen?)",
                     **disk,
+                    **({"index_freshness": freshness} if freshness else {}),
                 },
                 503,
             )
@@ -359,6 +388,15 @@ def _health_probe(config: dict) -> tuple[dict, int]:
         payload["detail"] = (
             f"latest index attempt ended {terminal['status']}; "
             "last successful index is older or absent"
+        )
+        status_code = 503
+    if freshness.get("stale_tail"):
+        payload["status"] = "stale_tail"
+        payload["detail"] = (
+            f"{freshness['pending_requests']} source request(s) queued, oldest "
+            f"{round(freshness['oldest_pending_age_s'])}s old (SLO "
+            f"{round(freshness['max_pending_age_s'])}s) — newer work is not "
+            "reaching the index"
         )
         status_code = 503
     fts_failed = _fts_rebuild_failed_count(index_root)
@@ -2369,21 +2407,8 @@ def _file_status_impl() -> dict:
         doc_ids = store.list_doc_ids()
         chunk_count = store.count_chunks()
     except Exception as exc:
-        if not _looks_like_lance_stale_read(exc):
-            return _error("retrieval_failed", f"Failed to read index status: {exc}",
-                           "Check that the index exists (run file_index_update).")
-        logger.warning("Refreshing LanceDB store after stale/corrupt read during status: %s", exc)
-        global _cache, _cache_index_signature, _cache_identity
-        _cache = None
-        _cache_index_signature = None
-        _cache_identity = None
-        try:
-            store, embed_provider, config = _get_deps()
-            doc_ids = store.list_doc_ids()
-            chunk_count = store.count_chunks()
-        except Exception as retry_exc:
-            return _error("retrieval_failed", f"Failed to read index status: {retry_exc}",
-                           "Check that the index exists (run file_index_update).")
+        return _error("retrieval_failed", f"Failed to read index status: {exc}",
+                       "Check that the index exists (run file_index_update).")
 
     import json
     index_root = Path(config["index_root"])

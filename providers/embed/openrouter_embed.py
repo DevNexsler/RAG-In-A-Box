@@ -15,7 +15,12 @@ import os
 
 import httpx
 
-from core.resilience import RateLimitError, TransientError, call_with_retry
+from core.resilience import (
+    RateLimitError,
+    TransientError,
+    call_with_retry,
+    raise_for_status,
+)
 from providers.embed.base import EmbedProvider
 from providers.embed.limits import bound_inputs, resolve_max_input_tokens
 
@@ -32,6 +37,16 @@ MAX_RETRIES = 5
 RETRY_BACKOFF = (2.0, 5.0, 15.0, 30.0, 60.0)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# DeepInfra — the upstream OpenRouter routes qwen3-embedding to — caps a single
+# input at 131072 characters *on top of* the model's 40960-token window, and
+# rejects anything longer with a permanent 422 (#1655):
+#     Value error, The input sequence should have less than 131072 characters.
+# The two limits are not interchangeable: ordinary English prose tokenizes at
+# ~4.9 characters per token, so an input bounded only to the token window is
+# still ~180k characters and fails every time. Measured against the live
+# endpoint, 131072 characters is accepted and 131073 is not.
+DEFAULT_MAX_INPUT_CHARS = 131_072
 
 
 class OpenRouterEmbedProvider(EmbedProvider):
@@ -52,6 +67,7 @@ class OpenRouterEmbedProvider(EmbedProvider):
         timeout: float = 120.0,
         base_url: str | None = None,
         max_input_tokens: int | None = None,
+        max_input_chars: int | None = None,
     ):
         self.model = model
         self.model_name = model  # alias for SemanticEmbeddingAdapter compatibility
@@ -61,6 +77,11 @@ class OpenRouterEmbedProvider(EmbedProvider):
         self.timeout = timeout
         self._base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
         self.max_input_tokens = max_input_tokens or resolve_max_input_tokens(model)
+        # Explicit None check, not `or`: 0 is the module's "no bound" value and
+        # has to stay reachable as an escape hatch if the route's cap changes.
+        self.max_input_chars = (
+            DEFAULT_MAX_INPUT_CHARS if max_input_chars is None else max_input_chars
+        )
 
         if not self.api_key:
             raise ValueError(
@@ -73,9 +94,13 @@ class OpenRouterEmbedProvider(EmbedProvider):
 
     def _call_embeddings(self, texts: list[str]) -> list[list[float]]:
         """Call /v1/embeddings via the shared resilience layer (retries transient
-        5xx/429/timeouts; permanent 4xx raise straight through)."""
+        5xx/429/timeouts; permanent 4xx raise straight through, carrying the
+        upstream reason from the response body)."""
         texts = bound_inputs(
-            texts, self.max_input_tokens, label=f"openrouter-embed[{self.model}]",
+            texts,
+            self.max_input_tokens,
+            max_input_chars=self.max_input_chars,
+            label=f"openrouter-embed[{self.model}]",
         )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -89,7 +114,9 @@ class OpenRouterEmbedProvider(EmbedProvider):
                 headers=headers,
                 timeout=self.timeout,
             )
-            resp.raise_for_status()  # 5xx/429 -> HTTPStatusError -> retried by the layer
+            # 5xx/429 -> HTTPStatusError -> retried by the layer; a permanent 4xx
+            # raises straight through carrying OpenRouter's reason (#1657).
+            raise_for_status(resp)
             data = resp.json()
             if "data" not in data:
                 # OpenRouter wraps upstream provider failures (e.g. Nebius 429 quota)

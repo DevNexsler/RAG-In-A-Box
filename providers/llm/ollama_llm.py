@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import time
 
+from core.resilience import raise_for_status
 from doc_enrichment import enrichment_response_schema
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ class OllamaGenerator:
 
         try:
             resp = httpx.get(f"{self.base_url}/api/tags", timeout=5.0)
-            resp.raise_for_status()
+            raise_for_status(resp)  # keep why the probe failed, not just its status
         except Exception as exc:
             raise RuntimeError(
                 f"Cannot reach Ollama at {self.base_url}. "
@@ -163,7 +164,9 @@ class OllamaGenerator:
                 )
                 if resp.status_code != 200:
                     self._check_ollama()
-                    resp.raise_for_status()
+                    # A permanent rejection is never retried, so this raise is the
+                    # only account of it — carry Ollama's reason with it (#1662).
+                    raise_for_status(resp)
 
                 self._model_loaded = True
                 data = resp.json()

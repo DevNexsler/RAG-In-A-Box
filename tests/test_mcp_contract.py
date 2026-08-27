@@ -2563,8 +2563,8 @@ def test_file_status_health_reranker_disabled():
             mcp_server._cache = old_cache
 
 
-def test_file_status_refreshes_cache_after_lance_manifest_error(tmp_path):
-    """A stale Lance table handle should be reopened once before status fails."""
+def test_file_status_returns_retrieval_failed_without_rebuilding_for_lance_read_error(tmp_path):
+    """A store read error belongs to LanceDBStore recovery, not MCP retry logic."""
     old_cache = mcp_server._cache
     old_signature = getattr(mcp_server, "_cache_index_signature", None)
     old_identity = getattr(mcp_server, "_cache_identity", None)
@@ -2597,10 +2597,8 @@ def test_file_status_refreshes_cache_after_lance_manifest_error(tmp_path):
         ) as build:
             result = mcp_server._file_status_impl()
 
-        assert "error" not in result
-        assert result["doc_count"] == 1
-        assert result["chunk_count"] == 1
-        assert build.call_count == 1
+        assert result["code"] == "retrieval_failed"
+        assert build.call_count == 0
     finally:
         mcp_server._cache = old_cache
         mcp_server._cache_index_signature = old_signature
@@ -3131,6 +3129,109 @@ def test_health_probe_counterless_reconciled_run_is_not_a_failure(tmp_path, heal
     assert payload["indexer"] == "idle"
     assert payload["index_run"]["latest_terminal"]["status"] == "unknown"
     assert payload["index_run"]["unresolved_failure"] is False
+
+
+def _queue_pending_request(index_root, *, age_s: float, target: str = "mm0.bin"):
+    """One pending source request that has been waiting `age_s` seconds."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    from core.index_request_queue import IndexRequestQueue
+
+    queue = IndexRequestQueue(index_root)
+    request = queue.enqueue("chunks", "documents", target)
+    created_at = (
+        datetime.now(timezone.utc) - timedelta(seconds=age_s)
+    ).isoformat()
+    with sqlite3.connect(queue.path) as connection:
+        connection.execute(
+            "UPDATE index_requests SET created_at = ? WHERE id = ?",
+            (created_at, request.id),
+        )
+    return queue, request
+
+
+def test_health_probe_carries_index_freshness_on_every_payload(tmp_path, healthy_disk):
+    """Tail currency is telemetry, not just an alert: it rides on the ok payload
+    so an operator can watch it trend (#1625)."""
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload["index_freshness"]["pending_requests"] == 0
+    assert payload["index_freshness"]["stale_tail"] is False
+    assert payload["index_freshness"]["newest_content_at"] is None
+
+
+def test_health_probe_stale_tail_503s_behind_a_healthy_looking_indexer(
+    tmp_path, healthy_disk
+):
+    """The #1625 shape exactly: a live run, a fresh heartbeat, thousands of
+    successful writes — and source work that has been queued for hours. /health
+    returned 200 through all of it. Now the queue age names the state."""
+    import json
+
+    (tmp_path / "indexer.heartbeat").write_text("beat")
+    (tmp_path / "index_run_state.json").write_text(
+        json.dumps(_live_index_run_state(62_000))
+    )
+    _queue_pending_request(tmp_path, age_s=19_680)  # the observed 5h28m wait
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "stale_tail"
+    assert payload["indexer"] == "running"
+    assert payload["index_freshness"]["pending_requests"] == 1
+    assert payload["index_freshness"]["oldest_pending_age_s"] == pytest.approx(
+        19_680, abs=10
+    )
+    assert "not reaching the index" in payload["detail"]
+
+
+def test_health_probe_stale_tail_clears_when_the_backlog_drains(
+    tmp_path, healthy_disk
+):
+    """The alert recovers by itself — nothing has to acknowledge or reset it."""
+    queue, request = _queue_pending_request(tmp_path, age_s=7_200)
+
+    _payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+    assert status_code == 503
+
+    queue.complete(request)
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["index_freshness"]["stale_tail"] is False
+
+
+def test_health_probe_stale_tail_respects_its_env_slo(tmp_path, healthy_disk):
+    """Queue traffic inside the SLO is normal; only work that waits past it is
+    a stale tail."""
+    _queue_pending_request(tmp_path, age_s=600)
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+    assert status_code == 200
+    assert payload["index_freshness"]["pending_requests"] == 1
+
+    with patch.dict(os.environ, {"INDEX_PENDING_MAX_AGE_S": "300"}):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "stale_tail"
+    assert payload["index_freshness"]["max_pending_age_s"] == 300.0
+
+
+def test_health_probe_stale_tail_composes_with_disk_fields(tmp_path):
+    """Both conditions keep their fields; disk-full names the status (#0910)."""
+    _queue_pending_request(tmp_path, age_s=7_200)
+
+    with patch("mcp_server.shutil.disk_usage", return_value=_disk_usage(95)):
+        payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "disk_full"
+    assert payload["index_freshness"]["stale_tail"] is True
 
 
 def test_file_status_exposes_last_attempt_success_and_terminal_freshness(tmp_path):

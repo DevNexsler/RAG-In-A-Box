@@ -550,6 +550,11 @@ def test_vector_search_recovers_from_stale_store_handle():
         store.upsert_nodes([
             _make_node("a.md", "c:0", "apple banana", [1.0] + [0.0] * 767),
         ])
+        # A peer writer moves the table past this handle — what actually makes
+        # the handle below stale, and what read recovery keys on.
+        LanceDBStore(tmpdir, "test_chunks").upsert_nodes([
+            _make_node("b.md", "c:0", "cherry date", [0.0] * 768),
+        ])
 
         class _StaleTable:
             def search(self, *args, **kwargs):
@@ -3215,6 +3220,11 @@ def test_keyword_search_recovers_from_stale_store_handle():
             _make_node_with_meta("a.md", "c:0", "banana fruit tropical", vec, source_type="md"),
         ])
         store.create_fts_index()
+        # A peer writer moves the table past this handle — what actually makes
+        # the handle below stale, and what read recovery keys on.
+        LanceDBStore(tmpdir, "test_chunks").upsert_nodes([
+            _make_node_with_meta("b.md", "c:0", "cherry date", vec, source_type="md"),
+        ])
 
         class _StaleTable:
             def search(self, *args, **kwargs):
@@ -3230,6 +3240,64 @@ def test_keyword_search_recovers_from_stale_store_handle():
         hits = store.keyword_search("banana tropical", top_k=10)
         assert len(hits) == 1
         assert hits[0].doc_id == "a.md"
+
+
+def test_read_survives_a_second_table_swap_landing_inside_its_own_recovery():
+    """Schema evolution swaps the whole <table>.lance directory, so every open
+    read handle is left pointing at deleted files. A sweep on a new index does
+    that once per new metadata sub-field, in bursts — so the swap that follows
+    can land inside the reopen a read is already recovering through, and one
+    reopen is not enough (#1656)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [0.0] * 768
+        writer = LanceDBStore(tmpdir, "test_chunks")
+
+        def widen(**new_fields):
+            writer.upsert_nodes([
+                _make_node_with_meta("a.md", f"c:{i}", f"cobalt vestibule {i}", vec,
+                                     source_type="md", **new_fields)
+                for i in range(3)
+            ])
+
+        widen()
+        reader = LanceDBStore(tmpdir, "test_chunks")
+        assert len(reader.get_doc_chunks("a.md")) == 3  # warm the handle
+
+        # The next swap in the burst arrives while the reader is reopening.
+        # Widening is idempotent, so this fires exactly once.
+        reopen = reader._reopen_vector_store
+
+        def reopen_then_writer_swaps_again():
+            reopen()
+            widen(dup_count="2", dup_sources="quo")
+
+        reader._reopen_vector_store = reopen_then_writer_swaps_again
+        widen(dup_locations="c:0")
+
+        assert len(reader.get_doc_chunks("a.md")) == 3
+
+
+def test_read_failure_over_an_unmoved_table_reaches_the_caller():
+    """Recovery is for handles the writer moved out from under. A failure over a
+    table that has not moved is a real retrieval failure: retrying it would only
+    hide a broken index behind an empty-looking result (#1656)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        LanceDBStore(tmpdir, "test_chunks").upsert_nodes([
+            _make_node_with_meta("a.md", "c:0", "cobalt vestibule", [0.0] * 768,
+                                 source_type="md"),
+        ])
+        store = LanceDBStore(tmpdir, "test_chunks")  # handle is up to date
+
+        attempts = []
+
+        def _failing_read():
+            attempts.append(1)
+            # Wording of a stale-handle error, over a table nothing has touched.
+            raise RuntimeError("Not found: data/index/test_chunks.lance/data/abc123.lance")
+
+        with pytest.raises(RuntimeError):
+            store._run_read_with_recovery(_failing_read, [])
+        assert len(attempts) == 1
 
 
 # --- get_chunk / get_doc_chunks comprehensive tests ---
