@@ -83,3 +83,47 @@ def test_compaction_does_not_open_a_store_when_not_due(tmp_path):
 
     assert result["status"] == "not_due"
     open_store.assert_not_called()
+
+
+def test_maintenance_defers_while_an_index_writer_holds_the_table(tmp_path):
+    config = _config(tmp_path / "index")
+    store = MagicMock()
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_the_table():
+        with index_write_lock(config["index_root"], "chunks"):
+            acquired.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_the_table)
+    holder.start()
+    try:
+        assert acquired.wait(5)
+        with (
+            patch.object(fiv, "load_config", return_value=config),
+            patch.object(fiv, "open_store_with_recovery", return_value=store),
+        ):
+            result = fiv.maintain_index_if_idle()
+    finally:
+        release.set()
+        holder.join(5)
+
+    assert result == {"status": "writer_busy"}
+    store._finish_index_maintenance.assert_not_called()
+
+
+def test_maintenance_finishes_once_when_no_index_writer_holds_the_table(tmp_path):
+    config = _config(tmp_path / "index")
+    store = MagicMock()
+    table = object()
+    store._vs.table = table
+
+    with (
+        patch.object(fiv, "load_config", return_value=config),
+        patch.object(fiv, "open_store_with_recovery", return_value=store),
+    ):
+        result = fiv.maintain_index_if_idle()
+
+    assert result == {"status": "maintained"}
+    store._finish_index_maintenance.assert_called_once_with(table, date.today())
