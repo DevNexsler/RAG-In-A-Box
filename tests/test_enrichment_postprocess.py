@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from core.enrichment_postprocess import canonicalize_doc_type, repair_enrichment
 
 
@@ -93,6 +95,130 @@ def test_repair_disabled_returns_equal_copy():
 
     assert repaired == enrichment
     assert repaired is not enrichment
+
+
+def test_explicit_bare_correction_repairs_reversed_summary_when_postprocess_disabled():
+    enrichment = {
+        "enr_summary": "The corrected name is Shawn, not Sean.",
+        "enr_key_facts": json.dumps(["The corrected name is Shawn, not Sean."]),
+    }
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Correction: changed from Shawn to Sean.",
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    expected = "Correction: Sean (not Shawn)."
+    assert repaired["enr_summary"] == expected
+    assert json.loads(repaired["enr_key_facts"]) == [expected]
+
+
+def test_labeled_arrow_correction_repairs_reversed_summary_when_postprocess_disabled():
+    enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Husband name: Shawn -> Sean",
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
+def test_labeled_arrow_with_annotation_repairs_reversed_summary_when_postprocess_disabled():
+    enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Husband name: Shawn -> Sean; confirmed by sender.",
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
+def test_labeled_arrow_with_parenthetical_annotation_repairs_reversed_summary_when_postprocess_disabled():
+    enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Husband name: Shawn -> Sean (confirmed)",
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
+def test_explicit_email_correction_and_semicolon_inversion_are_grounded():
+    enrichment = {"enr_summary": "Contact remains old@example.com; not new@example.com."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Correction from old@example.com to new@example.com.",
+        title="Contact correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: new@example.com (not old@example.com)."
+
+
+def test_explicit_labeled_equals_arrow_correction_is_grounded():
+    enrichment = {"enr_summary": "The corrected ID is old-42, not new-43."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Account ID: old-42 => new-43",
+        title="Account correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: new-43 (not old-42)."
+
+
+def test_update_without_correction_cue_does_not_reverse_valid_summary():
+    enrichment = {"enr_summary": "Departure is Boston, not New York."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Updated itinerary: travel from Boston to New York.",
+        title="Travel update",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired == enrichment
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Correction from Shawn to Sean\nConfirmed by sender.",
+        "Correction from Shawn to Sean (confirmed by sender).",
+    ],
+)
+def test_unquoted_correction_annotation_does_not_become_part_of_corrected_value(text):
+    enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text=text,
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
 
 
 def test_enabled_rules_can_limit_repair_to_importance_only():

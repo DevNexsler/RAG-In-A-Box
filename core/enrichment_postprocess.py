@@ -8,6 +8,29 @@ _TOKEN_RE = re.compile(r"[a-z0-9$,.#/-]+", re.IGNORECASE)
 _LABEL_SEPARATOR_RE = re.compile(r"[-_ ]+")
 _DATE_RE = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b")
 _MONEY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d{2})?")
+_EXPLICIT_CORRECTION_PATTERNS = (
+    re.compile(
+        r"\b(?:correction|corrected|correcting)\b[^\n.]{0,80}?\bfrom\s+"
+        r"[\"'“”‘’](?P<old>[^\"'“”‘’\n]+)[\"'“”‘’]\s+to\s+"
+        r"[\"'“”‘’](?P<new>[^\"'“”‘’\n]+)[\"'“”‘’]",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:correction|corrected|correcting)\b[^\n.]{0,80}?\bfrom\s+"
+        r"(?P<old>\S(?:.*?\S)?)\s+to\s+(?P<new>\S(?:.*?\S)?)"
+        r"(?=(?:\s*(?:[;,]|\.(?:\s|$)|\(|—)|\s*$|\n))",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"[\"'“”‘’](?P<old>[^\"'“”‘’\n]+)[\"'“”‘’]\s*(?:->|=>|→)\s*"
+        r"[\"'“”‘’](?P<new>[^\"'“”‘’\n]+)[\"'“”‘’]"
+    ),
+    re.compile(
+        r"(?m)^\s*(?:[-*]\s*)?(?:[^:\n]{1,80}:\s*)?"
+        r"(?P<old>\S(?:.*?\S)?)\s*(?:->|=>|→)\s*(?P<new>\S(?:.*?\S)?)"
+        r"(?=\s*(?:[;,]|\.(?:\s|$)|\(|—|$))"
+    ),
+)
 
 _STOPWORDS = {
     "a",
@@ -183,11 +206,12 @@ def repair_enrichment(
     enabled_rules: Iterable[str] | None = None,
 ) -> dict[str, str]:
     repaired = dict(enrichment)
+    source_text = _document_text(text)
+    repaired = _repair_explicit_corrections(repaired, source_text)
     if not enabled:
         return repaired
     rules = _rule_set(enabled_rules)
 
-    source_text = _document_text(text)
     corpus = "\n".join(
         part for part in (title, source_type, source_text, _metadata_corpus(repaired)) if part
     )
@@ -209,6 +233,52 @@ def repair_enrichment(
             corpus_lower=corpus_lower,
         )
     return repaired
+
+
+def _repair_explicit_corrections(enrichment: dict[str, str], source_text: str) -> dict[str, str]:
+    """Replace only generated assertions that invert an explicit source correction."""
+    repaired = dict(enrichment)
+    for old, new in _explicit_corrections(source_text):
+        canonical = f"Correction: {new} (not {old})."
+        if _reverses_correction(repaired.get("enr_summary", ""), old, new):
+            repaired["enr_summary"] = canonical
+
+        facts = _fact_values(repaired.get("enr_key_facts", ""))
+        reversed_facts = [fact for fact in facts if _reverses_correction(fact, old, new)]
+        if reversed_facts:
+            repaired["enr_key_facts"] = json.dumps(
+                [canonical, *(fact for fact in facts if fact not in reversed_facts)]
+            )
+    return repaired
+
+
+def _explicit_corrections(source_text: str) -> list[tuple[str, str]]:
+    corrections: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for pattern in _EXPLICIT_CORRECTION_PATTERNS:
+        for match in pattern.finditer(source_text):
+            old = " ".join(match.group("old").split()).strip()
+            new = " ".join(match.group("new").split()).strip()
+            identity = (old.casefold(), new.casefold())
+            if not old or not new or identity[0] == identity[1] or identity in seen:
+                continue
+            corrections.append((old, new))
+            seen.add(identity)
+    return corrections
+
+
+def _reverses_correction(value: str, old: str, new: str) -> bool:
+    """Return whether text presents old value as correct and new value as wrong."""
+    old_re = re.escape(old)
+    new_re = re.escape(new)
+    return bool(
+        re.search(
+            rf"(?<!\w){old_re}(?!\w)[^\n]{{0,120}}?\b(?:not|rather than|instead of)\b\s*"
+            rf"(?<!\w){new_re}(?!\w)",
+            value,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _document_text(text: str) -> str:
