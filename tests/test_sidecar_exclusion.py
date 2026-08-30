@@ -31,6 +31,54 @@ def test_detects_sidecar_without_schema_version(tmp_path):
     assert _is_communication_sidecar(p) is True
 
 
+def test_detects_legacy_flat_attachment_review_sidecar(tmp_path):
+    """Pre-schema review manifests flatten message/media fields at top level."""
+    p = tmp_path / "photo.jpg.json"
+    _write(
+        p,
+        {
+            "message_id": "msg-1",
+            "provider_file_id": "file-1",
+            "filename": "photo.jpg",
+            "mime": "image/jpeg",
+            "retrieval_status": "saved",
+            "local_path": "/documents/photo.jpg",
+            "classification": "routine progress photo",
+            "visual_review": "Kitchen cabinet installation is complete.",
+        },
+    )
+    assert _is_communication_sidecar(p) is True
+
+
+def test_detects_legacy_flat_metadata_only_sidecar(tmp_path):
+    p = tmp_path / "attachment.metadata-only.json"
+    _write(
+        p,
+        {
+            "source_message_id": "msg-2",
+            "provider_file_id": "file-2",
+            "filename": "attachment.heic",
+            "mime_type": "image/heic",
+            "retrieval_status": "metadata_only",
+        },
+    )
+    assert _is_communication_sidecar(p) is True
+
+
+def test_flat_document_metadata_is_not_a_legacy_sidecar(tmp_path):
+    p = tmp_path / "export.json"
+    _write(
+        p,
+        {
+            "message_id": "business-record-1",
+            "filename": "quarterly-report.pdf",
+            "mime_type": "application/pdf",
+            "classification": "confidential",
+        },
+    )
+    assert _is_communication_sidecar(p) is False
+
+
 def test_legit_json_data_is_not_a_sidecar(tmp_path):
     p = tmp_path / "config.json"
     _write(p, {"setting": "value", "items": [1, 2, 3]})
@@ -44,9 +92,21 @@ def test_json_with_media_word_but_no_object_not_sidecar(tmp_path):
 
 
 def test_scan_skips_sidecars_keeps_real_docs(tmp_path):
-    # one sidecar, one real text doc, one real json data file
+    # modern + token-bearing legacy sidecars, one text doc, one real JSON file
     _write(tmp_path / "email-attachments/dan/msg1__mm0.json",
            {"schema_version": 2, "message": {"id": 1}, "media": {"storage_path": "a.pdf"}})
+    _write(
+        tmp_path / "quo-attachments/photo.jpg@00old@.json",
+        {
+            "message_id": "msg-1",
+            "provider_file_id": "file-1",
+            "filename": "photo.jpg",
+            "mime": "image/jpeg",
+            "retrieval_status": "saved",
+            "local_path": "/documents/photo.jpg",
+            "visual_review": "Kitchen cabinet installation is complete.",
+        },
+    )
     (tmp_path / "notes").mkdir()
     (tmp_path / "notes" / "real.txt").write_text("genuine document content")
     _write(tmp_path / "data" / "config.json", {"k": "v"})
@@ -58,6 +118,7 @@ def test_scan_skips_sidecars_keeps_real_docs(tmp_path):
     paths = {r["rel_path"] for r in records}
     # scan injects @ID@ into filenames, so match on stem, not full name.
     assert not any("msg1__mm0" in p for p in paths), "sidecar should be skipped"
+    assert not any("photo.jpg" in p for p in paths), "legacy sidecar should be skipped"
     assert any("real" in p and p.endswith(".txt") for p in paths), "real text doc should index"
     assert any("config" in p and p.endswith(".json") for p in paths), "legit json data should index"
     assert len(records) == 2, f"only the 2 real docs, got {len(records)}: {paths}"
