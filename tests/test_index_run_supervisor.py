@@ -533,6 +533,122 @@ def test_startup_reconciles_counterless_missing_run_as_nonblocking_unknown(tmp_p
     assert summary["unresolved_failure"] is False
 
 
+def test_startup_reconciles_counterless_run_behind_predecessor_heartbeat(tmp_path):
+    """A finished predecessor's stamp is history, not concurrent-run evidence.
+
+    Production 2026-08-30 05:16:53: run 513047d3 completed at 05:14:39 and left
+    its stamp in the single reused heartbeat file; run 4ca55ff6 then died in
+    flow startup before its first stamp. The predecessor's run id made the
+    no-evidence reconcile look foreign, so #1058's non-blocking path was never
+    reachable in production and /health went back to 503 (#1827).
+    """
+    active = {
+        "run_id": "4ca55ff6fc894c6dae16c86f854a526d",
+        "status": "running",
+        "pid": 919191,
+        "pgid": 919191,
+        "source_name": None,
+        "started_at": "2026-08-30T05:16:45+00:00",
+        "peak_rss_bytes": 99,
+    }
+    (tmp_path / "index_run_state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "current": active,
+                "last_attempt": active,
+                "last_success": None,
+            }
+        )
+    )
+    (tmp_path / "indexer.heartbeat").write_text(
+        json.dumps(
+            {
+                "run_id": "513047d3ed32452f9b8e6e7984f2148b",
+                "updated_at": "2026-08-30T05:14:39.807000+00:00",
+                "phase": "completed",
+                "queued": 13,
+                "processed": 13,
+                "skipped": 13,
+            }
+        )
+    )
+
+    from index_run_supervisor import IndexRunSupervisor
+
+    supervisor = IndexRunSupervisor(
+        tmp_path,
+        pid_alive=lambda _pid: False,
+        process_matches=lambda _pid: True,
+        monitor_interval=0.01,
+    )
+    summary = supervisor.status_summary()
+
+    assert summary["current"] is None
+    assert summary["last_attempt"]["status"] == "unknown"
+    assert summary["last_attempt"]["terminal_reason"] == "process_missing_on_reconcile"
+    assert summary["unresolved_failure"] is False
+
+
+def test_startup_keeps_counterless_run_lost_behind_a_concurrent_heartbeat(tmp_path):
+    """Only a stamp this run could not have preceded proves another indexer ran."""
+    cases = {
+        # Stamped after this run started: a second indexer really was active.
+        "concurrent": {
+            "run_id": "another-run",
+            "updated_at": "2026-08-30T05:17:10+00:00",
+            "phase": "process",
+            "queued": 13,
+            "processed": 2,
+            "skipped": 0,
+        },
+        # Undatable stamps cannot be placed before this run: stay fail-closed.
+        "undated": {"run_id": "another-run", "phase": "process"},
+        "naive": {
+            "run_id": "another-run",
+            "updated_at": "2026-08-30T05:14:39.807000",
+            "phase": "process",
+        },
+    }
+
+    from index_run_supervisor import IndexRunSupervisor
+
+    for case, heartbeat in cases.items():
+        root = tmp_path / case
+        root.mkdir()
+        active = {
+            "run_id": "4ca55ff6fc894c6dae16c86f854a526d",
+            "status": "running",
+            "pid": 919191,
+            "pgid": 919191,
+            "source_name": None,
+            "started_at": "2026-08-30T05:16:45+00:00",
+            "peak_rss_bytes": 99,
+        }
+        (root / "index_run_state.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "current": active,
+                    "last_attempt": active,
+                    "last_success": None,
+                }
+            )
+        )
+        (root / "indexer.heartbeat").write_text(json.dumps(heartbeat))
+
+        supervisor = IndexRunSupervisor(
+            root,
+            pid_alive=lambda _pid: False,
+            process_matches=lambda _pid: True,
+            monitor_interval=0.01,
+        )
+        summary = supervisor.status_summary()
+
+        assert summary["last_attempt"]["status"] == "lost", case
+        assert summary["unresolved_failure"] is True, case
+
+
 def test_shutdown_terminates_process_group_and_records_terminal_signal(tmp_path):
     process = FakeProcess()
     signals: list[tuple[int, int]] = []
