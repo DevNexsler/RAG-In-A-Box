@@ -118,6 +118,31 @@ def test_scan_leaves_non_cliq_message_text_and_hash_unchanged():
     assert record.change_hash == expected_hash
 
 
+def test_scan_preserves_plain_text_meaningful_urls():
+    text = "Review the permit at https://permits.example/cases/ABC-123?view=public"
+    source, _ = _source([_message("plain-link", text, source="zoho_mail")], [])
+
+    [record] = list(source.scan())
+
+    assert record.metadata["_text"] == text
+
+
+def test_scan_keeps_html_anchor_text_but_not_link_or_image_targets():
+    text = """
+    <html><body>
+      <p>Review <a href="https://tracker.example/r?token=secret">permit ABC-123</a>.</p>
+      <img src="https://assets.example/pixel.gif?recipient=secret">
+    </body></html>
+    """
+    source, _ = _source([_message("html-link", text, source="zoho_mail")], [])
+
+    [record] = list(source.scan())
+
+    assert "Review permit ABC-123." in record.metadata["_text"]
+    assert "tracker.example" not in record.metadata["_text"]
+    assert "assets.example" not in record.metadata["_text"]
+
+
 def test_scan_preserves_opaque_source_message_ids_verbatim():
     """Ticket #0618: the ledger holds keys like
     `zoho_cliq/1780327866430%2015958014910122`, which looked like an `_` that

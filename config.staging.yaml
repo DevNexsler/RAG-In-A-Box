@@ -125,6 +125,7 @@ chunking:
   max_chars: 1800
   overlap: 200
   min_chars: 150
+  max_chunks_per_document: 64
 
 enrichment:
   enabled: true
