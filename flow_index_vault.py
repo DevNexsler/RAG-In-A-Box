@@ -4693,6 +4693,7 @@ def _drain_index_requests(
     *,
     limit: int,
     prioritize: tuple[str, str] | None = None,
+    on_progress: Callable[[], Any] | None = None,
 ) -> dict[tuple[str, str], dict]:
     """Process one bounded queue snapshot without retrying failures in-place."""
     results: dict[tuple[str, str], dict] = {}
@@ -4723,6 +4724,8 @@ def _drain_index_requests(
                 "target": request.target,
                 "revision": request.revision,
             }
+            if on_progress is not None:
+                on_progress()
             continue
 
         if result.get("status") == "error" and result.get("reason") != "not_found":
@@ -4734,9 +4737,13 @@ def _drain_index_requests(
                 "target": request.target,
                 "revision": request.revision,
             }
+            if on_progress is not None:
+                on_progress()
             continue
         queue.complete(request)
         results[key] = result
+        if on_progress is not None:
+            on_progress()
     return results
 
 
@@ -4779,6 +4786,10 @@ def _service_index_queue(config: dict, table_name: str) -> int:
             store,
             doc_id_store,
             limit=int(config.get("index_queue", {}).get("sweep_service_limit", 16)),
+            # Targeted work can take minutes per document. Without a stamp
+            # between requests, a healthy batch can exceed the 30-minute
+            # freeze threshold and make /health report a false stall (#1876).
+            on_progress=lambda: _write_heartbeat(index_root),
         )
     except Exception:
         _get_logger().exception("Serving queued index requests mid-sweep failed")

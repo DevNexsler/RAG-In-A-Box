@@ -315,7 +315,16 @@ def _index_disk_usage(index_root: Path) -> dict:
 
 async def _run_health_probe(probe, config: dict) -> tuple[dict, int]:
     """Run synchronous probe work without blocking the HTTP event loop."""
-    return await asyncio.to_thread(probe, config)
+    payload, status_code = await asyncio.to_thread(probe, config)
+    if status_code >= 500:
+        logger.error(
+            "Health probe failed: probe=%s http_status=%d status=%s detail=%s",
+            getattr(probe, "__name__", type(probe).__name__),
+            status_code,
+            payload.get("status", "unknown"),
+            payload.get("detail", "unspecified"),
+        )
+    return payload, status_code
 
 
 def _health_probe(config: dict) -> tuple[dict, int]:

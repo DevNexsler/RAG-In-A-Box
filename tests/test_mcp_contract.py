@@ -2,6 +2,7 @@
 
 No external services needed. Uses mocks and direct function calls."""
 
+import logging
 import os
 import re
 import threading
@@ -2767,6 +2768,27 @@ async def test_slow_provider_probe_does_not_block_liveness_probe():
         assert status_code == 200
         assert payload == {"status": "ok"}
         release_slow.set()
+
+
+@pytest.mark.anyio
+async def test_failed_health_probe_logs_its_condition(caplog):
+    """Container logs must identify which health condition returned 503."""
+    with caplog.at_level(logging.ERROR, logger="mcp_server"):
+        payload, status_code = await mcp_server._run_health_probe(
+            lambda _config: (
+                {
+                    "status": "stalled",
+                    "detail": "indexer running but not progressing (frozen?)",
+                },
+                503,
+            ),
+            {},
+        )
+
+    assert status_code == 503
+    assert payload["status"] == "stalled"
+    assert "status=stalled" in caplog.text
+    assert "indexer running but not progressing" in caplog.text
 
 
 def test_probe_path_helper_accepts_health_and_subpaths():
