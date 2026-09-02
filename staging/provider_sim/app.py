@@ -187,6 +187,38 @@ def _fault_response(fault: str) -> Response | None:
                 },
             }
         )
+    if fault == "incomplete_enrichment":
+        enrichment = json.loads(_fake_enrichment(""))
+        enrichment["summary"] = "Incomplete-enrichment marker."
+        enrichment["key_facts"] = [
+            "importance",
+            "suggested_tags",
+            "suggested_folder",
+        ]
+        for field in ("importance", "suggested_tags", "suggested_folder"):
+            enrichment.pop(field)
+        return JSONResponse(
+            {
+                "id": "sim-incomplete-enrichment",
+                "object": "chat.completion",
+                "model": "sim-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(enrichment),
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 497,
+                    "total_tokens": 509,
+                },
+            }
+        )
     if fault == "overshoot_budget":
         # A COMPLETE structured answer that bills more completion tokens than
         # the request allowed. Production's LiteLLM route bills reasoning
@@ -462,6 +494,7 @@ _KNOWN_FAULTS = {
     "timeout",
     "garbage",
     "reasoning_only",
+    "incomplete_enrichment",
     "overshoot_budget",
     "hangup",
 }

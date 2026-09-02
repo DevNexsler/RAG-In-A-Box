@@ -16,10 +16,30 @@ from doc_enrichment import (
     _normalize_list,
     _normalize_enrichment,
     empty_enrichment,
+    enrichment_contract_errors,
     failed_enrichment,
     enrich_document,
     parse_enrichment_response,
 )
+
+
+def _complete_enrichment_payload(**overrides) -> dict:
+    payload = {
+        "summary": "Complete test enrichment.",
+        "doc_type": ["note"],
+        "entities_people": [],
+        "entities_places": [],
+        "entities_orgs": [],
+        "entities_dates": [],
+        "topics": [],
+        "keywords": [],
+        "key_facts": [],
+        "suggested_tags": [],
+        "suggested_folder": "",
+        "importance": 0.5,
+    }
+    payload.update(overrides)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +193,27 @@ def test_parse_enrichment_response_normalizes_valid_json():
     assert parsed["enr_importance"] == "0.7"
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"importance": "high"}, "importance: expected finite number in [0, 1]"),
+        ({"importance": float("nan")}, "importance: expected finite number in [0, 1]"),
+        ({"importance": 1.1}, "importance: expected finite number in [0, 1]"),
+        ({"entities_people": "Jane Doe"}, "entities_people: expected array"),
+        ({"topics": [7]}, "topics: expected string items"),
+        ({"key_facts": ["importance"]}, "key_facts: contains schema placeholder"),
+        ({"entities_orgs": ["suggested_folder"]}, "entities_orgs: contains schema placeholder"),
+    ],
+)
+def test_enrichment_contract_rejects_wrong_types_ranges_and_schema_tokens(
+    overrides,
+    expected,
+):
+    assert expected in enrichment_contract_errors(
+        _complete_enrichment_payload(**overrides)
+    )
+
+
 def test_parse_enrichment_response_handles_fenced_json():
     raw = '```json\n{"summary":"x","doc_type":["memo"],"topics":["ops"],"importance":0.7}\n```'
     parsed = parse_enrichment_response(raw)
@@ -245,6 +286,13 @@ class TestEnrichDocument:
     """Test enrich_document with mocked LLM generator."""
 
     def _make_generator(self, response: str) -> MagicMock:
+        try:
+            payload = json.loads(response)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        else:
+            if isinstance(payload, dict) and {"summary", "doc_type"} <= payload.keys():
+                response = json.dumps(_complete_enrichment_payload(**payload))
         gen = MagicMock()
         gen.generate.return_value = response
         return gen
@@ -415,8 +463,8 @@ class TestEnrichDocument:
                 taxonomy_store=taxonomy,
             )
 
-        assert result["_enrichment_failed"] == (
-            "structured_output_missing_required_fields: summary, doc_type"
+        assert result["_enrichment_failed"].startswith(
+            "structured_output_contract_invalid: summary: missing, doc_type: missing"
         )
         assert result["_enrichment_transient"] is False
         taxonomy.increment_usage.assert_not_called()
@@ -454,7 +502,9 @@ class TestEnrichDocument:
         assert len(call_args) < len(long_text)
 
     def test_markdown_fences_in_response(self):
-        response = '```json\n{"summary": "A doc", "doc_type": ["note"]}\n```'
+        response = "```json\n" + json.dumps(
+            _complete_enrichment_payload(summary="A doc")
+        ) + "\n```"
         gen = self._make_generator(response)
         result = enrich_document("Some text", "note.md", "md", gen)
         assert result["enr_summary"] == "A doc"
@@ -463,7 +513,9 @@ class TestEnrichDocument:
     def test_thinking_tags_in_response(self):
         response = (
             '<think>Let me analyze...</think>\n'
-            '{"summary": "Analyzed", "doc_type": ["note"], "topics": ["AI"]}'
+            + json.dumps(
+                _complete_enrichment_payload(summary="Analyzed", topics=["AI"])
+            )
         )
         gen = self._make_generator(response)
         result = enrich_document("Some text", "doc.md", "md", gen)

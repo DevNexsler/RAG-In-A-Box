@@ -251,6 +251,45 @@ async def test_reasoning_only_enrichment_retries_with_populated_facets(
 
 @pytest.mark.skipif(
     E2E_REAL,
+    reason="enrichment is live in real mode; simulator contract fault cannot be armed",
+)
+async def test_incomplete_enrichment_retries_before_lance_and_callback(
+    indexed_corpus,
+    api,
+    mcp_session,
+):
+    """#1918: parseable but contract-incomplete JSON never reaches consumers."""
+    await _arm_fault(
+        "/api/v1/chat/completions", "incomplete_enrichment", times=1
+    )
+
+    content = b"# Service\n\nMaintenance service was performed for apartment 8.\n"
+    result = await _upload_and_index(api, mcp_session, "contract-note.md", content)
+
+    events = await get_hook_events()
+    delivered = [
+        event
+        for event in events
+        if event.get("event") == "document.indexed"
+        and event.get("doc_id") == result["doc_id"]
+    ]
+    assert len(delivered) == 1, events
+    callback_facts = json.loads(delivered[0]["metadata"]["enr_key_facts"])
+    assert not {
+        "importance",
+        "suggested_tags",
+        "suggested_folder",
+    } & set(callback_facts)
+
+    chunk = await mcp_session.call_tool_json(
+        "file_get_chunk", {"doc_id": result["doc_id"], "loc": "c:0"}
+    )
+    assert chunk["enr_summary"] != "Incomplete-enrichment marker."
+    assert json.loads(chunk["enr_key_facts"]) == callback_facts
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
     reason="enrichment is live in real mode; simulator usage cannot be armed",
 )
 async def test_budget_overshoot_enrichment_is_kept_without_a_second_call(

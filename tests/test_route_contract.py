@@ -23,7 +23,20 @@ from core.route_contract import (
 from providers.llm.litellm_llm import LiteLLMGenerator
 
 _VALID_ENRICHMENT = json.dumps(
-    {"summary": "A lease renewal notice.", "doc_type": ["email"], "topics": ["lease"]}
+    {
+        "summary": "A lease renewal notice.",
+        "doc_type": ["email"],
+        "entities_people": [],
+        "entities_places": [],
+        "entities_orgs": [],
+        "entities_dates": [],
+        "topics": ["lease"],
+        "keywords": ["renewal"],
+        "key_facts": ["A lease renewal notice was sent."],
+        "suggested_tags": ["lease"],
+        "suggested_folder": "Housing/Leases",
+        "importance": 0.6,
+    }
 )
 
 

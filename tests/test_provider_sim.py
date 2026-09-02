@@ -492,6 +492,33 @@ async def test_fault_armed_reasoning_only_exhausts_then_recovers(client):
 
 
 @pytest.mark.anyio
+async def test_fault_armed_incomplete_enrichment_matches_1918_shape(client):
+    arm = await client.post(
+        "/admin/fault",
+        json={
+            "route_prefix": "/api/v1/chat/completions",
+            "fault": "incomplete_enrichment",
+            "times": 1,
+        },
+    )
+    assert arm.status_code == 200
+    response = await client.post(
+        "/api/v1/chat/completions",
+        json=_chat_payload("maintenance statement", {"type": "json_object"}),
+    )
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"]["completion_tokens"] == 497
+    enrichment = json.loads(body["choices"][0]["message"]["content"])
+    assert enrichment["key_facts"] == [
+        "importance",
+        "suggested_tags",
+        "suggested_folder",
+    ]
+    assert not {"importance", "suggested_tags", "suggested_folder"} & enrichment.keys()
+
+
+@pytest.mark.anyio
 async def test_fault_header_timeout_delays(client):
     start = time.monotonic()
     resp = await client.post(

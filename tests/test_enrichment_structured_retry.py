@@ -21,6 +21,7 @@ import pytest
 
 import flow_index_vault as fiv
 from core import enrichment_telemetry
+from core.hook_outbox import HookOutbox
 from extractors import begin_degradation_capture, collect_degradations
 from lancedb_store import LanceDBStore
 from providers.llm.litellm_llm import LiteLLMGenerator
@@ -38,8 +39,16 @@ def _enrichment_payload(**overrides) -> str:
     payload = {
         "summary": "Boiler service visit scheduled for the Ashfield site.",
         "doc_type": ["report"],
+        "entities_people": [],
+        "entities_places": ["Ashfield site"],
+        "entities_orgs": [],
+        "entities_dates": ["Tuesday"],
         "topics": ["maintenance"],
         "keywords": ["boiler", "inspection"],
+        "key_facts": ["Boiler service visit is booked for Tuesday."],
+        "suggested_tags": ["maintenance"],
+        "suggested_folder": "Properties/Ashfield",
+        "importance": 0.6,
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -80,6 +89,11 @@ def runtime(tmp_path):
         "config": {
             "dedupe": {"enabled": False},
             "enrichment": {"max_input_chars": 4000, "max_output_tokens": 5000},
+            "index_root": str(tmp_path / "index"),
+            "event_hooks": {
+                "enabled": True,
+                "hooks": [{"name": "test-sink", "events": ["document.indexed"]}],
+            },
             "pdf": {},
         },
     })
@@ -113,22 +127,36 @@ def _index_with_responses(doc: dict, responses: list) -> list:
     )
     fiv._RUNTIME["llm_generator"] = generator
     begin_degradation_capture()
-    with patch(
-        "providers.llm.litellm_llm.httpx.post", side_effect=responses
-    ) as post:
+    with (
+        patch("providers.llm.litellm_llm.httpx.post", side_effect=responses) as post,
+        patch(
+            "flow_index_vault.drain_due",
+            return_value={"accepted": 0, "retry_pending": 1, "redrive_required": 0},
+        ),
+    ):
         fiv.process_doc_task.fn(doc)
     return post.call_args_list
 
 
 def _stored_metadata(store: LanceDBStore, doc_id: str) -> dict:
+    rows = _stored_rows(store, doc_id)
+    assert rows, f"{doc_id} is not in the index"
+    return rows[0]["metadata"]
+
+
+def _stored_rows(store: LanceDBStore, doc_id: str) -> list[dict]:
+    if store._vs._table is None:
+        return []
     rows = (
         store._vs.table.to_lance()
         .to_table(columns=["doc_id", "metadata"])
         .to_pylist()
     )
-    rows = [r for r in rows if r["doc_id"] == doc_id]
-    assert rows, f"{doc_id} is not in the index"
-    return rows[0]["metadata"]
+    return [r for r in rows if r["doc_id"] == doc_id]
+
+
+def _queued_events(index_root) -> list[dict]:
+    return [delivery.event for delivery in HookOutbox(index_root).due(limit=20)]
 
 
 def test_malformed_first_response_then_valid_retry_stores_required_metadata(runtime):
@@ -150,10 +178,8 @@ def test_malformed_first_response_then_valid_retry_stores_required_metadata(runt
     assert not collect_degradations()
 
 
-def test_double_failure_stores_a_degraded_row_without_required_fields(runtime):
-    """Both responses omit doc_type. The row is still written (a partial row
-    beats no row) but carries no enrichment, and the degradation is permanent —
-    the model answered in full, so re-queueing it forever would be wrong."""
+def test_double_contract_failure_stores_no_row_or_success_callback(runtime):
+    """Exhausted structured retries are explicit failures, never index success."""
     docs_root, store = runtime
     doc = _write_doc(docs_root)
 
@@ -163,14 +189,42 @@ def test_double_failure_stores_a_degraded_row_without_required_fields(runtime):
     ])
 
     assert len(calls) == 2
-    stored = _stored_metadata(store, doc["doc_id"])
-    assert stored["enr_doc_type"] == ""
-    assert stored["enr_summary"] == ""
+    assert not _stored_rows(store, doc["doc_id"])
+    assert not _queued_events(fiv._RUNTIME["config"]["index_root"])
     degradations = collect_degradations()
     assert [d.reason for d in degradations] == ["enrichment_failed"]
     assert not any(d.transient for d in degradations), (
         "a model that answered in full is not a provider outage"
     )
+
+
+def test_incomplete_schema_token_response_retries_before_lance_and_callback(runtime):
+    """#1918: parseable JSON may still violate the complete output contract."""
+    docs_root, store = runtime
+    doc = _write_doc(docs_root)
+    malformed = _enrichment_payload(
+        key_facts=["importance", "suggested_tags", "suggested_folder"]
+    )
+    malformed_payload = json.loads(malformed)
+    for field in ("importance", "suggested_tags", "suggested_folder"):
+        malformed_payload.pop(field)
+
+    calls = _index_with_responses(doc, [
+        _response(json.dumps(malformed_payload), completion_tokens=497),
+        _response(_enrichment_payload(), completion_tokens=430),
+    ])
+
+    assert len(calls) == 2
+    assert calls[1].kwargs["json"]["reasoning_effort"] == "none"
+    stored = _stored_metadata(store, doc["doc_id"])
+    assert json.loads(stored["enr_key_facts"]) == [
+        "Boiler service visit is booked for Tuesday."
+    ]
+    events = _queued_events(fiv._RUNTIME["config"]["index_root"])
+    assert [event["doc_id"] for event in events] == [doc["doc_id"]]
+    assert json.loads(events[0]["metadata"]["enr_key_facts"]) == [
+        "Boiler service visit is booked for Tuesday."
+    ]
 
 
 def test_a_complete_response_that_overshot_the_budget_costs_one_call(runtime):

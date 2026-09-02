@@ -2601,6 +2601,9 @@ def _process_doc_task(
                     postprocess_rules=enrichment_cfg.get("postprocess_rules"),
                 )
                 enrichment_failed = bool(enrichment.get("_enrichment_failed"))
+                enrichment_contract_failed = bool(
+                    enrichment.get("_enrichment_contract_failed")
+                )
                 if enrichment_failed:
                     reason = enrichment.pop("_enrichment_failed")
                     logger.warning("Enrichment failed for '%s': %s", doc_id, reason)
@@ -2617,7 +2620,10 @@ def _process_doc_task(
                     _queue_taxonomy_usage(enrichment, _RUNTIME.get("taxonomy_usage"))
                 enrichment.pop("_enrichment_failed", None)
                 enrichment.pop("_enrichment_transient", None)
+                enrichment.pop("_enrichment_contract_failed", None)
                 doc_meta.update(enrichment)
+                if enrichment_contract_failed:
+                    return
             else:
                 doc_meta.update(empty_enrichment())
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -238,7 +239,14 @@ _SCHEMA_FIELD_DESCRIPTIONS = {
 _SCHEMA_PLACEHOLDER_VALUES = {
     description.lower() for description in _SCHEMA_FIELD_DESCRIPTIONS.values()
 }
-_SCHEMA_PLACEHOLDER_VALUES.update({"type1", "type2"})
+_SCHEMA_PLACEHOLDER_VALUES.update(
+    {
+        "type1",
+        "type2",
+        *(_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW),
+        *(f"enr_{key}" for key in (*_ENRICHMENT_KEYS_RAW, *_CONTEXT_KEYS_RAW)),
+    }
+)
 
 _CONTEXT_AMBIGUITY_TERMS = (
     "ambiguous",
@@ -481,6 +489,62 @@ def parse_enrichment_response(raw_response: str) -> dict[str, str]:
     return _normalize_enrichment(parsed)
 
 
+def enrichment_contract_errors(payload: Any) -> list[str]:
+    """Return field-level violations of the persisted enrichment contract.
+
+    Validation happens on the raw object so normalization cannot hide omitted
+    keys or coerce wrong scalar/list types into plausible stored strings.
+    Context fields remain optional for providers used without nearby context,
+    but every present field must match the same type contract.
+    """
+    if not isinstance(payload, dict):
+        return ["response: expected object"]
+
+    errors = [
+        f"{field}: missing"
+        for field in _ENRICHMENT_KEYS_RAW
+        if field not in payload
+    ]
+    all_fields = (*_ENRICHMENT_KEYS_RAW, *_CONTEXT_KEYS_RAW)
+    string_fields = tuple(
+        field for field in all_fields if field in _SCHEMA_STRING_KEYS
+    )
+    list_fields = tuple(
+        field
+        for field in all_fields
+        if field not in _SCHEMA_STRING_KEYS and field != "importance"
+    )
+
+    for field in string_fields:
+        if field in payload and not isinstance(payload[field], str):
+            errors.append(f"{field}: expected string")
+
+    for field in list_fields:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if not isinstance(value, list):
+            errors.append(f"{field}: expected array")
+            continue
+        if any(not isinstance(item, str) for item in value):
+            errors.append(f"{field}: expected string items")
+            continue
+        if any(_is_placeholder_value(field, item) for item in value):
+            errors.append(f"{field}: contains schema placeholder")
+
+    if "importance" in payload:
+        importance = payload["importance"]
+        if (
+            isinstance(importance, bool)
+            or not isinstance(importance, (int, float))
+            or not math.isfinite(float(importance))
+            or not 0.0 <= float(importance) <= 1.0
+        ):
+            errors.append("importance: expected finite number in [0, 1]")
+
+    return errors
+
+
 def missing_required_fields(enrichment: dict[str, str]) -> list[str]:
     """Required enrichment fields this normalized enrichment does not carry.
 
@@ -504,9 +568,12 @@ def structured_response_is_usable(raw_response: str) -> bool:
     "did the model deliver the metadata we asked for" (#1097).
     """
     try:
-        enrichment = parse_enrichment_response(raw_response)
+        payload = _extract_json(raw_response)
     except (ValueError, TypeError):  # json.JSONDecodeError is a ValueError
         return False
+    if enrichment_contract_errors(payload):
+        return False
+    enrichment = _normalize_enrichment(payload)
     return not missing_required_fields(enrichment)
 
 
@@ -724,7 +791,16 @@ def enrich_document(
                 len(raw_response),
             )
 
-            enrichment = parse_enrichment_response(raw_response)
+            payload = _extract_json(raw_response)
+            contract_errors = enrichment_contract_errors(payload)
+            if contract_errors:
+                result = failed_enrichment(
+                    "structured_output_contract_invalid: "
+                    + ", ".join(contract_errors)
+                )
+                result["_enrichment_contract_failed"] = True
+                return result
+            enrichment = _normalize_enrichment(payload)
             enrichment = _repair_context_omissions(enrichment, truncated, context_text)
             enrichment = repair_enrichment(
                 enrichment,
@@ -742,10 +818,12 @@ def enrich_document(
                     title,
                     ", ".join(missing_required),
                 )
-                return failed_enrichment(
+                result = failed_enrichment(
                     "structured_output_missing_required_fields: "
                     + ", ".join(missing_required)
                 )
+                result["_enrichment_contract_failed"] = True
+                return result
 
             # Increment usage_count for matched taxonomy entries
             if taxonomy_store is not None and record_taxonomy_usage:

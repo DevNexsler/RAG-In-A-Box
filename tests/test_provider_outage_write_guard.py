@@ -40,7 +40,16 @@ class _GoodLLM:
         return json.dumps({
             "summary": "Photo of bags left by the bins, reported as a theft risk.",
             "doc_type": ["image", "message"],
+            "entities_people": [],
+            "entities_places": [],
+            "entities_orgs": [],
+            "entities_dates": [],
             "topics": ["property", "theft", "security"],
+            "keywords": ["bags", "bins", "theft"],
+            "key_facts": ["Bags were left by the bins."],
+            "suggested_tags": ["security"],
+            "suggested_folder": "Properties/Security",
+            "importance": 0.7,
         })
 
 
@@ -58,7 +67,7 @@ class _BrokenLLM:
     """Reachable, but its answer is unusable — permanent, says something real."""
 
     def generate(self, prompt, max_tokens=512):
-        return json.dumps({"topics": ["whatever"]})  # no summary/doc_type
+        return "not json {"
 
 
 @pytest.fixture
