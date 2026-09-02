@@ -221,7 +221,7 @@ class TestEnrichmentDegradation:
                 failed = _process_docs([doc], concurrency=1)
 
             assert failed == []
-            assert doc["doc_id"] in store.list_doc_ids()
+            assert doc["doc_id"] not in store.list_doc_ids()
             assert doc["doc_id"] in _RUNTIME["degraded_now"]
             reasons = _RUNTIME["degraded_now"][doc["doc_id"]]
             assert [reason.reason for reason in reasons] == ["enrichment_failed"]

@@ -23,8 +23,16 @@ def _enrichment_json(**overrides) -> str:
     payload = {
         "summary": "Quarterly maintenance report for the Ashfield site.",
         "doc_type": ["report"],
+        "entities_people": [],
+        "entities_places": ["Ashfield site"],
+        "entities_orgs": [],
+        "entities_dates": [],
         "topics": ["maintenance"],
         "keywords": ["boiler", "inspection"],
+        "key_facts": ["Quarterly maintenance was reported."],
+        "suggested_tags": ["maintenance"],
+        "suggested_folder": "Properties/Maintenance",
+        "importance": 0.5,
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -98,7 +106,7 @@ def test_litellm_generator_uses_configurable_openai_compatible_endpoint(tmp_path
 
 def test_qwen_bulk_uses_json_object_non_thinking_sampling():
     response = _completion_response(
-        '{"summary":"ok","doc_type":["email"]}',
+        _enrichment_json(summary="ok", doc_type=["email"]),
         completion_tokens=12,
     )
 
@@ -135,7 +143,7 @@ def test_qwen_bulk_uses_json_object_non_thinking_sampling():
 def test_qwen_bulk_retries_invalid_structured_response(invalid_content):
     invalid = _completion_response(invalid_content, completion_tokens=20)
     recovered = _completion_response(
-        '{"summary":"Recovered","doc_type":["email"]}',
+        _enrichment_json(summary="Recovered", doc_type=["email"]),
         completion_tokens=12,
     )
 
@@ -183,7 +191,7 @@ def test_litellm_generator_retries_budget_saturation_without_reasoning():
         reasoning="long hidden reasoning",
     )
     recovered = _completion_response(
-        '{"summary":"Recovered","doc_type":["email"],"topics":["ops"]}',
+        _enrichment_json(summary="Recovered", doc_type=["email"], topics=["ops"]),
         completion_tokens=24,
     )
 
@@ -211,8 +219,12 @@ def test_litellm_generator_retries_explicit_length_without_usage():
         finish_reason="length",
     )
     recovered = _completion_response(
-        '{"summary":"Recovered","doc_type":["email"],'
-        '"topics":["lease"],"keywords":["renewal"]}',
+        _enrichment_json(
+            summary="Recovered",
+            doc_type=["email"],
+            topics=["lease"],
+            keywords=["renewal"],
+        ),
         completion_tokens=24,
     )
 
@@ -239,7 +251,7 @@ def test_litellm_generator_retries_reasoning_only_response_without_reasoning():
         reasoning="reasoning consumed output",
     )
     recovered = _completion_response(
-        '{"summary":"Recovered","doc_type":["email"]}',
+        _enrichment_json(summary="Recovered", doc_type=["email"]),
         completion_tokens=12,
     )
 
@@ -265,7 +277,7 @@ def test_litellm_generator_retries_structurally_empty_success_without_reasoning(
 ):
     empty_success = _completion_response(empty_content, completion_tokens=1)
     recovered = _completion_response(
-        '{"summary":"Recovered","doc_type":["email"]}',
+        _enrichment_json(summary="Recovered", doc_type=["email"]),
         completion_tokens=12,
     )
 
@@ -430,7 +442,7 @@ def test_litellm_generator_sends_configured_reasoning_effort_on_first_attempt():
     pays for a second full prompt.  The first attempt has to be configurable.
     """
     complete = _completion_response(
-        '{"summary":"Direct","doc_type":["email"],"topics":["ops"]}',
+        _enrichment_json(summary="Direct", doc_type=["email"], topics=["ops"]),
         completion_tokens=24,
     )
 
