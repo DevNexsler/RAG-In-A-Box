@@ -103,7 +103,13 @@ def test_openrouter_media_provider_sends_audio_input_payload(tmp_path: Path):
     audio.write_bytes(b"fake-audio")
     provider = OpenRouterMediaProvider(
         api_key="sk-test",
-        audio_models=["openai/whisper-1"],
+        audio_models=[
+            {
+                "model": "mistralai/voxtral-small-24b-2507",
+                "endpoint": "chat/completions",
+                "parameters": {"temperature": 0.0, "top_p": 1.0},
+            }
+        ],
         video_model="google/gemini-2.5-flash-lite",
         max_file_size_mb=1,
     )
@@ -113,7 +119,9 @@ def test_openrouter_media_provider_sends_audio_input_payload(tmp_path: Path):
 
     assert result == "transcribed text"
     payload = post.call_args.kwargs["json"]
-    assert payload["model"] == "openai/whisper-1"
+    assert payload["model"] == "mistralai/voxtral-small-24b-2507"
+    assert payload["temperature"] == 0.0
+    assert payload["top_p"] == 1.0
     content = payload["messages"][0]["content"]
     assert content[1]["type"] == "input_audio"
     assert content[1]["input_audio"]["format"] == "mp3"
@@ -148,6 +156,94 @@ def test_openrouter_media_provider_falls_back_between_audio_models(tmp_path: Pat
         "openai/whisper-1",
         "mistralai/voxtral-small-24b-2507",
     ]
+
+
+def test_openrouter_whisper_uses_transcription_endpoint(tmp_path: Path, monkeypatch):
+    """Mirror OpenRouter's Whisper endpoint contract and its production 400."""
+    from providers.media import build_media_provider
+
+    audio = tmp_path / "voice.wav"
+    audio.write_bytes(b"same-audio-fixture")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    provider = build_media_provider(
+        {
+            "media": {
+                "enabled": True,
+                "audio_model": "openai/whisper-1",
+                "fallback_audio_models": [],
+                "audio_model_endpoint": "audio/transcriptions",
+                "video_model": "google/gemini-2.5-flash-lite",
+            }
+        }
+    )._primary
+
+    def provider_faithful_post(url, *, json, **kwargs):
+        request = httpx.Request("POST", url)
+        if url.endswith("/chat/completions"):
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": (
+                            "openai/whisper-1 is a transcription model and cannot be used "
+                            "with the chat/completions endpoint. Use the "
+                            "/api/v1/audio/transcriptions endpoint instead."
+                        )
+                    }
+                },
+                request=request,
+            )
+        assert url.endswith("/audio/transcriptions")
+        assert json == {
+            "model": "openai/whisper-1",
+            "input_audio": {
+                "data": base64.b64encode(b"same-audio-fixture").decode("ascii"),
+                "format": "wav",
+            },
+        }
+        return httpx.Response(200, json={"text": "whisper transcript"}, request=request)
+
+    with patch("providers.media.openrouter_media.httpx.post", side_effect=provider_faithful_post):
+        assert provider.transcribe_audio(audio) == "whisper transcript"
+
+
+def test_openrouter_voxtral_sends_compatible_greedy_parameters(tmp_path: Path, monkeypatch):
+    """Mirror Voxtral's rejection when greedy sampling omits top_p=1."""
+    from providers.media import build_media_provider
+
+    audio = tmp_path / "voice.wav"
+    audio.write_bytes(b"same-audio-fixture")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    provider = build_media_provider(
+        {
+            "media": {
+                "enabled": True,
+                "audio_model": "mistralai/voxtral-small-24b-2507",
+                "fallback_audio_models": [],
+                "audio_model_endpoint": "chat/completions",
+                "audio_model_parameters": {"temperature": 0.0, "top_p": 1.0},
+                "video_model": "google/gemini-2.5-flash-lite",
+            }
+        }
+    )._primary
+
+    def provider_faithful_post(url, *, json, **kwargs):
+        request = httpx.Request("POST", url)
+        assert url.endswith("/chat/completions")
+        if json.get("temperature") == 0.0 and json.get("top_p") != 1.0:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "top_p must be 1 when using greedy sampling."}},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "voxtral transcript"}}]},
+            request=request,
+        )
+
+    with patch("providers.media.openrouter_media.httpx.post", side_effect=provider_faithful_post):
+        assert provider.transcribe_audio(audio) == "voxtral transcript"
 
 
 def test_openrouter_media_provider_all_audio_models_fail_is_transient(tmp_path: Path):

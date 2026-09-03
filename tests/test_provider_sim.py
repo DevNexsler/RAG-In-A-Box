@@ -431,6 +431,60 @@ async def test_fault_armed_429_exhausts(client):
 
 
 @pytest.mark.anyio
+async def test_audio_routes_enforce_recorded_openrouter_contracts(client):
+    audio = {"data": "ZmFrZS1hdWRpbw==", "format": "wav"}
+    media_content = [
+        {"type": "text", "text": "Transcribe"},
+        {"type": "input_audio", "input_audio": audio},
+    ]
+
+    whisper_chat = await client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "openai/whisper-1",
+            "messages": [{"role": "user", "content": media_content}],
+            "temperature": 0.0,
+        },
+    )
+    assert whisper_chat.status_code == 400
+    assert "cannot be used with the chat/completions endpoint" in whisper_chat.text
+
+    whisper_stt = await client.post(
+        "/api/v1/audio/transcriptions",
+        json={"model": "openai/whisper-1", "input_audio": audio},
+    )
+    assert whisper_stt.status_code == 200
+    assert "model openai/whisper-1" in whisper_stt.json()["text"]
+
+    voxtral_bad = await client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "mistralai/voxtral-small-24b-2507",
+            "messages": [{"role": "user", "content": media_content}],
+            "temperature": 0.0,
+        },
+    )
+    assert voxtral_bad.status_code == 400
+    assert voxtral_bad.json()["error"]["message"] == (
+        "top_p must be 1 when using greedy sampling."
+    )
+
+    voxtral_ok = await client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "mistralai/voxtral-small-24b-2507",
+            "messages": [{"role": "user", "content": media_content}],
+            "temperature": 0.0,
+            "top_p": 1.0,
+        },
+    )
+    assert voxtral_ok.status_code == 200
+    assert "model mistralai/voxtral-small-24b-2507" in (
+        voxtral_ok.json()["choices"][0]["message"]["content"]
+    )
+
+
+@pytest.mark.anyio
 async def test_fault_armed_hangup_cuts_the_connection(client):
     # Unlike 429/garbage, this fault is not an answer: the provider is gone
     # mid-request (#0619). The caller must get no usable response at all.
