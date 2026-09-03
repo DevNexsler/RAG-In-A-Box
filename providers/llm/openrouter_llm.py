@@ -17,8 +17,8 @@ from typing import Any, TypedDict
 
 import httpx
 
-from core.resilience import raise_for_status
-from doc_enrichment import enrichment_response_schema
+from core.resilience import TransientError, raise_for_status
+from doc_enrichment import enrichment_response_schema, parse_enrichment_response
 from providers.llm.trace_recorder import LLMTraceRecorder
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,13 @@ def _is_response_format_rejection(response: httpx.Response) -> bool:
             "schema",
         )
     )
+
+
+def _has_enrichment_summary(content: str) -> bool:
+    try:
+        return bool(parse_enrichment_response(content).get("enr_summary"))
+    except (ValueError, TypeError):
+        return False
 
 
 class OpenRouterReplayMetadata(TypedDict):
@@ -121,7 +128,23 @@ class OpenRouterGenerator:
         self, user_prompt: str, max_tokens: int = 512
     ) -> OpenRouterReplayMetadata:
         """Generate structured JSON plus request/response metadata."""
-        return self._request_with_metadata(user_prompt, max_tokens=max_tokens)
+        initial = self._request_with_metadata(user_prompt, max_tokens=max_tokens)
+        if _has_enrichment_summary(initial["content"]):
+            return initial
+
+        logger.warning(
+            "OpenRouter returned an empty enrichment summary for model %s; "
+            "retrying once.",
+            self.model,
+        )
+        recovered = self._request_with_metadata(user_prompt, max_tokens=max_tokens)
+        if _has_enrichment_summary(recovered["content"]):
+            return recovered
+
+        raise TransientError(
+            "OpenRouter returned empty enrichment summary after retry "
+            f"(model={self.model})"
+        )
 
     def _request_with_metadata(
         self, user_prompt: str, max_tokens: int = 512
