@@ -47,7 +47,7 @@ from contextvars import ContextVar, copy_context
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Iterator, Mapping, Sequence
 
 from prefect import flow, task
 from prefect.logging import get_run_logger
@@ -1095,14 +1095,17 @@ def _log_run_completion(
     indexed_chunks: int,
     elapsed_seconds: float,
     actionable_skips: dict[str, list[str]] | None = None,
+    failed_sources: Sequence[str] = (),
 ) -> None:
     # `completion` is queue drain: a skipped document counts as processed, so
     # 100% is reachable with zero work done. The indexed counts ride on the same
     # line so the percentage can never be read alone as "work happened" (#1173).
     completion = 100.0 if queued == 0 else processed * 100.0 / queued
-    logger.info(
+    message = (
         "Index run completion: run_id=%s queued=%d processed=%d skipped=%d "
-        "indexed_docs=%d indexed_chunks=%d elapsed=%.1fs completion=%.1f%%",
+        "indexed_docs=%d indexed_chunks=%d elapsed=%.1fs completion=%.1f%%"
+    )
+    args: list[Any] = [
         run_id,
         queued,
         processed,
@@ -1111,7 +1114,14 @@ def _log_run_completion(
         indexed_chunks,
         elapsed_seconds,
         completion,
-    )
+    ]
+    if failed_sources:
+        # A cycle that covered only some of its sources is not a full cycle,
+        # and `completion=` measures queue drain, not coverage — so the run
+        # says which sources it never scanned, on the same line (#2020).
+        message += " partial=true failed_sources=%s"
+        args.append(",".join(failed_sources))
+    logger.info(message, *args)
     if actionable_skips:
         logger.warning(
             "Index run has permanent actionable skips: %s", actionable_skips
@@ -1254,6 +1264,7 @@ def _reconcile_degraded_docs(
     scanned_sources: set[str],
     full_scan: bool,
     *,
+    failed_sources: Collection[str] = (),
     now: float | None = None,
 ) -> tuple[list[dict], dict, dict]:
     """Re-queue docs that previously indexed with transient degradations
@@ -1276,7 +1287,9 @@ def _reconcile_degraded_docs(
                            immediately.
     - ``requeued``       — resolved against this scan and forced back in
     - ``source_not_scanned`` — its source did not run this pass (a
-                           source-scoped index); untouched, not aged
+                           source-scoped index, or its scan() raised and the
+                           source is in ``failed_sources``); untouched, not
+                           aged
     - ``unresolved``     — its source scanned fine but the id is gone, so
                            nothing can ever resolve it: age it, and after
                            _DEGRADED_MAX_UNRESOLVED_RUNS escalate it out to
@@ -1312,6 +1325,7 @@ def _reconcile_degraded_docs(
 
     for doc_id in sorted(docs):
         entry = dict(docs[doc_id])
+        entry_source = str(doc_id).split("::", 1)[0]
         if doc_id in existing:
             stored_change_key = str(entry.get("change_key") or "")
             unchanged = (
@@ -1347,9 +1361,15 @@ def _reconcile_degraded_docs(
                 bucket = "requeued"
             else:
                 bucket = "backoff"
-        elif str(doc_id).split("::", 1)[0] not in scanned_sources and not full_scan:
-            # Source-scoped run: another source's entries are not evidence of
-            # anything. Only a full scan can conclude a namespace is gone.
+        elif entry_source in failed_sources or (
+            entry_source not in scanned_sources and not full_scan
+        ):
+            # No scan, no evidence — whether because this run was scoped to
+            # another source, or because this source's scan() raised. Only a
+            # scan that actually ran can conclude a namespace is gone; ageing
+            # these would turn a provider outage into permanent dead-lettering
+            # (#2020). A namespace missing from a *complete* full scan is a
+            # different case and still ages below.
             bucket = "source_not_scanned"
         else:
             bucket = "unresolved"
@@ -1647,6 +1667,7 @@ def _reap_vanished_registry_rows(
     filesystem_roots: dict[str, Path],
     *,
     source_scope: str | None,
+    failed_sources: Collection[str] = (),
     max_delete_ratio: float,
     min_docs_for_ratio: int,
     logger: logging.Logger,
@@ -1666,7 +1687,8 @@ def _reap_vanished_registry_rows(
     skips — presence means "intentionally excluded", which deep health
     classifies; only absence is lifecycle's job). A filesystem source whose
     root is unavailable (unmounted?) is left entirely alone: absence can't be
-    proven there.
+    proven there — and so is a source in ``failed_sources``, whose scan raised
+    and therefore proved nothing about any of its rows (#2020).
 
     Deletion goes row by row through DocIDStore.delete() with each row's
     exact stored key — legacy bare + namespaced dual rows both die — and
@@ -1691,6 +1713,12 @@ def _reap_vanished_registry_rows(
     reaped: set[str] = set()
     blocked: dict[str, tuple[int, int]] = {}
     for source, rows in sorted(rows_by_source.items()):
+        if source in failed_sources:
+            logger.warning(
+                "Skipping registry reap for source '%s' — its scan failed this run",
+                source,
+            )
+            continue
         root = filesystem_roots.get(source)
         if root is not None and not root.is_dir():
             logger.warning(
@@ -3272,8 +3300,8 @@ def _should_use_shadow_rebuild(
 
 
 def _scan_and_register_sources(
-    all_sources, doc_id_store, index_root
-) -> tuple[list[dict], dict[str, object]]:
+    all_sources, doc_id_store, index_root, *, logger: logging.Logger | None = None
+) -> tuple[list[dict], dict[str, object], list[str]]:
     """Scan every configured source, build the record list + record map, and
     register each namespaced doc_id in the persistent registry.
 
@@ -3281,42 +3309,77 @@ def _scan_and_register_sources(
     {namespaced_id: rel_path} for test/tool use and distinct_source_names()
     enumerate every source that has indexed docs.
 
+    Sources are isolated from each other: a source whose scan() raises is
+    reported in the returned failed-source list and contributes nothing, and
+    the remaining sources are still scanned. One transient dependency blip
+    (a database in crash recovery, an unmounted root) used to propagate out of
+    the flow and cost an entire index cycle, including every source that was
+    perfectly healthy (#2020).
+
+    A failed source's *partial* records are dropped rather than committed. Its
+    scan produced no evidence about the source at all, and every downstream
+    rule that reads "stored but not scanned" as removal — the delete diff, the
+    registry reap, the degraded ledger — must see the source as unscanned
+    rather than as half-emptied.
+
     The scan runs before any doc is processed, so it is one of the flow's two
     per-doc-heartbeat-free windows (the other is the post-processing/FTS phase).
     On a large corpus it can dominate a run's wall-clock, so it re-stamps the
     indexer heartbeat as it progresses — otherwise a healthy but busy scan ages
     the heartbeat past INDEXER_HEARTBEAT_MAX_AGE and /health false-503s (#0127).
+
+    Returns (records, {namespaced doc_id: SourceRecord}, failed source names).
     """
+    log = logger or logging.getLogger(__name__)
     all_records: list[dict] = []
     source_records_by_ns_doc_id: dict[str, object] = {}  # namespaced doc_id → SourceRecord
+    failed_sources: list[str] = []
     _write_heartbeat(index_root)  # scan started — progress, not a freeze
     scanned_count = 0
     for src in all_sources:
-        for rec in src.scan():
-            ns_doc_id = f"{src.name}::{rec.doc_id}"
-            all_records.append({
-                "doc_id": ns_doc_id,
-                "rel_path": rec.natural_key,
-                "abs_path": rec.metadata.get("abs_path", rec.natural_key),
-                "mtime": rec.mtime,
-                "change_hash": getattr(rec, "change_hash", "") or "",
-                "size": rec.size,
-                "ext": rec.metadata.get("ext", ""),
-                "source_type": rec.source_type,
-                "source_name": src.name,
-                **(
-                    {"skip_reason": rec.metadata["skip_reason"]}
-                    if rec.metadata.get("skip_reason")
-                    else {}
-                ),
-            })
-            source_records_by_ns_doc_id[ns_doc_id] = rec
-            doc_id_store.register(ns_doc_id, rec.natural_key, source_name=src.name)
-            scanned_count += 1
-            if scanned_count % _SCAN_HEARTBEAT_EVERY == 0:
-                _write_heartbeat(index_root)
+        src_records: list[dict] = []
+        src_records_by_ns_doc_id: dict[str, object] = {}
+        try:
+            for rec in src.scan():
+                ns_doc_id = f"{src.name}::{rec.doc_id}"
+                src_records.append({
+                    "doc_id": ns_doc_id,
+                    "rel_path": rec.natural_key,
+                    "abs_path": rec.metadata.get("abs_path", rec.natural_key),
+                    "mtime": rec.mtime,
+                    "change_hash": getattr(rec, "change_hash", "") or "",
+                    "size": rec.size,
+                    "ext": rec.metadata.get("ext", ""),
+                    "source_type": rec.source_type,
+                    "source_name": src.name,
+                    **(
+                        {"skip_reason": rec.metadata["skip_reason"]}
+                        if rec.metadata.get("skip_reason")
+                        else {}
+                    ),
+                })
+                src_records_by_ns_doc_id[ns_doc_id] = rec
+                scanned_count += 1
+                if scanned_count % _SCAN_HEARTBEAT_EVERY == 0:
+                    _write_heartbeat(index_root)
+        except Exception as exc:
+            failed_sources.append(src.name)
+            log.error(
+                "Source '%s' failed to scan after %d record(s) (%s: %s) — its "
+                "documents are left untouched this run; the remaining sources "
+                "are still indexed",
+                src.name, len(src_records), type(exc).__name__, exc,
+                exc_info=True,
+            )
+            continue
+        all_records.extend(src_records)
+        source_records_by_ns_doc_id.update(src_records_by_ns_doc_id)
+        for record in src_records:
+            doc_id_store.register(
+                record["doc_id"], record["rel_path"], source_name=src.name
+            )
     _write_heartbeat(index_root)  # scan complete — enter diff/process
-    return all_records, source_records_by_ns_doc_id
+    return all_records, source_records_by_ns_doc_id, failed_sources
 
 
 # --- Flow ---
@@ -3628,9 +3691,29 @@ def index_vault_flow(
     # Multi-source scan: iterate over all configured sources, namespace doc_ids.
     # Re-stamps the heartbeat as it goes so a long scan doesn't false-503 /health.
     memory_observer.sample("phase_start", phase="scan_diff")
-    all_records, source_records_by_ns_doc_id = _scan_and_register_sources(
-        all_sources, doc_id_store, index_root
+    all_records, source_records_by_ns_doc_id, failed_scan_sources = (
+        _scan_and_register_sources(
+            all_sources, doc_id_store, index_root, logger=logger
+        )
     )
+    if failed_scan_sources:
+        if len(failed_scan_sources) == len(all_sources):
+            # Nothing was scanned, so nothing can be concluded: a run that
+            # reported itself partial here would claim a coverage it never had.
+            raise RuntimeError(
+                "Every configured source failed to scan "
+                f"({', '.join(failed_scan_sources)}) — aborting the run"
+            )
+        logger.error(
+            "Partial index run: %d of %d sources failed to scan (%s) — their "
+            "documents, registry rows and degraded entries are left untouched",
+            len(failed_scan_sources), len(all_sources),
+            ", ".join(failed_scan_sources),
+        )
+        for failed_source in failed_scan_sources:
+            _RUNTIME.setdefault("_warnings", []).append(
+                f"source_scan_failed:{failed_source}"
+            )
     _RUNTIME["source_records_by_ns_doc_id"] = source_records_by_ns_doc_id
     scanned = all_records
     communication_context_provider = build_context_provider_from_records(
@@ -3675,8 +3758,9 @@ def index_vault_flow(
         scanned,
         to_add_or_update,
         degraded_ledger,
-        scanned_sources={s.name for s in all_sources},
+        scanned_sources={s.name for s in all_sources} - set(failed_scan_sources),
         full_scan=source_name is None,
+        failed_sources=failed_scan_sources,
     )
     if degraded_report["total"]:
         if degraded_report["requeued"]:
@@ -3800,6 +3884,19 @@ def index_vault_flow(
         force_full_rebuild=bool(safety_cfg.get("force_full_rebuild", False)),
         stored_doc_count=stored_doc_count,
     )
+    if using_shadow_rebuild and failed_scan_sources:
+        # Promoting a shadow replaces the whole corpus, so building one from a
+        # scan that missed a source would delete that source wholesale — the
+        # same mass deletion the per-source guards below exist to prevent. Fall
+        # back to an in-place update and let the operator re-run the rebuild
+        # once every source is reachable (#2020).
+        logger.error(
+            "Skipping shadow rebuild: %s did not scan this run, so the shadow "
+            "would not hold the full corpus — updating in place instead",
+            ", ".join(failed_scan_sources),
+        )
+        _RUNTIME.setdefault("_warnings", []).append("shadow_rebuild_skipped_partial_scan")
+        using_shadow_rebuild = False
 
     # SAFETY: block mass deletion from an anomalous (partial/empty) scan, PER
     # SOURCE. to_delete is everything stored-but-not-scanned. If one source
@@ -3819,7 +3916,17 @@ def index_vault_flow(
     kept_deletes: list[str] = []
     for src_name, dels in deletes_by_source.items():
         src_stored = stored_by_source.get(src_name, 0)
-        if src_stored >= min_docs_for_ratio and len(dels) > src_stored * max_delete_ratio:
+        if src_name in failed_scan_sources:
+            # Its scan raised, so "stored but not scanned" says nothing about
+            # this source at all. The ratio guard below cannot cover this: a
+            # source with fewer than min_docs_for_ratio stored docs would have
+            # every one of them deleted and re-enriched next run (#2020).
+            logger.error(
+                "SKIPPING %d deletions for source '%s' — its scan failed this "
+                "run, so its documents are kept untouched",
+                len(dels), src_name,
+            )
+        elif src_stored >= min_docs_for_ratio and len(dels) > src_stored * max_delete_ratio:
             logger.error(
                 "ABORTING %d deletions for source '%s' (> %.0f%% of %d stored) — "
                 "scan likely partial (source unreachable?). Those docs kept. "
@@ -3967,6 +4074,7 @@ def index_vault_flow(
         set(stored_mtimes),
         filesystem_source_roots(config),
         source_scope=source_name,
+        failed_sources=failed_scan_sources,
         max_delete_ratio=max_delete_ratio,
         min_docs_for_ratio=min_docs_for_ratio,
         logger=logger,
@@ -4178,6 +4286,7 @@ def index_vault_flow(
         indexed_chunks=int(progress.get("indexed_chunks") or 0),
         elapsed_seconds=run_seconds,
         actionable_skips=actionable_skip_docs(_load_skip_ledger(index_root)),
+        failed_sources=failed_scan_sources,
     )
     _update_run_progress(phase="completed")
     _write_heartbeat(index_root)
