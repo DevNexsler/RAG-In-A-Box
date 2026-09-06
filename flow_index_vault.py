@@ -1616,6 +1616,32 @@ def _merge_skip_ledger(
     return {"docs": docs}
 
 
+def _record_permanent_skip(doc: dict, reasons: Sequence[str]) -> list[str]:
+    """Quarantine one in-flight document; return the reasons the ledger stored.
+
+    The single seam for every permanent-skip lane a queued document can take —
+    an explicit skip collected from extraction (duplicate, oversized, no text)
+    and a terminal, non-transient processing failure alike. Both record the doc
+    with its change key so the diff stops re-fetching it every run, so both are
+    skips as far as the run's own accounting is concerned. Returning the stored
+    reasons is what lets the caller feed _advance_run_progress the same
+    breakdown the ledger got: before this seam existed the terminal lane wrote
+    a ledger entry without touching the counters, so a run with k terminal
+    failures reported `skipped=N` on `Index stats:` and `N+k docs added to skip
+    ledger` on the very next line (#2184).
+    """
+    normalized = sorted({str(reason) for reason in reasons})
+    # Same lock as the other ledgers: the flow processes documents concurrently.
+    with _RUNTIME.get("degraded_lock") or nullcontext():
+        doc_id = doc["doc_id"]
+        _RUNTIME.setdefault("skip_now", {})[doc_id] = {
+            "reasons": normalized,
+            "change_key": _change_key(doc),
+        }
+        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
+    return normalized
+
+
 def _persist_scan_skips(index_root: Path, records: list[dict], logger) -> None:
     """Persist terminal scan decisions as one ledger update before extraction."""
     if not records:
@@ -2947,26 +2973,22 @@ def _process_docs(
             process_doc_task(doc)
             reasons = collect_degradations()
             skips = collect_skips()
-            skip_reasons = list(skips)
-            lock = _RUNTIME.get("degraded_lock")
-            if lock is not None:
-                with lock:
-                    doc_id = doc["doc_id"]
-                    if skips:
-                        # Permanent skip (duplicate/oversized/corrupt): record
-                        # with the file's change key so the diff stops looping.
-                        _RUNTIME.setdefault("skip_now", {})[doc_id] = {
-                            "reasons": sorted(set(skips)),
-                            "change_key": _change_key(doc),
-                        }
-                        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
-                    elif reasons:
-                        _RUNTIME.setdefault("degraded_now", {})[doc_id] = reasons
-                        _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
-                    else:
-                        # Indexed cleanly — drop from both ledgers.
-                        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
-                        _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
+            if skips:
+                # Permanent skip (duplicate/oversized/corrupt): record with the
+                # file's change key so the diff stops looping.
+                skip_reasons = _record_permanent_skip(doc, skips)
+            else:
+                lock = _RUNTIME.get("degraded_lock")
+                if lock is not None:
+                    with lock:
+                        doc_id = doc["doc_id"]
+                        if reasons:
+                            _RUNTIME.setdefault("degraded_now", {})[doc_id] = reasons
+                            _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
+                        else:
+                            # Indexed cleanly — drop from both ledgers.
+                            _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
+                            _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
             return None
         except Exception as exc:
             outcome = "failed"
@@ -2995,15 +3017,11 @@ def _process_docs(
                 # change key exactly like a permanent skip. Without this the doc
                 # is re-fetched, re-OCR'd, re-enriched and re-embedded on every
                 # run, forever (#0569) — the skip ledger's bounded retry turns
-                # that into one attempt per day until the content changes.
-                if lock is not None:
-                    with lock:
-                        doc_id = doc["doc_id"]
-                        _RUNTIME.setdefault("skip_now", {})[doc_id] = {
-                            "reasons": [f"terminal_error:{type(exc).__name__}"],
-                            "change_key": _change_key(doc),
-                        }
-                        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
+                # that into one attempt per day until the content changes. It is
+                # a ledgered skip, so it is counted as one (#2184).
+                skip_reasons = _record_permanent_skip(
+                    doc, [f"terminal_error:{type(exc).__name__}"]
+                )
             return doc["doc_id"]
         finally:
             if debug_concurrency:
