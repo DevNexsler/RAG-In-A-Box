@@ -83,6 +83,7 @@ from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
 from core.dedupe import compute_file_identity
 from core.resilience import CircuitOpenError, is_transient
+from core import degraded_policy, standing_conditions
 from core.skip_policy import actionable_skip_docs, is_permanent_skip_entry
 from core.sensitive_content import (
     redact_sensitive_text,
@@ -916,17 +917,11 @@ def _refresh_repaired_sidecar_docs(
     return changed, failed
 
 
-# Doc-specific failures charge `attempts`; a doc is abandoned once it reaches
-# this cap. Raised from 5 to 12 alongside exponential backoff (dpark 2026-07-28):
-# with retries now spaced out, more of them span a long time without hammering,
-# so a genuinely-flaky doc gets more chances before we give up.
-_DEGRADED_MAX_ATTEMPTS = 12
-
-# Stored provider-error artifacts cannot heal through another indexer pass: the
-# upstream producer must replace their bytes. Give that producer a short grace
-# window, then park an unchanged artifact instead of retrying it forever.
-_DEGRADED_MAX_BLOCKED_ATTEMPTS = 3
-_BLOCKED_UPSTREAM_REASON_SUFFIX = ":blocked_on_upstream"
+# The retry budgets and the terminal test live in core.degraded_policy: the
+# health probe classifies the same ledger and must not re-derive them (#2101).
+_DEGRADED_MAX_ATTEMPTS = degraded_policy.MAX_ATTEMPTS
+_DEGRADED_MAX_BLOCKED_ATTEMPTS = degraded_policy.MAX_BLOCKED_ATTEMPTS
+_BLOCKED_UPSTREAM_REASON_SUFFIX = degraded_policy.BLOCKED_UPSTREAM_REASON_SUFFIX
 
 # The v1 ledger cap was 5. The v1->v2 migration keys "was this capped under v1"
 # off this historical value, NOT the live cap above — otherwise raising the live
@@ -1112,6 +1107,8 @@ def _log_run_completion(
         elapsed_seconds,
         completion,
     )
+    # Only passed when the standing-condition announcement is due — an
+    # unchanged permanent-skip set must not re-warn every run (#2101).
     if actionable_skips:
         logger.warning(
             "Index run has permanent actionable skips: %s", actionable_skips
@@ -1318,11 +1315,7 @@ def _reconcile_degraded_docs(
                 bool(stored_change_key)
                 and stored_change_key == _change_key(queued_by_id[doc_id])
             )
-            capped = (
-                int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
-                or int(entry.get("blocked_attempts", 0))
-                >= _DEGRADED_MAX_BLOCKED_ATTEMPTS
-            )
+            capped = degraded_policy.is_terminal_entry(entry)
             backoff_elapsed = (
                 now - float(entry.get("last_attempt_at", 0.0))
             ) >= _degraded_backoff_seconds(entry)
@@ -1334,11 +1327,7 @@ def _reconcile_degraded_docs(
                 bucket = "backoff"
             else:
                 bucket = "already_queued"
-        elif (
-            int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
-            or int(entry.get("blocked_attempts", 0))
-            >= _DEGRADED_MAX_BLOCKED_ATTEMPTS
-        ):
+        elif degraded_policy.is_terminal_entry(entry):
             bucket = "capped"
         elif doc_id in by_id:
             # Resolvable — but only re-admit once the backoff window elapsed.
@@ -1377,6 +1366,48 @@ def _reconcile_degraded_docs(
             if str(record.get("doc_id", "")) not in deferred
         ]
     return queue, {**ledger, "docs": docs}, report
+
+
+# Standing-condition keys (core.standing_conditions). Each names one
+# operator-actionable state that no indexer run can clear by itself, so it is
+# reported on transition and on a periodic digest instead of every run (#2101).
+_STANDING_DEGRADED_CAPPED = "degraded_capped"
+_STANDING_ACTIONABLE_SKIPS = "actionable_skips"
+
+
+def _report_terminal_cap(
+    logger: logging.Logger,
+    index_root: Path,
+    degraded_report: dict,
+    ledger: dict,
+) -> None:
+    """Report the terminal-cap set when it appears, changes, clears or is due
+    a digest — never on every run for an unchanged set.
+
+    The prod set had not moved since 2026-08-11 and still produced 117 of a
+    24h window's 118 ERROR lines, which is how the one real event in that
+    window got lost (#2101). The per-run `Degraded ledger: … N capped …` INFO
+    summary and the `degraded_capped:N` index-metadata warning keep carrying
+    the standing count in between.
+    """
+    docs = ledger.get("docs", {}) if isinstance(ledger, dict) else {}
+    capped_reasons = {
+        doc_id: list(docs.get(doc_id, {}).get("reasons", []))
+        for doc_id in degraded_report.get("capped", [])
+    }
+    announcement = standing_conditions.announce(
+        index_root, _STANDING_DEGRADED_CAPPED, capped_reasons
+    )
+    if announcement.announce:
+        logger.error(
+            "%d degraded docs parked at terminal cap (%s); source change or "
+            "manual action required: %s",
+            len(capped_reasons),
+            announcement.transition,
+            capped_reasons,
+        )
+    elif announcement.cleared:
+        logger.info("Terminal cap cleared: no degraded docs remain parked")
 
 
 def _merge_degraded_ledger(
@@ -3737,16 +3768,6 @@ def index_vault_flow(
                     _degraded_unresolved_path(index_root).name,
                 )
         if degraded_report["capped"]:
-            capped_reasons = {
-                doc_id: degraded_ledger["docs"][doc_id].get("reasons", [])
-                for doc_id in degraded_report["capped"]
-            }
-            logger.error(
-                "%d degraded docs parked at terminal cap; source change or manual "
-                "action required: %s",
-                len(degraded_report["capped"]),
-                capped_reasons,
-            )
             _RUNTIME.setdefault("_warnings", []).append(
                 f"degraded_capped:{len(degraded_report['capped'])}"
             )
@@ -3754,6 +3775,11 @@ def index_vault_flow(
         # and escalation above have to land now to survive this run.
         if degraded_report["unresolved"]:
             _save_degraded_ledger(index_root, degraded_ledger)
+    # The terminal cap is a standing state: nothing an indexer run does can
+    # change it, so it is an ERROR when it appears, changes or clears (and a
+    # daily digest) — not on all ~116 runs of a day. The counts stay on every
+    # run's `Degraded ledger:` summary and in index_metadata warnings (#2101).
+    _report_terminal_cap(logger, index_root, degraded_report, degraded_ledger)
     # Drop docs already decided 'do not index' (duplicate/oversized/corrupt)
     # whose file is unchanged — stops the reprocess-every-run loop — and claim
     # the bounded retries this run hands out.
@@ -4168,6 +4194,15 @@ def index_vault_flow(
     )
     memory_observer.sample("phase_finish", phase="finalize")
     progress = _run_progress_snapshot()
+    # Permanent actionable skips are a standing condition too — the same set
+    # (#1066's corrupt docs) warned byte-identically on 116 of 116 runs — so
+    # they follow the terminal cap's rule: announce transitions, not runs.
+    actionable_skips = actionable_skip_docs(_load_skip_ledger(index_root))
+    skip_announcement = standing_conditions.announce(
+        index_root, _STANDING_ACTIONABLE_SKIPS, actionable_skips
+    )
+    if skip_announcement.cleared:
+        logger.info("Permanent actionable skips cleared: none remain")
     _log_run_completion(
         logger,
         run_id=str(progress.get("run_id", "unmanaged")),
@@ -4177,7 +4212,7 @@ def index_vault_flow(
         indexed_docs=int(progress.get("indexed_docs") or 0),
         indexed_chunks=int(progress.get("indexed_chunks") or 0),
         elapsed_seconds=run_seconds,
-        actionable_skips=actionable_skip_docs(_load_skip_ledger(index_root)),
+        actionable_skips=actionable_skips if skip_announcement.announce else None,
     )
     _update_run_progress(phase="completed")
     _write_heartbeat(index_root)

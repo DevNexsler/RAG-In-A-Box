@@ -135,6 +135,55 @@ def test_include_degraded_ignores_docs_no_longer_scanned():
     assert out == []
 
 
+# --- terminal classification shared with the health probe (ticket #2101) ---
+
+def test_terminal_entry_covers_both_budgets():
+    from core.degraded_policy import is_terminal_entry
+
+    assert not is_terminal_entry({"attempts": _DEGRADED_MAX_ATTEMPTS - 1})
+    assert is_terminal_entry({"attempts": _DEGRADED_MAX_ATTEMPTS})
+    assert not is_terminal_entry({"blocked_attempts": 2})
+    assert is_terminal_entry({"blocked_attempts": 3})
+    # 233 transient tries are observability only — the doc still self-heals.
+    assert not is_terminal_entry({"attempts": 0, "transient_attempts": 233})
+
+
+def test_partition_splits_retrying_from_terminal():
+    from core.degraded_policy import partition_degraded_docs
+
+    retrying, terminal = partition_degraded_docs({"docs": {
+        "documents::retrying": {"reasons": ["ocr_describe_failed"], "attempts": 1},
+        "documents::001Og": {
+            "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+            "attempts": 0,
+            "blocked_attempts": 3,
+        },
+    }})
+
+    assert retrying == {"documents::retrying"}
+    assert terminal == {"documents::001Og"}
+
+
+def test_terminal_docs_group_by_reason_for_reporting():
+    from core.degraded_policy import terminal_degraded_docs
+
+    assert terminal_degraded_docs({"docs": {
+        "documents::001Og": {
+            "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+            "blocked_attempts": 3,
+        },
+        "documents::001Oo": {
+            "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+            "blocked_attempts": 3,
+        },
+        "documents::retrying": {"reasons": ["ocr_describe_failed"], "attempts": 1},
+    }}) == {
+        "vision_sidecar_failed:blocked_on_upstream": [
+            "documents::001Og", "documents::001Oo",
+        ]
+    }
+
+
 # --- total reconciliation (ticket #0618) ---
 
 def test_reconcile_partitions_every_entry_exactly_once():

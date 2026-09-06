@@ -18,6 +18,7 @@ from core import index_freshness
 from core.artifacts import is_communication_sidecar
 from core.logging_setup import configure_logging_from_config
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
+from core.degraded_policy import partition_degraded_docs, terminal_degraded_docs
 from core.skip_policy import actionable_skip_docs
 from core.storage import SearchHit
 from core.tracing import get_tracer
@@ -915,6 +916,31 @@ def _source_health_status(
     return "ok", "observed_source"
 
 
+def _standing_actions(*groups: dict[str, list[str]]) -> dict:
+    """Roll every standing operator action up into one reported facet.
+
+    A standing action is a document no indexer run can advance on its own —
+    parked at the degraded ledger's terminal cap, or skipped as permanently
+    corrupt. Only the source owner or an operator can clear one.
+
+    They are deliberately kept OUT of `overall`: a top-level status pinned at
+    `degraded` by a 25-day-old backlog cannot report the next problem, and a
+    monitor that can only read one value is not a monitor (#1242, #2101). The
+    whole set is reported here instead, by reason and with its document ids, so
+    nothing is hidden by that choice — and `overall` is free to move when
+    something genuinely new breaks.
+    """
+    merged: dict[str, list[str]] = {}
+    for group in groups:
+        for reason, doc_ids in group.items():
+            merged.setdefault(str(reason), []).extend(str(d) for d in doc_ids)
+    by_reason = {
+        reason: sorted(set(doc_ids)) for reason, doc_ids in sorted(merged.items())
+    }
+    doc_ids = {doc_id for ids in by_reason.values() for doc_id in ids}
+    return {"count": len(doc_ids), "by_reason": by_reason}
+
+
 def _overall_deep_health(
     source_statuses: list[str],
     *,
@@ -1036,17 +1062,23 @@ def _not_extractable_doc_ids(index_root: Path) -> tuple[set[str], str | None]:
     return doc_ids, None
 
 
-def _ledger_doc_ids(path: Path) -> tuple[set[str], str | None]:
+def _read_ledger(path: Path) -> tuple[dict, str | None]:
+    """Load a doc ledger ({"docs": {...}}); an unreadable one is an error."""
     if not path.exists():
-        return set(), None
+        return {"docs": {}}, None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         docs = payload.get("docs", {}) if isinstance(payload, dict) else {}
         if not isinstance(docs, dict):
             raise ValueError("ledger docs must be an object")
-        return {str(doc_id) for doc_id in docs}, None
+        return payload, None
     except (OSError, ValueError, TypeError) as exc:
-        return set(), str(exc)
+        return {"docs": {}}, str(exc)
+
+
+def _ledger_doc_ids(path: Path) -> tuple[set[str], str | None]:
+    ledger, error = _read_ledger(path)
+    return {str(doc_id) for doc_id in ledger.get("docs", {})}, error
 
 
 def _group_backing_object_state(root: Path | None, rel_paths: set[str]) -> str:
@@ -1084,7 +1116,10 @@ def _registry_coverage(
     """Classify content groups as indexed, intentionally skipped, retrying,
     deleted, intentionally empty, or missing."""
     skip_ids, skip_error = _ledger_doc_ids(index_root / "skip_docs.json")
-    degraded_ids, degraded_error = _ledger_doc_ids(index_root / "degraded_docs.json")
+    degraded_ledger, degraded_error = _read_ledger(index_root / "degraded_docs.json")
+    # A doc past its retry budget is NOT retry-pending: no run will pick it up
+    # again, so calling it that tells an operator to wait forever (#2101).
+    retrying_ids, terminal_degraded_ids = partition_degraded_docs(degraded_ledger)
     no_text_ids, log_error = _not_extractable_doc_ids(index_root)
     roots = filesystem_source_roots(config)
     errors = [error for error in (skip_error, degraded_error, log_error) if error]
@@ -1096,6 +1131,7 @@ def _registry_coverage(
             "indexed_group_count": 0,
             "not_extractable_group_count": 0,
             "retry_pending_group_count": 0,
+            "manual_action_required_group_count": 0,
             "deleted_object_group_count": 0,
             "intentionally_empty_group_count": 0,
             "missing_group_count": 0,
@@ -1105,7 +1141,8 @@ def _registry_coverage(
             group_ids = set(group.get("doc_ids", set()))
             indexed = bool(group_ids & indexed_doc_ids)
             intentionally_skipped = bool(group_ids & (skip_ids | no_text_ids))
-            retry_pending = bool(group_ids & degraded_ids)
+            retry_pending = bool(group_ids & retrying_ids)
+            manual_action_required = bool(group_ids & terminal_degraded_ids)
             sidecar = False
             if root is not None:
                 sidecar = any(
@@ -1135,6 +1172,9 @@ def _registry_coverage(
                 elif retry_pending:
                     counts["covered_group_count"] += 1
                     counts["retry_pending_group_count"] += 1
+                elif manual_action_required:
+                    counts["covered_group_count"] += 1
+                    counts["manual_action_required_group_count"] += 1
                 else:
                     counts["missing_group_count"] += 1
         coverage[source_name] = counts
@@ -1366,6 +1406,12 @@ def _compute_deep_health(
         for doc_ids_for_reason in actionable_skips.values()
         for doc_id in doc_ids_for_reason
     }
+    # A read error here is already reported through registry_coverage_error,
+    # which reads the same file; an unreadable ledger yields no standing set.
+    degraded_ledger, _ = _read_ledger(index_root / "degraded_docs.json")
+    standing_actions = _standing_actions(
+        actionable_skips, terminal_degraded_docs(degraded_ledger)
+    )
     provider_failures = _recent_provider_failures(index_root)
     source_names = sorted(
         set(configured_sources)
@@ -1393,6 +1439,9 @@ def _compute_deep_health(
         retry_pending_doc_count = int(
             source_coverage.get("retry_pending_group_count") or 0
         )
+        manual_action_required_doc_count = int(
+            source_coverage.get("manual_action_required_group_count") or 0
+        )
         deleted_object_group_count = int(
             source_coverage.get("deleted_object_group_count") or 0
         )
@@ -1416,13 +1465,20 @@ def _compute_deep_health(
             not_extractable_doc_count=(
                 not_extractable_doc_count
                 + retry_pending_doc_count
+                + manual_action_required_doc_count
                 + deleted_object_group_count
                 + intentionally_empty_group_count
             ),
         )
         if retry_pending_doc_count > 0 and status == "ok":
+            # A live, self-healing condition outranks a standing one: it is the
+            # one that can still change on its own.
             status = "indexing" if indexer_running else "degraded"
             reason = "retry_pending"
+        elif manual_action_required_doc_count > 0 and status == "ok":
+            # Accounted for, but no run will ever clear it — same class as
+            # `not_extractable`, named so an operator can act on it (#2101).
+            reason = "manual_action_required"
         source_statuses.append(status)
         source_actionable_ids = sorted(
             doc_id
@@ -1445,6 +1501,7 @@ def _compute_deep_health(
             "index_content_group_count": index_content_group_count,
             "not_extractable_doc_count": not_extractable_doc_count,
             "retry_pending_doc_count": retry_pending_doc_count,
+            "manual_action_required_doc_count": manual_action_required_doc_count,
             "deleted_object_group_count": deleted_object_group_count,
             "intentionally_empty_group_count": intentionally_empty_group_count,
             "unindexed_registry_doc_count": unindexed_registry_doc_count,
@@ -1462,15 +1519,13 @@ def _compute_deep_health(
         registry_error=registry_error,
         provider_status=provider_failures["status"],
     )
-    if actionable_ids and overall in {"ok", "unknown"}:
-        overall = "degraded"
-
     return {
         "cached": False,
         "last_ran_at": _utc_iso(time.time()),
         "ttl_seconds": _DEEP_HEALTH_CACHE_TTL_SECONDS,
         "uses_llm": False,
         "overall": overall,
+        "standing_actions": standing_actions,
         "sources": sources,
         "checks": {
             "registry_available": registry_error is None,
@@ -3609,8 +3664,13 @@ if HAS_MCP and FastMCP is not None:
                   the last indexing run (0 = clean).
                 - deep_check: Deterministic source coverage check, cached for 600s
                   and persisted to index_health.json. Includes cached, last_ran_at,
-                  uses_llm=false, overall, and per-source registry/index counts plus
-                  latest registry/index timestamps.
+                  uses_llm=false, overall, standing_actions, and per-source
+                  registry/index counts plus latest registry/index timestamps.
+                - deep_check.standing_actions: documents no indexing run can
+                  advance — parked at the degraded ledger's terminal cap or
+                  permanently unreadable — grouped by reason. These need an
+                  operator or a source change; they do not hold `overall` at
+                  degraded, so `overall` still moves for a NEW problem.
                 - provider_status/provider_failures: Log-derived provider failure
                   summary from recent indexer logs (no live LLM/provider probe).
 

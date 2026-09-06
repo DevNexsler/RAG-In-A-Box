@@ -1846,6 +1846,125 @@ def test_deep_health_reports_retry_pending_source_as_degraded(tmp_path):
     assert result["overall"] == "degraded"
 
 
+def test_deep_health_reports_terminal_cap_as_manual_action_not_retry_pending(tmp_path):
+    """#2101: the ledger parks a doc at its terminal cap ("manual action
+    required") while the probe called the same doc `retry_pending` — telling
+    an operator to wait for a retry the ledger already stopped scheduling."""
+    import json
+    from doc_id_store import DocIDStore
+
+    docs_root = tmp_path / "documents"
+    docs_root.mkdir()
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("001Og", "photo.jpg.vl.json", source_name="documents")
+    registry.close()
+    (docs_root / "photo.jpg.vl.json").write_text('{"error": "provider offline"}')
+    (tmp_path / "degraded_docs.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "docs": {
+                    "documents::001Og": {
+                        "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+                        "attempts": 0,
+                        "blocked_attempts": 3,
+                        "transient_attempts": 233,
+                    }
+                },
+            }
+        )
+    )
+
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [
+                {"type": "filesystem", "name": "documents", "root": str(docs_root)}
+            ],
+        },
+        doc_ids=[],
+        chunk_count=0,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-09-05T00:00:00+00:00",
+    )
+    documents = result["sources"]["documents"]
+
+    assert documents["reason"] == "manual_action_required"
+    assert documents["manual_action_required_doc_count"] == 1
+    assert documents["retry_pending_doc_count"] == 0
+    # A standing operator to-do must not pin the live signal: a monitor that
+    # can only read `degraded` cannot report the next problem.
+    assert documents["status"] == "ok"
+    assert result["overall"] == "ok"
+    assert result["standing_actions"] == {
+        "count": 1,
+        "by_reason": {
+            "vision_sidecar_failed:blocked_on_upstream": ["documents::001Og"]
+        },
+    }
+
+
+def test_deep_health_still_degrades_on_a_new_failure_beside_a_standing_action(tmp_path):
+    """The standing terminal doc must not hide a genuinely new degradation."""
+    import json
+    from doc_id_store import DocIDStore
+
+    docs_root = tmp_path / "documents"
+    docs_root.mkdir()
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("001Og", "photo.jpg.vl.json", source_name="documents")
+    registry.register("001New", "fresh.jpg.vl.json", source_name="documents")
+    registry.close()
+    (docs_root / "photo.jpg.vl.json").write_text('{"error": "provider offline"}')
+    (docs_root / "fresh.jpg.vl.json").write_text('{"error": "provider offline"}')
+    (tmp_path / "degraded_docs.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "docs": {
+                    "documents::001Og": {
+                        "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+                        "attempts": 0,
+                        "blocked_attempts": 3,
+                    },
+                    "documents::001New": {
+                        "reasons": ["ocr_describe_failed"],
+                        "attempts": 1,
+                    },
+                },
+            }
+        )
+    )
+
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [
+                {"type": "filesystem", "name": "documents", "root": str(docs_root)}
+            ],
+        },
+        doc_ids=[],
+        chunk_count=0,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-09-05T00:00:00+00:00",
+    )
+    documents = result["sources"]["documents"]
+
+    assert documents["status"] == "degraded"
+    assert documents["reason"] == "retry_pending"
+    assert documents["retry_pending_doc_count"] == 1
+    assert documents["manual_action_required_doc_count"] == 1
+    assert result["overall"] == "degraded"
+
+
 def test_deep_health_surfaces_actionable_corrupt_document_ids(tmp_path):
     import json
     from doc_id_store import DocIDStore
@@ -1889,7 +2008,13 @@ def test_deep_health_surfaces_actionable_corrupt_document_ids(tmp_path):
         last_run_at="2026-08-10T00:00:00+00:00",
     )
 
-    assert result["overall"] == "degraded"
+    # #2101: a permanent corrupt-document skip is a standing operator action —
+    # reported in full, but no longer pinning `overall` at degraded forever.
+    assert result["overall"] == "ok"
+    assert result["standing_actions"] == {
+        "count": 1,
+        "by_reason": {"corrupt_mangled_binary": ["documents::001sp"]},
+    }
     assert result["checks"]["actionable_skips"] == {
         "count": 1,
         "by_reason": {"corrupt_mangled_binary": ["documents::001sp"]},
