@@ -83,6 +83,16 @@ def inject_id_into_filename(filename: str, doc_id: str) -> str:
     return f"{stem}@{doc_id}@{ext}"
 
 
+#: ``dedupe_status`` of a row whose bytes are known never to produce an index
+#: row (no text extracted, unreadable/encrypted, quarantined, corrupt). Such a
+#: row must not win a canonical election: duplicates elected against it can
+#: never resolve to content, so the whole cohort's content ends up in no row at
+#: all and the duplicates' downstream callbacks have no payload to carry
+#: (#2097). A cohort whose members are all unindexable is the honest, explicit
+#: form of "intentionally empty" — it holds no canonical pointer to resolve.
+DEDUPE_STATUS_UNINDEXABLE = "unindexable"
+
+
 def _cohort_key(size_bytes: int, content_hash: bytes, hash_algo: str) -> str:
     """Stable identifier for one exact-content cohort.
 
@@ -935,14 +945,27 @@ class DocIDStore:
                 )
                 if doc_id not in candidate_ids:
                     candidates.append(caller)
-                candidates.sort(key=lambda row: (
+                # A row recorded as unindexable neither wins an election it did
+                # not initiate nor is rewritten by one. Electing it would hand
+                # the cohort back to a member that cannot land content, and
+                # demoting it to a duplicate of a canonical that has not been
+                # indexed yet is how a phantom canonical re-forms (#2097). Only
+                # its own pass — which holds the skip ledger — may revise it.
+                # The caller is always eligible: it reached here having judged
+                # itself indexable.
+                eligible = [
+                    row
+                    for row in candidates
+                    if row[0] == doc_id or row[7] != DEDUPE_STATUS_UNINDEXABLE
+                ]
+                eligible.sort(key=lambda row: (
                     row[12] if row[12] is not None else row[2],
                     row[2],
                     row[0],
                 ))
-                winner = candidates[0]
+                winner = eligible[0]
                 now = time.time()
-                for row in candidates:
+                for row in eligible:
                     row_doc_id = row[0]
                     is_winner = row_doc_id == winner[0]
                     is_caller = row_doc_id == doc_id
@@ -999,6 +1022,132 @@ class DocIDStore:
                 ).fetchone()
                 return self._registry_row_to_dict(updated)
             except Exception:
+                self._conn.rollback()
+                raise
+
+    def mark_exact_hash_cohort_unindexable(
+        self,
+        doc_id: str,
+        size_bytes: int,
+        content_hash: bytes,
+        *,
+        hash_algo: str,
+        reason: str,
+    ) -> list[str]:
+        """Record this exact-content cohort as one that cannot hold content.
+
+        The caller has evidence — a skip verdict about these exact bytes — that
+        no member of this cohort will ever produce an index row. Electing one of
+        them canonical anyway is what strands the others: they are marked
+        duplicates of a canonical that resolves to nothing, so the content is in
+        no row at all and their downstream callbacks have no payload (#2097).
+
+        So the cohort keeps its content identity (its members are still known to
+        be byte-identical) and loses its canonical pointer entirely: every
+        member becomes ``unindexable``. That is the explicit form of an
+        intentionally empty cohort — ``find_canonical_by_exact_hash`` sees no
+        canonical, no duplicate points anywhere, and each member is processed on
+        its own merits and reaches its own skip verdict. A member that becomes
+        indexable later (its bytes changed, OCR came back) leaves the state on
+        its own pass by winning the election it initiates.
+
+        Returns the member ids. Idempotent: a cohort already recorded this way
+        is not rewritten.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                caller = self._conn.execute(
+                    """
+                    SELECT doc_id, rel_path, created, source_name, size_bytes, content_hash,
+                           hash_algo, dedupe_status, canonical_doc_id, archive_path,
+                           duplicate_reason, duplicate_of_doc_id, first_seen_at, last_seen_at
+                    FROM doc_registry
+                    WHERE doc_id = ?
+                    """,
+                    (doc_id,),
+                ).fetchone()
+                if caller is None:
+                    raise KeyError(doc_id)
+                self._reject_stranding_canonical_move(
+                    caller,
+                    new_size_bytes=size_bytes,
+                    new_content_hash=content_hash,
+                    new_hash_algo=hash_algo,
+                )
+                members = [
+                    row[0]
+                    for row in self._conn.execute(
+                        """
+                        SELECT doc_id
+                        FROM doc_registry
+                        WHERE size_bytes = ? AND content_hash = ? AND hash_algo = ?
+                        ORDER BY doc_id
+                        """,
+                        (size_bytes, content_hash, hash_algo),
+                    )
+                ]
+                if doc_id not in members:
+                    members = sorted([*members, doc_id])
+                pending = self._conn.execute(
+                    f"""
+                    SELECT 1 FROM doc_registry
+                    WHERE doc_id IN ({",".join("?" * len(members))})
+                      AND (dedupe_status != ? OR canonical_doc_id IS NOT NULL
+                           OR size_bytes IS NOT ? OR content_hash IS NOT ?
+                           OR hash_algo IS NOT ?)
+                    LIMIT 1
+                    """,
+                    (
+                        *members,
+                        DEDUPE_STATUS_UNINDEXABLE,
+                        size_bytes,
+                        content_hash,
+                        hash_algo,
+                    ),
+                ).fetchone()
+                if pending is None:
+                    self._conn.commit()
+                    return members
+                now = time.time()
+                self._conn.executemany(
+                    """
+                    UPDATE doc_registry
+                    SET size_bytes = ?,
+                        content_hash = ?,
+                        hash_algo = ?,
+                        dedupe_status = ?,
+                        canonical_doc_id = NULL,
+                        archive_path = NULL,
+                        duplicate_reason = ?,
+                        duplicate_of_doc_id = NULL,
+                        first_seen_at = COALESCE(first_seen_at, created),
+                        last_seen_at = ?
+                    WHERE doc_id = ?
+                    """,
+                    [
+                        (
+                            size_bytes,
+                            content_hash,
+                            hash_algo,
+                            DEDUPE_STATUS_UNINDEXABLE,
+                            reason,
+                            now,
+                            member,
+                        )
+                        for member in members
+                    ],
+                )
+                # The cohort has left the absence-triggered reset game, so a
+                # suppression record for it would only block a genuine reset if
+                # it ever re-forms around indexed content (#1258).
+                self._conn.execute(
+                    "DELETE FROM dedupe_cohort_resets WHERE cohort_key = ?",
+                    (_cohort_key(size_bytes, content_hash, hash_algo),),
+                )
+                self._conn.commit()
+                return members
+            except BaseException:
                 self._conn.rollback()
                 raise
 
