@@ -1218,8 +1218,33 @@ class LanceDBStore:
         self._vs = self._build_vector_store()
         self._mark_handle_current()
 
+    def _table_directory_moved(self) -> bool:
+        """True when ``<table>.lance`` is a different directory than the one this
+        handle was opened on (a peer's schema evolution swapped it)."""
+        snapshot = self._open_table_snapshot
+        if snapshot is None:
+            return False
+        try:
+            stat = Path(self._dataset_path()).stat()
+        except OSError:
+            return False
+        return (stat.st_dev, stat.st_ino) != tuple(snapshot[:2])
+
     def _checkout_latest(self) -> None:
-        """Refresh an existing Lance table handle without rebuilding the store."""
+        """Refresh an existing Lance table handle without rebuilding the store.
+
+        Only while the table is still the same directory. A peer's schema
+        evolution swaps ``<table>.lance`` for a new incarnation whose version
+        numbers restart, and Table.checkout_latest() on the old handle then
+        binds the old dataset's index metadata to the new version: every read
+        after it fails with ``Not found: _indices/<old uuid>`` while the
+        snapshot reads as current, so the stale-read recovery never fires
+        (deterministic; it took the fresh-stack e2e down 1 run in 4). A moved
+        directory gets the full reopen instead.
+        """
+        if self._table_directory_moved():
+            self._reopen_vector_store()
+            return
         try:
             self._vs.table.checkout_latest()
         except TableNotFoundError:

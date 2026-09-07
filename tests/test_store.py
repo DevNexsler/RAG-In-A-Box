@@ -3978,3 +3978,71 @@ def test_upsert_does_not_insert_when_the_delete_of_old_rows_fails():
                 store.upsert_nodes([_make_node("note.md", "c:0", "v2", [0.3] * 768)])
         assert _doc_rows(store, "note.md") == ["note.md::c:0"]
         assert store.get_chunk("note.md", "c:0").text == "v1"
+
+
+# ---------------------------------------------------------------------------
+# checkout_latest after a same-path table swap
+#
+# Schema evolution swaps `<table>.lance` for a new incarnation whose version
+# numbers restart at 1. Table.checkout_latest() on a handle opened before the
+# swap binds the OLD dataset's index metadata to the new version number: every
+# read after it fails with `Not found: _indices/<old uuid>` while the handle's
+# snapshot reads as current, so stale-read recovery never fires (measured
+# deterministic on lance 4 and 10; hit the fresh-stack e2e 1 run in 4).
+# ---------------------------------------------------------------------------
+
+
+def _build_incarnation(root: str) -> LanceDBStore:
+    """Identical build sequence each time: same commits, same index set."""
+    store = LanceDBStore(root, "test_chunks")
+    for i in range(4):
+        store.upsert_nodes([_make_node(f"d{i}.md", "c:0", f"text {i}", [float(i == j) for j in range(768)])])
+    store.upsert_nodes([_make_node("d1.md", "c:0", "text 1 again", [float(1 == j) for j in range(768)])])
+    store.create_fts_index()
+    store.ensure_vector_index()
+    return store
+
+
+def _swap_in_new_incarnation(root: str) -> None:
+    import shutil
+
+    other = tempfile.mkdtemp()
+    try:
+        _build_incarnation(other)
+        shutil.move(f"{root}/test_chunks.lance", f"{root}/test_chunks__schema_backup.lance")
+        shutil.move(f"{other}/test_chunks.lance", f"{root}/test_chunks.lance")
+        shutil.rmtree(f"{root}/test_chunks__schema_backup.lance")
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
+def _reads_work(store: LanceDBStore) -> None:
+    assert store.vector_search([float(2 == j) for j in range(768)], top_k=1)[0].doc_id == "d2.md"
+    assert store.keyword_search("text", top_k=3)
+    assert store.get_chunk("d1.md", "c:0") is not None
+    assert store.vector_index_available() is True
+
+
+def test_checkout_latest_reopens_after_a_same_path_table_swap():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = _build_incarnation(tmpdir)
+        _reads_work(store)
+
+        _swap_in_new_incarnation(tmpdir)
+        store._checkout_latest()  # what every write path and the serving refresh call
+
+        _reads_work(store)
+        assert store._table_moved_under_open_handle() is False
+
+
+def test_checkout_latest_keeps_the_handle_when_the_directory_is_unchanged():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = _build_incarnation(tmpdir)
+        handle = store._vs
+        LanceDBStore(tmpdir, "test_chunks").upsert_nodes(
+            [_make_node("peer.md", "c:0", "peer wrote", [0.5] * 768)]
+        )  # a peer commit bumps the version; the directory is the same
+        store._checkout_latest()
+        assert store._vs is handle
+        assert store.get_chunk("peer.md", "c:0") is not None
+        assert store._table_moved_under_open_handle() is False
