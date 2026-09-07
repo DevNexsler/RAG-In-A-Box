@@ -10,7 +10,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-UNITS=(doc-organizer-backup.service doc-organizer-backup.timer)
+UNITS=(doc-organizer-backup.service doc-organizer-backup.timer doc-organizer-memory-watchdog.service doc-organizer-memory-watchdog.timer)
 
 mkdir -p "$UNIT_DIR"
 for u in "${UNITS[@]}"; do
@@ -20,6 +20,7 @@ done
 
 systemctl --user daemon-reload
 systemctl --user enable --now doc-organizer-backup.timer
+systemctl --user enable --now doc-organizer-memory-watchdog.timer
 
 # Remove the legacy bare crontab line, if present (single source of truth is now
 # the repo timer). Guarded so re-runs are no-ops.
@@ -32,4 +33,4 @@ echo
 echo "Live trigger now derives from: $REPO_DIR/deploy/systemd/"
 systemctl --user --no-pager is-enabled doc-organizer-backup.timer
 systemctl --user --no-pager is-active doc-organizer-backup.timer
-systemctl --user list-timers doc-organizer-backup.timer --no-pager || true
+systemctl --user list-timers doc-organizer-backup.timer doc-organizer-memory-watchdog.timer --no-pager || true

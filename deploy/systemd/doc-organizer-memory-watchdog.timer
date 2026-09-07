@@ -1,0 +1,10 @@
+[Unit]
+Description=Every 5 minutes: doc-organizer memory watchdog
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=doc-organizer-memory-watchdog.service
+
+[Install]
+WantedBy=timers.target

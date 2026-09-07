@@ -1,0 +1,12 @@
+[Unit]
+Description=doc-organizer: restart the server when its resident set outgrows the shared cgroup
+Documentation=https://github.com/DevNexsler/RAG-In-A-Box
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/RAG-in-a-Box
+# Threshold override: DOC_ORGANIZER_RSS_RESTART_MB (default 7000). Never
+# restarts while an index run holds the table or the container is unhealthy.
+ExecStart=/usr/bin/python3 %h/projects/RAG-in-a-Box/scripts/memory_watchdog.py
+StandardOutput=append:%h/backups/doc-organizer/memory-watchdog.log
+StandardError=append:%h/backups/doc-organizer/memory-watchdog.log
