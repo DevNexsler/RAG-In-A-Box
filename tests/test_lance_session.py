@@ -109,3 +109,18 @@ def test_taxonomy_store_shares_the_session(session, tmp_path):
 
     assert store.count() == 1
     assert session.size_bytes > idle_bytes
+
+
+def test_importing_lance_session_opts_out_of_centroid_statistics(monkeypatch):
+    """index_stats() otherwise prints a raw WARN to stderr on first use — an
+    untimestamped line in indexer.log (#0546) from every sweep's health read."""
+    import importlib
+    import os
+
+    monkeypatch.delenv("LANCE_INCLUDE_VECTOR_CENTROIDS", raising=False)
+    importlib.reload(lance_session)
+    assert os.environ["LANCE_INCLUDE_VECTOR_CENTROIDS"] == "false"
+
+    monkeypatch.setenv("LANCE_INCLUDE_VECTOR_CENTROIDS", "true")
+    importlib.reload(lance_session)  # an explicit operator setting wins
+    assert os.environ["LANCE_INCLUDE_VECTOR_CENTROIDS"] == "true"

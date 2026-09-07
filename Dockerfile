@@ -1,6 +1,9 @@
 FROM python:3.13-slim
 
 WORKDIR /app
+# Lean Lance index statistics (no centroid copy, no stderr WARN in indexer.log);
+# core/lance_session.py sets the same default for processes outside the image.
+ENV LANCE_INCLUDE_VECTOR_CENTROIDS=false
 
 COPY requirements.txt .
 # Filter out Apple Silicon-only packages (mlx-*) that won't install on Linux

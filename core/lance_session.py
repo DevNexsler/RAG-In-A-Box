@@ -18,12 +18,20 @@ the bounded defaults below rather than LanceDB's.
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import lancedb
+# Lance's index statistics include the IVF centroids unless told otherwise, and
+# it says so with a WARN written straight to stderr on the first index_stats()
+# call — one untimestamped line in the line-parsed indexer.log (#0546) every
+# sweep, and for a 256-partition x 4096-dim index a needless 4 MB copy per
+# health check. Opt into the lean statistics before anything asks for them.
+os.environ.setdefault("LANCE_INCLUDE_VECTOR_CENTROIDS", "false")
+
+import lancedb  # noqa: E402
 
 # Room for the serving hot set while leaving the 8 GiB container enough headroom
 # for the Python heap and a concurrent index run.  Tune via the ``lancedb``
