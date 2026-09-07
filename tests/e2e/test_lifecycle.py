@@ -16,12 +16,14 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from pathlib import Path
 
+import anyio
 import pytest
 
 from tests.e2e.client import search_hits as _hits
-from tests.e2e.conftest import NOTE_PHRASE
+from tests.e2e.conftest import EXPECTED_CORPUS_DOCS, NOTE_PHRASE, wait_for_index
 
 pytestmark = pytest.mark.anyio
 E2E_REAL = os.environ.get("E2E_REAL") == "1"
@@ -217,3 +219,52 @@ async def test_rest_search_parity(indexed_corpus, api):
     payload = resp.json()
     assert not payload.get("error"), payload
     assert any("note" in r.get("rel_path", "") for r in payload["results"]), payload
+
+
+async def _sweep_and_wait(mcp_session, *, min_docs: int) -> dict:
+    started = await mcp_session.call_tool_json("file_index_update", {})
+    assert started.get("status") == "started", started
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if (await mcp_session.call_tool_json("file_status", {})).get("indexer_running"):
+            break
+        await anyio.sleep(1)
+    return await wait_for_index(mcp_session, min_docs=min_docs)
+
+
+async def test_reindexed_document_has_no_stale_chunks(indexed_corpus, api, mcp_session):
+    """A re-indexed document's chunk set must be exactly the new one.
+
+    pylance 11 reads a double-quoted literal as a column name, so llama-index's
+    delete() filter matched nothing and every re-index kept the old chunks
+    beside the new ones — production, 2026-09-07, `documents::002KC` doubled.
+    The store now issues its own filter; this proves it through the real image
+    and the real sweep, so a dependency bump that breaks deletes fails the gate.
+    """
+    paragraph = "The quartz beacon rotates every seventh tide and hums at dusk. " * 40
+    v1 = ("# Quartz beacon\n\n" + (paragraph + "\n\n") * 3).encode()  # several chunks
+    v2 = b"# Quartz beacon\n\nThe quartz beacon was decommissioned; one short paragraph remains.\n"
+
+    resp = await api.post("/api/upload", files={"file": ("quartz-beacon.md", v1)})
+    assert resp.status_code == 201, resp.text
+    await _sweep_and_wait(mcp_session, min_docs=EXPECTED_CORPUS_DOCS + 1)
+
+    hits = _hits(await mcp_session.call_tool_json(
+        "file_search", {"query": "quartz beacon seventh tide", "top_k": 10}))
+    quartz = [h for h in hits if "quartz" in (h.get("text") or h.get("snippet") or "").lower()
+              or "quartz-beacon" in str(h.get("rel_path") or h.get("doc_id") or "")]
+    assert quartz, hits
+    doc_id = quartz[0]["doc_id"]
+    chunks_v1 = await mcp_session.call_tool_json("file_get_doc_chunks", {"doc_id": doc_id})
+    assert isinstance(chunks_v1, list) and len(chunks_v1) >= 2, chunks_v1
+
+    resp = await api.post("/api/upload", files={"file": ("quartz-beacon.md", v2)})
+    assert resp.status_code == 201, resp.text
+    await _sweep_and_wait(mcp_session, min_docs=EXPECTED_CORPUS_DOCS + 1)
+
+    chunks_v2 = await mcp_session.call_tool_json("file_get_doc_chunks", {"doc_id": doc_id})
+    assert isinstance(chunks_v2, list) and chunks_v2, chunks_v2
+    locs = [c.get("loc") for c in chunks_v2]
+    assert len(locs) == len(set(locs)), f"duplicate chunk locs after re-index: {locs}"
+    assert len(chunks_v2) < len(chunks_v1), (len(chunks_v1), len(chunks_v2))
+    assert all("decommissioned" in (c.get("text") or "") for c in chunks_v2), chunks_v2

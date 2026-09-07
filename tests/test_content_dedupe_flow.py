@@ -269,19 +269,21 @@ def test_provider_error_cohort_cleanup_recovers_after_lance_delete_failure(runti
         "00002", len(raw), digest, hash_algo="blake3"
     )
 
-    original_delete = store._vs.delete
+    # The store issues its own delete filter (LanceDBStore._delete_doc_rows)
+    # rather than llama-index's, so that is the seam a Lance failure hits.
+    original_delete = LanceDBStore._delete_doc_rows
     delete_attempts = 0
 
-    def fail_first_delete(_vector_store, doc_id):
+    def fail_first_delete(_store, doc_id):
         nonlocal delete_attempts
         delete_attempts += 1
         if delete_attempts == 1:
             raise OSError("busy")
-        return original_delete(doc_id)
+        return original_delete(_store, doc_id)
 
     fiv.begin_degradation_capture()
     with patch.object(
-        type(store._vs), "delete", autospec=True, side_effect=fail_first_delete
+        LanceDBStore, "_delete_doc_rows", autospec=True, side_effect=fail_first_delete
     ):
         fiv.process_doc_task.fn(a)
     retained_after_failure = registry.find_canonical_by_exact_hash(

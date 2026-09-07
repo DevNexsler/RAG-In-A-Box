@@ -119,6 +119,11 @@ _VECTOR_INDEX_ROWS_PER_PARTITION = 256
 _VECTOR_INDEX_TYPES = frozenset(
     {"IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_HNSW_SQ", "IVF_HNSW_PQ"}
 )
+# Rows written outside a sweep (the single-document path) sit in an unindexed
+# tail that every query flat-scans until the next index merge. A tail this
+# long means the merge has stopped running, which is the silent regression
+# the health check exists to surface.
+VECTOR_INDEX_STALE_TAIL_ROWS = 1000
 _VECTOR_NPROBES = _DEFAULT_VECTOR_NPROBES
 _VECTOR_SEARCH_GATE_LIMIT = _DEFAULT_MAX_CONCURRENT_VECTOR_SEARCHES
 _VECTOR_SEARCH_GATE = threading.BoundedSemaphore(_VECTOR_SEARCH_GATE_LIMIT)
@@ -172,6 +177,19 @@ def ivf_partitions_for(rows: int) -> int:
             rows // _VECTOR_INDEX_ROWS_PER_PARTITION,
         ),
     )
+
+
+def empty_vector_index_stats() -> dict[str, Any]:
+    """The vector_index_stats() shape for a table with no ANN index."""
+    return {
+        "available": False,
+        "name": None,
+        "index_type": None,
+        "num_indices": 0,
+        "indexed_rows": 0,
+        "unindexed_rows": 0,
+        "stale": False,
+    }
 
 
 def vector_index_settings_from_config(config: dict | None) -> dict[str, Any]:
@@ -1977,16 +1995,18 @@ class LanceDBStore:
                     with self._measure_memory("storage_delete", **memory_fields):
                         for doc_id in doc_ids:
                             try:
-                                self._vs.delete(doc_id)
+                                self._delete_doc_rows(doc_id)
                             except TableNotFoundError:
                                 pass  # Table not created yet on first run
                             except Exception as e:
-                                logger.warning(
-                                    "Failed to delete old data for %s: %s",
-                                    doc_id,
-                                    e,
+                                # Inserting after a failed delete would leave the
+                                # old chunks beside the new ones — silently. Fail
+                                # the document instead; the flow records it and
+                                # retries it on a later run.
+                                logger.error(
+                                    "Failed to delete old data for %s: %s", doc_id, e
                                 )
-                                continue
+                                raise
                             self._completed_insert_doc_ids.discard(doc_id)
                 # Add new nodes
                 try:
@@ -2167,7 +2187,7 @@ class LanceDBStore:
         with self._measure_memory("storage_delete", **memory_fields):
             for doc_id in doc_ids:
                 try:
-                    self._vs.delete(doc_id)
+                    self._delete_doc_rows(doc_id)
                 except TableNotFoundError:
                     pass  # Table not created yet — nothing to delete
                 except Exception as e:
@@ -2299,6 +2319,49 @@ class LanceDBStore:
         """
         return self._run_read_with_recovery(lambda: self._vs.table.count_rows(), 0)
 
+    def _delete_doc_rows(self, doc_id: str) -> None:
+        """Delete every chunk row of one document with our own filter.
+
+        llama-index's LanceDBVectorStore.delete() writes the id in double
+        quotes, which the SQL dialect in pylance >= 11 reads as a column name
+        (``No field named "documents::002KC"``): the delete matched nothing and
+        re-indexed documents kept their stale chunks. Single quotes are a
+        string literal in every Lance version.
+        """
+        self._vs.table.delete(f"doc_id = '{self._sql_escape(doc_id)}'")
+
+    def _vector_query(self, query_vector: list[float], where: str | None):
+        """The one vector query every search runs — explain_vector_search
+        explains exactly this builder, so a plan-level test cannot drift from
+        what production executes."""
+        q = self._vs.table.search(query_vector, query_type="vector")
+        if hasattr(q, "nprobes"):
+            # IVF partitions probed; ignored while the table has no ANN index.
+            q = q.nprobes(_VECTOR_NPROBES)
+        if where:
+            q = q.where(where, prefilter=True)
+        return q
+
+    def explain_vector_search(
+        self, query_vector: list[float], where: str | None = None, top_k: int = 10
+    ) -> str:
+        """Lance's physical plan for vector_search(query_vector, top_k, where).
+
+        An indexed table plans ``ANNSubIndex``/``ANNIvfPartition``; a table
+        without a vector index plans ``KNNVectorDistance`` over a full
+        ``LanceRead`` of the vector column — the brute-force scan that costs
+        ~1.9 GB per query at 88k rows. Tests assert on this text; operators can
+        call it to prove which one production is doing.
+        """
+        return str(
+            self._run_read_with_recovery(
+                lambda: self._vector_query(query_vector, where)
+                .limit(top_k)
+                .explain_plan(),
+                "",
+            )
+        )
+
     def vector_search(
         self,
         query_vector: list[float],
@@ -2311,13 +2374,7 @@ class LanceDBStore:
         Raises on failure so the caller (hybrid_search) can track degradation.
         """
         def _op():
-            q = self._vs.table.search(query_vector, query_type="vector")
-            if hasattr(q, "nprobes"):
-                # IVF partitions probed; ignored while the table has no ANN index.
-                q = q.nprobes(_VECTOR_NPROBES)
-            if where:
-                q = q.where(where, prefilter=True)
-            rows = q.limit(top_k).to_list()
+            rows = self._vector_query(query_vector, where).limit(top_k).to_list()
             if not include_vector:
                 for row in rows:
                     row.pop("vector", None)
@@ -2548,10 +2605,26 @@ class LanceDBStore:
     def _merge_index_deltas(self) -> None:
         """Merge newly written rows into the existing indices without
         rewriting data files. Raises on failure so the flow can fall back to
-        a full FTS rebuild."""
+        a full FTS rebuild.
+
+        Ask Lance to fold *every* delta, not its default of one: lance 4 (the
+        test venv) reads ``num_indices_to_merge=1`` as "the new delta only" and
+        leaves a fresh delta index behind on every call — even with nothing to
+        merge — so each vector query consults one more sub-index per sweep;
+        lance 10 (the image) merges into the latest. Passing the current delta
+        count plus one collapses to a single index on both, and the health
+        stats (``num_indices``) plus the e2e status test pin that it stays so."""
         import lance
 
-        lance.dataset(self._dataset_path()).optimize.optimize_indices()
+        dataset = lance.dataset(self._dataset_path())
+        deltas = 1
+        for index in dataset.list_indices():
+            try:
+                stats = dataset.stats.index_stats(index["name"])
+                deltas = max(deltas, int(stats.get("num_indices") or 1))
+            except Exception:
+                logger.debug("index_stats unavailable for %r", index, exc_info=True)
+        dataset.optimize.optimize_indices(num_indices_to_merge=deltas + 1)
 
     def _prune_versions(self, label: str) -> None:
         """Reclaim superseded, untagged Lance versions older than the
@@ -2717,6 +2790,39 @@ class LanceDBStore:
             )
         except Exception:
             return False
+
+    def vector_index_stats(self) -> dict[str, Any]:
+        """ANN index health on ``vector``: presence, type, how many delta
+        indices a query has to consult, and the unindexed tail (rows written
+        since the last merge, flat-scanned on every query). ``stale`` flips
+        when the tail passes VECTOR_INDEX_STALE_TAIL_ROWS — the merge has
+        stopped running. Never raises; a missing table or index reads as absent."""
+
+        def _op():
+            table = self._vs.table
+            for index in table.list_indices():
+                if not self._is_vector_index(index):
+                    continue
+                stats = table.index_stats(index.name)
+                unindexed = int(getattr(stats, "num_unindexed_rows", 0) or 0)
+                return {
+                    "available": True,
+                    "name": index.name,
+                    "index_type": str(
+                        getattr(stats, "index_type", None)
+                        or getattr(index, "index_type", "")
+                    ),
+                    "num_indices": int(getattr(stats, "num_indices", 1) or 1),
+                    "indexed_rows": int(getattr(stats, "num_indexed_rows", 0) or 0),
+                    "unindexed_rows": unindexed,
+                    "stale": unindexed > VECTOR_INDEX_STALE_TAIL_ROWS,
+                }
+            return empty_vector_index_stats()
+
+        try:
+            return self._run_read_with_recovery(_op, empty_vector_index_stats())
+        except Exception:
+            return empty_vector_index_stats()
 
     def ensure_vector_index(
         self, index_type: str | None = None, num_partitions: int | None = None

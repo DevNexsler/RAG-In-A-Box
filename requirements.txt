@@ -14,7 +14,13 @@ llama-index-core>=0.11.0
 
 # LlamaIndex: LanceDB vector store
 llama-index-vector-stores-lancedb>=0.4.0
-lancedb>=0.24.2  # first release exposing Session, which bounds our Lance caches (#1157)
+# Pinned as a pair, deliberately. lancedb 0.38 / pylance 11 changed the SQL
+# dialect so a double-quoted literal is read as a column name; an unpinned
+# rebuild on 2026-09-07 shipped it and llama-index's delete() filter stopped
+# matching — re-indexed documents kept their stale chunks (rolled back within
+# the hour). Upgrade on purpose, through the gate, never by rebuild.
+lancedb==0.37.1  # >=0.24.2 for Session, which bounds our Lance caches (#1157)
+pylance==10.0.0
 tantivy>=0.20.1
 pyarrow>=14.0.0
 pandas>=2.0.0

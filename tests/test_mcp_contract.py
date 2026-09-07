@@ -1250,6 +1250,7 @@ def test_file_status_includes_health():
             mock_store._metadata_subfields.return_value = {"doc_id", "title"}
             mock_store.fts_available.return_value = True
             mock_store.vector_index_available.return_value = True
+            mock_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
             mock_config = {
                 "index_root": tmpdir,
@@ -1273,6 +1274,8 @@ def test_file_status_includes_health():
             health = result["health"]
             assert health["fts_available"] is True
             assert health["vector_index_available"] is True
+            assert health["vector_index"]["unindexed_rows"] == 0
+            assert health["vector_index"]["num_indices"] == 1
             assert health["reranker_enabled"] is True
             assert health["reranker_responsive"] is True
             assert health["last_index_failed_count"] == 1
@@ -1313,6 +1316,7 @@ def test_file_status_includes_cached_deep_health_source_coverage(tmp_path):
         mock_store._metadata_subfields.return_value = {"doc_id", "source_name"}
         mock_store.fts_available.return_value = True
         mock_store.vector_index_available.return_value = True
+        mock_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
         mcp_server._cache = (
             mock_store,
@@ -1389,6 +1393,7 @@ def test_file_status_persists_deep_health_snapshot_for_restart_cache(tmp_path):
         first_store._metadata_subfields.return_value = {"doc_id", "source_name"}
         first_store.fts_available.return_value = True
         first_store.vector_index_available.return_value = True
+        first_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
         mcp_server._cache = (first_store, MagicMock(), config)
         mcp_server._cache_index_signature = mcp_server._index_metadata_signature(config)
         mcp_server._cache_identity = id(mcp_server._cache)
@@ -1407,6 +1412,7 @@ def test_file_status_persists_deep_health_snapshot_for_restart_cache(tmp_path):
         second_store._metadata_subfields.return_value = {"doc_id", "source_name"}
         second_store.fts_available.return_value = True
         second_store.vector_index_available.return_value = True
+        second_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
         mcp_server._cache = (second_store, MagicMock(), config)
         mcp_server._cache_index_signature = mcp_server._index_metadata_signature(config)
         mcp_server._cache_identity = id(mcp_server._cache)
@@ -1457,6 +1463,7 @@ def test_file_status_deep_health_includes_source_freshness_fields(tmp_path):
         mock_store._metadata_subfields.return_value = {"doc_id", "source_name", "mtime"}
         mock_store.fts_available.return_value = True
         mock_store.vector_index_available.return_value = True
+        mock_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
         mcp_server._cache = (
             mock_store,
@@ -1660,6 +1667,7 @@ def test_deep_health_green_when_only_gaps_are_deleted_or_empty(tmp_path):
         doc_ids=["documents::00001"],
         chunk_count=1,
         fts_available=True,
+        vector_index_available=True,
         indexer_running=False,
         last_run_at="2026-07-19T00:00:00Z",
     )
@@ -1765,6 +1773,7 @@ def test_deep_health_uses_hash_group_and_ledger_coverage(
         ],
         chunk_count=2,
         fts_available=True,
+        vector_index_available=True,
         indexer_running=False,
         last_run_at="2026-07-15T00:00:00+00:00",
     )
@@ -1795,6 +1804,7 @@ def test_deep_health_keeps_index_only_source_healthy_without_registry(tmp_path):
         doc_ids=["external::record/1"],
         chunk_count=1,
         fts_available=True,
+        vector_index_available=True,
         indexer_running=False,
         last_run_at="2026-07-15T00:00:00+00:00",
     )
@@ -1840,6 +1850,7 @@ def test_deep_health_reports_retry_pending_source_as_degraded(tmp_path):
         doc_ids=[],
         chunk_count=0,
         fts_available=True,
+        vector_index_available=True,
         indexer_running=False,
         last_run_at="2026-07-15T00:00:00+00:00",
     )
@@ -1891,6 +1902,7 @@ def test_deep_health_surfaces_actionable_corrupt_document_ids(tmp_path):
         doc_ids=[],
         chunk_count=0,
         fts_available=True,
+        vector_index_available=True,
         indexer_running=False,
         last_run_at="2026-08-10T00:00:00+00:00",
     )
@@ -1975,6 +1987,7 @@ def test_deep_health_ignores_terminal_client_invalid_embedding_failure(
         doc_ids=[],
         chunk_count=0,
         fts_available=True,
+        vector_index_available=True,
         indexer_running=False,
         last_run_at="2026-07-15T00:00:00+00:00",
     )
@@ -2017,6 +2030,7 @@ def test_file_status_deep_health_treats_no_text_docs_as_processed(tmp_path):
         mock_store._metadata_subfields.return_value = {"doc_id", "source_name", "mtime"}
         mock_store.fts_available.return_value = True
         mock_store.vector_index_available.return_value = True
+        mock_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
         mcp_server._cache = (
             mock_store,
@@ -2280,6 +2294,7 @@ def test_file_status_surfaces_recent_provider_failures_from_logs(tmp_path):
         mock_store._metadata_subfields.return_value = {"doc_id", "source_name", "mtime"}
         mock_store.fts_available.return_value = True
         mock_store.vector_index_available.return_value = True
+        mock_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
         mcp_server._cache = (
             mock_store,
@@ -2334,6 +2349,7 @@ def test_file_status_reports_zombie_indexer_as_not_running():
             mock_store._metadata_subfields.return_value = {"doc_id"}
             mock_store.fts_available.return_value = True
             mock_store.vector_index_available.return_value = True
+            mock_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
             mcp_server._cache = (
                 mock_store,
@@ -2554,6 +2570,7 @@ def test_file_status_health_reranker_disabled():
             mock_store._metadata_subfields.return_value = {"doc_id"}
             mock_store.fts_available.return_value = False
             mock_store.vector_index_available.return_value = True
+            mock_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
             mock_config = {
                 "index_root": tmpdir,
@@ -2590,6 +2607,7 @@ def test_file_status_returns_retrieval_failed_without_rebuilding_for_lance_read_
         good_store._metadata_subfields.return_value = {"doc_id"}
         good_store.fts_available.return_value = True
         good_store.vector_index_available.return_value = True
+        good_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
         config = {
             "index_root": str(tmp_path),
@@ -2684,6 +2702,7 @@ def test_file_status_ignores_zombie_indexer_pid(tmp_path):
         mock_store._metadata_subfields.return_value = {"doc_id"}
         mock_store.fts_available.return_value = True
         mock_store.vector_index_available.return_value = True
+        mock_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
         mcp_server._cache = (
             mock_store,
@@ -2729,6 +2748,7 @@ def test_file_status_ignores_non_indexer_pid_file(tmp_path):
         mock_store._metadata_subfields.return_value = {"doc_id"}
         mock_store.fts_available.return_value = True
         mock_store.vector_index_available.return_value = True
+        mock_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
         mcp_server._cache = (
             mock_store,
@@ -3283,6 +3303,7 @@ def test_file_status_exposes_last_attempt_success_and_terminal_freshness(tmp_pat
     store._metadata_subfields.return_value = {"doc_id"}
     store.fts_available.return_value = True
     store.vector_index_available.return_value = True
+    store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
     config = {
         "index_root": str(tmp_path),
         "embeddings": {"provider": "openrouter"},
@@ -3300,3 +3321,58 @@ def test_file_status_exposes_last_attempt_success_and_terminal_freshness(tmp_pat
     assert result["index_run"]["last_success"]["run_id"] == "older-success"
     assert result["index_run"]["latest_terminal"]["status"] == "failed"
     assert result["index_run"]["unresolved_failure"] is True
+
+
+def test_overall_deep_health_tracks_the_vector_index_like_fts():
+    """No ANN index = every vector search is a brute-force scan (the 2026-09-06
+    OOM storm), so it degrades the verdict exactly as a missing FTS index does;
+    a first sweep builds it, so 'indexing' while one runs. An index whose
+    unindexed tail has outgrown the threshold means the merge stopped: degraded."""
+    verdict = mcp_server._overall_deep_health
+    base = dict(fts_available=True, registry_error=None)
+    assert verdict(["ok"], indexer_running=False, **base) == "ok"
+    assert verdict(["ok"], indexer_running=False, vector_index_available=False, **base) == "degraded"
+    assert verdict(["ok"], indexer_running=True, vector_index_available=False, **base) == "indexing"
+    assert verdict(["ok"], indexer_running=False, vector_index_stale=True, **base) == "degraded"
+    assert verdict(["ok"], indexer_running=True, vector_index_stale=True, **base) == "degraded"
+
+
+def test_deep_health_checks_carry_the_vector_index_stats(tmp_path):
+    stats = {
+        "available": True,
+        "name": "vector_idx",
+        "index_type": "IVF_FLAT",
+        "num_indices": 1,
+        "indexed_rows": 88_440,
+        "unindexed_rows": 3,
+        "stale": False,
+    }
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={"index_root": str(tmp_path), "sources": [{"type": "postgres", "name": "external"}]},
+        doc_ids=["external::record/1"],
+        chunk_count=1,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-09-06T00:00:00+00:00",
+        vector_index_available=True,
+        vector_index=stats,
+    )
+    assert result["checks"]["vector_index"] == stats
+    assert result["checks"]["vector_index_available"] is True
+    assert result["overall"] == "ok"
+
+    stale = mcp_server._compute_deep_health(
+        store=store,
+        config={"index_root": str(tmp_path), "sources": [{"type": "postgres", "name": "external"}]},
+        doc_ids=["external::record/1"],
+        chunk_count=1,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-09-06T00:00:00+00:00",
+        vector_index_available=True,
+        vector_index={**stats, "unindexed_rows": 5_000, "stale": True},
+    )
+    assert stale["overall"] == "degraded"

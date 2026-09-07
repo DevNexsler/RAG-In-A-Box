@@ -21,7 +21,11 @@ from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_sa
 from core.skip_policy import actionable_skip_docs
 from core.storage import SearchHit
 from core.tracing import get_tracer
-from lancedb_store import LanceDBStore, open_store_with_recovery
+from lancedb_store import (
+    LanceDBStore,
+    empty_vector_index_stats,
+    open_store_with_recovery,
+)
 from index_run_supervisor import IndexRunSupervisor, index_log_paths
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
@@ -922,6 +926,8 @@ def _overall_deep_health(
     indexer_running: bool,
     registry_error: str | None,
     provider_status: str = "ok",
+    vector_index_available: bool = True,
+    vector_index_stale: bool = False,
 ) -> str:
     if registry_error:
         return "degraded"
@@ -930,6 +936,14 @@ def _overall_deep_health(
     worst = max(worst, rank.get(provider_status, 1))
     if not fts_available:
         worst = max(worst, rank["indexing" if indexer_running else "degraded"])
+    # Same contract for the ANN index: absent means every vector search is a
+    # brute-force scan of the whole vector column (the 2026-09-06 OOM storm);
+    # a first sweep builds it, so "indexing" while one runs. A stale tail means
+    # the per-sweep merge has stopped — degraded even though the index exists.
+    if not vector_index_available:
+        worst = max(worst, rank["indexing" if indexer_running else "degraded"])
+    elif vector_index_stale:
+        worst = max(worst, rank["degraded"])
     if worst >= rank["critical"]:
         return "critical"
     if worst >= rank["degraded"]:
@@ -1343,6 +1357,7 @@ def _compute_deep_health(
     indexer_running: bool,
     last_run_at: str | None,
     vector_index_available: bool = False,
+    vector_index: dict | None = None,
 ) -> dict:
     index_root = Path(config["index_root"])
     configured_sources = _configured_source_names(config)
@@ -1462,6 +1477,8 @@ def _compute_deep_health(
         indexer_running=indexer_running,
         registry_error=registry_error,
         provider_status=provider_failures["status"],
+        vector_index_available=vector_index_available,
+        vector_index_stale=bool((vector_index or {}).get("stale")),
     )
     if actionable_ids and overall in {"ok", "unknown"}:
         overall = "degraded"
@@ -1480,6 +1497,7 @@ def _compute_deep_health(
             "chunk_count": chunk_count,
             "fts_available": fts_available,
             "vector_index_available": vector_index_available,
+            "vector_index": vector_index or empty_vector_index_stats(),
             "index_freshness_available": index_freshness_error is None,
             "index_freshness_error": index_freshness_error,
             "registry_coverage_available": coverage_error is None,
@@ -1559,6 +1577,7 @@ def _get_deep_health(
     indexer_running: bool,
     last_run_at: str | None,
     vector_index_available: bool = False,
+    vector_index: dict | None = None,
 ) -> dict:
     import copy
 
@@ -1593,6 +1612,7 @@ def _get_deep_health(
         indexer_running=indexer_running,
         last_run_at=last_run_at,
         vector_index_available=vector_index_available,
+        vector_index=vector_index,
     )
     _deep_health_cache = {
         "key": memory_key,
@@ -2561,7 +2581,8 @@ def _file_status_impl() -> dict:
     # Health: FTS availability, and the ANN index on the vector column (without
     # it every vector search is a brute-force scan of the whole column).
     fts_ok = store.fts_available()
-    vector_index_ok = store.vector_index_available()
+    vector_index_stats = store.vector_index_stats()
+    vector_index_ok = bool(vector_index_stats.get("available"))
 
     # Health: reranker status
     reranker_cfg = config.get("search", {}).get("reranker", {})
@@ -2613,6 +2634,7 @@ def _file_status_impl() -> dict:
         indexer_running=indexer_running,
         last_run_at=last_run_at,
         vector_index_available=vector_index_ok,
+        vector_index=vector_index_stats,
     )
     provider_failures = (
         deep_health.get("checks", {}).get("provider_failures")
@@ -2633,6 +2655,7 @@ def _file_status_impl() -> dict:
         "health": {
             "fts_available": fts_ok,
             "vector_index_available": vector_index_ok,
+            "vector_index": vector_index_stats,
             "reranker_enabled": reranker_enabled,
             "reranker_responsive": reranker_responsive,
             "last_index_failed_count": last_index_failed_count,

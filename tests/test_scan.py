@@ -239,6 +239,7 @@ def test_full_flow_suppresses_unchanged_empty_file_until_changed(tmp_path, caplo
     store.count_chunks.return_value = 0
     store.fts_available.return_value = True
     store.vector_index_available.return_value = True
+    store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
     taxonomy = MagicMock()
     taxonomy.count.return_value = 0
 
@@ -322,6 +323,7 @@ def test_full_flow_surfaces_parked_provider_error_without_self_heal_claim(
     store.count_chunks.return_value = 0
     store.fts_available.return_value = True
     store.vector_index_available.return_value = True
+    store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
     taxonomy = MagicMock()
     taxonomy.count.return_value = 0
 
@@ -1357,6 +1359,7 @@ def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = False
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -1540,6 +1543,7 @@ def test_existing_changed_store_prunes_before_processing_and_finalizes_without_r
     fake_store.count_chunks.return_value = 2
     fake_store.fts_available.return_value = True
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
     fake_store.prepare_indexing_maintenance.side_effect = lambda: events.append(
         "prepare"
     )
@@ -1574,6 +1578,7 @@ def test_fresh_store_skips_pre_index_maintenance_and_creates_fts_after_processin
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = False
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     _run_flow_with_fts_store(
         tmp_path,
@@ -1628,6 +1633,7 @@ def test_new_source_in_populated_shared_table_still_prunes_before_processing(
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = True
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     _run_flow_with_fts_store(
         tmp_path,
@@ -1649,6 +1655,7 @@ def test_delete_only_run_deletes_before_final_index_maintenance(tmp_path):
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = True
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
     fake_store.ensure_fts_index.side_effect = lambda **_kwargs: events.append("ensure")
 
     _run_flow_with_fts_store(
@@ -1679,6 +1686,7 @@ def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = True
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
     fake_store.ensure_fts_index.side_effect = RuntimeError(
         "rust future panicked: unknown error"
     )
@@ -1702,6 +1710,7 @@ def test_fts_full_rebuild_fallback_failure_records_warning(tmp_path):
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = True
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
     fake_store.ensure_fts_index.side_effect = RuntimeError(
         "rust future panicked: unknown error"
     )
@@ -1727,6 +1736,7 @@ def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
     active_store.count_chunks.return_value = 10
     active_store.fts_available.return_value = True
     active_store.vector_index_available.return_value = True
+    active_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     shadow_store = MagicMock()
     shadow_store.list_doc_ids.return_value = ["documents::new-1"]
@@ -1734,6 +1744,7 @@ def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
     shadow_store.count_chunks.return_value = 12
     shadow_store.fts_available.return_value = False
     shadow_store.vector_index_available.return_value = True
+    shadow_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -1846,6 +1857,7 @@ def test_large_degraded_requeue_does_not_trigger_shadow_rebuild(tmp_path):
     active_store.count_chunks.return_value = 1200
     active_store.fts_available.return_value = True
     active_store.vector_index_available.return_value = True
+    active_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -1920,6 +1932,7 @@ def _run_flow_over_scan(tmp_path, index_root, scanned_doc_ids, source_name="docu
     active_store.count_chunks.return_value = len(stored)
     active_store.fts_available.return_value = True
     active_store.vector_index_available.return_value = True
+    active_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -2011,6 +2024,7 @@ def test_index_flow_syncs_folder_taxonomy_from_sources(tmp_path):
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = True
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -2087,6 +2101,7 @@ def test_index_flow_source_scope_deletes_only_selected_source(tmp_path):
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = True
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -2191,6 +2206,7 @@ def test_index_flow_source_scope_skips_global_empty_registry_migration(tmp_path)
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = True
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 0
@@ -2257,6 +2273,7 @@ def test_index_flow_injects_media_provider_into_sources(tmp_path):
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = True
     fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -2350,3 +2367,74 @@ def test_write_index_metadata_counts_warnings_separately(tmp_path):
         "fts_rebuild_failed": 1,
     }
     assert meta["enrichment_failed_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Vector (ANN) index wiring in index_vault_flow
+# ---------------------------------------------------------------------------
+
+
+def _vector_index_stats(unindexed: int) -> dict:
+    return {
+        "available": True,
+        "name": "vector_idx",
+        "index_type": "IVF_FLAT",
+        "num_indices": 1,
+        "indexed_rows": 10,
+        "unindexed_rows": unindexed,
+        "stale": False,
+    }
+
+
+def _fake_store_for_vector_index_tests():
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = ["documents::doc-1"]
+    fake_store.list_doc_mtimes.return_value = {"documents::doc-1": 1.0}
+    fake_store.list_doc_change_hashes.return_value = {}
+    fake_store.count_chunks.return_value = 1
+    fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = _vector_index_stats(0)
+    return fake_store
+
+
+def test_flow_ensures_the_vector_index_on_every_run(tmp_path):
+    """The store never built an ANN index on its own; the flow must ask for one
+    every run (a no-op once it exists) — the six-month gap that let every query
+    brute-force scan the vector column."""
+    fake_store = _fake_store_for_vector_index_tests()
+    _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
+    fake_store.ensure_vector_index.assert_called_once_with(index_type=None, num_partitions=None)
+
+
+def test_vector_index_failure_is_a_warning_not_a_failed_run(tmp_path):
+    fake_store = _fake_store_for_vector_index_tests()
+    fake_store.ensure_vector_index.side_effect = RuntimeError("kmeans exploded")
+
+    meta_mock = _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
+
+    warnings = meta_mock.call_args[0][4] or []
+    assert any(w.startswith("vector_index_failed:") for w in warnings), warnings
+    fake_store.ensure_fts_index.assert_called_once_with()  # the run went on
+
+
+def test_noop_diff_still_merges_an_unindexed_vector_tail(tmp_path):
+    """Rows the single-document path wrote since the last sweep are flat-scanned
+    until merged. A sweep with nothing else to do must still run the
+    incremental index step, or that tail grows forever."""
+    fake_store = _fake_store_for_vector_index_tests()
+    fake_store.vector_index_stats.return_value = _vector_index_stats(12)
+
+    _run_flow_with_fts_store(tmp_path, fake_store, ([], []))
+
+    fake_store.ensure_fts_index.assert_called_once_with()
+    fake_store.create_fts_index.assert_not_called()
+
+
+def test_noop_diff_without_a_tail_skips_index_maintenance(tmp_path):
+    fake_store = _fake_store_for_vector_index_tests()
+
+    _run_flow_with_fts_store(tmp_path, fake_store, ([], []))
+
+    fake_store.ensure_fts_index.assert_not_called()
+    fake_store.create_fts_index.assert_not_called()

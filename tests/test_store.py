@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pyarrow as pa
 import pytest
@@ -3767,3 +3767,214 @@ def test_vector_search_concurrency_is_bounded_process_wide():
         finally:
             release.set()
             lancedb_store_module.configure_vector_search(**defaults)
+
+
+def test_vector_search_plan_uses_the_ann_index_with_and_without_prefilter():
+    """The regression that hid for six months: a table without a vector index
+    still answers every query, by brute-force scanning the whole vector column
+    (``KNNVectorDistance`` over a full ``LanceRead``). Pin the plan itself:
+    once the index exists, vector_search plans ``ANNSubIndex`` — for the plain
+    query and for the metadata-prefiltered one production runs."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        _seed_onehot_nodes(store, count=8)
+        query = [float(j == 2) for j in range(768)]
+        where = "metadata.source_type = 'md'"
+
+        flat_plan = store.explain_vector_search(query)
+        assert "KNNVectorDistance" in flat_plan and "ANNSubIndex" not in flat_plan
+
+        assert store.ensure_vector_index() is True
+        for clause in (None, where):
+            plan = store.explain_vector_search(query, where=clause)
+            assert "ANNSubIndex" in plan, plan
+            assert "KNNVectorDistance" not in plan, plan
+        assert store.vector_search(query, top_k=1, where=where)[0].doc_id == "d2.md"
+
+
+def test_vector_index_stats_reports_absent_present_and_unindexed_tail():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        assert store.vector_index_stats() == lancedb_store_module.empty_vector_index_stats()
+
+        _seed_onehot_nodes(store, count=6)
+        assert store.vector_index_stats()["available"] is False
+
+        store.ensure_vector_index()
+        stats = store.vector_index_stats()
+        assert stats["available"] is True
+        assert "IVF" in stats["index_type"].upper()
+        assert stats == {
+            **stats,
+            "num_indices": 1,
+            "indexed_rows": 6,
+            "unindexed_rows": 0,
+            "stale": False,
+        }
+
+        # Rows written after the build (the single-document path) form a tail
+        # the index does not cover yet.
+        store.upsert_nodes(
+            [_make_node("late.md", "c:0", "late", [0.5] * 768)]
+        )
+        stats = store.vector_index_stats()
+        assert stats["unindexed_rows"] == 1 and stats["indexed_rows"] == 6
+        assert stats["stale"] is False
+
+
+def test_index_maintenance_merges_the_tail_into_the_single_vector_index():
+    """The sweep's incremental step (ensure_fts_index -> optimize_indices) must
+    fold new rows into the existing vector index: tail back to 0, still ONE
+    index (a delta-per-merge index type would show num_indices climbing), and
+    the new row reachable through the ANN plan."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        _seed_onehot_nodes(store, count=6)
+        store.create_fts_index()
+        store.ensure_vector_index()
+
+        late = [0.0] * 768
+        late[700] = 1.0
+        store.upsert_nodes([_make_node("late.md", "c:0", "late", late)])
+        assert store.vector_index_stats()["unindexed_rows"] == 1
+
+        store.ensure_fts_index()  # what every index run calls after writes
+
+        stats = store.vector_index_stats()
+        assert stats["unindexed_rows"] == 0
+        assert stats["indexed_rows"] == 7
+        assert stats["num_indices"] == 1
+        assert "ANNSubIndex" in store.explain_vector_search(late)
+        assert store.vector_search(late, top_k=1)[0].doc_id == "late.md"
+
+
+def test_vector_index_stale_flag_trips_when_the_tail_outgrows_the_threshold(monkeypatch):
+    monkeypatch.setattr(lancedb_store_module, "VECTOR_INDEX_STALE_TAIL_ROWS", 2)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        _seed_onehot_nodes(store, count=4)
+        store.ensure_vector_index()
+        store.upsert_nodes(
+            [_make_node(f"tail{i}.md", "c:0", f"tail {i}", [0.1 * i] * 768) for i in range(3)]
+        )
+        stats = store.vector_index_stats()
+        assert stats["unindexed_rows"] == 3
+        assert stats["stale"] is True
+
+
+def test_schema_evolution_keeps_the_vector_index_or_ensure_restores_it():
+    """Widening the metadata struct swaps the physical table. Whatever Lance
+    does with the index across that swap, the flow's ensure step must leave
+    the table indexed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.0] * 768
+        store.upsert_nodes([_make_node_with_meta("a.pdf", "p:1:c:0", "pdf chunk", vec)])
+        store.ensure_vector_index()
+        assert store.vector_index_available() is True
+
+        store.upsert_nodes(
+            [_make_node_with_meta("b.md", "c:0", "md chunk", vec, section="Introduction")]
+        )
+        assert "section" in store._metadata_subfields()
+
+        store.ensure_vector_index()
+        assert store.vector_index_available() is True
+        assert "ANNSubIndex" in store.explain_vector_search(vec)
+
+
+def test_promoted_shadow_table_carries_its_vector_index():
+    """A shadow rebuild indexes the shadow before promote_table swaps it in, so
+    the active table never serves without the index."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        active = LanceDBStore(tmpdir, "test_chunks")
+        shadow = LanceDBStore(tmpdir, "test_chunks__shadow")
+        active.upsert_nodes([_make_node("active.md", "c:0", "active", [0.1] * 768)])
+        shadow.upsert_nodes([_make_node("shadow.md", "c:0", "shadow", [0.2] * 768)])
+        shadow.create_fts_index()
+        assert shadow.ensure_vector_index() is True
+
+        active.promote_table("test_chunks__shadow")
+
+        reopened = LanceDBStore(tmpdir, "test_chunks")
+        assert reopened.list_doc_ids() == ["shadow.md"]
+        assert reopened.vector_index_available() is True
+        assert "ANNSubIndex" in reopened.explain_vector_search([0.2] * 768)
+
+
+# ---------------------------------------------------------------------------
+# Document deletes must match rows in every Lance version
+#
+# pylance 11 changed the SQL dialect: a double-quoted literal is a column
+# name. llama-index's LanceDBVectorStore.delete() quotes ids that way, so under
+# lance 11 every re-index kept the old chunks beside the new ones (production,
+# 2026-09-07, `documents::002KC` doubled). The store now issues its own filter.
+# ---------------------------------------------------------------------------
+
+
+def _doc_rows(store: LanceDBStore, doc_id: str) -> list[str]:
+    table = store._vs.table.to_lance().to_table(columns=["id", "doc_id"])
+    return sorted(
+        row_id
+        for row_id, row_doc in zip(table["id"].to_pylist(), table["doc_id"].to_pylist())
+        if row_doc == doc_id
+    )
+
+
+def test_reupsert_replaces_every_chunk_and_leaves_no_stale_rows():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.3] * 768
+        store.upsert_nodes(
+            [_make_node("note.md", f"c:{i}", f"v1 chunk {i}", vec) for i in range(3)]
+        )
+        store.upsert_nodes([_make_node("other.md", "c:0", "untouched", vec)])
+        assert _doc_rows(store, "note.md") == ["note.md::c:0", "note.md::c:1", "note.md::c:2"]
+
+        store.upsert_nodes(
+            [_make_node("note.md", f"c:{i}", f"v2 chunk {i}", vec) for i in range(2)]
+        )
+
+        assert _doc_rows(store, "note.md") == ["note.md::c:0", "note.md::c:1"]
+        assert store.get_chunk("note.md", "c:0").text == "v2 chunk 0"
+        assert _doc_rows(store, "other.md") == ["other.md::c:0"]
+        assert store.count_chunks() == 3
+
+
+def test_delete_by_doc_ids_removes_every_row_of_the_document():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        vec = [0.3] * 768
+        store.upsert_nodes(
+            [_make_node("gone.md", f"c:{i}", f"chunk {i}", vec) for i in range(4)]
+            + [_make_node("kept.md", "c:0", "kept", vec)]
+        )
+        store.delete_by_doc_ids(["gone.md"])
+        assert _doc_rows(store, "gone.md") == []
+        assert _doc_rows(store, "kept.md") == ["kept.md::c:0"]
+
+
+def test_document_deletes_use_a_single_quoted_literal_not_llama_index_delete():
+    """Deterministic across Lance versions: the filter itself is ours, escaped,
+    and llama-index's double-quoted delete() is never called."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("o'brien.md", "c:0", "text", [0.3] * 768)])
+        fake_table = MagicMock()
+        with patch.object(type(store._vs), "table", new_callable=PropertyMock, return_value=fake_table):
+            with patch.object(type(store._vs), "delete") as llama_delete:
+                store.delete_by_doc_ids(["o'brien.md"])
+        fake_table.delete.assert_called_once_with("doc_id = 'o''brien.md'")
+        llama_delete.assert_not_called()
+
+
+def test_upsert_does_not_insert_when_the_delete_of_old_rows_fails():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        node = _make_node("note.md", "c:0", "v1", [0.3] * 768)
+        store.upsert_nodes([node])
+        with patch.object(store, "_delete_doc_rows", side_effect=RuntimeError("filter rejected")):
+            with pytest.raises(RuntimeError, match="filter rejected"):
+                store.upsert_nodes([_make_node("note.md", "c:0", "v2", [0.3] * 768)])
+        assert _doc_rows(store, "note.md") == ["note.md::c:0"]
+        assert store.get_chunk("note.md", "c:0").text == "v1"

@@ -4020,6 +4020,18 @@ def index_vault_flow(
         logger.info("FTS index unavailable after no-op diff — rebuilding FTS index")
         should_update_fts = True
         needs_full_rebuild = True
+    if not should_update_fts:
+        # Rows the single-document path wrote since the last merge sit in an
+        # unindexed tail that every vector query flat-scans. A no-op diff
+        # would skip the merge and let that tail grow sweep after sweep, so
+        # run the incremental step (optimize_indices covers every index).
+        vector_tail = int(store.vector_index_stats().get("unindexed_rows") or 0)
+        if vector_tail:
+            logger.info(
+                "Vector index has %d unindexed rows after a no-op diff — merging index deltas",
+                vector_tail,
+            )
+            should_update_fts = True
 
     fts_rebuild_ok = True
     if should_update_fts:

@@ -97,8 +97,16 @@ async def test_status_healthy_shape(indexed_corpus, mcp_session):
     assert health["fts_available"] is True
     # The sweep must leave an ANN index on the vector column: without it every
     # vector search brute-force scans the whole fp32 column and a search burst
-    # OOM-kills the container (20 restarts on 2026-09-06).
+    # OOM-kills the container (20 restarts on 2026-09-06). And it must be one
+    # fully merged index — no unindexed tail, no pile of delta indices.
     assert health["vector_index_available"] is True
+    vector_index = health["vector_index"]
+    assert vector_index["available"] is True, vector_index
+    assert "IVF" in str(vector_index["index_type"]).upper(), vector_index
+    assert vector_index["unindexed_rows"] == 0, vector_index
+    assert vector_index["num_indices"] == 1, vector_index
+    assert vector_index["indexed_rows"] == status["chunk_count"], (vector_index, status["chunk_count"])
+    assert vector_index["stale"] is False
     assert health["reranker_enabled"] is True
     assert health["reranker_responsive"] is True
     assert health["last_index_failed_count"] == 0
@@ -249,3 +257,33 @@ async def test_index_update_scoped_sweep(indexed_corpus, mcp_session):
                 capture_output=True,
                 text=True,
             )
+
+
+async def test_second_sweep_merges_new_rows_into_the_single_vector_index(
+    indexed_corpus, api, mcp_session
+):
+    """Rows written after the index was built are flat-scanned until the next
+    sweep merges them. The merge must fold them into the ONE existing index —
+    unindexed tail back to 0, num_indices still 1 — through the real image and
+    the real flow, not a mocked store."""
+    before = (await mcp_session.call_tool_json("file_status", {}))["health"]["vector_index"]
+    assert before["available"] is True, before
+
+    content = b"# Tail\n\nRows added after the first sweep are merged, not scanned forever.\n"
+    resp = await api.post("/api/upload", files={"file": ("vector-tail-note.md", content)})
+    assert resp.status_code == 201, resp.text
+    started = await mcp_session.call_tool_json("file_index_update", {})
+    assert started.get("status") == "started", started
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if (await mcp_session.call_tool_json("file_status", {})).get("indexer_running"):
+            break
+        await anyio.sleep(1)
+    status = await wait_for_index(mcp_session, min_docs=EXPECTED_CORPUS_DOCS + 1)
+
+    after = status["health"]["vector_index"]
+    assert after["available"] is True, after
+    assert after["indexed_rows"] > before["indexed_rows"], (before, after)
+    assert after["unindexed_rows"] == 0, after
+    assert after["num_indices"] == 1, after
+    assert after["indexed_rows"] == status["chunk_count"], (after, status["chunk_count"])

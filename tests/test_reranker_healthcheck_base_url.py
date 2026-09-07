@@ -22,6 +22,9 @@ class _FakeStore:
     def vector_index_available(self):
         return True
 
+    def vector_index_stats(self):
+        return {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
+
     def _metadata_subfields(self):
         return set()
 
