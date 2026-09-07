@@ -76,6 +76,12 @@ services:
       # server that orphans when earlyoom kills the indexer (49+ orphans /
       # ~19 GiB baseline). One intentional server, never a leak.
       - PREFECT_SERVER_ALLOW_EPHEMERAL_MODE=false
+      # Lance sizes its IO and CPU pools to the host's 32 cores (the container has
+      # no cpu limit): 64 threads, each with allocator arenas that retain a share
+      # of every query's partition reads. 8/8 caps the fan-out for one 88k-row
+      # table; the index run's throughput is bound by provider calls, not this.
+      - LANCE_IO_THREADS=${LANCE_IO_THREADS:-8}
+      - LANCE_CPU_THREADS=${LANCE_CPU_THREADS:-8}
 
 networks:
   rag-net:
