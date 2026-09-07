@@ -118,7 +118,12 @@ from memory_observer import MemoryObserver
 from core.hook_outbox import HookOutbox
 from hooks.delivery import drain_due, queue_event
 from hooks.events import build_document_indexed_event
-from lancedb_store import LanceDBStore, compaction_is_due, open_store_with_recovery
+from lancedb_store import (
+    LanceDBStore,
+    compaction_is_due,
+    open_store_with_recovery,
+    vector_index_settings_from_config,
+)
 
 # Lazy tracer: module-level caching is safe, it resolves the provider per call.
 # Spans are no-ops unless setup_tracing() ran with tracing.enabled: true.
@@ -3986,6 +3991,21 @@ def index_vault_flow(
         )
         _RUNTIME.setdefault("degraded_clean", set()).update(reaped_ids)
         _RUNTIME.setdefault("skip_clean", set()).update(reaped_ids)
+
+    # ANN index on the vector column, ahead of the FTS step so that step's
+    # optimize_indices() merge covers it too. Without it every vector search is
+    # a brute-force scan of the whole fp32 column (~1.9 GB transient per query
+    # at 88k rows), and concurrent searches took the container to its memory
+    # cgroup ceiling 20 times on 2026-09-06. Creation is a one-time build
+    # (~30-45 s on that table); every later run is a no-op here plus the
+    # incremental merge below. Failure degrades to the flat scan and is
+    # reported, never fails the run — the FTS step's contract.
+    try:
+        if store.ensure_vector_index(**vector_index_settings_from_config(config)):
+            logger.info("Vector index built for table %r", store.table_name)
+    except Exception as exc:
+        logger.error("Vector index update failed: %s", exc)
+        _RUNTIME.setdefault("_warnings", []).append(f"vector_index_failed: {exc}")
 
     # Keep the native FTS index current after data changes. The Lance-native
     # index updates incrementally — ensure_fts_index() creates it if missing

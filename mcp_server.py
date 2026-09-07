@@ -1342,6 +1342,7 @@ def _compute_deep_health(
     fts_available: bool,
     indexer_running: bool,
     last_run_at: str | None,
+    vector_index_available: bool = False,
 ) -> dict:
     index_root = Path(config["index_root"])
     configured_sources = _configured_source_names(config)
@@ -1478,6 +1479,7 @@ def _compute_deep_health(
             "index_doc_count": len(doc_ids),
             "chunk_count": chunk_count,
             "fts_available": fts_available,
+            "vector_index_available": vector_index_available,
             "index_freshness_available": index_freshness_error is None,
             "index_freshness_error": index_freshness_error,
             "registry_coverage_available": coverage_error is None,
@@ -1556,6 +1558,7 @@ def _get_deep_health(
     fts_available: bool,
     indexer_running: bool,
     last_run_at: str | None,
+    vector_index_available: bool = False,
 ) -> dict:
     import copy
 
@@ -1589,6 +1592,7 @@ def _get_deep_health(
         fts_available=fts_available,
         indexer_running=indexer_running,
         last_run_at=last_run_at,
+        vector_index_available=vector_index_available,
     )
     _deep_health_cache = {
         "key": memory_key,
@@ -2554,8 +2558,10 @@ def _file_status_impl() -> dict:
         except Exception as exc:
             logger.warning("Failed to read index_metadata.json: %s", exc)
 
-    # Health: FTS availability
+    # Health: FTS availability, and the ANN index on the vector column (without
+    # it every vector search is a brute-force scan of the whole column).
     fts_ok = store.fts_available()
+    vector_index_ok = store.vector_index_available()
 
     # Health: reranker status
     reranker_cfg = config.get("search", {}).get("reranker", {})
@@ -2606,6 +2612,7 @@ def _file_status_impl() -> dict:
         fts_available=fts_ok,
         indexer_running=indexer_running,
         last_run_at=last_run_at,
+        vector_index_available=vector_index_ok,
     )
     provider_failures = (
         deep_health.get("checks", {}).get("provider_failures")
@@ -2625,6 +2632,7 @@ def _file_status_impl() -> dict:
         "index_run": index_run,
         "health": {
             "fts_available": fts_ok,
+            "vector_index_available": vector_index_ok,
             "reranker_enabled": reranker_enabled,
             "reranker_responsive": reranker_responsive,
             "last_index_failed_count": last_index_failed_count,

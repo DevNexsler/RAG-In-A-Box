@@ -238,6 +238,7 @@ def test_full_flow_suppresses_unchanged_empty_file_until_changed(tmp_path, caplo
     store.list_doc_change_hashes.return_value = {}
     store.count_chunks.return_value = 0
     store.fts_available.return_value = True
+    store.vector_index_available.return_value = True
     taxonomy = MagicMock()
     taxonomy.count.return_value = 0
 
@@ -320,6 +321,7 @@ def test_full_flow_surfaces_parked_provider_error_without_self_heal_claim(
     store.list_doc_change_hashes.return_value = {}
     store.count_chunks.return_value = 0
     store.fts_available.return_value = True
+    store.vector_index_available.return_value = True
     taxonomy = MagicMock()
     taxonomy.count.return_value = 0
 
@@ -1354,6 +1356,7 @@ def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
     fake_store.list_doc_mtimes.return_value = {"documents::doc-1": 1.0}
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = False
+    fake_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -1536,6 +1539,7 @@ def test_existing_changed_store_prunes_before_processing_and_finalizes_without_r
     fake_store.list_doc_change_hashes.return_value = {}
     fake_store.count_chunks.return_value = 2
     fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
     fake_store.prepare_indexing_maintenance.side_effect = lambda: events.append(
         "prepare"
     )
@@ -1569,6 +1573,7 @@ def test_fresh_store_skips_pre_index_maintenance_and_creates_fts_after_processin
     fake_store.list_doc_change_hashes.return_value = {}
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = False
+    fake_store.vector_index_available.return_value = True
 
     _run_flow_with_fts_store(
         tmp_path,
@@ -1622,6 +1627,7 @@ def test_new_source_in_populated_shared_table_still_prunes_before_processing(
     fake_store.list_doc_change_hashes.return_value = {}
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
 
     _run_flow_with_fts_store(
         tmp_path,
@@ -1642,6 +1648,7 @@ def test_delete_only_run_deletes_before_final_index_maintenance(tmp_path):
     fake_store.list_doc_change_hashes.return_value = {}
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
     fake_store.ensure_fts_index.side_effect = lambda **_kwargs: events.append("ensure")
 
     _run_flow_with_fts_store(
@@ -1671,6 +1678,7 @@ def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
     fake_store.list_doc_change_hashes.return_value = {}
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
     fake_store.ensure_fts_index.side_effect = RuntimeError(
         "rust future panicked: unknown error"
     )
@@ -1693,6 +1701,7 @@ def test_fts_full_rebuild_fallback_failure_records_warning(tmp_path):
     fake_store.list_doc_change_hashes.return_value = {}
     fake_store.count_chunks.return_value = 1
     fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
     fake_store.ensure_fts_index.side_effect = RuntimeError(
         "rust future panicked: unknown error"
     )
@@ -1717,12 +1726,14 @@ def test_forced_rebuild_uses_shadow_table_and_preserves_active_store(tmp_path):
     active_store.list_doc_mtimes.return_value = {"documents::old-1": 1.0}
     active_store.count_chunks.return_value = 10
     active_store.fts_available.return_value = True
+    active_store.vector_index_available.return_value = True
 
     shadow_store = MagicMock()
     shadow_store.list_doc_ids.return_value = ["documents::new-1"]
     shadow_store.list_doc_mtimes.return_value = {}
     shadow_store.count_chunks.return_value = 12
     shadow_store.fts_available.return_value = False
+    shadow_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -1834,6 +1845,7 @@ def test_large_degraded_requeue_does_not_trigger_shadow_rebuild(tmp_path):
     active_store.list_doc_mtimes.return_value = stored
     active_store.count_chunks.return_value = 1200
     active_store.fts_available.return_value = True
+    active_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -1907,6 +1919,7 @@ def _run_flow_over_scan(tmp_path, index_root, scanned_doc_ids, source_name="docu
     active_store.list_doc_mtimes.return_value = stored
     active_store.count_chunks.return_value = len(stored)
     active_store.fts_available.return_value = True
+    active_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -1997,6 +2010,7 @@ def test_index_flow_syncs_folder_taxonomy_from_sources(tmp_path):
     fake_store.list_doc_mtimes.return_value = {}
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -2072,6 +2086,7 @@ def test_index_flow_source_scope_deletes_only_selected_source(tmp_path):
     }
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1
@@ -2175,6 +2190,7 @@ def test_index_flow_source_scope_skips_global_empty_registry_migration(tmp_path)
     fake_store.list_doc_mtimes.return_value = {}
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 0
@@ -2240,6 +2256,7 @@ def test_index_flow_injects_media_provider_into_sources(tmp_path):
     fake_store.list_doc_mtimes.return_value = {}
     fake_store.count_chunks.return_value = 0
     fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 1

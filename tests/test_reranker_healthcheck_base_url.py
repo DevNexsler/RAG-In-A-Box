@@ -19,6 +19,9 @@ class _FakeStore:
     def fts_available(self):
         return True
 
+    def vector_index_available(self):
+        return True
+
     def _metadata_subfields(self):
         return set()
 

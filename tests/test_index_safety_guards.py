@@ -46,6 +46,7 @@ def _run_flow(tmp_path, *, scanned_doc_ids, stored_mtimes, registry_count,
     active_store.list_doc_mtimes.return_value = dict(stored_mtimes)
     active_store.count_chunks.return_value = len(stored_mtimes)
     active_store.fts_available.return_value = True
+    active_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = registry_count
@@ -205,6 +206,7 @@ def test_partial_source_deletion_caught_per_source_not_global(tmp_path):
     active_store.list_doc_mtimes.return_value = dict(stored)
     active_store.count_chunks.return_value = len(stored)
     active_store.fts_available.return_value = True
+    active_store.vector_index_available.return_value = True
 
     fake_registry = MagicMock()
     fake_registry.count.return_value = 300

@@ -3594,3 +3594,163 @@ def test_open_store_with_recovery_reraises_non_corruption():
                 open_store_with_recovery("/tmp/index", "chunks")
 
     recover.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Vector (ANN) index + vector-search concurrency gate
+#
+# Without an ANN index every vector search brute-force scans the whole fp32
+# vector column (~1.9 GB transient per query at 88k rows x 4096 dims); four
+# concurrent searches took the 8 GiB container to its cgroup ceiling 20 times
+# on 2026-09-06. These pin the two defences: the index exists after
+# ensure_vector_index(), and concurrent searches are bounded process-wide.
+# ---------------------------------------------------------------------------
+
+
+def _seed_onehot_nodes(store: LanceDBStore, count: int = 6) -> None:
+    store.upsert_nodes(
+        [
+            _make_node(
+                f"d{i}.md", "c:0", f"text {i}", [float(i == j) for j in range(768)]
+            )
+            for i in range(count)
+        ]
+    )
+
+
+def _vector_indices(store: LanceDBStore) -> list:
+    return [
+        index
+        for index in store._vs.table.list_indices()
+        if list(index.columns) == ["vector"]
+    ]
+
+
+def test_ensure_vector_index_creates_ann_index_once_and_search_stays_exact():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        _seed_onehot_nodes(store)
+        assert store.vector_index_available() is False
+        assert _vector_indices(store) == []
+
+        assert store.ensure_vector_index() is True
+        assert store.vector_index_available() is True
+        assert len(_vector_indices(store)) == 1
+
+        # Second call is a no-op: no rebuild, no second index.
+        assert store.ensure_vector_index() is False
+        assert len(_vector_indices(store)) == 1
+
+        hits = store.vector_search([float(j == 3) for j in range(768)], top_k=1)
+        assert hits[0].doc_id == "d3.md"
+
+
+def test_ensure_vector_index_skips_table_without_rows():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        assert store.ensure_vector_index() is False
+        assert store.vector_index_available() is False
+
+
+def test_ensure_vector_index_honours_configured_type_and_rejects_unknown():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        _seed_onehot_nodes(store)
+        with pytest.raises(ValueError):
+            store.ensure_vector_index(index_type="FLAT_EARTH")
+        assert store.ensure_vector_index(index_type="IVF_HNSW_SQ") is True
+        (index,) = _vector_indices(store)
+        assert "HNSW" in str(index.index_type).upper()
+
+
+def test_vector_index_settings_from_config_reads_search_section():
+    settings = lancedb_store_module.vector_index_settings_from_config(
+        {"search": {"vector_index": {"type": "IVF_HNSW_SQ", "num_partitions": 4}}}
+    )
+    assert settings == {"index_type": "IVF_HNSW_SQ", "num_partitions": 4}
+    assert lancedb_store_module.vector_index_settings_from_config({}) == {
+        "index_type": None,
+        "num_partitions": None,
+    }
+
+
+def test_configure_vector_search_from_config_sets_process_knobs():
+    defaults = lancedb_store_module.vector_search_settings()
+    try:
+        lancedb_store_module.configure_vector_search_from_config(
+            {"search": {"nprobes": 7, "max_concurrent_vector_searches": 2}}
+        )
+        assert lancedb_store_module.vector_search_settings() == {
+            "nprobes": 7,
+            "max_concurrent": 2,
+        }
+        # Missing keys leave the knobs alone.
+        lancedb_store_module.configure_vector_search_from_config({})
+        assert lancedb_store_module.vector_search_settings() == {
+            "nprobes": 7,
+            "max_concurrent": 2,
+        }
+        with pytest.raises(ValueError):
+            lancedb_store_module.configure_vector_search(max_concurrent=0)
+    finally:
+        lancedb_store_module.configure_vector_search(**defaults)
+
+
+def test_vector_search_concurrency_is_bounded_process_wide():
+    """Six concurrent vector searches, gate of 2: never more than 2 inside Lance."""
+    defaults = lancedb_store_module.vector_search_settings()
+    state = {"in_flight": 0, "peak": 0}
+    guard = threading.Lock()
+    release = threading.Event()
+
+    class _SlowQuery:
+        def where(self, *a, **k):
+            return self
+
+        def nprobes(self, *a, **k):
+            return self
+
+        def limit(self, *a, **k):
+            return self
+
+        def select(self, *a, **k):
+            return self
+
+        def to_list(self):
+            with guard:
+                state["in_flight"] += 1
+                state["peak"] = max(state["peak"], state["in_flight"])
+            release.wait(5)
+            with guard:
+                state["in_flight"] -= 1
+            return []
+
+    fake_table = MagicMock()
+    fake_table.search.side_effect = lambda *a, **k: _SlowQuery()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store._vs = SimpleNamespace(table=fake_table)
+        try:
+            lancedb_store_module.configure_vector_search(max_concurrent=2)
+            threads = [
+                threading.Thread(
+                    target=store.vector_search, args=([0.0] * 768, 1), daemon=True
+                )
+                for _ in range(6)
+            ]
+            for t in threads:
+                t.start()
+            deadline = time.time() + 2
+            while time.time() < deadline and state["peak"] < 2:
+                time.sleep(0.01)
+            time.sleep(0.2)  # let any over-admitted searches show up
+            assert state["peak"] == 2, state
+            release.set()
+            for t in threads:
+                t.join(5)
+            assert state["peak"] == 2, state
+            assert fake_table.search.call_count == 6
+        finally:
+            release.set()
+            lancedb_store_module.configure_vector_search(**defaults)

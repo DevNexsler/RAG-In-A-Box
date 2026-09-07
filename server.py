@@ -23,6 +23,7 @@ from core import lance_session
 from core.config import load_config
 from core.logging_setup import configure_logging_from_config
 from core.tracing import setup_tracing
+from lancedb_store import configure_vector_search_from_config
 from mcp_server import (
     build_index_scheduler,
     initialize_index_supervisor,
@@ -45,6 +46,11 @@ def main() -> None:
     # LanceDB sizes its caches for a dedicated host and the server grows into
     # the container's memory cgroup until the OOM-killer takes it down (#1157).
     lance_session.configure_from_config(config)
+
+    # Cap concurrent vector searches and set IVF nprobes from the search config.
+    # The cap is what keeps a search burst from reaching the memory cgroup
+    # ceiling while the table's ANN index is missing (see lancedb_store).
+    configure_vector_search_from_config(config)
 
     host = config.get("mcp", {}).get("host", "0.0.0.0")
     port = int(os.environ.get("PORT", config.get("mcp", {}).get("port", 7788)))

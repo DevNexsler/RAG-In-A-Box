@@ -146,6 +146,12 @@ search:
   keyword_top_k: 50
   final_top_k: 10
   rrf_k: 60
+  # Production's ANN-index block verbatim so e2e exercises the same index type
+  # and serving knobs the deployed config does.
+  vector_index:
+    type: "IVF_FLAT"
+  nprobes: 40
+  max_concurrent_vector_searches: 3
   reranker:
     enabled: true
     provider: "deepinfra"

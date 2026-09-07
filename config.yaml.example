@@ -163,6 +163,17 @@ search:
   importance:
     field: "enr_importance"                # metadata field: LLM-generated or frontmatter-overridden (0.0-1.0)
     weight: 0.3                            # scaling: score *= (0.7 + 0.3 * importance); 0.0 = disabled
+  # ANN index on the vector column, built by the index run if missing and kept
+  # current by the per-run index merge. Without it every vector search is a
+  # brute-force scan of the whole fp32 column (~1.9 GB transient per query at
+  # 88k rows x 4096 dims) and a burst of searches OOM-kills the container.
+  # Measured on that table: IVF_FLAT recall@50 0.995 at nprobes 40, p50 17 ms
+  # (flat scan: 1200 ms).
+  vector_index:
+    type: "IVF_FLAT"                      # lancedb index_type: IVF_FLAT | IVF_HNSW_SQ | IVF_PQ | IVF_SQ
+    # num_partitions: 256                 # default: sqrt(rows) capped at 256; HNSW uses 1
+  nprobes: 40                             # IVF partitions probed per query (recall vs latency)
+  max_concurrent_vector_searches: 3       # searches inside Lance at once per process; the rest queue
   reranker:
     enabled: true
     provider: "deepinfra"                 # Qwen3-Reranker-8B via DeepInfra (always-on, no cold start)

@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -94,6 +95,70 @@ _SCHEMA_EVOLUTION_RSS_SAFETY_PERCENT = 10
 # that is checked while the worker runs (#1254).
 _WORKER_MEMORY_RESERVE_PERCENT = 15
 _WORKER_MEMORY_POLL_SECONDS = 0.25
+
+# Vector-search serving knobs, sized once per process from the ``search`` config
+# section (server.py calls configure_vector_search_from_config); scripts and
+# tests get these defaults.
+#
+# The ANN index is the point. Without one every vector search is a brute-force
+# scan of the entire fp32 ``vector`` column — 1.45 GB at 88k rows x 4096 dims,
+# ~1.9 GB transient per query with ~1 GB of it retained by Lance's allocator
+# afterwards — and four concurrent searches took the 8 GiB container to its
+# memory cgroup ceiling 20 times on 2026-09-06. The gate bounds that transient
+# for the window before the index exists (or if it is ever lost); nprobes is
+# the IVF recall/latency knob. Measured on that table, IVF_FLAT with 256
+# partitions: recall@50 0.985 at nprobes 20, 0.995 at 40, 0.998 at 64, at p50
+# 11/17/24 ms against 1200 ms for the flat scan.
+_DEFAULT_VECTOR_INDEX_TYPE = "IVF_FLAT"
+_DEFAULT_VECTOR_NPROBES = 40
+_DEFAULT_MAX_CONCURRENT_VECTOR_SEARCHES = 3
+_VECTOR_INDEX_MAX_PARTITIONS = 256
+_VECTOR_INDEX_TYPES = frozenset(
+    {"IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_HNSW_SQ", "IVF_HNSW_PQ"}
+)
+_VECTOR_NPROBES = _DEFAULT_VECTOR_NPROBES
+_VECTOR_SEARCH_GATE_LIMIT = _DEFAULT_MAX_CONCURRENT_VECTOR_SEARCHES
+_VECTOR_SEARCH_GATE = threading.BoundedSemaphore(_VECTOR_SEARCH_GATE_LIMIT)
+
+
+def configure_vector_search(
+    *, nprobes: int | None = None, max_concurrent: int | None = None
+) -> None:
+    """Set the process-wide vector-search knobs; None leaves a knob unchanged.
+
+    Replacing the gate never strands an in-flight search: vector_search binds
+    the gate object it acquired and releases that same object.
+    """
+    global _VECTOR_NPROBES, _VECTOR_SEARCH_GATE, _VECTOR_SEARCH_GATE_LIMIT
+    if nprobes is not None:
+        if int(nprobes) < 1:
+            raise ValueError(f"nprobes must be >= 1, got {nprobes!r}")
+        _VECTOR_NPROBES = int(nprobes)
+    if max_concurrent is not None:
+        if int(max_concurrent) < 1:
+            raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent!r}")
+        _VECTOR_SEARCH_GATE_LIMIT = int(max_concurrent)
+        _VECTOR_SEARCH_GATE = threading.BoundedSemaphore(_VECTOR_SEARCH_GATE_LIMIT)
+
+
+def configure_vector_search_from_config(config: dict | None) -> None:
+    """Size the vector-search knobs from the ``search`` config section."""
+    search_cfg = (config or {}).get("search") or {}
+    configure_vector_search(
+        nprobes=search_cfg.get("nprobes"),
+        max_concurrent=search_cfg.get("max_concurrent_vector_searches"),
+    )
+
+
+def vector_search_settings() -> dict[str, int]:
+    """The current knobs, for health output and tests."""
+    return {"nprobes": _VECTOR_NPROBES, "max_concurrent": _VECTOR_SEARCH_GATE_LIMIT}
+
+
+def vector_index_settings_from_config(config: dict | None) -> dict[str, Any]:
+    """``search.vector_index`` config → LanceDBStore.ensure_vector_index kwargs."""
+    cfg = ((config or {}).get("search") or {}).get("vector_index") or {}
+    return {"index_type": cfg.get("type"), "num_partitions": cfg.get("num_partitions")}
 
 
 def _cgroup_v2_dirs(
@@ -2228,6 +2293,9 @@ class LanceDBStore:
         """
         def _op():
             q = self._vs.table.search(query_vector, query_type="vector")
+            if hasattr(q, "nprobes"):
+                # IVF partitions probed; ignored while the table has no ANN index.
+                q = q.nprobes(_VECTOR_NPROBES)
             if where:
                 q = q.where(where, prefilter=True)
             rows = q.limit(top_k).to_list()
@@ -2236,7 +2304,13 @@ class LanceDBStore:
                     row.pop("vector", None)
             return [self._row_to_hit(row) for row in rows]
 
-        return self._run_read_with_recovery(_op, [])
+        # Process-wide cap on searches inside Lance at once: each one is the
+        # memory transient described at _VECTOR_SEARCH_GATE, and a burst of
+        # them is what reached the cgroup ceiling. Bind the gate object so a
+        # reconfigure mid-flight releases the semaphore that was acquired.
+        gate = _VECTOR_SEARCH_GATE
+        with gate:
+            return self._run_read_with_recovery(_op, [])
 
     # --- Full-Text Search (BM25, Lance-native inverted index) ---
 
@@ -2603,6 +2677,79 @@ class LanceDBStore:
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _is_vector_index(index: Any) -> bool:
+        columns = list(getattr(index, "columns", None) or [])
+        index_type = str(getattr(index, "index_type", "")).upper()
+        return columns == ["vector"] and "IVF" in index_type
+
+    def vector_index_available(self) -> bool:
+        """True when an ANN index covers the ``vector`` column (health check for file_status)."""
+        try:
+            return bool(
+                self._run_read_with_recovery(
+                    lambda: any(
+                        self._is_vector_index(index)
+                        for index in self._vs.table.list_indices()
+                    ),
+                    False,
+                )
+            )
+        except Exception:
+            return False
+
+    def ensure_vector_index(
+        self, index_type: str | None = None, num_partitions: int | None = None
+    ) -> bool:
+        """Create the ANN index on ``vector`` if the table has none.
+
+        Returns True when an index was built, False when one already exists or
+        the table has no rows to index. Rows written afterwards are merged into
+        it by _merge_index_deltas (optimize_indices covers every index) — the
+        same incremental path the FTS index takes — and are searched by a flat
+        scan of just that tail until then.
+
+        ``metric="l2"`` is what the unindexed search has always used, so this
+        changes speed and memory, not the ordering (the embeddings are
+        unit-norm, so L2 and cosine rank identically regardless).
+        ``replace=False`` so a lost race can never silently rebuild a 45-second
+        index. The keyword form of create_index is the one both lancedb 0.30
+        (test venv) and 0.37 (image) accept.
+        """
+        if self.vector_index_available():
+            return False
+        rows = self.count_chunks()
+        if rows == 0:
+            return False
+        chosen = str(index_type or _DEFAULT_VECTOR_INDEX_TYPE).upper()
+        if chosen not in _VECTOR_INDEX_TYPES:
+            raise ValueError(
+                f"unsupported vector index type {chosen!r}; expected one of "
+                f"{sorted(_VECTOR_INDEX_TYPES)}"
+            )
+        if num_partitions is None:
+            # HNSW builds one graph per partition; one partition is the graph.
+            # IVF: sqrt(rows) partitions, capped — 256 for the 88k-row table.
+            num_partitions = (
+                1
+                if "HNSW" in chosen
+                else max(1, min(_VECTOR_INDEX_MAX_PARTITIONS, math.isqrt(rows)))
+            )
+        self._vs.table.create_index(
+            metric="l2",
+            vector_column_name="vector",
+            index_type=chosen,
+            num_partitions=int(num_partitions),
+            replace=False,
+        )
+        logger.info(
+            "Vector index created on column 'vector': type=%s partitions=%d rows=%d",
+            chosen,
+            int(num_partitions),
+            rows,
+        )
+        return True
 
     def keyword_search(
         self,

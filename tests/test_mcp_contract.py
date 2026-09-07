@@ -1249,6 +1249,7 @@ def test_file_status_includes_health():
             mock_store.count_chunks.return_value = 50
             mock_store._metadata_subfields.return_value = {"doc_id", "title"}
             mock_store.fts_available.return_value = True
+            mock_store.vector_index_available.return_value = True
 
             mock_config = {
                 "index_root": tmpdir,
@@ -1271,6 +1272,7 @@ def test_file_status_includes_health():
             assert "health" in result
             health = result["health"]
             assert health["fts_available"] is True
+            assert health["vector_index_available"] is True
             assert health["reranker_enabled"] is True
             assert health["reranker_responsive"] is True
             assert health["last_index_failed_count"] == 1
@@ -1310,6 +1312,7 @@ def test_file_status_includes_cached_deep_health_source_coverage(tmp_path):
         mock_store.count_chunks.return_value = 2
         mock_store._metadata_subfields.return_value = {"doc_id", "source_name"}
         mock_store.fts_available.return_value = True
+        mock_store.vector_index_available.return_value = True
 
         mcp_server._cache = (
             mock_store,
@@ -1385,6 +1388,7 @@ def test_file_status_persists_deep_health_snapshot_for_restart_cache(tmp_path):
         first_store.count_chunks.return_value = 1
         first_store._metadata_subfields.return_value = {"doc_id", "source_name"}
         first_store.fts_available.return_value = True
+        first_store.vector_index_available.return_value = True
         mcp_server._cache = (first_store, MagicMock(), config)
         mcp_server._cache_index_signature = mcp_server._index_metadata_signature(config)
         mcp_server._cache_identity = id(mcp_server._cache)
@@ -1402,6 +1406,7 @@ def test_file_status_persists_deep_health_snapshot_for_restart_cache(tmp_path):
         second_store.count_chunks.return_value = 2
         second_store._metadata_subfields.return_value = {"doc_id", "source_name"}
         second_store.fts_available.return_value = True
+        second_store.vector_index_available.return_value = True
         mcp_server._cache = (second_store, MagicMock(), config)
         mcp_server._cache_index_signature = mcp_server._index_metadata_signature(config)
         mcp_server._cache_identity = id(mcp_server._cache)
@@ -1451,6 +1456,7 @@ def test_file_status_deep_health_includes_source_freshness_fields(tmp_path):
         ]
         mock_store._metadata_subfields.return_value = {"doc_id", "source_name", "mtime"}
         mock_store.fts_available.return_value = True
+        mock_store.vector_index_available.return_value = True
 
         mcp_server._cache = (
             mock_store,
@@ -2010,6 +2016,7 @@ def test_file_status_deep_health_treats_no_text_docs_as_processed(tmp_path):
         mock_store.list_recent_docs.return_value = [{"doc_id": "documents::indexed", "mtime": 1000.0}]
         mock_store._metadata_subfields.return_value = {"doc_id", "source_name", "mtime"}
         mock_store.fts_available.return_value = True
+        mock_store.vector_index_available.return_value = True
 
         mcp_server._cache = (
             mock_store,
@@ -2272,6 +2279,7 @@ def test_file_status_surfaces_recent_provider_failures_from_logs(tmp_path):
         mock_store.list_recent_docs.return_value = [{"doc_id": "documents::doc-1", "mtime": 1000.0}]
         mock_store._metadata_subfields.return_value = {"doc_id", "source_name", "mtime"}
         mock_store.fts_available.return_value = True
+        mock_store.vector_index_available.return_value = True
 
         mcp_server._cache = (
             mock_store,
@@ -2325,6 +2333,7 @@ def test_file_status_reports_zombie_indexer_as_not_running():
             mock_store.count_chunks.return_value = 1
             mock_store._metadata_subfields.return_value = {"doc_id"}
             mock_store.fts_available.return_value = True
+            mock_store.vector_index_available.return_value = True
 
             mcp_server._cache = (
                 mock_store,
@@ -2544,6 +2553,7 @@ def test_file_status_health_reranker_disabled():
             mock_store.count_chunks.return_value = 20
             mock_store._metadata_subfields.return_value = {"doc_id"}
             mock_store.fts_available.return_value = False
+            mock_store.vector_index_available.return_value = True
 
             mock_config = {
                 "index_root": tmpdir,
@@ -2579,6 +2589,7 @@ def test_file_status_returns_retrieval_failed_without_rebuilding_for_lance_read_
         good_store.count_chunks.return_value = 1
         good_store._metadata_subfields.return_value = {"doc_id"}
         good_store.fts_available.return_value = True
+        good_store.vector_index_available.return_value = True
 
         config = {
             "index_root": str(tmp_path),
@@ -2672,6 +2683,7 @@ def test_file_status_ignores_zombie_indexer_pid(tmp_path):
         mock_store.count_chunks.return_value = 1
         mock_store._metadata_subfields.return_value = {"doc_id"}
         mock_store.fts_available.return_value = True
+        mock_store.vector_index_available.return_value = True
 
         mcp_server._cache = (
             mock_store,
@@ -2716,6 +2728,7 @@ def test_file_status_ignores_non_indexer_pid_file(tmp_path):
         mock_store.count_chunks.return_value = 1
         mock_store._metadata_subfields.return_value = {"doc_id"}
         mock_store.fts_available.return_value = True
+        mock_store.vector_index_available.return_value = True
 
         mcp_server._cache = (
             mock_store,
@@ -3269,6 +3282,7 @@ def test_file_status_exposes_last_attempt_success_and_terminal_freshness(tmp_pat
     store.count_chunks.return_value = 1
     store._metadata_subfields.return_value = {"doc_id"}
     store.fts_available.return_value = True
+    store.vector_index_available.return_value = True
     config = {
         "index_root": str(tmp_path),
         "embeddings": {"provider": "openrouter"},

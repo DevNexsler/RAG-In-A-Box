@@ -95,6 +95,10 @@ async def test_status_healthy_shape(indexed_corpus, mcp_session):
     assert "doc_id" in status["metadata_fields"]
     health = status["health"]
     assert health["fts_available"] is True
+    # The sweep must leave an ANN index on the vector column: without it every
+    # vector search brute-force scans the whole fp32 column and a search burst
+    # OOM-kills the container (20 restarts on 2026-09-06).
+    assert health["vector_index_available"] is True
     assert health["reranker_enabled"] is True
     assert health["reranker_responsive"] is True
     assert health["last_index_failed_count"] == 0
