@@ -360,3 +360,47 @@ async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_
     payload = await mcp_session.call_tool_json(
         "file_search", {"query": phrase, "top_k": 50})
     assert search_hits(payload, stem), payload["results"]
+
+
+async def test_reindexed_document_has_no_stale_chunks(indexed_corpus, api, mcp_session):
+    """A re-indexed document's rows must be exactly the new ones.
+
+    pylance 11 reads a double-quoted literal as a column name, so llama-index's
+    delete() filter matched nothing and every re-index kept the old chunks
+    beside the new ones — production, 2026-09-07, `documents::002KC` doubled.
+    The store now issues its own filter. Measured on physical rows: the table's
+    chunk_count (count_rows) must not grow when a one-chunk document is
+    re-indexed through its assigned path, and every chunk served must be the
+    new text.
+    """
+    v1 = b"# Quartz beacon\n\nThe quartz beacon rotates every seventh tide.\n"
+    v2 = b"# Quartz beacon\n\nThe quartz beacon was decommissioned last winter.\n"
+    first = await _upload_and_index(api, mcp_session, "quartz-beacon.md", v1)
+    # Indexing ASSIGNS the id-stamped path; re-uploading the bare name would
+    # mint a second document and leave the first row untouched.
+    assigned, doc_id = first["rel_path"], first["doc_id"]
+
+    status_v1 = await mcp_session.call_tool_json("file_status", {})
+    chunks_v1 = await mcp_session.call_tool_json("file_get_doc_chunks", {"doc_id": doc_id})
+    assert isinstance(chunks_v1, list) and chunks_v1, chunks_v1
+    assert all("seventh tide" in (c.get("text") or "") for c in chunks_v1), chunks_v1
+
+    resp = await api.post("/api/upload", files={"file": (assigned, v2)})
+    assert resp.status_code == 201, resp.text
+    second = await mcp_session.call_tool_json(
+        "file_index_document", {"target": assigned, "source_name": "documents"})
+    assert second["doc_id"] == doc_id, second
+
+    status_v2 = await mcp_session.call_tool_json("file_status", {})
+    assert status_v2["chunk_count"] == status_v1["chunk_count"], (
+        status_v1["chunk_count"], status_v2["chunk_count"])
+    vector_index = status_v2["health"]["vector_index"]
+    assert vector_index["indexed_rows"] + vector_index["unindexed_rows"] == status_v2["chunk_count"], vector_index
+
+    chunks_v2 = await mcp_session.call_tool_json("file_get_doc_chunks", {"doc_id": doc_id})
+    assert isinstance(chunks_v2, list) and chunks_v2, chunks_v2
+    locs = [c.get("loc") for c in chunks_v2]
+    assert len(locs) == len(set(locs)), f"duplicate chunk locs after re-index: {locs}"
+    assert len(chunks_v2) == len(chunks_v1), (len(chunks_v1), len(chunks_v2))
+    assert all("decommissioned" in (c.get("text") or "") for c in chunks_v2), chunks_v2
+    assert not any("seventh tide" in (c.get("text") or "") for c in chunks_v2), chunks_v2
