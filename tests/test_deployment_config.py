@@ -151,7 +151,8 @@ def test_compose_enforces_configurable_resource_envelope():
     compose = yaml.safe_load(Path("docker-compose.yml").read_text())
     service = compose["services"]["doc-organizer"]
 
-    assert service["mem_limit"] == "${DOC_ORGANIZER_MEMORY_LIMIT:-8g}"
+    # 10g since 2026-09-07: bounded ~3.5-5 GB server plateau + ~3.7 GB sweep (see compose comment).
+    assert service["mem_limit"] == "${DOC_ORGANIZER_MEMORY_LIMIT:-10g}"
     assert service["mem_reservation"] == "${DOC_ORGANIZER_MEMORY_RESERVATION:-4g}"
     assert service["pids_limit"] == "${DOC_ORGANIZER_PIDS_LIMIT:-512}"
 
