@@ -86,6 +86,15 @@ services:
       # table; the index run's throughput is bound by provider calls, not this.
       - LANCE_IO_THREADS=${LANCE_IO_THREADS:-8}
       - LANCE_CPU_THREADS=${LANCE_CPU_THREADS:-8}
+      # glibc malloc (Python's allocator; Lance uses its own jemalloc) gives every
+      # worker thread a private arena and keeps that thread's freed search
+      # objects — ~100 candidate rows with text, metadata and a 4096-float list
+      # per query — instead of returning them. Each new MCP session lands its
+      # call on a fresh thread, so the server grew ~0.4 GB/h under organic load
+      # and needed a restart every ~14 h (2026-09-07). Measured, 80 searches on
+      # fresh threads: 457 -> 1084 MB by default, 449 -> 484 MB with these two.
+      - MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-2}
+      - MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-131072}
 
 networks:
   rag-net:
