@@ -3663,6 +3663,19 @@ def test_ensure_vector_index_honours_configured_type_and_rejects_unknown():
         assert "HNSW" in str(index.index_type).upper()
 
 
+def test_ivf_partitions_scale_with_rows_and_never_train_empty_clusters():
+    """Lance trains centroids on 256 rows per partition; a 37-row hermetic
+    table asked for 6 partitions warned about empty clusters on stderr — two
+    untimestamped lines in indexer.log, the #0546 contract (caught by e2e)."""
+    partitions = lancedb_store_module.ivf_partitions_for
+    assert partitions(0) == 1
+    assert partitions(37) == 1
+    assert partitions(255) == 1
+    assert partitions(5000) == 19  # rows // 256, below sqrt(5000) = 70
+    assert partitions(88_440) == 256  # sqrt = 297, rows // 256 = 345, cap 256
+    assert partitions(10_000_000) == 256
+
+
 def test_vector_index_settings_from_config_reads_search_section():
     settings = lancedb_store_module.vector_index_settings_from_config(
         {"search": {"vector_index": {"type": "IVF_HNSW_SQ", "num_partitions": 4}}}

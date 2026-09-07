@@ -113,6 +113,9 @@ _DEFAULT_VECTOR_INDEX_TYPE = "IVF_FLAT"
 _DEFAULT_VECTOR_NPROBES = 40
 _DEFAULT_MAX_CONCURRENT_VECTOR_SEARCHES = 3
 _VECTOR_INDEX_MAX_PARTITIONS = 256
+# Lance trains IVF centroids on sample_rate (256) rows per partition; fewer
+# than that and k-means leaves clusters empty and warns about it on stderr.
+_VECTOR_INDEX_ROWS_PER_PARTITION = 256
 _VECTOR_INDEX_TYPES = frozenset(
     {"IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_HNSW_SQ", "IVF_HNSW_PQ"}
 )
@@ -153,6 +156,22 @@ def configure_vector_search_from_config(config: dict | None) -> None:
 def vector_search_settings() -> dict[str, int]:
     """The current knobs, for health output and tests."""
     return {"nprobes": _VECTOR_NPROBES, "max_concurrent": _VECTOR_SEARCH_GATE_LIMIT}
+
+
+def ivf_partitions_for(rows: int) -> int:
+    """IVF partition count for a table of ``rows``: sqrt(rows), never more than
+    Lance can train (rows / 256), clamped to [1, 256]. 88k rows -> 256; a
+    37-row hermetic table -> 1, so a tiny table never trains empty clusters."""
+    if rows <= 0:
+        return 1
+    return max(
+        1,
+        min(
+            _VECTOR_INDEX_MAX_PARTITIONS,
+            math.isqrt(rows),
+            rows // _VECTOR_INDEX_ROWS_PER_PARTITION,
+        ),
+    )
 
 
 def vector_index_settings_from_config(config: dict | None) -> dict[str, Any]:
@@ -2730,12 +2749,7 @@ class LanceDBStore:
             )
         if num_partitions is None:
             # HNSW builds one graph per partition; one partition is the graph.
-            # IVF: sqrt(rows) partitions, capped — 256 for the 88k-row table.
-            num_partitions = (
-                1
-                if "HNSW" in chosen
-                else max(1, min(_VECTOR_INDEX_MAX_PARTITIONS, math.isqrt(rows)))
-            )
+            num_partitions = 1 if "HNSW" in chosen else ivf_partitions_for(rows)
         self._vs.table.create_index(
             metric="l2",
             vector_column_name="vector",
