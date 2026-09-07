@@ -82,3 +82,16 @@ def test_script_no_wait_yields_to_a_running_writer(seeded, capsys):
     assert "already has a writer" in report["error"]
     assert report["created"] is False
     assert LanceDBStore(index_root, "chunks").vector_index_available() is False
+
+
+def test_script_rebuild_replaces_the_index(seeded, capsys):
+    import lance
+
+    index_root, config_path = seeded
+    _run(capsys, ["--config", str(config_path)])
+    before = [i["uuid"] for i in lance.dataset(f"{index_root}/chunks.lance").list_indices() if "vector" in i["fields"]]
+    code, report = _run(capsys, ["--config", str(config_path), "--rebuild"])
+    assert code == 0 and report["created"] is True and report["vector_index_available"] is True
+    assert "IVF" in str(report["index_type"]).upper()
+    after = [i["uuid"] for i in lance.dataset(f"{index_root}/chunks.lance").list_indices() if "vector" in i["fields"]]
+    assert before != after and len(after) == 1

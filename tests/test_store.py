@@ -3680,10 +3680,11 @@ def test_vector_index_settings_from_config_reads_search_section():
     settings = lancedb_store_module.vector_index_settings_from_config(
         {"search": {"vector_index": {"type": "IVF_HNSW_SQ", "num_partitions": 4}}}
     )
-    assert settings == {"index_type": "IVF_HNSW_SQ", "num_partitions": 4}
+    assert settings == {"index_type": "IVF_HNSW_SQ", "num_partitions": 4, "num_sub_vectors": None}
     assert lancedb_store_module.vector_index_settings_from_config({}) == {
         "index_type": None,
         "num_partitions": None,
+        "num_sub_vectors": None,
     }
 
 
@@ -3696,17 +3697,21 @@ def test_configure_vector_search_from_config_sets_process_knobs():
         assert lancedb_store_module.vector_search_settings() == {
             "nprobes": 7,
             "max_concurrent": 2,
+            "refine_factor": defaults["refine_factor"],
         }
         # Missing keys leave the knobs alone.
         lancedb_store_module.configure_vector_search_from_config({})
         assert lancedb_store_module.vector_search_settings() == {
             "nprobes": 7,
             "max_concurrent": 2,
+            "refine_factor": defaults["refine_factor"],
         }
         with pytest.raises(ValueError):
             lancedb_store_module.configure_vector_search(max_concurrent=0)
     finally:
-        lancedb_store_module.configure_vector_search(**defaults)
+        lancedb_store_module.configure_vector_search(
+            nprobes=defaults["nprobes"], max_concurrent=defaults["max_concurrent"]
+        )
 
 
 def test_vector_search_concurrency_is_bounded_process_wide():
@@ -3766,7 +3771,7 @@ def test_vector_search_concurrency_is_bounded_process_wide():
             assert fake_table.search.call_count == 6
         finally:
             release.set()
-            lancedb_store_module.configure_vector_search(**defaults)
+            lancedb_store_module.configure_vector_search(nprobes=defaults["nprobes"], max_concurrent=defaults["max_concurrent"])
 
 
 def test_vector_search_plan_uses_the_ann_index_with_and_without_prefilter():
@@ -4046,3 +4051,91 @@ def test_checkout_latest_keeps_the_handle_when_the_directory_is_unchanged():
         assert store._vs is handle
         assert store.get_chunk("peer.md", "c:0") is not None
         assert store._table_moved_under_open_handle() is False
+
+
+# ---------------------------------------------------------------------------
+# IVF_PQ: refine step, small-table fallback, operator rebuild
+# ---------------------------------------------------------------------------
+
+
+def test_refine_factor_is_applied_to_the_vector_query_when_configured():
+    defaults = lancedb_store_module.vector_search_settings()
+    calls: list[tuple] = []
+
+    class _Q:
+        def nprobes(self, n):
+            calls.append(("nprobes", n)); return self
+
+        def refine_factor(self, n):
+            calls.append(("refine_factor", n)); return self
+
+        def where(self, *a, **k):
+            return self
+
+        def limit(self, *a, **k):
+            return self
+
+        def to_list(self):
+            return []
+
+    fake_table = MagicMock(); fake_table.search.side_effect = lambda *a, **k: _Q()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks"); store._vs = SimpleNamespace(table=fake_table)
+        try:
+            lancedb_store_module.configure_vector_search(nprobes=40, refine_factor=10)
+            store.vector_search([0.0] * 768, top_k=5)
+            assert ("nprobes", 40) in calls and ("refine_factor", 10) in calls
+            calls.clear()
+            lancedb_store_module.configure_vector_search(refine_factor=0)  # off
+            store.vector_search([0.0] * 768, top_k=5)
+            assert ("nprobes", 40) in calls and not any(c[0] == "refine_factor" for c in calls)
+            assert lancedb_store_module.vector_search_settings()["refine_factor"] is None
+        finally:
+            lancedb_store_module.configure_vector_search(
+                nprobes=defaults["nprobes"], max_concurrent=defaults["max_concurrent"],
+                refine_factor=defaults["refine_factor"] or 0,
+            )
+
+
+def test_configure_vector_search_from_config_reads_refine_factor():
+    defaults = lancedb_store_module.vector_search_settings()
+    try:
+        lancedb_store_module.configure_vector_search_from_config({"search": {"refine_factor": 7}})
+        assert lancedb_store_module.vector_search_settings()["refine_factor"] == 7
+    finally:
+        lancedb_store_module.configure_vector_search(refine_factor=defaults["refine_factor"] or 0)
+
+
+def test_vector_index_settings_carry_num_sub_vectors():
+    settings = lancedb_store_module.vector_index_settings_from_config(
+        {"search": {"vector_index": {"type": "IVF_PQ", "num_sub_vectors": 256}}}
+    )
+    assert settings == {"index_type": "IVF_PQ", "num_partitions": None, "num_sub_vectors": 256}
+
+
+def test_ivf_pq_on_a_small_table_falls_back_to_ivf_flat():
+    """Lance cannot train PQ codebooks under 256 rows (fresh stacks, e2e corpus);
+    the run must still leave an ANN index behind."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        _seed_onehot_nodes(store, count=6)
+        assert store.ensure_vector_index(index_type="IVF_PQ", num_sub_vectors=48) is True
+        stats = store.vector_index_stats()
+        assert stats["available"] is True
+        assert "PQ" not in stats["index_type"].upper() and "IVF" in stats["index_type"].upper()
+        assert store.vector_search([float(j == 3) for j in range(768)], top_k=1)[0].doc_id == "d3.md"
+
+
+def test_ensure_vector_index_replace_rebuilds_over_an_existing_index():
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        _seed_onehot_nodes(store, count=6)
+        store.ensure_vector_index()
+        uuid_before = [i["uuid"] for i in lance.dataset(f"{tmpdir}/test_chunks.lance").list_indices() if "vector" in i["fields"]]
+        assert store.ensure_vector_index() is False  # present -> no-op
+        assert store.ensure_vector_index(replace=True) is True
+        uuid_after = [i["uuid"] for i in lance.dataset(f"{tmpdir}/test_chunks.lance").list_indices() if "vector" in i["fields"]]
+        assert uuid_before != uuid_after and len(uuid_after) == 1
+        assert store.vector_index_stats()["num_indices"] == 1

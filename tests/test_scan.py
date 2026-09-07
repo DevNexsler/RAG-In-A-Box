@@ -2404,7 +2404,9 @@ def test_flow_ensures_the_vector_index_on_every_run(tmp_path):
     brute-force scan the vector column."""
     fake_store = _fake_store_for_vector_index_tests()
     _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
-    fake_store.ensure_vector_index.assert_called_once_with(index_type=None, num_partitions=None)
+    fake_store.ensure_vector_index.assert_called_once_with(
+        index_type=None, num_partitions=None, num_sub_vectors=None
+    )
 
 
 def test_vector_index_failure_is_a_warning_not_a_failed_run(tmp_path):

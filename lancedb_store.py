@@ -111,6 +111,14 @@ _WORKER_MEMORY_POLL_SECONDS = 0.25
 # 11/17/24 ms against 1200 ms for the flat scan.
 _DEFAULT_VECTOR_INDEX_TYPE = "IVF_FLAT"
 _DEFAULT_VECTOR_NPROBES = 40
+# IVF_PQ re-scores the top k x refine_factor candidates with exact distances;
+# without it PQ recall@50 measured 0.78 on the production table, 0.989 at 10,
+# 0.995 at 20 — the IVF_FLAT figure — at 32 ms p50. None = no refine step
+# (right for IVF_FLAT, which is exact already).
+_DEFAULT_VECTOR_REFINE_FACTOR: int | None = None
+# Lance trains PQ codebooks on at least this many rows; smaller tables (fresh
+# stacks, the hermetic e2e corpus) get IVF_FLAT instead, which is exact anyway.
+_VECTOR_INDEX_PQ_MIN_ROWS = 256
 _DEFAULT_MAX_CONCURRENT_VECTOR_SEARCHES = 3
 _VECTOR_INDEX_MAX_PARTITIONS = 256
 # Lance trains IVF centroids on sample_rate (256) rows per partition; fewer
@@ -125,23 +133,33 @@ _VECTOR_INDEX_TYPES = frozenset(
 # the health check exists to surface.
 VECTOR_INDEX_STALE_TAIL_ROWS = 1000
 _VECTOR_NPROBES = _DEFAULT_VECTOR_NPROBES
+_VECTOR_REFINE_FACTOR = _DEFAULT_VECTOR_REFINE_FACTOR
 _VECTOR_SEARCH_GATE_LIMIT = _DEFAULT_MAX_CONCURRENT_VECTOR_SEARCHES
 _VECTOR_SEARCH_GATE = threading.BoundedSemaphore(_VECTOR_SEARCH_GATE_LIMIT)
 
 
 def configure_vector_search(
-    *, nprobes: int | None = None, max_concurrent: int | None = None
+    *,
+    nprobes: int | None = None,
+    max_concurrent: int | None = None,
+    refine_factor: int | None = None,
 ) -> None:
-    """Set the process-wide vector-search knobs; None leaves a knob unchanged.
+    """Set the process-wide vector-search knobs; None leaves a knob unchanged
+    (``refine_factor=0`` turns the refine step off).
 
     Replacing the gate never strands an in-flight search: vector_search binds
     the gate object it acquired and releases that same object.
     """
     global _VECTOR_NPROBES, _VECTOR_SEARCH_GATE, _VECTOR_SEARCH_GATE_LIMIT
+    global _VECTOR_REFINE_FACTOR
     if nprobes is not None:
         if int(nprobes) < 1:
             raise ValueError(f"nprobes must be >= 1, got {nprobes!r}")
         _VECTOR_NPROBES = int(nprobes)
+    if refine_factor is not None:
+        if int(refine_factor) < 0:
+            raise ValueError(f"refine_factor must be >= 0, got {refine_factor!r}")
+        _VECTOR_REFINE_FACTOR = int(refine_factor) or None
     if max_concurrent is not None:
         if int(max_concurrent) < 1:
             raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent!r}")
@@ -155,12 +173,17 @@ def configure_vector_search_from_config(config: dict | None) -> None:
     configure_vector_search(
         nprobes=search_cfg.get("nprobes"),
         max_concurrent=search_cfg.get("max_concurrent_vector_searches"),
+        refine_factor=search_cfg.get("refine_factor"),
     )
 
 
-def vector_search_settings() -> dict[str, int]:
+def vector_search_settings() -> dict[str, int | None]:
     """The current knobs, for health output and tests."""
-    return {"nprobes": _VECTOR_NPROBES, "max_concurrent": _VECTOR_SEARCH_GATE_LIMIT}
+    return {
+        "nprobes": _VECTOR_NPROBES,
+        "max_concurrent": _VECTOR_SEARCH_GATE_LIMIT,
+        "refine_factor": _VECTOR_REFINE_FACTOR,
+    }
 
 
 def ivf_partitions_for(rows: int) -> int:
@@ -195,7 +218,11 @@ def empty_vector_index_stats() -> dict[str, Any]:
 def vector_index_settings_from_config(config: dict | None) -> dict[str, Any]:
     """``search.vector_index`` config → LanceDBStore.ensure_vector_index kwargs."""
     cfg = ((config or {}).get("search") or {}).get("vector_index") or {}
-    return {"index_type": cfg.get("type"), "num_partitions": cfg.get("num_partitions")}
+    return {
+        "index_type": cfg.get("type"),
+        "num_partitions": cfg.get("num_partitions"),
+        "num_sub_vectors": cfg.get("num_sub_vectors"),
+    }
 
 
 def _cgroup_v2_dirs(
@@ -2363,6 +2390,10 @@ class LanceDBStore:
         if hasattr(q, "nprobes"):
             # IVF partitions probed; ignored while the table has no ANN index.
             q = q.nprobes(_VECTOR_NPROBES)
+        if _VECTOR_REFINE_FACTOR and hasattr(q, "refine_factor"):
+            # Exact re-scoring of the top k x factor candidates: what makes a
+            # PQ index accurate. A no-op cost on IVF_FLAT (already exact).
+            q = q.refine_factor(_VECTOR_REFINE_FACTOR)
         if where:
             q = q.where(where, prefilter=True)
         return q
@@ -2850,7 +2881,12 @@ class LanceDBStore:
             return empty_vector_index_stats()
 
     def ensure_vector_index(
-        self, index_type: str | None = None, num_partitions: int | None = None
+        self,
+        index_type: str | None = None,
+        num_partitions: int | None = None,
+        num_sub_vectors: int | None = None,
+        *,
+        replace: bool = False,
     ) -> bool:
         """Create the ANN index on ``vector`` if the table has none.
 
@@ -2860,6 +2896,14 @@ class LanceDBStore:
         same incremental path the FTS index takes — and are searched by a flat
         scan of just that tail until then.
 
+        ``replace=True`` rebuilds over an existing index — an operator action
+        (scripts/ensure_vector_index.py --rebuild) for changing the index type,
+        never something the index run does on its own: a PQ build peaks at
+        ~6 GB on the production table, which does not fit beside the live
+        server inside the container's cgroup. Tables under
+        _VECTOR_INDEX_PQ_MIN_ROWS get IVF_FLAT whatever was configured; Lance
+        cannot train PQ codebooks on fewer rows, and flat is exact anyway.
+
         ``metric="l2"`` is what the unindexed search has always used, so this
         changes speed and memory, not the ordering (the embeddings are
         unit-norm, so L2 and cosine rank identically regardless).
@@ -2867,7 +2911,7 @@ class LanceDBStore:
         index. The keyword form of create_index is the one both lancedb 0.30
         (test venv) and 0.37 (image) accept.
         """
-        if self.vector_index_available():
+        if not replace and self.vector_index_available():
             return False
         rows = self.count_chunks()
         if rows == 0:
@@ -2878,20 +2922,34 @@ class LanceDBStore:
                 f"unsupported vector index type {chosen!r}; expected one of "
                 f"{sorted(_VECTOR_INDEX_TYPES)}"
             )
+        if "PQ" in chosen and rows < _VECTOR_INDEX_PQ_MIN_ROWS:
+            logger.info(
+                "Vector index: %s needs %d rows to train, table has %d — building IVF_FLAT",
+                chosen,
+                _VECTOR_INDEX_PQ_MIN_ROWS,
+                rows,
+            )
+            chosen = "IVF_FLAT"
         if num_partitions is None:
             # HNSW builds one graph per partition; one partition is the graph.
             num_partitions = 1 if "HNSW" in chosen else ivf_partitions_for(rows)
+        extra: dict[str, Any] = {}
+        if "PQ" in chosen and num_sub_vectors:
+            extra["num_sub_vectors"] = int(num_sub_vectors)
         self._vs.table.create_index(
             metric="l2",
             vector_column_name="vector",
             index_type=chosen,
             num_partitions=int(num_partitions),
-            replace=False,
+            replace=bool(replace),
+            **extra,
         )
         logger.info(
-            "Vector index created on column 'vector': type=%s partitions=%d rows=%d",
+            "Vector index %s on column 'vector': type=%s partitions=%d%s rows=%d",
+            "rebuilt" if replace else "created",
             chosen,
             int(num_partitions),
+            f" sub_vectors={extra['num_sub_vectors']}" if extra else "",
             rows,
         )
         return True

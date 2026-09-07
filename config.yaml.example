@@ -170,9 +170,14 @@ search:
   # Measured on that table: IVF_FLAT recall@50 0.995 at nprobes 40, p50 17 ms
   # (flat scan: 1200 ms).
   vector_index:
-    type: "IVF_FLAT"                      # lancedb index_type: IVF_FLAT | IVF_HNSW_SQ | IVF_PQ | IVF_SQ
+    type: "IVF_PQ"                        # lancedb index_type: IVF_PQ | IVF_FLAT | IVF_HNSW_SQ | IVF_SQ
+    num_sub_vectors: 256                  # PQ: 4096-dim -> 256 x 16-dim codes, 256 B per row vs 16 KB
     # num_partitions: 256                 # default: sqrt(rows) capped at 256; HNSW uses 1
+    # Tables under 256 rows get IVF_FLAT (PQ cannot train); changing the type on
+    # an existing table is an operator rebuild: scripts/ensure_vector_index.py --rebuild
+    # (peaks ~6 GB on 88k rows — run it in a sibling container, not the cgroup).
   nprobes: 40                             # IVF partitions probed per query (recall vs latency)
+  refine_factor: 20                       # PQ: exact re-score of top k x 20; recall@50 0.78 (none) -> 0.989 (10) -> 0.995 (20) = IVF_FLAT, 32 ms
   max_concurrent_vector_searches: 3       # searches inside Lance at once per process; the rest queue
   reranker:
     enabled: true

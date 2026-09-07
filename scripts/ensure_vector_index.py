@@ -17,7 +17,9 @@ under the index root, so it serializes across containers: a running index run
 finishes first, and no writer interleaves with the build. Every later index run
 finds the index present and only merges new rows into it.
 
-Prints one JSON line. ``--check`` reports without building; ``--no-wait`` exits 3
+Prints one JSON line. ``--check`` reports without building; ``--rebuild``
+replaces the existing index with the configured type (how the index type is
+changed — the index run never rebuilds on its own); ``--no-wait`` exits 3
 instead of waiting for a running writer.
 """
 
@@ -45,6 +47,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--table", default=None, help="override config lancedb.table")
     parser.add_argument("--check", action="store_true", help="report only; build nothing")
     parser.add_argument(
+        "--rebuild", action="store_true", help="replace the existing index with the configured type"
+    )
+    parser.add_argument(
         "--no-wait", action="store_true", help="exit 3 if another index writer holds the table"
     )
     args = parser.parse_args(argv)
@@ -60,10 +65,12 @@ def main(argv: list[str] | None = None) -> int:
             store = LanceDBStore(index_root, table_name)
             if not args.check:
                 report["created"] = store.ensure_vector_index(
-                    **vector_index_settings_from_config(config)
+                    **vector_index_settings_from_config(config), replace=args.rebuild
                 )
+            stats = store.vector_index_stats()
             report["rows"] = store.count_chunks()
-            report["vector_index_available"] = store.vector_index_available()
+            report["vector_index_available"] = stats["available"]
+            report["index_type"] = stats["index_type"]
     except IndexWriteLockBusy as exc:
         report["error"] = str(exc)
         print(json.dumps(report))

@@ -61,11 +61,16 @@ def _recall(store: LanceDBStore, rng: np.random.Generator) -> float:
 
 @pytest.fixture(scope="module")
 def scaled_store():
+    """Embedding-like vectors: each document's chunks cluster around its own
+    centre. (i.i.d. Gaussian noise is product quantisation's worst case — no
+    structure for the codebooks to capture, recall@10 0.59 at refine 10 —
+    and nothing like what an embedding model produces.)"""
     rng = np.random.default_rng(20260906)
     with tempfile.TemporaryDirectory() as tmpdir:
         store = LanceDBStore(tmpdir, "chunks")
+        centres = rng.standard_normal((DOCS, DIM)).astype(np.float32) * 3
         for d in range(DOCS):
-            vectors = rng.standard_normal((CHUNKS_PER_DOC, DIM)).astype(np.float32)
+            vectors = (rng.standard_normal((CHUNKS_PER_DOC, DIM)) + centres[d]).astype(np.float32)
             store.upsert_nodes(
                 [_node(f"doc{d}.md", f"c:{c}", vectors[c].tolist()) for c in range(CHUNKS_PER_DOC)]
             )
@@ -106,3 +111,35 @@ def test_tail_added_after_the_build_is_merged_and_found(scaled_store):
     assert stats["num_indices"] == 1
     assert _ann_top_k(store, tail[7], 1) == {"tail.md::c:7"}
     assert _recall(store, rng) >= 0.98
+
+
+def test_ivf_pq_with_refine_matches_flat_at_this_scale(scaled_store):
+    """The production configuration: PQ codes (32 x 16-dim here, 256 x 16 in
+    prod) with exact re-scoring of the top k x refine_factor. Rebuilt over the FLAT index
+    the way the operator script does it; recall against the brute-force answer
+    must stay high, the merge must keep one index, and the plan must be ANN."""
+    store, rng = scaled_store
+    defaults = lancedb_store_module.vector_search_settings()
+    try:
+        assert store.ensure_vector_index(index_type="IVF_PQ", num_sub_vectors=32, replace=True) is True
+        stats = store.vector_index_stats()
+        assert "PQ" in stats["index_type"].upper() and stats["num_indices"] == 1
+        assert stats["unindexed_rows"] == 0
+
+        lancedb_store_module.configure_vector_search(refine_factor=20)
+        assert "ANNSubIndex" in store.explain_vector_search([0.0] * DIM)
+        assert _recall(store, rng) >= 0.95
+
+        lancedb_store_module.configure_vector_search(refine_factor=0)
+        unrefined = _recall(store, rng)
+        lancedb_store_module.configure_vector_search(refine_factor=20)
+        assert _recall(store, rng) > unrefined  # the refine step is what makes PQ accurate
+
+        tail = rng.standard_normal((40, DIM)).astype(np.float32)
+        store.upsert_nodes([_node("pqtail.md", f"c:{c}", tail[c].tolist()) for c in range(40)])
+        store.ensure_fts_index()
+        stats = store.vector_index_stats()
+        assert stats["unindexed_rows"] == 0 and stats["num_indices"] == 1
+        assert _ann_top_k(store, tail[3], 1) == {"pqtail.md::c:3"}
+    finally:
+        lancedb_store_module.configure_vector_search(refine_factor=defaults["refine_factor"] or 0)
