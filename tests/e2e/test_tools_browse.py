@@ -97,16 +97,20 @@ async def test_status_healthy_shape(indexed_corpus, mcp_session):
     assert health["fts_available"] is True
     # The sweep must leave an ANN index on the vector column: without it every
     # vector search brute-force scans the whole fp32 column and a search burst
-    # OOM-kills the container (20 restarts on 2026-09-06). And it must be one
-    # fully merged index — no unindexed tail, no pile of delta indices.
+    # OOM-kills the container (20 restarts on 2026-09-06). And it must be ONE
+    # index covering every row: rows that earlier tests wrote through the
+    # single-document path sit in an unindexed tail until the next sweep merges
+    # them (test_second_sweep_merges_new_rows_into_the_single_vector_index
+    # sweeps and asserts that tail is 0), so here the invariant is coverage,
+    # not an empty tail.
     assert health["vector_index_available"] is True
     vector_index = health["vector_index"]
     assert vector_index["available"] is True, vector_index
     assert "IVF" in str(vector_index["index_type"]).upper(), vector_index
-    assert vector_index["unindexed_rows"] == 0, vector_index
     assert vector_index["num_indices"] == 1, vector_index
-    assert vector_index["indexed_rows"] == status["chunk_count"], (vector_index, status["chunk_count"])
-    assert vector_index["stale"] is False
+    assert vector_index["indexed_rows"] + vector_index["unindexed_rows"] == status["chunk_count"], (
+        vector_index, status["chunk_count"])
+    assert vector_index["stale"] is False, vector_index
     assert health["reranker_enabled"] is True
     assert health["reranker_responsive"] is True
     assert health["last_index_failed_count"] == 0
