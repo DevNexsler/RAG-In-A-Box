@@ -51,3 +51,10 @@ async def test_context_builder_returns_dossier(mcp_session):
 async def test_context_builder_requires_identifier(mcp_session):
     out = await mcp_session.call_tool_json("context_builder", {})
     assert "identifier" in out.get("error", ""), out
+
+
+async def test_context_builder_exact_event_mode_validates_public_arguments(mcp_session):
+    out = await mcp_session.call_tool_json('context_builder', {'event_refs': []})
+    assert 'event_refs' in out.get('error', ''), out
+    mixed = await mcp_session.call_tool_json('context_builder', {'event_refs': ['one'], 'phone': '2025550123'})
+    assert 'cannot be mixed' in mixed.get('error', ''), mixed

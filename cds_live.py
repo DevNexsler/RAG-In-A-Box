@@ -90,6 +90,29 @@ order by m.sent_at desc limit 5
 """
 
 
+_IDENTITY_ALIASES_BASE_SQL = """
+/* identity_aliases */
+with anchor_names as (
+    select distinct lower(btrim(display_name)) as name_key
+    from participants
+    where display_name is not null
+      and btrim(display_name) <> ''
+      and lower(btrim(display_name)) <> lower(btrim(participant_key))
+      and ({predicate})
+), unique_name as (
+    select min(name_key) as name_key
+    from anchor_names
+    having count(*) = 1
+)
+select distinct p.display_name, p.email, coalesce(p.phone, p.phone_number)
+from participants p
+join unique_name u on lower(btrim(p.display_name)) = u.name_key
+where p.email is not null or p.phone is not null or p.phone_number is not null
+order by p.display_name, p.email, coalesce(p.phone, p.phone_number)
+limit 12
+"""
+
+
 def _ts(value):
     if value is None:
         return None
@@ -121,6 +144,36 @@ def fetch_inbound_summary(cur, email, phone) -> dict:
     row = cur.fetchone()
     count, latest = (row[0], row[1]) if row else (0, None)
     return {"inbound_count_30d": count or 0, "latest_inbound_at": _ts(latest)}
+
+
+def fetch_identity_aliases(cur, email, phone) -> list[dict]:
+    """Return bounded identifier candidates joined by one unambiguous CDS name.
+
+    Aliases remain evidence, never an asserted merge. A source identifier whose
+    CDS rows publish multiple real display names returns no aliases.
+    """
+    preds, params = [], []
+    if email:
+        preds.append("lower(email) = lower(%s)")
+        params.append(email)
+    if phone:
+        preds.append("phone = %s or phone_number = %s")
+        params.extend([phone, phone])
+    if not preds:
+        return []
+    cur.execute(
+        _IDENTITY_ALIASES_BASE_SQL.format(predicate=" or ".join(preds)),
+        tuple(params),
+    )
+    aliases = []
+    for name, alias_email, alias_phone in cur.fetchall():
+        item = {"name": name}
+        if alias_email:
+            item["email"] = alias_email
+        if alias_phone:
+            item["phone_e164"] = alias_phone
+        aliases.append(item)
+    return aliases
 
 
 def fetch_outbound_evidence(cur, email, phone, lead_id) -> list[dict]:
@@ -210,7 +263,8 @@ def _reset_conn() -> None:
 
 
 _EMPTY = {"inbound_count_30d": 0, "latest_inbound_at": None,
-          "latest_outbound_at": None, "outbound_evidence": []}
+          "latest_outbound_at": None, "outbound_evidence": [],
+          "identity_aliases": []}
 
 
 def cds_source(contact: dict) -> dict:
@@ -229,6 +283,7 @@ def cds_source(contact: dict) -> dict:
         conn = _get_readonly_conn()
         with conn.cursor() as cur:
             inbound = fetch_inbound_summary(cur, email, phone)
+            identity_aliases = fetch_identity_aliases(cur, email, phone)
             outbound_evidence = fetch_outbound_evidence(cur, email, phone, lead_id)
             conversation = fetch_conversation(cur, contact)
         conn.rollback()  # close the read-only txn cleanly
@@ -247,5 +302,6 @@ def cds_source(contact: dict) -> dict:
         "latest_inbound_at": inbound["latest_inbound_at"],
         "latest_outbound_at": latest_outbound_at,
         "outbound_evidence": outbound_evidence,
+        "identity_aliases": identity_aliases,
         "conversation": conversation,
     }

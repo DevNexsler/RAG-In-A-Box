@@ -76,6 +76,23 @@ def test_inbound_summary_no_identifiers_skips_query():
     assert cur.executed == []
 
 
+def test_identity_aliases_bridge_one_unambiguous_source_name():
+    cur = FakeCursor({"identity_aliases": [
+        ("Jason Mignosi", "relay@convo.zillow.com", None),
+        ("Jason Mignosi", None, "+15709940075"),
+    ]})
+
+    out = cds_live.fetch_identity_aliases(
+        cur, "relay@convo.zillow.com", None
+    )
+
+    assert out == [
+        {"name": "Jason Mignosi", "email": "relay@convo.zillow.com"},
+        {"name": "Jason Mignosi", "phone_e164": "+15709940075"},
+    ]
+    assert cur.executed and "count(*) = 1" in cur.executed[0]
+
+
 def test_cds_source_degrades_on_connection_error(monkeypatch):
     monkeypatch.setattr(cds_live, "_get_readonly_conn",
                         lambda: (_ for _ in ()).throw(RuntimeError("no dsn")))
