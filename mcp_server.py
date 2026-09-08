@@ -2347,15 +2347,21 @@ def _context_builder_impl(
     lead_id: str | None = None,
     latest_inbound_at: str | None = None,
     include: list[str] | None = None,
+    history_since: str | None = None,
+    history_limit: int = 50,
+    history_cursor: str | None = None,
 ) -> dict:
     """Deterministic contact dossier. Never raises: invalid input (no
     identifiers) becomes ``{"error": ...}``; per-source failures degrade
     loud inside ``context_builder.build_context`` instead of raising."""
     try:
+        from cds_history import history_request
+        history = history_request(history_since, history_limit, history_cursor)
         contact = ctxb.normalize_contact(
             email=email, phone=phone, name=name, lead_id=lead_id,
             latest_inbound_at=latest_inbound_at,
         )
+        contact["history"] = history
     except ValueError as exc:
         return {"error": str(exc)}
 
@@ -3395,6 +3401,9 @@ if HAS_MCP and FastMCP is not None:
         lead_id: str | None = None,
         latest_inbound_at: str | None = None,
         include: list[str] | None = None,
+        history_since: str | None = None,
+        history_limit: int = 50,
+        history_cursor: str | None = None,
     ) -> dict:
         """Deterministic contact dossier: FactBook identity, exact CDS comm
         history + our-outbound evidence, exact-filtered comm context, and a
@@ -3410,7 +3419,17 @@ if HAS_MCP and FastMCP is not None:
             latest_inbound_at: ISO-8601 timestamp of the latest known inbound
                 message from this contact; used to compute
                 our_outbound_after_latest_inbound when CDS itself found no
-                inbound message (e.g. the message predates the 30-day window).
+                inbound message. A newer CDS timestamp takes precedence over
+                a stale caller hint. CDS latest inbound is now all-time;
+                inbound_count_30d remains a 30-day count.
+            history_since: Optional timezone-aware ISO-8601 lower bound from
+                caller's source evidence. Without it, retrieve newest messages
+                regardless of age. Never infer history completeness from silence.
+            history_limit: Messages per page, 1–100 (default 50). Bodies capped
+                at 4,000 characters with explicit truncation flags.
+            history_cursor: Opaque next_cursor from cds.conversation. Reuse
+                the same identity and history_since; accumulate pages until
+                window_exhausted, checking every page for body truncation.
             include: Optional subset of {"factbook", "cds", "comm_context"}
                 ("comm" is also accepted as an alias for "comm_context") —
                 sources not listed come back {"status": "skipped", ...}
@@ -3421,7 +3440,7 @@ if HAS_MCP and FastMCP is not None:
             {
               "contact": {...},           # normalized identifiers
               "factbook": {...},          # FactBook identity, or error/skipped
-              "cds": {...},               # CDS inbound/outbound evidence, or error/skipped
+              "cds": {...},               # includes exact conversation + coverage
               "comm_context": {...},      # exact-filtered semantic hits, or error/skipped
               "derived": {"our_outbound_after_latest_inbound": true|false|"unknown"},
               "elapsed_ms": ...,
@@ -3433,6 +3452,8 @@ if HAS_MCP and FastMCP is not None:
         return _context_builder_impl(
             email=email, phone=phone, name=name, lead_id=lead_id,
             latest_inbound_at=latest_inbound_at, include=include,
+            history_since=history_since, history_limit=history_limit,
+            history_cursor=history_cursor,
         )
 
     @mcp.tool(description=sorq.build_sor_query_description())

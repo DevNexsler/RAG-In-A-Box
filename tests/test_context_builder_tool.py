@@ -195,4 +195,5 @@ async def test_tool_registered_and_delegates(monkeypatch):
         "email": "a@b.com", "phone": "4847614094", "name": "Jess",
         "lead_id": "123", "latest_inbound_at": "2026-08-27T00:00:00Z",
         "include": ["cds"],
+        "history_since": None, "history_limit": 50, "history_cursor": None,
     }
