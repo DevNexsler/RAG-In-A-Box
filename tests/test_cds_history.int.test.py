@@ -50,6 +50,8 @@ def database():
         with conn.cursor() as cur:
             cur.executemany("INSERT INTO messages VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
         conn.execute("INSERT INTO message_participants VALUES (2,1),(2,3),(6,1)")
+        # Preserve production's existing optional alias-suggestion query contract.
+        conn.execute("ALTER TABLE participants ADD COLUMN display_name text; ALTER TABLE participants ADD COLUMN participant_key text")
         conn.commit()
         yield conn, old
 
