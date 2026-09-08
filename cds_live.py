@@ -32,6 +32,7 @@ import os
 import psycopg
 
 from core.logging_setup import MAX_ERROR_CHARS, collapse
+from cds_history import fetch_conversation, unavailable_history
 
 CDS_ENV_VAR = "COMM_DATA_STORE_DSN"
 
@@ -42,12 +43,12 @@ CDS_ENV_VAR = "COMM_DATA_STORE_DSN"
 # email-only contact spuriously matching p.phone = ''), so an identifier
 # that isn't present on the contact contributes no predicate at all.
 _INBOUND_BASE_SQL = """
-select count(*), max(m.sent_at)
+select count(distinct m.id) filter (where m.sent_at > now() - interval '30 days'), max(m.sent_at)
 from messages m
 join message_participants mp on mp.message_id = m.id
 join participants p on p.id = mp.participant_id
 where m.direction = 'inbound'
-  and m.sent_at > now() - interval '30 days'
+  and m.sent_at <= now()
   and ({predicate})
 """
 _INBOUND_EMAIL_PRED = "lower(p.email) = lower(%s)"
@@ -98,7 +99,7 @@ def _ts(value):
 
 
 def fetch_inbound_summary(cur, email, phone) -> dict:
-    """Count + latest inbound message from this contact in the last 30 days.
+    """Recent count plus all-time latest inbound, including quiet contacts.
 
     Only identifiers actually present on the contact get a predicate (see
     `_INBOUND_BASE_SQL`'s docstring note above) -- an email-only contact
@@ -222,20 +223,22 @@ def cds_source(contact: dict) -> dict:
     phone = contact.get("phone_e164")
     lead_id = contact.get("lead_id")
     if not (email or phone or lead_id):
-        return {"status": "no_identifiers", **_EMPTY}
+        return {"status": "no_identifiers", **_EMPTY, "conversation": unavailable_history("no_identifiers")}
 
     try:
         conn = _get_readonly_conn()
         with conn.cursor() as cur:
             inbound = fetch_inbound_summary(cur, email, phone)
             outbound_evidence = fetch_outbound_evidence(cur, email, phone, lead_id)
+            conversation = fetch_conversation(cur, contact)
         conn.rollback()  # close the read-only txn cleanly
     except Exception as exc:
         _reset_conn()
         # collapse (not bare str(exc)): a DSN-parse or auth failure can echo
         # credentials into the exception text (same discipline as
         # factbook_client._call_tool's error path).
-        return {"status": f"error:{collapse(exc, MAX_ERROR_CHARS)}", **_EMPTY}
+        return {"status": f"error:{collapse(exc, MAX_ERROR_CHARS)}", **_EMPTY,
+                "conversation": unavailable_history("error")}
 
     latest_outbound_at = outbound_evidence[0]["at"] if outbound_evidence else None
     return {
@@ -244,4 +247,5 @@ def cds_source(contact: dict) -> dict:
         "latest_inbound_at": inbound["latest_inbound_at"],
         "latest_outbound_at": latest_outbound_at,
         "outbound_evidence": outbound_evidence,
+        "conversation": conversation,
     }

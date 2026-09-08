@@ -79,7 +79,8 @@ def _ts(value):
 def derive_flags(contact: dict, cds_result: dict) -> dict:
     if cds_result.get("status") != "ok":
         return {"our_outbound_after_latest_inbound": "unknown"}
-    inbound = _ts(contact.get("latest_inbound_at")) or _ts(cds_result.get("latest_inbound_at"))
+    candidates = [_ts(contact.get("latest_inbound_at")), _ts(cds_result.get("latest_inbound_at"))]
+    inbound = max((value for value in candidates if value is not None), default=None)
     if inbound is None:
         return {"our_outbound_after_latest_inbound": "unknown"}
     for item in cds_result.get("outbound_evidence") or []:
