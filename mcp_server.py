@@ -3429,6 +3429,9 @@ if HAS_MCP and FastMCP is not None:
                 IDs. Returns cds.events instead of a contact dossier. Cannot
                 combine with contact/history options; include may be ["cds"].
                 Missing or duplicate IDs are explicit, not guessed.
+                Use calendar:<UID> for calendar records: every owner copy and
+                field is preserved, including conflicting schedules/statuses.
+                Calendar records are not proof of attendance or completion.
             event_cursor: Opaque cds.events.next_cursor. Reuse same event_refs.
                 Accumulate 12,000-character body fragments until exhausted;
                 validate body_offset, body_total_chars and body_sha256.
