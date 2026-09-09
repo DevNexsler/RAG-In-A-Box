@@ -99,6 +99,15 @@ def fetch_conversation(cur, contact: dict) -> dict:
         JOIN participants p ON p.id=mp.participant_id
         WHERE mp.message_id=m.id AND (""" + " OR ".join(participants) + "))"
     where += " OR (m.direction='outbound' AND (" + " OR ".join(recipients) + "))"
+    if email and not calls:
+        # Cliq raw sender identity survives absent normalized participant links.
+        # Channel recipients and body mentions do not establish sender ownership.
+        where += """ OR (m.source='zoho_cliq' AND EXISTS (
+            SELECT 1 FROM jsonb_array_elements(CASE
+                WHEN jsonb_typeof(r.payload->'participants')='array'
+                THEN r.payload->'participants' ELSE '[]'::jsonb END) pt
+            WHERE pt->>'kind'='sender' AND lower(pt->>'address')=%s))"""
+        recipient_params.append(email)
     table, event_time = "m", "m.sent_at"
     if calls:
         where = "EXISTS (SELECT 1 FROM participants p WHERE p.id=c.host_participant_id AND (" + " OR ".join(participants) + "))"

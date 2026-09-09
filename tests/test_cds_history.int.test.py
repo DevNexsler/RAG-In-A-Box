@@ -103,3 +103,24 @@ def test_real_recent_count_deduplicates_participant_matches(database):
     with conn.cursor() as cur:
         result = cds_live.fetch_inbound_summary(cur, "person@example.test", "+12025550123")
     assert result["inbound_count_30d"] == 1
+
+
+def test_raw_cliq_sender_email_recovers_event_without_participant_link(database):
+    conn, old = database
+    for rid, source, kind, address in [
+        (10, 'zoho_cliq', 'sender', 'PERSON@example.test'),
+        (11, 'zoho_cliq', 'to', 'person@example.test'),
+        (12, 'unknown_provider', 'sender', 'person@example.test'),
+        (13, 'zoho_cliq', 'sender', 'other@example.test'),
+    ]:
+        conn.execute('INSERT INTO raw_events VALUES (%s,%s)',
+                     (rid, Jsonb({'participants': [{'kind': kind, 'address': address}]})))
+        conn.execute('INSERT INTO messages VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                     (rid, source, 'raw-' + str(rid), old + dt.timedelta(minutes=10),
+                      'inbound', 'Stored sender name', None, 'Mention person@example.test in body.',
+                      None, None, rid, 99))
+    with conn.cursor() as cur:
+        result = fetch_conversation(cur, {'email': 'person@example.test'})
+    assert [m['source_message_id'] for m in result['messages']] == ['raw-10', 'mail', 'withdrawal']
+    assert result['coverage_complete']
+    assert result['messages'][0]['sender_name'] == 'Stored sender name'
