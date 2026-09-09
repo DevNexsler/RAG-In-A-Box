@@ -53,16 +53,18 @@ def fetch_event_page(cur, refs, state):
     if re.fullmatch(r'AC[0-9a-fA-F]{32}', ref):
         # Quo uses AC IDs for both SMS and calls. Check both typed stores;
         # collisions stay ambiguous, never silently prefer one source kind.
-        transcript = 't.body'
+        transcript = "coalesce(t.body,'')"
         cur.execute(
             "/* exact_call_event_page */ SELECT 'call:' || c.id::text,c.source,c.source_call_id,c.started_at,"
             "CASE c.direction WHEN 'incoming' THEN 'inbound' WHEN 'outgoing' THEN 'outbound' ELSE c.direction END,"
-            "NULL::text,'Call transcript',"
+            "NULL::text,CASE WHEN t.body IS NULL THEN 'Call metadata (no transcript)' ELSE 'Call transcript' END,"
             f"substring({transcript} from %s for %s),length({transcript}),"
-            f"encode(sha256(convert_to({transcript},'UTF8')),'hex') "
-            "FROM calls c CROSS JOIN LATERAL (SELECT nullif(c.transcript,'') AS body UNION "
-            "SELECT nullif(transcript_text,'') FROM transcripts WHERE call_id=c.id) t "
-            "WHERE c.source_call_id=%s AND t.body IS NOT NULL ORDER BY c.id,t.body LIMIT 2",
+            f"encode(sha256(convert_to({transcript},'UTF8')),'hex'),"
+            "c.duration_seconds,c.status,c.from_number,c.to_number "
+            "FROM calls c LEFT JOIN LATERAL (SELECT body FROM (SELECT nullif(c.transcript,'') AS body UNION "
+            "SELECT nullif(transcript_text,'') FROM transcripts WHERE call_id=c.id) candidates "
+            "WHERE body IS NOT NULL) t ON TRUE "
+            "WHERE c.source_call_id=%s ORDER BY c.id,t.body LIMIT 2",
             (offset + 1, BODY_PAGE_CHARS, ref),
         )
         rows += cur.fetchall()
@@ -74,11 +76,15 @@ def fetch_event_page(cur, refs, state):
         ambiguous.append(ref)
     else:
         message = dict(zip(("id", "source", "source_message_id", "sent_at", "direction",
-                            "sender_name", "subject", "body", "body_total_chars", "body_sha256"), rows[0]))
+                            "sender_name", "subject", "body", "body_total_chars", "body_sha256",
+                            "duration_seconds", "call_status", "from_number", "to_number"), rows[0]))
         message["id"] = str(message["id"])
         if message['id'].startswith('call:'):
-            message['event_kind'] = 'call_transcript'
-            message['body_authority'] = 'Stored call transcript, not a verbatim audio verification or summary.'
+            available = message['body_total_chars'] > 0
+            message['event_kind'] = 'call_transcript' if available else 'call_metadata'
+            message['transcript_status'] = 'available' if available else 'unavailable'
+            message['body_authority'] = ('Stored call transcript, not a verbatim audio verification or summary.'
+                if available else 'Call metadata only; not evidence of what was said. No stored transcript available.')
         message["sent_at"] = message["sent_at"].isoformat() if message["sent_at"] else None
         metadata = {k: v for k, v in message.items() if k != "body"}
         version = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
