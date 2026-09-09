@@ -33,6 +33,7 @@ services:
       - doc-organizer-data:/data/index
       - ./config.yaml:/app/config.yaml:ro
       - ./.evals:/app/.evals
+      - /run/fileshare:/run/fileshare:ro
     command: ["python", "server.py"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -42,6 +43,8 @@ services:
       - comm-net
       - mcp-backplane
     environment:
+      - QUANTUM_SHARE_GUARD_SOCKET=/run/fileshare/guard.sock
+      - QUANTUM_SHARE_GUARD_ROOT=/data/documents
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - DEEPINFRA_API_KEY=${DEEPINFRA_API_KEY}
       - LITELLM_API_KEY=${LITELLM_API_KEY}

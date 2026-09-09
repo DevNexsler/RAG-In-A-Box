@@ -667,8 +667,13 @@ def scan_filesystem_records(
             # ID also reaches the filename decides cleared vs. unresolved.
             claim_rejected = claimed_token is not None and existing_id is None
 
-            if existing_id is None and doc_id_store and any(
-                rel_str.startswith(p) for p in norm_prefixes
+            # Preserve shared filenames while continuing registry-based indexing.
+            # A configured but unavailable audit also preserves the filename.
+            from core.share_guard import preserve_shared_path
+
+            if existing_id is None and doc_id_store and (
+                any(rel_str.startswith(p) for p in norm_prefixes)
+                or preserve_shared_path(full_path)
             ):
                 # Deposit-owned path: never rename. Identity comes from the
                 # registry keyed by relative path.
