@@ -58,3 +58,16 @@ async def test_context_builder_exact_event_mode_validates_public_arguments(mcp_s
     assert 'event_refs' in out.get('error', ''), out
     mixed = await mcp_session.call_tool_json('context_builder', {'event_refs': ['one'], 'phone': '2025550123'})
     assert 'cannot be mixed' in mixed.get('error', ''), mixed
+
+
+async def test_context_builder_call_history_opt_in_crosses_real_mcp_schema(mcp_session):
+    out = await mcp_session.call_tool_json('context_builder', {
+        'phone': '2025550123', 'history_kind': 'calls', 'include': ['cds']})
+    assert not out.get('error'), out
+    assert out['contact']['history']['kind'] == 'calls'
+    # This staging database deliberately lacks CDS tables. Never turn that into
+    # an empty, supposedly complete call history.
+    assert out['cds']['status'].startswith('error:'), out
+    invalid = await mcp_session.call_tool_json('context_builder', {
+        'phone': '2025550123', 'history_kind': 'unknown'})
+    assert 'history_kind' in invalid.get('error', ''), invalid

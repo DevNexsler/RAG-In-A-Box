@@ -2352,6 +2352,7 @@ def _context_builder_impl(
     history_cursor: str | None = None,
     event_refs: list[str] | None = None,
     event_cursor: str | None = None,
+    history_kind: str = "messages",
 ) -> dict:
     """Deterministic contact dossier. Never raises: invalid input (no
     identifiers) becomes ``{"error": ...}``; per-source failures degrade
@@ -2359,13 +2360,13 @@ def _context_builder_impl(
     try:
         if event_refs is not None:
             from cds_exact_events import exact_event_context
-            if any(v is not None for v in (email, phone, name, lead_id, latest_inbound_at, history_since, history_cursor)) or include not in (None, ["cds"]) or history_limit != 50:
+            if any(v is not None for v in (email, phone, name, lead_id, latest_inbound_at, history_since, history_cursor)) or include not in (None, ["cds"]) or history_limit != 50 or history_kind != "messages":
                 raise ValueError("event_refs mode cannot be mixed with contact/history options")
             return exact_event_context(event_refs, event_cursor)
         if event_cursor is not None:
             raise ValueError("event_cursor requires event_refs")
         from cds_history import history_request
-        history = history_request(history_since, history_limit, history_cursor)
+        history = history_request(history_since, history_limit, history_cursor, history_kind)
         contact = ctxb.normalize_contact(
             email=email, phone=phone, name=name, lead_id=lead_id,
             latest_inbound_at=latest_inbound_at,
@@ -3415,6 +3416,7 @@ if HAS_MCP and FastMCP is not None:
         history_cursor: str | None = None,
         event_refs: list[str] | None = None,
         event_cursor: str | None = None,
+        history_kind: str = "messages",
     ) -> dict:
         """Deterministic contact dossier: FactBook identity, exact CDS comm
         history + our-outbound evidence, exact-filtered comm context, and a
@@ -3450,6 +3452,11 @@ if HAS_MCP and FastMCP is not None:
             history_cursor: Opaque next_cursor from cds.conversation. Reuse
                 the same identity and history_since; accumulate pages until
                 window_exhausted, checking every page for body truncation.
+            history_kind: Default messages preserves existing behavior. Calls
+                returns typed call references in cds.conversation.messages;
+                use event_refs for transcripts or explicit transcriptless metadata.
+                Cursors cannot switch kinds. Call reference coverage does not
+                claim transcript coverage.
             include: Optional subset of {"factbook", "cds", "comm_context"}
                 ("comm" is also accepted as an alias for "comm_context") —
                 sources not listed come back {"status": "skipped", ...}
@@ -3474,6 +3481,7 @@ if HAS_MCP and FastMCP is not None:
             latest_inbound_at=latest_inbound_at, include=include,
             history_since=history_since, history_limit=history_limit,
             history_cursor=history_cursor,
+            **({"history_kind": history_kind} if history_kind != "messages" else {}),
             **({"event_refs": event_refs, "event_cursor": event_cursor}
                if event_refs is not None or event_cursor is not None else {}),
         )
