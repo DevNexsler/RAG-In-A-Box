@@ -42,13 +42,32 @@ def fetch_event_page(cur, refs, state):
     index, offset = state["index"], state["offset"]
     ref = refs[index]
     body = "coalesce(nullif(body,''),nullif(body_text,''),content,'')"
-    cur.execute(
-        "/* exact_event_page */ SELECT id,source,source_message_id,sent_at,direction,sender_name,subject,"
-        f"substring({body} from %s for %s),length({body}),"
-        f"encode(sha256(convert_to({body},'UTF8')),'hex') "
-        "FROM messages WHERE source_message_id=%s ORDER BY id LIMIT 2",
-        (offset + 1, BODY_PAGE_CHARS, ref),
-    )
+    if ref.startswith('calendar:'):
+        uid = ref.removeprefix('calendar:')
+        if not uid.strip():
+            raise ValueError('calendar reference requires a nonempty UID')
+        # Preserve every field of every owner copy. Do not pick an owner or
+        # silently decide which conflicting schedule/status should win.
+        cur.execute('''/* exact_calendar_event_page */
+            WITH copies AS (
+                SELECT c.source,c.uid,jsonb_agg(to_jsonb(c) ORDER BY c.id)::text AS body,
+                       max(coalesce(c.last_modified,c.updated_at,c.created_at,c.starts_at)) AS at
+                FROM calendar_events c WHERE c.uid=%s OR c.source_event_id=%s
+                GROUP BY c.source,c.uid)
+            SELECT 'calendar:' || source || ':' || coalesce(uid,%s),source,%s,at,
+                   NULL::text,NULL::text,'Calendar record copies (schedule only)',
+                   substring(body from %s for %s),length(body),
+                   encode(sha256(convert_to(body,'UTF8')),'hex')
+            FROM copies ORDER BY source,uid LIMIT 2''',
+                    (uid, uid, uid, ref, offset + 1, BODY_PAGE_CHARS))
+    else:
+        cur.execute(
+            "/* exact_event_page */ SELECT id,source,source_message_id,sent_at,direction,sender_name,subject,"
+            f"substring({body} from %s for %s),length({body}),"
+            f"encode(sha256(convert_to({body},'UTF8')),'hex') "
+            "FROM messages WHERE source_message_id=%s ORDER BY id LIMIT 2",
+            (offset + 1, BODY_PAGE_CHARS, ref),
+        )
     rows = cur.fetchall()
     if re.fullmatch(r'AC[0-9a-fA-F]{32}', ref):
         # Quo uses AC IDs for both SMS and calls. Check both typed stores;
@@ -79,6 +98,11 @@ def fetch_event_page(cur, refs, state):
                             "sender_name", "subject", "body", "body_total_chars", "body_sha256",
                             "duration_seconds", "call_status", "from_number", "to_number"), rows[0]))
         message["id"] = str(message["id"])
+        if message['id'].startswith('calendar:'):
+            message['event_kind'] = 'calendar_record_set'
+            message['body_authority'] = ('Stored calendar owner copies; not proof of attendance or completion. '
+                'All copies and fields preserved, including conflicting statuses. No owner/version is selected as authoritative.')
+            message['timestamp_authority'] = 'Latest stored copy modification time, not scheduled meeting time. Read starts_at/ends_at inside each copy.'
         if message['id'].startswith('call:'):
             available = message['body_total_chars'] > 0
             message['event_kind'] = 'call_transcript' if available else 'call_metadata'
