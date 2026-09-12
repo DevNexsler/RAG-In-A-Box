@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from core.benchmarking.runner import run_benchmark
+from core.resilience import TransientError
 from doc_enrichment import _CONTEXT_KEYS_RAW, _ENRICHMENT_KEYS_RAW
 from providers.llm.ollama_llm import _ENRICHMENT_SCHEMA as OLLAMA_ENRICHMENT_SCHEMA
 from providers.llm.openrouter_llm import (
@@ -38,6 +39,55 @@ def test_generate_with_metadata_returns_content_usage_and_latency(tmp_path):
     assert result["content"] == '{"summary":"ok"}'
     assert result["response"]["usage"]["total_tokens"] == 42
     assert result["latency_ms"] >= 0
+
+
+def test_openrouter_retries_an_empty_enrichment_summary():
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    empty = httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": '{"summary":""}'}}]},
+        request=request,
+    )
+    recovered = httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": '{"summary":"Recovered"}'}}]},
+        request=request,
+    )
+
+    with patch(
+        "providers.llm.openrouter_llm.httpx.post",
+        side_effect=[empty, recovered],
+    ) as mock_post:
+        result = OpenRouterGenerator(api_key="secret-key").generate("document")
+
+    assert json.loads(result)["summary"] == "Recovered"
+    assert mock_post.call_count == 2
+
+
+@pytest.mark.parametrize("empty_content", ["", " ", '{"summary":""}'])
+def test_openrouter_classifies_empty_summary_after_retry(empty_content):
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    empty = httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": empty_content}}]},
+        request=request,
+    )
+
+    with patch(
+        "providers.llm.openrouter_llm.httpx.post",
+        return_value=empty,
+    ) as mock_post:
+        generator = OpenRouterGenerator(
+            model="openai/gpt-4.1-mini",
+            api_key="secret-key",
+        )
+        with pytest.raises(
+            TransientError,
+            match="OpenRouter returned empty enrichment summary after retry.*gpt-4.1-mini",
+        ):
+            generator.generate("document")
+
+    assert mock_post.call_count == 2
 
 
 def test_openrouter_json_schema_includes_importance(tmp_path):

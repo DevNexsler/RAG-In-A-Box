@@ -91,7 +91,9 @@ def _llm_provider(base_url: str | None):
 
 
 def test_llm_base_url_override(capture_post):
-    calls = capture_post({"choices": [{"message": {"content": "{}"}}]})
+    calls = capture_post(
+        {"choices": [{"message": {"content": '{"summary":"ok"}'}}]}
+    )
     provider = _llm_provider(OVERRIDE)
     provider.generate("hi")
     assert calls["url"].startswith(OVERRIDE)
@@ -99,7 +101,9 @@ def test_llm_base_url_override(capture_post):
 
 
 def test_llm_base_url_default(capture_post):
-    calls = capture_post({"choices": [{"message": {"content": "{}"}}]})
+    calls = capture_post(
+        {"choices": [{"message": {"content": '{"summary":"ok"}'}}]}
+    )
     provider = _llm_provider(None)
     provider.generate("hi")
     assert calls["url"] == "https://openrouter.ai/api/v1/chat/completions"
