@@ -35,6 +35,7 @@ LOG="${BACKUP_DIR}/backup.log"
 mkdir -p "${BACKUP_DIR}/weekly" "${BACKUP_DIR}/monthly"
 exec 9>"${BACKUP_DIR}/.backup.lock"
 flock -n 9 || { echo "backup already running"; exit 0; }
+[ ! -e "${BACKUP_DIR}/${OUT}" ] || { echo "snapshot already exists: ${OUT}" >&2; exit 1; }
 PARTIAL="${OUT}.partial"
 trap 'rm -f -- "${BACKUP_DIR}/${PARTIAL}"' EXIT
 
@@ -46,7 +47,7 @@ if docker exec "${DOC_BACKUP_CONTAINER:-doc-organizer}" test -f /data/index/inde
   RUNNING=" (indexer was running — point-in-time snapshot)"
 fi
 
-docker run --rm \
+docker run --rm --network none \
   -v "${VOLUME}:/vol:ro" \
   -v "${BACKUP_DIR}:/backup" \
   alpine sh -c '
