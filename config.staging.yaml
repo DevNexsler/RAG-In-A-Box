@@ -106,6 +106,14 @@ media:
   provider: "openrouter"
   base_url: "http://provider-sim:9999/api/v1"
   audio_model: "openai/whisper-1"
+  audio_model_endpoint: "audio/transcriptions"
+  fallback_audio_models:
+    - "mistralai/voxtral-small-24b-2507"
+    - "google/gemini-2.5-flash-lite"
+  fallback_audio_model_endpoint: "chat/completions"
+  fallback_audio_model_parameters:
+    temperature: 0.0
+    top_p: 1.0
   video_model: "qwen/qwen3.5-397b-a17b"
   max_file_size_mb: 50
   timeout: 60

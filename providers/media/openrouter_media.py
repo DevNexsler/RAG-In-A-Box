@@ -6,7 +6,9 @@ import base64
 import logging
 import mimetypes
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Mapping
 
 import httpx
 
@@ -66,6 +68,38 @@ _VIDEO_MIME_BY_EXT = {
     "avi": "video/x-msvideo",
 }
 
+_AUDIO_ENDPOINTS = {"audio/transcriptions", "chat/completions"}
+
+
+@dataclass(frozen=True)
+class AudioModelRoute:
+    """One audio model plus the OpenRouter request contract it supports."""
+
+    model: str
+    endpoint: str = "chat/completions"
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_config(cls, value: str | Mapping[str, Any]) -> "AudioModelRoute":
+        if isinstance(value, str):
+            route = cls(model=value)
+        elif isinstance(value, Mapping):
+            route = cls(
+                model=str(value.get("model", "")).strip(),
+                endpoint=str(value.get("endpoint", "chat/completions")).strip().lstrip("/"),
+                parameters=dict(value.get("parameters") or {}),
+            )
+        else:
+            raise TypeError("audio model route must be a model string or mapping")
+        if not route.model:
+            raise ValueError("audio model route requires model")
+        if route.endpoint not in _AUDIO_ENDPOINTS:
+            raise ValueError(
+                f"Unsupported audio model endpoint {route.endpoint!r}; "
+                f"expected one of {sorted(_AUDIO_ENDPOINTS)}"
+            )
+        return route
+
 
 class MediaFileTooLargeError(MediaPolicyError):
     """Raised when a local media file exceeds configured upload size."""
@@ -74,11 +108,11 @@ class MediaFileTooLargeError(MediaPolicyError):
 
 
 class OpenRouterMediaProvider:
-    """Extract text from audio/video via OpenRouter chat completions."""
+    """Extract text from audio/video through capability-specific OpenRouter routes."""
 
     def __init__(
         self,
-        audio_models: list[str],
+        audio_models: list[str | Mapping[str, Any] | AudioModelRoute],
         video_model: str,
         api_key: str | None = None,
         base_url: str = "https://openrouter.ai/api/v1",
@@ -87,7 +121,11 @@ class OpenRouterMediaProvider:
     ) -> None:
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.base_url = base_url.rstrip("/")
-        self.audio_models = audio_models
+        self.audio_routes = [
+            value if isinstance(value, AudioModelRoute) else AudioModelRoute.from_config(value)
+            for value in audio_models
+        ]
+        self.audio_models = [route.model for route in self.audio_routes]
         self.video_model = video_model
         self.timeout = timeout
         self.max_file_size_bytes = int(max_file_size_mb * 1024 * 1024)
@@ -116,12 +154,23 @@ class OpenRouterMediaProvider:
         ]
 
         last_exc: Exception | None = None
-        for model in self.audio_models:
+        for route in self.audio_routes:
             try:
-                return self._chat(model=model, content=content)
+                if route.endpoint == "audio/transcriptions":
+                    return self._transcribe(
+                        model=route.model,
+                        audio_b64=audio_b64,
+                        audio_format=audio_format,
+                        parameters=route.parameters,
+                    )
+                return self._chat(
+                    model=route.model,
+                    content=content,
+                    parameters=route.parameters,
+                )
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 last_exc = exc
-                logger.warning("OpenRouter audio model failed (%s): %s", model, exc)
+                logger.warning("OpenRouter audio model failed (%s): %s", route.model, exc)
 
         raise TransientError("All OpenRouter audio models failed") from last_exc
 
@@ -161,20 +210,50 @@ class OpenRouterMediaProvider:
             mimetypes.guess_type(file_path.name)[0] or "video/mp4",
         )
 
-    def _chat(self, model: str, content: list[dict]) -> str:
+    def _transcribe(
+        self,
+        *,
+        model: str,
+        audio_b64: str,
+        audio_format: str,
+        parameters: Mapping[str, Any],
+    ) -> str:
         payload = {
+            **parameters,
             "model": model,
-            "messages": [{"role": "user", "content": content}],
-            "temperature": 0.0,
+            "input_audio": {"data": audio_b64, "format": audio_format},
         }
-        headers = {
+        response = httpx.post(
+            f"{self.base_url}/audio/transcriptions",
+            json=payload,
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        raise_for_status(response)
+        return str(response.json()["text"]).strip()
+
+    def _headers(self) -> dict[str, str]:
+        return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+
+    def _chat(
+        self,
+        model: str,
+        content: list[dict],
+        parameters: Mapping[str, Any] | None = None,
+    ) -> str:
+        payload = {
+            **(parameters or {}),
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+        }
+        payload.setdefault("temperature", 0.0)
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             json=payload,
-            headers=headers,
+            headers=self._headers(),
             timeout=self.timeout,
         )
         raise_for_status(response)  # a permanent 4xx keeps OpenRouter's reason

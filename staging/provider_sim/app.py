@@ -2,7 +2,8 @@
 
 Speaks the exact HTTP dialects the production doc-organizer code speaks:
 
-- OpenRouter:  POST /api/v1/embeddings, POST /api/v1/chat/completions
+- OpenRouter:  POST /api/v1/embeddings, POST /api/v1/chat/completions,
+               POST /api/v1/audio/transcriptions
 - DeepInfra:   POST /v1/inference/{model}  (model contains slashes)
 - DeepSeek OCR2: POST /extract, POST /describe  (multipart, field "file")
 - Ollama:      POST /api/chat  (NDJSON streaming or single JSON)
@@ -318,9 +319,34 @@ async def chat_completions(request: Request) -> dict:
     text = _messages_text(messages)
 
     if media:
+        model = body.get("model", "sim-model")
+        if model == "openai/whisper-1":
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": (
+                            "openai/whisper-1 is a transcription model and cannot be used "
+                            "with the chat/completions endpoint. Use the "
+                            "/api/v1/audio/transcriptions endpoint instead."
+                        )
+                    }
+                },
+            )
+        if (
+            model == "mistralai/voxtral-small-24b-2507"
+            and body.get("temperature") == 0.0
+            and body.get("top_p") != 1.0
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {"message": "top_p must be 1 when using greedy sampling."}
+                },
+            )
         marker = _sha12(json.dumps(media, sort_keys=True).encode())
         kinds = "+".join(sorted({part.get("type", "") for part in media}))
-        content = f"[transcript] simulated {kinds} transcript {marker}"
+        content = f"[transcript] simulated {kinds} transcript {marker} model {model}"
     else:
         response_format = body.get("response_format") or {}
         if response_format.get("type") in ("json_schema", "json_object"):
@@ -357,6 +383,18 @@ async def chat_completions(request: Request) -> dict:
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
+    }
+
+
+@app.post("/api/v1/audio/transcriptions")
+async def audio_transcriptions(request: Request) -> dict:
+    body = await request.json()
+    audio = body.get("input_audio") or {}
+    model = body.get("model", "sim-model")
+    marker = _sha12(json.dumps(audio, sort_keys=True).encode())
+    return {
+        "text": f"[transcript] simulated input_audio transcript {marker} model {model}",
+        "model": model,
     }
 
 

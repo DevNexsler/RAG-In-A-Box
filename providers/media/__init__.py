@@ -1,6 +1,7 @@
 """Media providers: extract searchable text from audio/video files."""
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from providers.media.base import MediaProvider
@@ -13,23 +14,92 @@ _VIDEO_PROMPT = "Describe this video's visual content in detail for document sea
 _AUDIO_PROMPT = "Transcribe this audio faithfully for document search."
 
 
-def _dedupe_models(models: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for model in models:
-        model = str(model).strip()
-        if model and model not in seen:
-            seen.add(model)
-            result.append(model)
-    return result
-
-
-def _model_list(value) -> list[str]:
+def _model_list(value) -> list:
     if value is None:
         return []
     if isinstance(value, str):
         return [value]
     return list(value)
+
+
+def _audio_model_route(
+    value,
+    *,
+    default_endpoint: str,
+    parameter_overrides: dict | None = None,
+) -> dict:
+    """Normalize legacy model strings and explicit capability mappings."""
+    if isinstance(value, Mapping):
+        model = value.get("model")
+        endpoint = value.get("endpoint", default_endpoint)
+        explicit_parameters = value.get("parameters") or {}
+    else:
+        model = value
+        endpoint = default_endpoint
+        explicit_parameters = {}
+    endpoint = str(endpoint).strip().lstrip("/")
+    parameters = (
+        {"temperature": 0.0, "top_p": 1.0}
+        if endpoint == "chat/completions"
+        else {}
+    )
+    parameters.update(parameter_overrides or {})
+    parameters.update(explicit_parameters)
+    return {
+        "model": str(model).strip(),
+        "endpoint": endpoint,
+        "parameters": parameters,
+    }
+
+
+def _openrouter_audio_routes(
+    media_cfg: dict,
+    *,
+    default_fallbacks: tuple[str, ...] = (
+        "mistralai/voxtral-small-24b-2507",
+        "google/gemini-2.5-flash-lite",
+    ),
+) -> list[dict]:
+    """Resolve ordered audio models into endpoint-and-payload capabilities."""
+    configured = media_cfg.get("audio_models")
+    if configured is not None:
+        values = _model_list(configured)
+        routes = [
+            _audio_model_route(value, default_endpoint="chat/completions")
+            for value in values
+        ]
+    else:
+        primary = _audio_model_route(
+            media_cfg.get("audio_model", "openai/whisper-1"),
+            default_endpoint=media_cfg.get(
+                "audio_model_endpoint", "audio/transcriptions"
+            ),
+            parameter_overrides=media_cfg.get("audio_model_parameters"),
+        )
+        routes = [primary]
+        routes.extend(
+            _audio_model_route(
+                value,
+                default_endpoint=media_cfg.get(
+                    "fallback_audio_model_endpoint", "chat/completions"
+                ),
+                parameter_overrides=media_cfg.get("fallback_audio_model_parameters"),
+            )
+            for value in _model_list(
+                media_cfg.get(
+                    "fallback_audio_models",
+                    list(default_fallbacks),
+                )
+            )
+        )
+
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for route in routes:
+        if route["model"] and route["model"] not in seen:
+            seen.add(route["model"])
+            unique.append(route)
+    return unique
 
 
 class _LiteLLMMediaProvider:
@@ -101,10 +171,7 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
     video_fb = audio_fb = None
     if os.environ.get("OPENROUTER_API_KEY"):
         or_cfg = media_cfg.get("openrouter_fallback", {}) or {}
-        audio_models = _dedupe_models(
-            _model_list(or_cfg.get("audio_model", "openai/whisper-1"))
-            + _model_list(or_cfg.get("fallback_audio_models", []))
-        )
+        audio_models = _openrouter_audio_routes(or_cfg, default_fallbacks=())
         or_provider = OpenRouterMediaProvider(
             api_key=or_cfg.get("api_key"),
             base_url=or_cfg.get("base_url", "https://openrouter.ai/api/v1"),
@@ -137,25 +204,14 @@ def build_media_provider(config: dict) -> MediaProvider | None:
     if provider != "openrouter":
         raise ValueError(f"Unknown media provider: {provider}")
 
-    primary_audio = media_cfg.get("audio_model", "openai/whisper-1")
-    fallback_audio = _model_list(
-        media_cfg.get(
-            "fallback_audio_models",
-            ["mistralai/voxtral-small-24b-2507", "google/gemini-2.5-flash-lite"],
-        )
-    )
-    audio_models = media_cfg.get("audio_models")
-    if audio_models is None:
-        audio_models = [primary_audio, *fallback_audio]
-    else:
-        audio_models = _model_list(audio_models)
+    audio_models = _openrouter_audio_routes(media_cfg)
 
     from providers.media.openrouter_media import OpenRouterMediaProvider
 
     primary = OpenRouterMediaProvider(
         api_key=media_cfg.get("api_key"),
         base_url=media_cfg.get("base_url", "https://openrouter.ai/api/v1"),
-        audio_models=_dedupe_models(list(audio_models)),
+        audio_models=audio_models,
         video_model=media_cfg.get("video_model", DEFAULT_VIDEO_MODEL),
         timeout=media_cfg.get("timeout", 300.0),
         max_file_size_mb=media_cfg.get("max_file_size_mb", 50.0),
