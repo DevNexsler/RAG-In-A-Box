@@ -16,7 +16,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from sources.base import SourceRecord
-from sources.text_normalization import build_text_normalizer
+from sources.text_normalization import build_text_normalizer, normalize_source_text
 from extractors import ExtractionResult
 
 
@@ -106,13 +106,20 @@ class PostgresSource:
                 for row in cur:
                     doc_id = spec.id_template.format(**row)
                     text = row.get(spec.text_column) or ""
-                    change_hash_salt = ""
+                    change_hash_salts: list[str] = []
+                    normalized = normalize_source_text(spec.source_type, text)
+                    if not normalized.should_index:
+                        continue
+                    text = normalized.text
+                    if normalized.change_hash_salt:
+                        change_hash_salts.append(normalized.change_hash_salt)
                     if text_normalizer is not None:
                         normalized = text_normalizer.normalize(text, row)
                         if not normalized.should_index:
                             continue
                         text = normalized.text
-                        change_hash_salt = normalized.change_hash_salt
+                        if normalized.change_hash_salt:
+                            change_hash_salts.append(normalized.change_hash_salt)
                     mtime_val = row[spec.mtime_column]
                     mtime = mtime_val.timestamp() if mtime_val else 0.0
                     metadata = {c: row[c] for c in spec.metadata_columns if c in row}
@@ -122,8 +129,8 @@ class PostgresSource:
                     # this instead of mtime, so an upstream job bumping
                     # updated_at without changing the body never re-indexes.
                     hash_input = text
-                    if change_hash_salt:
-                        hash_input = f"{change_hash_salt}\0{text}"
+                    if change_hash_salts:
+                        hash_input = f"{'|'.join(change_hash_salts)}\0{text}"
                     change_hash = hashlib.blake2b(
                         hash_input.encode("utf-8"), digest_size=16
                     ).hexdigest()

@@ -137,6 +137,7 @@ _LOCKED_INDEX_CONFIG: ContextVar[dict | None] = ContextVar(
     "locked_index_config",
     default=None,
 )
+_DEFAULT_MAX_CHUNKS_PER_DOCUMENT = 64
 
 
 def _measure_index_memory(subphase: str, doc_id: str):
@@ -368,6 +369,32 @@ def _split_section(
             chunks.extend(splitter.split_text(sub))
         return chunks
     return splitter.split_text(text)
+
+
+class _DocumentChunkBudget:
+    """Bound one document's embedding/write expansion across all split paths."""
+
+    def __init__(self, doc_id: str, max_chunks: int, logger_obj):
+        self._doc_id = doc_id
+        self._max_chunks = max_chunks
+        self._logger = logger_obj
+        self._kept = 0
+        self._reported = False
+
+    def take(self, chunks: list[str]) -> list[str]:
+        remaining = max(0, self._max_chunks - self._kept)
+        kept = chunks[:remaining]
+        self._kept += len(kept)
+        if len(chunks) > remaining and not self._reported:
+            self._reported = True
+            self._logger.warning(
+                "Chunk expansion limited for %s: generated more than %d chunks; "
+                "embedding and storage capped at configured limit",
+                self._doc_id,
+                self._max_chunks,
+            )
+            note_degradation("chunk_expansion_limited", transient=False)
+        return kept
 
 
 def _matches_any(rel_str: str, patterns: list[str]) -> bool:
@@ -2682,6 +2709,14 @@ def _process_doc_task(
         # Every chunk is prepended with a contextual header before embedding
         # so it is self-describing in isolation.
         nodes: list[TextNode] = []
+        chunk_budget = _DocumentChunkBudget(
+            doc_id,
+            config.get("chunking", {}).get(
+                "max_chunks_per_document",
+                _DEFAULT_MAX_CHUNKS_PER_DOCUMENT,
+            ),
+            logger,
+        )
 
         if ext == "pdf" and len(result.pages) > 1:
             for page_text in result.pages:
@@ -2692,8 +2727,10 @@ def _process_doc_task(
                     page_body = _with_communication_caption(page_body, source_metadata)
                 page_body = redact_sensitive_text(page_body)
                 page_body = collapse_runaway_repetition(page_body)
-                raw_chunks = _split_section(
-                    page_body, splitter, semantic_splitter, semantic_threshold
+                raw_chunks = chunk_budget.take(
+                    _split_section(
+                        page_body, splitter, semantic_splitter, semantic_threshold
+                    )
                 )
                 ctx = _build_chunk_context(doc_meta, page=page_text.page)
                 contextualized = [ctx + c for c in raw_chunks]
@@ -2735,6 +2772,10 @@ def _process_doc_task(
                     all_ctx.append(ctx + raw)
                     all_sections.append(heading_ctx)
 
+            all_raw = chunk_budget.take(all_raw)
+            all_ctx = all_ctx[:len(all_raw)]
+            all_sections = all_sections[:len(all_raw)]
+
             with _tracer.start_as_current_span("embed", attributes={"chunk_count": len(all_ctx)}):
                 with _measure_index_memory("embed", doc_id):
                     vectors = embed_provider.embed_texts(all_ctx)
@@ -2759,8 +2800,10 @@ def _process_doc_task(
         else:
             # Images, media, or single-page PDFs
             loc_prefix = source_type if source_type in ("img", "audio", "video") else ""
-            raw_chunks = _split_section(
-                full_text, splitter, semantic_splitter, semantic_threshold
+            raw_chunks = chunk_budget.take(
+                _split_section(
+                    full_text, splitter, semantic_splitter, semantic_threshold
+                )
             )
             ctx = _build_chunk_context(doc_meta)
             contextualized = [ctx + c for c in raw_chunks]
@@ -2795,26 +2838,31 @@ def _process_doc_task(
                 "Conversation messages before and after this attachment.\n\n"
                 f"[Conversation context]\n{context_text}"
             )
-            with _tracer.start_as_current_span(
-                "embed", attributes={"chunk_count": 1}
-            ):
-                with _measure_index_memory("embed", doc_id):
-                    context_vector = embed_provider.embed_texts([context_body])[0]
+            bounded_context = chunk_budget.take([context_body])
+            if bounded_context:
+                with _tracer.start_as_current_span(
+                    "embed", attributes={"chunk_count": 1}
+                ):
+                    with _measure_index_memory("embed", doc_id):
+                        context_vector = embed_provider.embed_texts(bounded_context)[0]
+            else:
+                context_vector = None
             context_loc = "context:c:0"
-            context_node = TextNode(
-                text=context_body,
-                id_=f"{doc_id}::{context_loc}",
-                embedding=context_vector,
-                metadata={
-                    **doc_meta,
-                    "loc": context_loc,
-                    "snippet": context_text[:200],
-                },
-            )
-            context_node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                node_id=doc_id
-            )
-            nodes.append(context_node)
+            if context_vector is not None:
+                context_node = TextNode(
+                    text=context_body,
+                    id_=f"{doc_id}::{context_loc}",
+                    embedding=context_vector,
+                    metadata={
+                        **doc_meta,
+                        "loc": context_loc,
+                        "snippet": context_text[:200],
+                    },
+                )
+                context_node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=doc_id
+                )
+                nodes.append(context_node)
 
         # --- Persist into store ---
         # The scan/diff proves which documents are absent. Insert those

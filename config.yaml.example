@@ -108,6 +108,7 @@ chunking:
   max_chars: 1800
   overlap: 200
   min_chars: 150
+  max_chunks_per_document: 64             # cap anomalous extraction expansion before embedding
   semantic:
     enabled: false                        # disabled — requires local Ollama server
     # Enable with local Ollama: see config.local.yaml.example

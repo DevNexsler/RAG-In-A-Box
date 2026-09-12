@@ -558,6 +558,20 @@ def test_split_section_above_threshold():
     assert any("machines" in c for c in chunks)
 
 
+def test_document_chunk_budget_caps_and_reports_degradation():
+    logger = MagicMock()
+    fiv.begin_degradation_capture()
+    budget = fiv._DocumentChunkBudget("comm_messages::mail/large", 2, logger)
+
+    assert budget.take(["one", "two", "three"]) == ["one", "two"]
+    assert budget.take(["four"]) == []
+
+    logger.warning.assert_called_once()
+    assert [item.reason for item in fiv.collect_degradations()] == [
+        "chunk_expansion_limited"
+    ]
+
+
 # --- process_doc_task communication context ---
 
 
