@@ -61,6 +61,19 @@ class _BrokenLLM:
         return json.dumps({"topics": ["whatever"]})  # no summary/doc_type
 
 
+class _ReversedCorrectionLLM:
+    """Returns a syntactically valid but source-contradicting correction."""
+
+    def generate(self, prompt, max_tokens=512):
+        return json.dumps(
+            {
+                "summary": "A critical correction: Shawn Brown, not Sean.",
+                "doc_type": ["message"],
+                "key_facts": ["Husband's name is Shawn Brown, not Sean."],
+            }
+        )
+
+
 @pytest.fixture
 def runtime(tmp_path):
     logger_patch = patch("flow_index_vault.get_run_logger", return_value=MagicMock())
@@ -141,6 +154,40 @@ def test_transient_outage_keeps_the_enriched_row(runtime, outage):
         "a provider outage overwrote the enriched row with an empty one"
     )
     assert after["enr_topics"] == good["enr_topics"]
+
+
+def test_explicit_correction_is_grounded_before_lancedb_write(runtime):
+    """A reversed generated correction must not reach the stored metadata surface."""
+    docs_root, store = runtime
+    doc = _write_doc(
+        docs_root,
+        "sor/task-2124.md",
+        'Inbound: "Yes Sean Brown is my husband". Correcting husband name from "Shawn" to "Sean" Brown.',
+    )
+
+    _index(doc, _ReversedCorrectionLLM())
+
+    stored = _stored_metadata(store, doc["doc_id"])
+    expected = "Correction: Sean (not Shawn)."
+    assert stored["enr_summary"] == expected
+    assert json.loads(stored["enr_key_facts"]) == [expected]
+
+
+def test_middle_correction_is_grounded_before_lancedb_write(runtime):
+    """Grounding must inspect source text beyond the prompt's head/tail sample."""
+    docs_root, store = runtime
+    doc = _write_doc(
+        docs_root,
+        "sor/task-2124-middle.md",
+        "start " * 600
+        + 'Correction: husband name from "Shawn" to "Sean". '
+        + "end " * 600,
+    )
+
+    _index(doc, _ReversedCorrectionLLM())
+
+    stored = _stored_metadata(store, doc["doc_id"])
+    assert stored["enr_summary"] == "Correction: Sean (not Shawn)."
 
 
 def test_transient_outage_is_counted_for_the_run_summary(runtime):

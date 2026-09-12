@@ -728,7 +728,7 @@ def enrich_document(
             enrichment = _repair_context_omissions(enrichment, truncated, context_text)
             enrichment = repair_enrichment(
                 enrichment,
-                text=truncated,
+                text=text,
                 title=title,
                 source_type=source_type,
                 enabled=postprocess_enrichment,
