@@ -15,7 +15,9 @@ post-run drain trustworthy in the first place (bounded work, retained retries,
 an intact sweep runtime).
 """
 
+import os
 import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -223,6 +225,31 @@ def test_sweep_queue_service_is_bounded_per_checkpoint(tmp_path, sweep_runtime):
 
     assert drained == 3
     assert len(queue.pending("chunks", limit=20)) == 7
+
+
+def test_sweep_queue_service_refreshes_heartbeat_between_requests(
+    tmp_path, sweep_runtime
+):
+    """A progressing targeted batch must not make the full sweep look frozen."""
+    queue = IndexRequestQueue(tmp_path)
+    for target in ("newer-a.bin", "newer-b.bin"):
+        queue.enqueue("chunks", "documents", target)
+    heartbeat = tmp_path / "indexer.heartbeat"
+    heartbeat.write_text("old")
+    stale = time.time() - 4000
+    os.utime(heartbeat, (stale, stale))
+    seen_heartbeat_mtimes: list[float] = []
+
+    def serve(cfg, request, store, registry):
+        seen_heartbeat_mtimes.append(heartbeat.stat().st_mtime)
+        return _indexed(request.target)
+
+    config = {"index_root": str(tmp_path), "index_queue": {"sweep_service_limit": 2}}
+    with patch.object(fiv, "_index_document_unlocked", side_effect=serve):
+        assert fiv._service_index_queue(config, "chunks") == 2
+
+    assert seen_heartbeat_mtimes[0] == stale
+    assert seen_heartbeat_mtimes[1] > stale
 
 
 def test_sweep_queue_service_retains_a_failed_request_for_retry(
