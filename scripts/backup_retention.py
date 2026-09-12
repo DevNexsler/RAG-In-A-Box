@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime
 import errno
 import hashlib
+import gzip
 import os
 from pathlib import Path
 import re
@@ -30,14 +31,18 @@ def archives(directory: Path) -> list[Path]:
 
 
 def verify(path: Path) -> None:
-    # Read every member so truncated payloads are not promoted or used to prune.
-    with tarfile.open(path, "r:gz") as archive:
-        for member in archive:
-            if member.isfile():
-                stream = archive.extractfile(member)
-                if stream is not None:
-                    while stream.read(1024 * 1024):
-                        pass
+    # A tar reader can stop before the gzip trailer. Drain the compressed
+    # stream as well so CRC/length corruption cannot qualify a restore point.
+    with gzip.open(path, "rb") as compressed:
+        with tarfile.open(fileobj=compressed, mode="r:") as archive:
+            for member in archive:
+                if member.isfile():
+                    stream = archive.extractfile(member)
+                    if stream is not None:
+                        while stream.read(1024 * 1024):
+                            pass
+        while compressed.read(1024 * 1024):
+            pass
 
 
 def link_copy(source: Path, target: Path) -> None:

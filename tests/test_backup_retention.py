@@ -97,3 +97,17 @@ def test_symlinks_are_not_retention_targets(tmp_path):
     link.symlink_to(outside)
     m.rotate(tmp_path, backup(tmp_path, "20260915-010000"))
     assert link.is_symlink() and outside.exists()
+
+
+def test_bad_gzip_checksum_prevents_pruning(tmp_path):
+    import pytest
+
+    m = module()
+    old = backup(tmp_path / "monthly", "20250101-000000")
+    latest = backup(tmp_path, "20260915-010000")
+    payload = bytearray(latest.read_bytes())
+    payload[-8] ^= 1  # CRC trailer corruption leaves every tar member readable.
+    latest.write_bytes(payload)
+    with pytest.raises(OSError):
+        m.rotate(tmp_path, latest)
+    assert old.exists()
