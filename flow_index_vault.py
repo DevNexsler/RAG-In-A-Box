@@ -1626,6 +1626,35 @@ def _merge_skip_ledger(
     return {"docs": docs}
 
 
+def _skip_ledger_entry(doc: dict, reasons: Sequence[str]) -> dict:
+    """Build one processed document's skip-ledger entry and log its outcome.
+
+    Every terminal outcome a document can reach is recorded per document —
+    `Inserted N chunks: <id>` for a write, `Skipping <id>: <reason> (<path>)`
+    for a skip — so a run's log accounts for every document it processed. A
+    skip reason used to exist only inside the per-run aggregate and
+    `skip_docs.json`, which made a deliberate skip and a document dropped by a
+    bug produce identical log output: `Processing:` and then nothing (#2100).
+
+    The entry and the line are built together on purpose. The ledger and the
+    log cannot drift, and a skip reason added anywhere in the document
+    pipeline is attributable per document without touching this function.
+
+    Callers persist the returned entry the way their lane does: the full flow
+    accumulates entries and merges them once at the end of the run, the
+    targeted single-document path merges immediately.
+    """
+    doc_id = str(doc["doc_id"])
+    reason_list = sorted({str(reason) for reason in reasons})
+    _get_logger().info(
+        "Skipping %s: %s (%s)",
+        doc_id,
+        ", ".join(reason_list),
+        doc.get("rel_path") or doc_id,
+    )
+    return {"reasons": reason_list, "change_key": _change_key(doc)}
+
+
 def _persist_scan_skips(index_root: Path, records: list[dict], logger) -> None:
     """Persist terminal scan decisions as one ledger update before extraction."""
     if not records:
@@ -2385,10 +2414,6 @@ def _process_doc_task(
                 logger.warning("Dedupe gate failed for %s (indexing normally): %s", doc_id, exc)
             if winner is not None and winner.get("doc_id") != bare_id:
                 canonical_ns = f"{source_name}::{winner['doc_id']}"
-                logger.info(
-                    "Duplicate content: %s matches canonical %s — skipping indexing",
-                    doc_id, canonical_ns,
-                )
                 if dedupe_cfg.get("skip_duplicate_indexing", True):
                     try:
                         store.delete_by_doc_ids([doc_id])
@@ -2957,18 +2982,18 @@ def _process_docs(
             process_doc_task(doc)
             reasons = collect_degradations()
             skips = collect_skips()
-            skip_reasons = list(skips)
+            skip_entry = _skip_ledger_entry(doc, skips) if skips else None
+            # The aggregate counts exactly the reasons the per-document line
+            # named, so the two reconcile for any run.
+            skip_reasons = skip_entry["reasons"] if skip_entry else []
             lock = _RUNTIME.get("degraded_lock")
             if lock is not None:
                 with lock:
                     doc_id = doc["doc_id"]
-                    if skips:
+                    if skip_entry is not None:
                         # Permanent skip (duplicate/oversized/corrupt): record
                         # with the file's change key so the diff stops looping.
-                        _RUNTIME.setdefault("skip_now", {})[doc_id] = {
-                            "reasons": sorted(set(skips)),
-                            "change_key": _change_key(doc),
-                        }
+                        _RUNTIME.setdefault("skip_now", {})[doc_id] = skip_entry
                         _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
                     elif reasons:
                         _RUNTIME.setdefault("degraded_now", {})[doc_id] = reasons
@@ -4606,7 +4631,7 @@ def _record_single_doc_outcome(index_root: Path, doc: dict) -> None:
     if skips:
         skip_ledger = _merge_skip_ledger(
             _load_skip_ledger(index_root),
-            {doc_id: {"reasons": sorted(set(skips)), "change_key": _change_key(doc)}},
+            {doc_id: _skip_ledger_entry(doc, skips)},
             set(),
         )
         _save_skip_ledger(index_root, skip_ledger)
