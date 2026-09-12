@@ -2923,13 +2923,15 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
     on a short interval, spawns the guarded full sweep on a long one, and offers
     the daily Lance compaction its idle window on a long one, reusing the exact
     vetted mechanisms (_file_index_update_impl for the sweep, drain_index_queue
-    for the queue, compact_index_if_idle for the compaction).
+    for the queue, compact_index_if_idle for the compaction, and
+    maintain_index_if_idle for cheap Lance upkeep).
     """
     from core.index_scheduler import IndexScheduler
     from flow_index_vault import (
         compact_index_if_idle,
         drain_hook_outbox,
         drain_index_queue,
+        maintain_index_if_idle,
     )
 
     sched_cfg = config.get("scheduler", {})
@@ -2956,11 +2958,13 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
         drain_interval_s=float(sched_cfg.get("drain_interval_s", 60)),
         sweep_interval_s=float(sched_cfg.get("sweep_interval_s", 3600)),
         compact_interval_s=float(sched_cfg.get("compact_interval_s", 3600)),
+        maintenance_interval_s=float(sched_cfg.get("maintenance_interval_s", 3600)),
         drain_fn=drain_queues,
         sweep_fn=lambda: _file_index_update_impl(config_path),
         sweep_running_fn=lambda: is_indexer_running(config),
         run_was_interrupted_fn=lambda: index_run_was_interrupted(config),
         compact_fn=lambda: compact_index_if_idle(config_path),
+        maintenance_fn=lambda: maintain_index_if_idle(config_path),
     )
 
 

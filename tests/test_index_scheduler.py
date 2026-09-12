@@ -189,6 +189,36 @@ def test_seed_leaves_the_sweep_due_when_the_previous_run_was_interrupted():
     assert calls == {"drain": 1, "sweep": 1}
 
 
+def test_interrupted_boot_runs_maintenance_before_sweep_takes_writer_lock():
+    """Boot maintenance owns idle window before resumed sweep claims table."""
+    writer = {"held": False}
+    events = []
+
+    def maintenance_fn():
+        if writer["held"]:
+            return {"status": "writer_busy"}
+        events.append("maintenance")
+        return {"status": "attempted"}
+
+    def sweep_fn():
+        writer["held"] = True
+        events.append("sweep")
+        return {"pid": 1001}
+
+    sched, _ = _scheduler(
+        run_was_interrupted_fn=lambda: True,
+        maintenance_interval_s=3600,
+        maintenance_fn=maintenance_fn,
+        sweep_fn=sweep_fn,
+    )
+
+    sched.seed(now=1000.0)
+    actions = sched.tick(now=1000.0)
+
+    assert events == ["maintenance", "sweep"]
+    assert ("maintenance", {"status": "attempted"}) in actions
+
+
 def test_seed_still_suppresses_the_boot_sweep_after_a_clean_previous_run():
     sched, calls = _scheduler(run_was_interrupted_fn=lambda: False)
     sched.seed(now=1000.0)
@@ -289,6 +319,28 @@ def test_compaction_is_off_without_a_job():
     assert not any(k == "compact" for k, _ in sched.tick(now=5.0))
 
 
+def test_maintenance_runs_after_seeded_clean_boot_without_a_sweep_completion():
+    """Cheap Lance upkeep must not wait for the next heavy sweep."""
+    maintenance = []
+    sched, calls = _scheduler(
+        maintenance_interval_s=3600,
+        maintenance_fn=lambda: maintenance.append("maintained") or {"status": "maintained"},
+        sweep_running_fn=lambda: True,
+    )
+
+    sched.seed(now=1000.0)
+    actions = sched.tick(now=4600.0)
+
+    assert ("maintenance", {"status": "maintained"}) in actions
+    assert calls["sweep"] == 0
+    assert maintenance == ["maintained"]
+
+
+def test_maintenance_is_off_without_a_job():
+    sched, _ = _scheduler()
+    assert not any(k == "maintenance" for k, _ in sched.tick(now=5.0))
+
+
 def test_compaction_error_is_captured_not_raised():
     def boom():
         raise RuntimeError("worker died")
@@ -307,3 +359,14 @@ def test_build_scheduler_enabled_wires_the_compaction_job():
     })
     assert sched is not None
     assert sched.compact_interval_s == 1800
+
+
+def test_build_scheduler_enabled_wires_the_maintenance_job():
+    from mcp_server import build_index_scheduler
+
+    sched = build_index_scheduler({
+        "index_root": "/tmp/x",
+        "scheduler": {"enabled": True, "maintenance_interval_s": 1800},
+    })
+    assert sched is not None
+    assert sched.maintenance_interval_s == 1800

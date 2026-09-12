@@ -4876,6 +4876,36 @@ def compact_index_if_idle(config_path: str = "config.yaml") -> dict:
         return {"status": "writer_busy"}
 
 
+def maintain_index_if_idle(config_path: str = "config.yaml") -> dict:
+    """Run cheap Lance maintenance only while no index writer owns the table."""
+    from datetime import date
+
+    config = load_config(config_path)
+    index_root = Path(config["index_root"])
+    table_name = config.get("lancedb", {}).get("table", "chunks")
+    logger = _get_logger()
+    try:
+        with index_write_lock(index_root, table_name, blocking=False):
+            store = open_store_with_recovery(
+                index_root,
+                table_name,
+                logger_obj=logger,
+                auto_recover=True,
+            )
+            with store.exclusive_writer_session():
+                store._finish_index_maintenance(store._vs.table, date.today())
+        # The finalizer best-effort skips later work after tag failure, so this
+        # reports only that maintenance was attempted, not guaranteed complete.
+        return {"status": "attempted"}
+    except IndexWriteLockBusy:
+        logger.info(
+            "Lance maintenance deferred: an index writer holds table %r; "
+            "retrying in the next idle window",
+            table_name,
+        )
+        return {"status": "writer_busy"}
+
+
 def drain_index_queue(config_path: str = "config.yaml", *, limit: int | None = None) -> dict:
     """Drain pending targeted index requests WITHOUT enqueueing a new one.
 
