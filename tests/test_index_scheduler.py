@@ -233,6 +233,36 @@ def test_build_scheduler_resumes_the_sweep_after_an_unresolved_index_failure(tmp
     assert sweeps == ["swept"]
 
 
+def test_build_scheduler_resumes_a_sweep_stopped_by_clean_container_shutdown(tmp_path):
+    """A graceful restart is healthy, but it must not abandon partial work."""
+    import mcp_server
+
+    class _Supervisor:
+        def status_summary(self) -> dict:
+            return {
+                "current": None,
+                "unresolved_failure": False,
+                "latest_terminal": {
+                    "status": "terminated",
+                    "terminal_reason": "shutdown_requested",
+                },
+            }
+
+    sweeps: list[str] = []
+    original = mcp_server._get_index_run_supervisor
+    mcp_server._get_index_run_supervisor = lambda config: _Supervisor()
+    try:
+        scheduler = build_index_scheduler_for_test(mcp_server, tmp_path)
+        scheduler._sweep_fn = lambda: sweeps.append("swept")
+        scheduler._drain_fn = lambda: None
+        scheduler.seed(now=1000.0)
+        scheduler.tick(now=1000.0)
+    finally:
+        mcp_server._get_index_run_supervisor = original
+
+    assert sweeps == ["swept"]
+
+
 def test_build_scheduler_suppresses_the_boot_sweep_after_a_clean_index_run(tmp_path):
     import mcp_server
 

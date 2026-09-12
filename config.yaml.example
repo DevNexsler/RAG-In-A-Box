@@ -199,6 +199,14 @@ lancedb:
   index_cache_mb: 512
   metadata_cache_mb: 128
 
+# Unattended catch-up after host/container restarts. Sweeps are differential,
+# and also run the Doc-ID Markdown link self-heal pass.
+scheduler:
+  enabled: true
+  drain_interval_s: 60
+  sweep_interval_s: 3600
+  compact_interval_s: 3600
+
 logging:
   level: "WARNING"                        # DEBUG, INFO, WARNING, ERROR
 

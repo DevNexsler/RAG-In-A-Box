@@ -2905,14 +2905,22 @@ def is_indexer_running(config: dict) -> bool:
 
 
 def index_run_was_interrupted(config: dict) -> bool:
-    """True when the newest terminal index run did not succeed and no later run
-    superseded it — i.e. a run that was interrupted rather than finished.
+    """True when the newest index run stopped before completing.
 
-    This is the same unresolved-failure state ``/health`` reports as 503, read
-    here so the scheduler can resume the interrupted sweep at boot instead of
-    parking its remaining documents for a whole sweep interval (#1153).
+    Hard failures use the same unresolved-failure state ``/health`` reports as
+    503. A graceful server/container shutdown deliberately records the child as
+    ``terminated`` and keeps health green, but that sweep is still incomplete
+    and must resume on the next boot rather than waiting a full interval.
     """
-    return bool(_get_index_run_supervisor(config).status_summary()["unresolved_failure"])
+    summary = _get_index_run_supervisor(config).status_summary()
+    if summary["unresolved_failure"]:
+        return True
+    terminal = summary.get("latest_terminal")
+    return bool(
+        isinstance(terminal, dict)
+        and terminal.get("status") == "terminated"
+        and terminal.get("terminal_reason") == "shutdown_requested"
+    )
 
 
 def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
