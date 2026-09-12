@@ -83,7 +83,11 @@ from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
 from core.dedupe import compute_file_identity
 from core.resilience import CircuitOpenError, is_transient
-from core.skip_policy import actionable_skip_docs, is_permanent_skip_entry
+from core.skip_policy import (
+    actionable_skip_docs,
+    content_terminal_skip_reasons,
+    is_permanent_skip_entry,
+)
 from core.sensitive_content import (
     redact_sensitive_text,
     sanitize_metadata,
@@ -1901,11 +1905,57 @@ def _index_duplicate_delivery_context(
     return True
 
 
+def _build_payloadless_duplicate_event(
+    doc: dict,
+    canonical_doc_id: str,
+) -> dict[str, Any]:
+    """Announce a duplicate delivery whose canonical holds no payload.
+
+    Same event shape as any other ``document.indexed``, carrying the duplicate's
+    own identity and an empty body: a consumer learns the delivery happened and
+    which canonical it belongs to, and can read the content from the canonical
+    when it lands.
+    """
+    doc_id = str(doc["doc_id"])
+    rel_path = str(doc.get("rel_path") or doc_id)
+    source_type = canonical_source_type(doc.get("source_type") or doc.get("ext", ""))
+    return build_document_indexed_event(
+        doc_id=doc_id,
+        source_name=str(doc.get("source_name") or "documents"),
+        source_type=source_type,
+        rel_path=rel_path,
+        abs_path=str(doc.get("abs_path") or ""),
+        text="",
+        metadata={
+            "doc_id": doc_id,
+            "rel_path": rel_path,
+            "source_type": source_type,
+            "source_name": str(doc.get("source_name") or "documents"),
+            "mtime": float(doc.get("mtime") or 0.0),
+            "size": int(doc.get("size") or 0),
+            "title": doc_id,
+            "folder": derive_folder(rel_path),
+            "status": "active",
+            "canonical_doc_id": canonical_doc_id,
+            "canonical_payload_available": "false",
+        },
+        chunks=[],
+    )
+
+
 def _build_duplicate_document_indexed_event(
     doc: dict,
     canonical_doc_id: str,
-) -> dict[str, Any] | None:
-    """Build alias callback data from the canonical document's indexed payload."""
+) -> dict[str, Any]:
+    """Build alias callback data from the canonical document's indexed payload.
+
+    The canonical is checked for content before a copy is ever marked its
+    duplicate, so an empty payload here means the rows went away between that
+    check and this read. The event is still built — from the duplicate's own
+    identity, carrying no text — because dropping it is how a delivery becomes
+    invisible on both sides: consumers are never told the document exists and
+    the outbox has nothing to retry (#2097).
+    """
     store: LanceDBStore = _RUNTIME["store"]
     canonical_chunks = sorted(
         store.get_doc_chunks(canonical_doc_id),
@@ -1915,7 +1965,7 @@ def _build_duplicate_document_indexed_event(
         ),
     )
     if not canonical_chunks:
-        return None
+        return _build_payloadless_duplicate_event(doc, canonical_doc_id)
 
     first_chunk = canonical_chunks[0]
     doc_id = str(doc["doc_id"])
@@ -2093,11 +2143,11 @@ def _provider_error_artifact(raw_bytes: bytes, ext: str) -> tuple[str, bool] | N
     return reason, transient
 
 
-def _canonical_is_intentionally_unindexed(canonical_ns_doc_id: str) -> bool:
-    """Whether a canonical missing from LanceDB was deliberately never indexed.
+def _terminal_skip_reasons(ns_doc_id: str) -> list[str]:
+    """Recorded verdicts that this document's bytes produce no index row.
 
-    Absence from the table only means the canonical was *lost* if the document
-    was supposed to be there. A doc that extracts no text (or is oversized, or
+    Absence from LanceDB only means a document was *lost* if it was supposed to
+    be there. A doc that extracts no text (or is oversized, encrypted, or
     corrupt) is skipped by design and is legitimately absent forever, so the
     skip ledger — not the table — is what distinguishes "lost" from "never
     indexed on purpose" (#1252). Without that distinction a cohort whose
@@ -2105,27 +2155,34 @@ def _canonical_is_intentionally_unindexed(canonical_ns_doc_id: str) -> bool:
     finds the current canonical absent, dissolves the cohort, elects the other
     member, and is skipped again in turn.
 
-    This run's decisions count too: a canonical skipped a few documents ago is
+    Only reasons that are a verdict about the bytes count — a ``duplicate_of:``
+    entry is the dedupe gate's own decision, so reading it back as evidence
+    about the content would be circular (see ``content_terminal_skip_reasons``).
+
+    This run's decisions count too: a document skipped a few documents ago is
     only in ``skip_now`` until the end-of-run merge persists it, and a cohort
     reset drops its members' ledger entries, so a ledger-only test would still
     ping-pong on the very first pass. Change keys are deliberately not compared
     — a canonical whose bytes moved is re-evaluated by the diff on its own, and
     is handled by the stranded-cohort path, not by reopening here.
 
-    A canonical that becomes indexable later (its file changed, OCR came back)
+    A document that becomes indexable later (its file changed, OCR came back)
     is picked up by the skip ledger's own bounded retry, which re-attempts it
-    and drops its entry once it lands content. Re-electing the cohort is not
-    what recovers that case, so leaving the cohort alone costs nothing.
+    and drops its entry once it lands content.
     """
     with _RUNTIME.get("degraded_lock") or nullcontext():
-        if canonical_ns_doc_id in (_RUNTIME.get("skip_now") or {}):
-            return True
+        pending = (_RUNTIME.get("skip_now") or {}).get(ns_doc_id)
+    if pending is not None:
+        reasons = content_terminal_skip_reasons(pending)
+        if reasons:
+            return reasons
     # index_root is read from config because it is the one source both the full
     # flow and the targeted single-doc path populate.
     index_root = (_RUNTIME.get("config") or {}).get("index_root")
     if not index_root:
-        return False
-    return canonical_ns_doc_id in _load_skip_ledger(Path(index_root)).get("docs", {})
+        return []
+    ledger = _load_skip_ledger(Path(index_root)).get("docs", {})
+    return content_terminal_skip_reasons(ledger.get(ns_doc_id) or {})
 
 
 def _reset_invalid_dedupe_cohort(
@@ -2328,14 +2385,15 @@ def _process_doc_task(
                 if winner is not None and winner.get("doc_id") != bare_id:
                     canonical_ns = f"{source_name}::{winner['doc_id']}"
                     canonical_has_content = store.contains_doc_id(canonical_ns)
-                    if canonical_has_content or _canonical_is_intentionally_unindexed(
-                        canonical_ns
-                    ):
-                        if canonical_has_content:
-                            # The cohort holds content again, so any earlier reset
-                            # of it no longer describes the present state: forget
-                            # it, or a later genuine loss could not reopen (#1258).
-                            registry.clear_cohort_reset(len(raw_bytes), digest, "blake3")
+                    canonical_skip_reasons = (
+                        [] if canonical_has_content
+                        else _terminal_skip_reasons(canonical_ns)
+                    )
+                    if canonical_has_content:
+                        # The cohort holds content again, so any earlier reset
+                        # of it no longer describes the present state: forget
+                        # it, or a later genuine loss could not reopen (#1258).
+                        registry.clear_cohort_reset(len(raw_bytes), digest, "blake3")
                         _run_identity_op_with_stranded_cohort_recovery(
                             lambda: registry.update_dedupe_identity(
                                 bare_id,
@@ -2348,6 +2406,36 @@ def _process_doc_task(
                             ),
                             registry, store, bare_id, source_name, logger,
                         )
+                    elif canonical_skip_reasons:
+                        # The canonical carries a verdict about these exact
+                        # bytes: it will never hold an index row. Deduping
+                        # against it puts the content in no row at all and
+                        # leaves the callback with no payload to send (#2097).
+                        # Record the cohort as intentionally empty instead —
+                        # no canonical pointer for anyone to resolve — and let
+                        # this copy be processed on its own merits.
+                        _run_identity_op_with_stranded_cohort_recovery(
+                            lambda: registry.mark_exact_hash_cohort_unindexable(
+                                bare_id,
+                                len(raw_bytes),
+                                digest,
+                                hash_algo="blake3",
+                                reason=(
+                                    "terminal skip: "
+                                    + ", ".join(canonical_skip_reasons)
+                                ),
+                            ),
+                            registry, store, bare_id, source_name, logger,
+                        )
+                        logger.info(
+                            "Exact-content cohort of %s is intentionally empty "
+                            "(%s); indexing %s on its own merits",
+                            canonical_ns,
+                            ", ".join(canonical_skip_reasons),
+                            doc_id,
+                        )
+                        winner = None
+                        elect_canonical = False
                     else:
                         logger.warning(
                             "Dedupe canonical %s is absent from LanceDB; reopening cohort",
@@ -2371,16 +2459,39 @@ def _process_doc_task(
                             elect_canonical = False
                         winner = None
                 if winner is None and elect_canonical:
-                    winner = _run_identity_op_with_stranded_cohort_recovery(
-                        lambda: registry.claim_canonical_by_exact_hash(
-                            bare_id,
-                            len(raw_bytes),
-                            digest,
-                            hash_algo="blake3",
-                            duplicate_reason="exact content match at index time",
-                        ),
-                        registry, store, bare_id, source_name, logger,
+                    # A document that will not produce an index row must not be
+                    # eligible to be a canonical: the election is the moment a
+                    # phantom becomes permanent, and the verdict is already
+                    # known here (#2097).
+                    own_skip_reasons = (
+                        [] if store.contains_doc_id(doc_id)
+                        else _terminal_skip_reasons(doc_id)
                     )
+                    if own_skip_reasons:
+                        _run_identity_op_with_stranded_cohort_recovery(
+                            lambda: registry.mark_exact_hash_cohort_unindexable(
+                                bare_id,
+                                len(raw_bytes),
+                                digest,
+                                hash_algo="blake3",
+                                reason=(
+                                    "terminal skip: "
+                                    + ", ".join(own_skip_reasons)
+                                ),
+                            ),
+                            registry, store, bare_id, source_name, logger,
+                        )
+                    else:
+                        winner = _run_identity_op_with_stranded_cohort_recovery(
+                            lambda: registry.claim_canonical_by_exact_hash(
+                                bare_id,
+                                len(raw_bytes),
+                                digest,
+                                hash_algo="blake3",
+                                duplicate_reason="exact content match at index time",
+                            ),
+                            registry, store, bare_id, source_name, logger,
+                        )
             except Exception as exc:
                 logger.warning("Dedupe gate failed for %s (indexing normally): %s", doc_id, exc)
             if winner is not None and winner.get("doc_id") != bare_id:
@@ -2404,16 +2515,9 @@ def _process_doc_task(
                         _RUNTIME.setdefault("_warnings", []).append(warning)
                         logger.warning(warning)
                     else:
-                        if duplicate_event is None:
-                            logger.warning(
-                                "Canonical payload unavailable for duplicate callback: %s -> %s",
-                                doc_id,
-                                canonical_ns,
-                            )
-                        else:
-                            _dispatch_document_indexed_event(
-                                config, duplicate_event, logger
-                            )
+                        _dispatch_document_indexed_event(
+                            config, duplicate_event, logger
+                        )
                     # A canonical that was intentionally skipped holds no chunks
                     # to carry the provenance; asking for the rewrite would only
                     # raise (and warn) on every pass.

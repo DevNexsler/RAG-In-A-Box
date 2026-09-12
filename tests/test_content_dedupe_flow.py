@@ -1029,8 +1029,219 @@ def test_skip_only_cohort_converges_after_one_pass(runtime, tmp_path):
     assert not [w for w in warnings if "reopening cohort" in w], warnings
     assert not [w for w in warnings if "dup-metadata update failed" in w], warnings
     assert store.list_doc_ids() == []
-    assert [ref["doc_id"] for ref in registry.duplicate_refs_for_canonical("001X6")] == [
-        "001X7"
-    ], "canonical must stay put instead of ping-ponging between the members"
+    # Settled means "no canonical pointer left to resolve", not "one member
+    # holds canonical status forever": the cohort cannot produce an index row,
+    # so a duplicate of it would put the content in no row at all (#2097).
+    assert registry.duplicate_refs_for_canonical("001X6") == []
+    assert _dedupe_statuses(registry) == {
+        "001X6": "unindexable",
+        "001X7": "unindexable",
+    }
     ledger = fiv._load_skip_ledger(index_root)["docs"]
     assert set(ledger) == {"documents::001X6", "documents::001X7"}
+
+
+def _dedupe_statuses(registry: DocIDStore) -> dict[str, str]:
+    return {
+        row[0]: row[1]
+        for row in registry._conn.execute(
+            "SELECT doc_id, dedupe_status FROM doc_registry"
+        )
+    }
+
+
+def _seed_ledger(index_root: Path, ns_doc_ids: dict[str, list[str]]) -> None:
+    """Write a persisted skip ledger, as an earlier run's merge would leave it."""
+    fiv._save_skip_ledger(
+        index_root,
+        {
+            "docs": {
+                ns_doc_id: {
+                    "reasons": reasons,
+                    "change_key": "mtime:1.0",
+                    "skipped_at": 1.0,
+                }
+                for ns_doc_id, reasons in ns_doc_ids.items()
+            }
+        },
+    )
+
+
+def test_phantom_canonical_cohort_is_repaired_into_an_empty_one(runtime, tmp_path):
+    """The production shape of #2097, repaired on the duplicate's next pass.
+
+    `001X6` is canonical and ledgered `no_text_extracted`, so it holds zero
+    chunk rows and always will; `001X7` is its duplicate and is therefore
+    skipped "against" it. The content is in NO row — not under the canonical
+    (skipped) and not under the duplicate (skipped as a duplicate) — and the
+    duplicate's callback has no payload to carry. One pass over the duplicate
+    must leave no member pointing at a canonical that holds no content.
+    """
+    docs_root, store, registry = runtime
+    index_root = tmp_path / "index"
+    fiv._RUNTIME["degraded_lock"] = Lock()
+    fiv._RUNTIME["skip_now"] = {}
+    fiv._RUNTIME["skip_clean"] = set()
+
+    blank = "   \n\n\t\n   "
+    a = _make_doc(docs_root, "quo/_indexes/one.md", blank, "001X6")
+    b = _make_doc(docs_root, "quo/_indexes/two.md", blank, "001X7")
+    _register(registry, a)
+    _register(registry, b)
+    raw = Path(a["abs_path"]).read_bytes()
+    digest = blake3.blake3(raw).digest()
+    registry.claim_canonical_by_exact_hash("001X6", len(raw), digest, hash_algo="blake3")
+    registry.claim_canonical_by_exact_hash("001X7", len(raw), digest, hash_algo="blake3")
+    _seed_ledger(index_root, {"documents::001X6": ["no_text_extracted"]})
+    assert [ref["doc_id"] for ref in registry.duplicate_refs_for_canonical("001X6")] == [
+        "001X7"
+    ]
+
+    fiv._process_docs([b])
+
+    assert registry.duplicate_refs_for_canonical("001X6") == []
+    assert registry.find_canonical_by_exact_hash(len(raw), digest, "blake3") is None
+    assert _phantom_canonicals(registry, store) == {}
+    assert _dedupe_statuses(registry) == {
+        "001X6": "unindexable",
+        "001X7": "unindexable",
+    }
+    assert store.list_doc_ids() == []
+
+
+def _phantom_canonicals(registry: DocIDStore, store: LanceDBStore) -> dict[str, list[str]]:
+    """Duplicate rows whose canonical holds no chunk rows — the #2097 defect.
+
+    The same assertion the production verifier makes against the deployed
+    registry and index (`1252-1258-dedupe-cohort-bounded.sh`).
+    """
+    indexed = set(store.list_doc_ids())
+    phantoms: dict[str, list[str]] = {}
+    for row in registry._conn.execute(
+        "SELECT doc_id, canonical_doc_id, source_name FROM doc_registry "
+        "WHERE dedupe_status = 'duplicate' AND canonical_doc_id IS NOT NULL"
+    ):
+        doc_id, canonical, source_name = row
+        namespaced = f"{source_name or 'documents'}::{canonical}"
+        if namespaced not in indexed:
+            phantoms.setdefault(namespaced, []).append(doc_id)
+    return phantoms
+
+
+def test_terminal_skip_document_is_not_elected_dedupe_canonical(runtime, tmp_path):
+    """The election is where a phantom canonical becomes permanent (#2097).
+
+    A document whose recorded verdict is that these bytes produce no index row
+    must not win the election: every later copy would be marked a duplicate of
+    a canonical that can never resolve. Later copies then form no duplicate
+    row at all — the cohort is recorded as intentionally empty instead.
+    """
+    docs_root, store, registry = runtime
+    index_root = tmp_path / "index"
+    fiv._RUNTIME["degraded_lock"] = Lock()
+    fiv._RUNTIME["skip_now"] = {}
+    fiv._RUNTIME["skip_clean"] = set()
+
+    blank = "   \n\n\t\n   "
+    a = _make_doc(docs_root, "quo/_indexes/one.md", blank, "002JK")
+    b = _make_doc(docs_root, "quo/_indexes/two.md", blank, "002JL")
+    c = _make_doc(docs_root, "quo/_indexes/three.md", blank, "002JM")
+    for doc in (a, b, c):
+        _register(registry, doc)
+    _seed_ledger(index_root, {"documents::002JK": ["no_text_extracted"]})
+
+    fiv._process_docs([a])
+
+    raw = Path(a["abs_path"]).read_bytes()
+    digest = blake3.blake3(raw).digest()
+    assert registry.find_canonical_by_exact_hash(len(raw), digest, "blake3") is None
+    assert _dedupe_statuses(registry)["002JK"] == "unindexable"
+
+    # Later copies of the same bytes are never handed to it, and the cohort
+    # settles with no canonical pointer for anyone to resolve.
+    fiv._process_docs([b, c])
+
+    assert registry.duplicate_refs_for_canonical("002JK") == []
+    assert _phantom_canonicals(registry, store) == {}
+    assert set(_dedupe_statuses(registry).values()) == {"unindexable"}
+    assert store.list_doc_ids() == []
+
+
+def test_indexable_member_reclaims_canonical_from_an_empty_cohort(runtime, tmp_path):
+    """An intentionally empty cohort is a verdict, not a dead end.
+
+    When one member becomes indexable — its bytes changed, OCR came back, so
+    its skip entry is gone — it wins the election it initiates and the cohort
+    holds real content again.
+    """
+    docs_root, store, registry = runtime
+    index_root = tmp_path / "index"
+    fiv._RUNTIME["degraded_lock"] = Lock()
+    fiv._RUNTIME["skip_now"] = {}
+    fiv._RUNTIME["skip_clean"] = set()
+
+    body = "Recovered attachment text that extracts cleanly."
+    doc = _make_doc(docs_root, "quo/_indexes/one.md", body, "002JK")
+    _register(registry, doc)
+    raw = Path(doc["abs_path"]).read_bytes()
+    digest = blake3.blake3(raw).digest()
+    registry.mark_exact_hash_cohort_unindexable(
+        "002JK", len(raw), digest, hash_algo="blake3", reason="terminal skip: no_text_extracted"
+    )
+
+    fiv._process_docs([doc])
+
+    assert store.contains_doc_id("documents::002JK")
+    assert _dedupe_statuses(registry)["002JK"] == "canonical"
+    assert registry.find_canonical_by_exact_hash(len(raw), digest, "blake3") is not None
+
+
+def test_duplicate_callback_is_announced_when_canonical_payload_vanishes(
+    runtime, monkeypatch
+):
+    """A duplicate delivery is never dropped on a WARNING (#2097).
+
+    The canonical holds content when the copy is marked its duplicate, so an
+    empty payload here is a race. Returning without emitting anything is what
+    made the loss silent on both sides: consumers were never told the document
+    existed and the outbox had nothing to retry.
+    """
+    docs_root, store, registry = runtime
+    body = "Duplicate attachment body with indexed canonical content."
+    canonical = _make_doc(docs_root, "f/canonical.md", body, "00001")
+    duplicate = _make_doc(docs_root, "f/duplicate.md", body, "00002")
+    _register(registry, canonical)
+    _register(registry, duplicate)
+    index_root = str(docs_root.parent / "index")
+    fiv._RUNTIME["config"].update(
+        {
+            "index_root": index_root,
+            "event_hooks": {
+                "enabled": True,
+                "hooks": [{"name": "cds", "events": ["document.indexed"]}],
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "flow_index_vault.drain_due",
+        lambda outbox, **kwargs: {
+            "accepted": 0,
+            "retry_pending": 1,
+            "redrive_required": 0,
+        },
+    )
+
+    fiv.process_doc_task.fn(canonical)
+    monkeypatch.setattr(store, "get_doc_chunks", MagicMock(return_value=[]))
+    fiv.process_doc_task.fn(duplicate)
+
+    events = [
+        delivery.event
+        for delivery in HookOutbox(index_root).due(limit=4)
+        if delivery.event["doc_id"] == duplicate["doc_id"]
+    ]
+    assert len(events) == 1, "the duplicate delivery must reach the outbox"
+    assert events[0]["rel_path"] == duplicate["rel_path"]
+    assert events[0]["metadata"]["canonical_doc_id"] == canonical["doc_id"]
+    assert events[0]["metadata"]["canonical_payload_available"] == "false"
+    assert events[0]["text"] == ""
