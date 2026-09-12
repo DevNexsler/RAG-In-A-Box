@@ -120,6 +120,67 @@ def test_openrouter_media_provider_sends_audio_input_payload(tmp_path: Path):
     assert content[1]["input_audio"]["data"] == base64.b64encode(b"fake-audio").decode("ascii")
 
 
+def test_media_provider_routes_audio_and_video_to_separate_chat_endpoints(tmp_path: Path):
+    from providers.media.openrouter_media import OpenRouterMediaProvider
+
+    audio = tmp_path / "voice.mp3"
+    audio.write_bytes(b"fake-audio")
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake-video")
+    provider = OpenRouterMediaProvider(
+        api_key="openrouter-key",
+        base_url="https://openrouter.example/v1",
+        audio_api_key="litellm-key",
+        audio_base_url="http://litellm.example/v1/",
+        audio_models=["transcribe-diarized"],
+        video_model="qwen/video",
+        max_file_size_mb=1,
+    )
+
+    with patch(
+        "providers.media.openrouter_media.httpx.post",
+        return_value=_ok_response(),
+    ) as post:
+        provider.transcribe_audio(audio)
+        provider.analyze_video(video)
+
+    audio_call, video_call = post.call_args_list
+    assert audio_call.args[0] == "http://litellm.example/v1/chat/completions"
+    assert audio_call.kwargs["headers"]["Authorization"] == "Bearer litellm-key"
+    assert audio_call.kwargs["json"]["model"] == "transcribe-diarized"
+    audio_prompt = audio_call.kwargs["json"]["messages"][0]["content"][0]["text"]
+    assert "No intelligible speech" in audio_prompt
+    assert "Never invent" in audio_prompt
+    assert video_call.args[0] == "https://openrouter.example/v1/chat/completions"
+    assert video_call.kwargs["headers"]["Authorization"] == "Bearer openrouter-key"
+    assert video_call.kwargs["json"]["model"] == "qwen/video"
+
+
+def test_build_media_provider_resolves_litellm_audio_credentials(monkeypatch):
+    from providers.media import build_media_provider
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("LITELLM_API_KEY", "stale-scoped-key")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "litellm-key")
+    provider = build_media_provider(
+        {
+            "media": {
+                "enabled": True,
+                "provider": "openrouter",
+                "audio_provider": "litellm",
+                "audio_base_url": "http://127.0.0.1:14000/v1",
+                "audio_model": "transcribe-diarized",
+                "fallback_audio_models": [],
+            }
+        }
+    )
+
+    primary = provider._primary
+    assert primary.audio_models == ["transcribe-diarized"]
+    assert primary.audio_base_url == "http://127.0.0.1:14000/v1"
+    assert primary.audio_api_key == "litellm-key"
+
+
 def test_openrouter_media_provider_falls_back_between_audio_models(tmp_path: Path):
     from providers.media.openrouter_media import OpenRouterMediaProvider
 

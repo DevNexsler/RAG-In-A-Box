@@ -52,7 +52,7 @@ def main() -> None:
     # ceiling while the table's ANN index is missing (see lancedb_store).
     configure_vector_search_from_config(config)
 
-    host = config.get("mcp", {}).get("host", "0.0.0.0")
+    host = os.environ.get("MCP_HOST", config.get("mcp", {}).get("host", "0.0.0.0"))
     port = int(os.environ.get("PORT", config.get("mcp", {}).get("port", 7788)))
 
     # One persistent Prefect server for the container's lifetime; index

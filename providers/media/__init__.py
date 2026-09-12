@@ -137,6 +137,10 @@ def build_media_provider(config: dict) -> MediaProvider | None:
     if provider != "openrouter":
         raise ValueError(f"Unknown media provider: {provider}")
 
+    audio_provider = media_cfg.get("audio_provider", provider)
+    if audio_provider not in {"openrouter", "litellm", "openai_compatible"}:
+        raise ValueError(f"Unknown audio media provider: {audio_provider}")
+
     primary_audio = media_cfg.get("audio_model", "openai/whisper-1")
     fallback_audio = _model_list(
         media_cfg.get(
@@ -152,9 +156,18 @@ def build_media_provider(config: dict) -> MediaProvider | None:
 
     from providers.media.openrouter_media import OpenRouterMediaProvider
 
+    audio_api_key = media_cfg.get("audio_api_key")
+    if not audio_api_key and audio_provider in {"litellm", "openai_compatible"}:
+        audio_api_key = (
+            os.environ.get("LITELLM_MASTER_KEY", "")
+            or os.environ.get("LITELLM_API_KEY", "")
+        )
+
     primary = OpenRouterMediaProvider(
         api_key=media_cfg.get("api_key"),
         base_url=media_cfg.get("base_url", "https://openrouter.ai/api/v1"),
+        audio_api_key=audio_api_key,
+        audio_base_url=media_cfg.get("audio_base_url"),
         audio_models=_dedupe_models(list(audio_models)),
         video_model=media_cfg.get("video_model", DEFAULT_VIDEO_MODEL),
         timeout=media_cfg.get("timeout", 300.0),

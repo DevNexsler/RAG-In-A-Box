@@ -8,6 +8,7 @@ proven by tests/sources/test_filesystem_source.py.
 
 from pathlib import Path
 from glob import escape as glob_escape
+import errno
 import logging
 import re
 from typing import Iterator
@@ -127,8 +128,12 @@ def _communication_sidecar_metadata(media_path: Path) -> dict[str, str]:
 
 def _find_communication_sidecar(media_path: Path) -> Path | None:
     exact = media_path.with_suffix(".json")
-    if exact.exists():
-        return exact
+    try:
+        if exact.exists():
+            return exact
+    except OSError as exc:
+        if exc.errno != errno.ENAMETOOLONG:
+            raise
 
     match = _INJECTED_ID_SUFFIX_RE.match(media_path.stem)
     if not match:

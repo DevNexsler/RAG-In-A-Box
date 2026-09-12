@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 _AUDIO_TRANSCRIBE_PROMPT = (
     "Transcribe this audio faithfully for document search. If multiple speakers "
     "are clear, label them only as Speaker 1, Speaker 2, and do not infer "
-    "identity. Return plain text only."
+    "identity. If no speech is intelligible, return [No intelligible speech] "
+    "and nothing else. Never invent or reconstruct dialogue. Return plain text only."
 )
 _VIDEO_ANALYZE_PROMPT = (
     "You are reviewing a residential/property walkthrough video for maintenance, "
@@ -82,11 +83,19 @@ class OpenRouterMediaProvider:
         video_model: str,
         api_key: str | None = None,
         base_url: str = "https://openrouter.ai/api/v1",
+        audio_api_key: str | None = None,
+        audio_base_url: str | None = None,
         timeout: float = 300.0,
         max_file_size_mb: float = 50.0,
     ) -> None:
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.base_url = base_url.rstrip("/")
+        self.audio_base_url = (audio_base_url or self.base_url).rstrip("/")
+        self.audio_api_key = (
+            self.api_key
+            if audio_base_url is None and audio_api_key is None
+            else (audio_api_key or "")
+        )
         self.audio_models = audio_models
         self.video_model = video_model
         self.timeout = timeout
@@ -94,6 +103,11 @@ class OpenRouterMediaProvider:
 
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY not set. Set it in .env or pass api_key.")
+        if not self.audio_api_key:
+            raise ValueError(
+                "Audio API key not set. Set LITELLM_API_KEY/LITELLM_MASTER_KEY "
+                "or pass media.audio_api_key."
+            )
         if not self.audio_models:
             raise ValueError("At least one audio model is required")
         if not self.video_model:
@@ -118,12 +132,17 @@ class OpenRouterMediaProvider:
         last_exc: Exception | None = None
         for model in self.audio_models:
             try:
-                return self._chat(model=model, content=content)
+                return self._chat(
+                    model=model,
+                    content=content,
+                    base_url=self.audio_base_url,
+                    api_key=self.audio_api_key,
+                )
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 last_exc = exc
-                logger.warning("OpenRouter audio model failed (%s): %s", model, exc)
+                logger.warning("Audio chat model failed (%s): %s", model, exc)
 
-        raise TransientError("All OpenRouter audio models failed") from last_exc
+        raise TransientError("All audio chat models failed") from last_exc
 
     def analyze_video(self, file_path: str | Path) -> str:
         """Analyze a local video file using a base64 data URL."""
@@ -161,18 +180,27 @@ class OpenRouterMediaProvider:
             mimetypes.guess_type(file_path.name)[0] or "video/mp4",
         )
 
-    def _chat(self, model: str, content: list[dict]) -> str:
+    def _chat(
+        self,
+        model: str,
+        content: list[dict],
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> str:
+        request_base_url = (base_url or self.base_url).rstrip("/")
+        request_api_key = self.api_key if api_key is None else api_key
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.0,
         }
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {request_api_key}",
             "Content-Type": "application/json",
         }
         response = httpx.post(
-            f"{self.base_url}/chat/completions",
+            f"{request_base_url}/chat/completions",
             json=payload,
             headers=headers,
             timeout=self.timeout,

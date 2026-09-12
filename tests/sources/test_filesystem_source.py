@@ -192,6 +192,26 @@ def test_injected_media_id_still_finds_plain_preexisting_sidecar(tmp_path):
     assert _find_communication_sidecar(media) == sidecar
 
 
+def test_sidecar_lookup_handles_near_limit_filename(tmp_path):
+    from sources.filesystem import _find_communication_sidecar
+
+    media = tmp_path / ("a" * 252 + ".md")
+    media.write_text("document")
+    assert _find_communication_sidecar(media) is None
+
+
+def test_sidecar_lookup_preserves_other_filesystem_errors(tmp_path, monkeypatch):
+    import errno
+    from sources.filesystem import _find_communication_sidecar
+
+    def denied(_path):
+        raise PermissionError(errno.EACCES, "denied")
+
+    monkeypatch.setattr(Path, "exists", denied)
+    with pytest.raises(PermissionError):
+        _find_communication_sidecar(tmp_path / "document.md")
+
+
 def test_scan_does_not_mutate_flow_runtime(tmp_path, monkeypatch):
     """FilesystemSource.scan should not depend on flow_index_vault._RUNTIME."""
     from doc_id_store import DocIDStore

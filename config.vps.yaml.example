@@ -81,6 +81,8 @@ ocr:
 media:
   enabled: true
   provider: "openrouter"
+  # audio_provider: "litellm"             # optional separate audio route
+  # audio_base_url: "http://host.docker.internal:14000/v1"
   audio_model: "openai/whisper-1"
   fallback_audio_models:
     - "mistralai/voxtral-small-24b-2507"
