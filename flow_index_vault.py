@@ -124,6 +124,7 @@ from lancedb_store import (
     open_store_with_recovery,
     vector_index_settings_from_config,
 )
+from markdown_link_repair import build_doc_id_aliases, repair_markdown_links
 
 # Lazy tracer: module-level caching is safe, it resolves the provider per call.
 # Spans are no-ops unless setup_tracing() ran with tracing.enabled: true.
@@ -511,6 +512,7 @@ def scan_filesystem_records(
 
     records = []
     ledger = _SweepLedger()
+    renamed_paths: dict[str, str] = {}
     # Track IDs seen this scan to detect collisions (two files with same @XXXXX@)
     seen_ids: dict[str, str] = {}  # doc_id → rel_path of first file seen
 
@@ -703,6 +705,7 @@ def scan_filesystem_records(
             elif existing_id is None and doc_id_store:
                 # No ID in filename (or collision stripped it) — assign one and rename
                 doc_id = doc_id_store.next_id()
+                old_rel_str = rel_str
                 # Strip any old @XXXXX@ from filename before injecting new one
                 clean_fname = _strip_id_from_filename(fname)
                 new_fname = inject_id_into_filename(clean_fname, doc_id)
@@ -725,6 +728,7 @@ def scan_filesystem_records(
                 else:
                     full_path = new_full_path
                     rel_str = str(full_path.relative_to(root)).replace("\\", "/")
+                    renamed_paths[old_rel_str] = rel_str
                     doc_id_store.register(doc_id, rel_str)
                     seen_ids[doc_id] = rel_str
                     if claim_rejected:
@@ -766,6 +770,32 @@ def scan_filesystem_records(
                     f"empty_file:{stat.st_size}:{stat.st_mtime_ns}"
                 )
             records.append(record)
+
+    # A full scan repairs historical broken links from the registry.  A
+    # targeted scan stays cheap unless it actually renamed a file, in which
+    # case inbound links to that file must be repaired immediately.
+    full_link_repair = "**/*.md" in include or "**/*.markdown" in include
+    if doc_id_store and (renamed_paths or full_link_repair):
+        registered_paths = (
+            (row["rel_path"] for row in doc_id_store.list_rows())
+            if full_link_repair
+            else ()
+        )
+        aliases = build_doc_id_aliases(root, registered_paths, renamed_paths)
+        repair = repair_markdown_links(root, aliases, exclude=exclude, logger=logger)
+        if repair.changed_paths:
+            changed = set(repair.changed_paths)
+            # Link repair happens after the walk so refresh the metadata that
+            # diff_index_task uses to detect changed Markdown documents.
+            for record in records:
+                if record["rel_path"] not in changed:
+                    continue
+                try:
+                    repaired_stat = Path(record["abs_path"]).stat()
+                except OSError:
+                    continue
+                record["mtime"] = repaired_stat.st_mtime
+                record["size"] = repaired_stat.st_size
 
     ledger.log_summary(logger)
     return records
