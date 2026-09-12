@@ -26,50 +26,41 @@
 
 set -euo pipefail
 
-VOLUME="rag-in-a-box_doc-organizer-data"
-BACKUP_DIR="/home/danpark/backups/doc-organizer"
+VOLUME="${DOC_BACKUP_VOLUME:-rag-in-a-box_doc-organizer-data}"
+BACKUP_DIR="${DOC_BACKUP_DIR:-/home/danpark/backups/doc-organizer}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="index-${STAMP}.tar.gz"
 LOG="${BACKUP_DIR}/backup.log"
 
 mkdir -p "${BACKUP_DIR}/weekly" "${BACKUP_DIR}/monthly"
+exec 9>"${BACKUP_DIR}/.backup.lock"
+flock -n 9 || { echo "backup already running"; exit 0; }
+PARTIAL="${OUT}.partial"
+trap 'rm -f -- "${BACKUP_DIR}/${PARTIAL}"' EXIT
 
 log() { echo "$(date -Is) $*" >> "${LOG}"; }
 
 # Flag (but don't skip) backups taken while the indexer is writing.
 RUNNING=""
-if docker exec doc-organizer test -f /data/index/indexer.pid 2>/dev/null; then
+if docker exec "${DOC_BACKUP_CONTAINER:-doc-organizer}" test -f /data/index/indexer.pid 2>/dev/null; then
   RUNNING=" (indexer was running — point-in-time snapshot)"
 fi
 
 docker run --rm \
   -v "${VOLUME}:/vol:ro" \
   -v "${BACKUP_DIR}:/backup" \
-  alpine tar czf "/backup/${OUT}" -C /vol \
-    --exclude='chunks__shadow.lance' \
-    --exclude='*.corrupt' \
-    --exclude='indexer.log*' \
-    .
+  alpine sh -c '
+    tar czf "$1" -C /vol --exclude="chunks__shadow.lance" \
+      --exclude="*.corrupt" --exclude="indexer.log*" . && chown "$2:$3" "$1"
+  ' sh "/backup/${PARTIAL}" "$(id -u)" "$(id -g)"
+
+gzip -t "${BACKUP_DIR}/${PARTIAL}"
+mv "${BACKUP_DIR}/${PARTIAL}" "${BACKUP_DIR}/${OUT}"
 
 SIZE=$(du -h "${BACKUP_DIR}/${OUT}" | cut -f1)
 log "OK ${OUT} ${SIZE}${RUNNING}"
 
-# Sunday → keep a weekly copy
-if [ "$(date +%u)" = "7" ]; then
-  cp "${BACKUP_DIR}/${OUT}" "${BACKUP_DIR}/weekly/${OUT}"
-  log "weekly copy ${OUT}"
-fi
-
-# First backup of the month (day ≤ 7) → keep a monthly copy
-if [ "$(date +%-d)" -le 7 ]; then
-  cp "${BACKUP_DIR}/${OUT}" "${BACKUP_DIR}/monthly/${OUT}"
-  log "monthly copy ${OUT}"
-fi
-
-# Retention: 3 daily, 4 weekly, 3 monthly (GFS) (find avoids ls-glob crash when empty)
-find "${BACKUP_DIR}" -maxdepth 1 -name 'index-*.tar.gz' -printf '%T@ %p\n' \
-  | sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -f
-find "${BACKUP_DIR}/weekly" -maxdepth 1 -name 'index-*.tar.gz' -printf '%T@ %p\n' \
-  | sort -rn | tail -n +5 | cut -d' ' -f2- | xargs -r rm -f
-find "${BACKUP_DIR}/monthly" -maxdepth 1 -name 'index-*.tar.gz' -printf '%T@ %p\n' \
-  | sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -f
+# Calendar-aware retention validates restore points before pruning. Weekly and
+# monthly paths share immutable daily files on the same filesystem.
+python3 "$(dirname "$0")/backup_retention.py" "$BACKUP_DIR" "$BACKUP_DIR/$OUT"
+log "retention OK: 3 daily, 4 distinct weeks, 3 distinct months"
