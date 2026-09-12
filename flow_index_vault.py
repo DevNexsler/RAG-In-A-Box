@@ -2621,6 +2621,8 @@ def _process_doc_task(
                         "enrichment_failed",
                         transient=bool(enrichment.get("_enrichment_transient")),
                     )
+                    if reason.startswith("structured_output_contract_violation:"):
+                        return
                 elif not enrichment.get("enr_summary"):
                     logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
                 if not enrichment_failed:

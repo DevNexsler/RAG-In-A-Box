@@ -40,7 +40,16 @@ class _GoodLLM:
         return json.dumps({
             "summary": "Photo of bags left by the bins, reported as a theft risk.",
             "doc_type": ["image", "message"],
+            "entities_people": [],
+            "entities_places": [],
+            "entities_orgs": [],
+            "entities_dates": [],
             "topics": ["property", "theft", "security"],
+            "keywords": ["bags", "bins"],
+            "key_facts": ["Bags were left by the bins."],
+            "suggested_tags": ["security"],
+            "suggested_folder": "Properties/Security",
+            "importance": 0.5,
         })
 
 
@@ -192,9 +201,8 @@ def test_first_index_still_writes_during_an_outage(runtime):
     assert stored["enr_summary"] == ""
 
 
-def test_permanent_enrichment_failure_still_rewrites(runtime):
-    """A reachable provider that cannot enrich this document is information
-    about the document — it must not freeze the row forever."""
+def test_contract_failure_preserves_the_existing_enriched_row(runtime):
+    """Malformed enrichment cannot replace consumer-visible good metadata."""
     docs_root, store = runtime
     doc = _write_doc(docs_root, "quo-attachments/annie/theft.md", "Bags left by the bins.")
 
@@ -202,4 +210,6 @@ def test_permanent_enrichment_failure_still_rewrites(runtime):
     doc["mtime"] += 1
     _index(doc, _BrokenLLM())
 
-    assert _stored_metadata(store, doc["doc_id"])["enr_summary"] == ""
+    assert _stored_metadata(store, doc["doc_id"])["enr_summary"].startswith(
+        "Photo of bags"
+    )

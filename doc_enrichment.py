@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -238,7 +239,20 @@ _SCHEMA_FIELD_DESCRIPTIONS = {
 _SCHEMA_PLACEHOLDER_VALUES = {
     description.lower() for description in _SCHEMA_FIELD_DESCRIPTIONS.values()
 }
-_SCHEMA_PLACEHOLDER_VALUES.update({"type1", "type2"})
+_SCHEMA_PLACEHOLDER_VALUES.update(
+    {
+        "type1",
+        "type2",
+        *(_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW),
+        *(f"enr_{key}" for key in (_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW)),
+    }
+)
+
+_SCHEMA_ARRAY_KEYS = set(_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW) - {
+    *_SCHEMA_STRING_KEYS,
+    "importance",
+}
+_SEMANTIC_ARRAY_KEYS = _SCHEMA_ARRAY_KEYS - {"context_source_message_ids"}
 
 _CONTEXT_AMBIGUITY_TERMS = (
     "ambiguous",
@@ -481,6 +495,59 @@ def parse_enrichment_response(raw_response: str) -> dict[str, str]:
     return _normalize_enrichment(parsed)
 
 
+def enrichment_contract_errors(raw_response: str) -> list[str]:
+    """Return violations of the complete provider enrichment contract."""
+    try:
+        parsed = _extract_json(raw_response)
+    except (ValueError, TypeError):
+        return ["invalid_json"]
+    if not isinstance(parsed, dict):
+        return ["root:not_object"]
+
+    errors = [
+        f"{key}:missing"
+        for key in _ENRICHMENT_KEYS_RAW
+        if key not in parsed
+    ]
+    for key in _SCHEMA_STRING_KEYS:
+        if key in parsed and not isinstance(parsed[key], str):
+            errors.append(f"{key}:not_string")
+    for key in _SCHEMA_ARRAY_KEYS:
+        if key not in parsed:
+            continue
+        value = parsed[key]
+        if not isinstance(value, list):
+            errors.append(f"{key}:not_array")
+            continue
+        if any(not isinstance(item, str) for item in value):
+            errors.append(f"{key}:non_string_item")
+            continue
+        if key in _SEMANTIC_ARRAY_KEYS and any(
+            _is_placeholder_value(key, item) for item in value
+        ):
+            errors.append(f"{key}:schema_placeholder")
+
+    importance = parsed.get("importance")
+    if "importance" in parsed and (
+        isinstance(importance, bool)
+        or not isinstance(importance, (int, float))
+        or not math.isfinite(importance)
+        or not 0.0 <= importance <= 1.0
+    ):
+        errors.append("importance:invalid_number")
+    if isinstance(parsed.get("summary"), str) and not parsed["summary"].strip():
+        errors.append("summary:empty")
+    doc_types = parsed.get("doc_type")
+    if isinstance(doc_types, list) and not any(
+        isinstance(item, str)
+        and item.strip()
+        and not _is_placeholder_value("doc_type", item)
+        for item in doc_types
+    ):
+        errors.append("doc_type:empty")
+    return errors
+
+
 def missing_required_fields(enrichment: dict[str, str]) -> list[str]:
     """Required enrichment fields this normalized enrichment does not carry.
 
@@ -503,11 +570,7 @@ def structured_response_is_usable(raw_response: str) -> bool:
     as a ceiling on it, so token counters answer a different question than
     "did the model deliver the metadata we asked for" (#1097).
     """
-    try:
-        enrichment = parse_enrichment_response(raw_response)
-    except (ValueError, TypeError):  # json.JSONDecodeError is a ValueError
-        return False
-    return not missing_required_fields(enrichment)
+    return not enrichment_contract_errors(raw_response)
 
 
 def _repair_context_omissions(
@@ -723,6 +786,18 @@ def enrich_document(
                 title,
                 len(raw_response),
             )
+
+            contract_errors = enrichment_contract_errors(raw_response)
+            if contract_errors and contract_errors != ["invalid_json"]:
+                logger.warning(
+                    "LLM structured output for '%s' violates enrichment contract: %s",
+                    title,
+                    ", ".join(contract_errors),
+                )
+                return failed_enrichment(
+                    "structured_output_contract_violation: "
+                    + ", ".join(contract_errors)
+                )
 
             enrichment = parse_enrichment_response(raw_response)
             enrichment = _repair_context_omissions(enrichment, truncated, context_text)
