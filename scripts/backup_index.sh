@@ -47,12 +47,23 @@ if docker exec "${DOC_BACKUP_CONTAINER:-doc-organizer}" test -f /data/index/inde
   RUNNING=" (indexer was running — point-in-time snapshot)"
 fi
 
-docker run --rm --network none \
+# GNU tar, not busybox: Lance compaction and SQLite WAL checkpoints delete
+# files while the snapshot is being read, and busybox tar treats every
+# vanished file as a fatal error (the nightly backup failed that way on
+# 2026-09-15/16). GNU tar with --ignore-failed-read skips vanished files, and
+# the "file changed as we read it" case is exit status 1, which is a valid
+# point-in-time snapshot here; anything else (2+) is a real failure.
+TAR_IMAGE="${DOC_BACKUP_TAR_IMAGE:-doc-organizer:latest}"
+docker run --rm --network none --entrypoint sh \
   -v "${VOLUME}:/vol:ro" \
   -v "${BACKUP_DIR}:/backup" \
-  alpine sh -c '
-    tar czf "$1" -C /vol --exclude="chunks__shadow.lance" \
-      --exclude="*.corrupt" --exclude="indexer.log*" . && chown "$2:$3" "$1"
+  "${TAR_IMAGE}" -c '
+    tar --ignore-failed-read --warning=no-file-removed --warning=no-file-changed \
+      -czf "$1" -C /vol --exclude="chunks__shadow.lance" \
+      --exclude="*.corrupt" --exclude="indexer.log*" .
+    status=$?
+    if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then exit "$status"; fi
+    chown "$2:$3" "$1"
   ' sh "/backup/${PARTIAL}" "$(id -u)" "$(id -g)"
 
 gzip -t "${BACKUP_DIR}/${PARTIAL}"
