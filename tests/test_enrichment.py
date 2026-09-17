@@ -241,6 +241,153 @@ def test_parse_context_placeholder_values_as_empty():
     assert parsed["enr_context_topics"] == ""
 
 
+# A store's "items were delivered" email and the earlier same-order message that
+# carried the payment summary, in the layout production indexes (#2562). Only
+# the earlier message has the totals and the card; every value is sanitized.
+DELIVERY_EMAIL = (
+    "Placed March 3, 2026\nOrder # 300000000000000001\nInvoice # 12345\n"
+    "Your Item(s) Were Delivered\nDelivered Tuesday, Mar 3, 2026\n"
+    "Address: 100 Example Lane, Anytown, PA 18000\n"
+    "Delivered Items: Tile Adhesive (25 Pound(s)) QTY1\n"
+    "Item #: 1000001|Model #: 2000002 Unit Price: $42.50|Subtotal: $42.50\n"
+    "Need to make a return? Start a Return/Replacement Online"
+)
+DELIVERY_CONTEXT = (
+    "BEFORE MESSAGES\n"
+    "[BEFORE 2026-03-03T09:12:00+00:00 message_id=1001 "
+    "source_message_id=<prepared@example.test> sender=orders@example.test] "
+    "Your order 300000000000000001 is being prepared. Subtotal $75.59 "
+    "Savings -$18.00 Tax $3.61 Total $61.20 Loyalty Discount applied. "
+    "Paid with Visa ending in 4242."
+)
+DELIVERY_PRIMARY_FACTS = [
+    "Delivered Tuesday, Mar 3, 2026 to 100 Example Lane, Anytown, PA 18000.",
+    "Invoice #12345; order #300000000000000001.",
+    "Return/replacement and billing/help links are provided.",
+]
+# What the model wrote from the earlier message, including a fact that mixes a
+# primary amount with the context-only card.
+DELIVERY_CONTEXT_FACTS = [
+    "Payment summary shows subtotal $75.59, savings $18.00, tax $3.61, and total $61.20.",
+    "Loyalty discount applied; card ending in 4242 was used.",
+    "Unit price $42.50 was charged to the card ending in 4242.",
+]
+
+
+class TestContextOnlyFactsLeavePrimaryFields:
+    """Facts only a nearby message supports are stored as context facts (#2562)."""
+
+    def _enrich(self, response: dict, text: str, context_text: str) -> dict:
+        gen = MagicMock()
+        gen.generate.return_value = json.dumps(response)
+        return enrich_document(text, "Your items were delivered", "pg_message", gen,
+                               context_text=context_text)
+
+    def test_context_payment_details_move_out_of_primary_facts_and_keywords(self):
+        response = {
+            "summary": "Delivery confirmation for order 300000000000000001.",
+            "doc_type": ["delivery confirmation"],
+            "keywords": [
+                "Order #300000000000000001",
+                "Invoice #12345",
+                "Delivered Tuesday, Mar 3, 2026",
+                "Subtotal $42.50",
+                "Total $61.20",
+                "Total Tax $3.61",
+                "Card ending 4242",
+                "Loyalty Discount",
+            ],
+            "key_facts": [
+                DELIVERY_PRIMARY_FACTS[0],
+                DELIVERY_PRIMARY_FACTS[1],
+                *DELIVERY_CONTEXT_FACTS,
+                DELIVERY_PRIMARY_FACTS[2],
+            ],
+            "context_key_facts": ["The earlier message shows the same order being prepared."],
+            "context_confidence": "high",
+            "context_relationship": "Earlier message about the same order.",
+            "context_source_message_ids": ["<prepared@example.test>"],
+        }
+
+        result = self._enrich(response, DELIVERY_EMAIL, DELIVERY_CONTEXT)
+
+        assert json.loads(result["enr_key_facts"]) == DELIVERY_PRIMARY_FACTS
+        assert json.loads(result["enr_context_key_facts"]) == [
+            "The earlier message shows the same order being prepared.",
+            *DELIVERY_CONTEXT_FACTS,
+        ]
+        # Keywords keep their stored spelling; the moved ones are already
+        # carried by the moved facts, so they are not repeated.
+        assert result["enr_keywords"] == (
+            "Order #300000000000000001, Invoice #12345, Delivered Tuesday, Mar 3, 2026, "
+            "Subtotal $42.50, Loyalty Discount"
+        )
+        # The model's own provenance is kept as written.
+        assert result["enr_context_confidence"] == "high"
+        assert result["enr_context_source_message_ids"] == "<prepared@example.test>"
+        assert result["enr_context_warning"] == ""
+
+    def test_facts_the_primary_text_supports_are_unchanged(self):
+        # The context repeats every number, and the model reformatted each one:
+        # thousands separator and cents, phone punctuation, a masked card, an
+        # ISO date that only the context's timestamp header spells that way, and
+        # a total it added up from the receipt's own line amounts.
+        text = (
+            "Receipt. Placed March 3, 2026. Order Total $1,041.00 "
+            "VISA XXXXXXXXXXXX4242. Questions? Call (804) 555-0142. "
+            "Payment received: Rent - $1,250, Water fee - $45."
+        )
+        context_text = (
+            "BEFORE MESSAGES\n"
+            "[BEFORE 2026-03-03T09:12:00+00:00 message_id=1001 "
+            "source_message_id=<confirm@example.test>] Order confirmed. "
+            "Total $1041.00 on Visa ending in 4242. Store phone 804-555-0142. "
+            "Transfer amount $1,295.00."
+        )
+        response = {
+            "summary": "Receipt for an order.",
+            "doc_type": ["receipt"],
+            "keywords": ["Total $1041", "Visa 4242", "804-555-0142", "2026-03-03"],
+            "key_facts": [
+                "Total was $1041.",
+                "Paid with Visa ending in 4242.",
+                "Store phone is 804-555-0142.",
+                "Order placed 2026-03-03.",
+                "Total payment amount was $1,295.",
+            ],
+            "importance": 0.5,
+        }
+
+        result = self._enrich(response, text, context_text)
+
+        assert result == parse_enrichment_response(json.dumps(response))
+
+    def test_context_only_keyword_is_kept_as_context_fact_with_provenance(self):
+        context_text = (
+            "BEFORE MESSAGES\n"
+            "[BEFORE source_message_id=<confirm@example.test>] Order confirmation. "
+            "Order total $88.14.\n"
+            "AFTER MESSAGES\n"
+            "[AFTER source_message_id=<survey@example.test>] Tell us how we did."
+        )
+        response = {
+            "summary": "Order is ready for pickup.",
+            "doc_type": ["pickup notification"],
+            "keywords": ["ready for pickup", "order total $88.14"],
+            "key_facts": ["The order is ready for pickup."],
+            "importance": 0.5,
+        }
+
+        result = self._enrich(response, "Your order is ready for pickup.", context_text)
+
+        assert result["enr_keywords"] == "ready for pickup"
+        assert json.loads(result["enr_key_facts"]) == ["The order is ready for pickup."]
+        assert json.loads(result["enr_context_key_facts"]) == ["order total $88.14"]
+        assert result["enr_context_source_message_ids"] == "<confirm@example.test>"
+        assert result["enr_context_confidence"] == "medium"
+        assert "omitted structured context fields" in result["enr_context_warning"]
+
+
 class TestEnrichDocument:
     """Test enrich_document with mocked LLM generator."""
 
