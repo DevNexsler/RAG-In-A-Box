@@ -698,7 +698,13 @@ class TestEnrichDocument:
         assert "NEARBY SAME-CHANNEL CONTEXT CANDIDATES" in prompt
         assert "may or may not describe the primary item" in prompt
 
-    def test_context_prompt_requires_context_fields_when_context_is_used(self):
+    def test_context_prompt_keeps_context_facts_out_of_primary_facts_and_keywords(self):
+        """The prompt sends context facts where storage keeps them (#2611).
+
+        Storage moves key facts and keywords that only nearby context supports
+        to context_key_facts (#2562). A prompt that allows a context fact in
+        key_facts or keywords once it is also in context_* contradicts that.
+        """
         response = json.dumps({
             "summary": "Photo context.",
             "doc_type": ["image"],
@@ -715,11 +721,19 @@ class TestEnrichDocument:
 
         prompt = gen.generate.call_args[0][0]
         assert (
-            "If you use nearby context in summary, entities, topics, keywords, "
-            "key_facts, tags, folder, or importance, you MUST also fill the "
-            "matching context_* fields"
+            "key_facts and keywords describe the PRIMARY ITEM only. Put facts and terms taken\n"
+            "from nearby context in context_key_facts only, never in key_facts or keywords."
         ) in prompt
-        assert "Do not place context-derived facts only in non-context fields" in prompt
+        assert "summary describes what the PRIMARY ITEM itself says." in prompt
+        shared = re.search(
+            r"If you use nearby context in (.*?), you\s+MUST also fill the matching "
+            r"context_\* fields",
+            prompt,
+            re.DOTALL,
+        )
+        assert shared is not None
+        shared_fields = set(re.split(r",\s*(?:or\s+)?", shared.group(1)))
+        assert shared_fields == {"entities", "topics", "tags", "folder", "importance"}
 
     def test_context_prompt_prioritizes_context_fields_before_summary(self):
         gen = self._make_generator('{"summary": "test", "doc_type": ["note"]}')

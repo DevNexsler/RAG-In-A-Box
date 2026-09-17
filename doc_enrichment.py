@@ -129,8 +129,12 @@ For "importance": rate the primary item's overall importance/usefulness on a 0.0
 Nearby same-channel context candidates may or may not describe the primary item.
 Treat nearby messages as candidates only. Judge relevance before using them.
 Avoid adding unrelated nearby conversation to any field.
-If you use nearby context in summary, entities, topics, keywords, key_facts, tags, folder, or importance, you MUST also fill the matching context_* fields.
-Do not place context-derived facts only in non-context fields.
+key_facts and keywords describe the PRIMARY ITEM only. Put facts and terms taken
+from nearby context in context_key_facts only, never in key_facts or keywords.
+summary describes what the PRIMARY ITEM itself says. It may name what the item
+replies to, but must not present nearby-context details as the item's content.
+If you use nearby context in entities, topics, tags, folder, or importance, you
+MUST also fill the matching context_* fields.
 Fill context_* fields only when nearby context is relevant to the PRIMARY ITEM.
 When using nearby context, set context_confidence, context_relationship, and
 context_source_message_ids. Use context_warning for ambiguity or rejected context.
