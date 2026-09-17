@@ -492,6 +492,21 @@ async def test_fault_armed_reasoning_only_exhausts_then_recovers(client):
 
 
 @pytest.mark.anyio
+async def test_fault_member_id_as_card_is_a_complete_enrichment(client, sim_module):
+    """#2526: the canned answer names a loyalty ID's tail as the payment card."""
+    resp = await client.post(
+        "/api/v1/chat/completions",
+        json=_chat_payload("Home Depot receipt", {"type": "json_object"}),
+        headers={"X-Sim-Fault": "member_id_as_card"},
+    )
+
+    assert resp.status_code == 200
+    enrichment = json.loads(resp.json()["choices"][0]["message"]["content"])
+    assert set(enrichment) == set(ENRICHMENT_KEYS)
+    assert sim_module.MEMBER_ID_AS_CARD_FACT in enrichment["key_facts"]
+
+
+@pytest.mark.anyio
 async def test_fault_header_timeout_delays(client):
     start = time.monotonic()
     resp = await client.post(

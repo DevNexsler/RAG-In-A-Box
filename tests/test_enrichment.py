@@ -729,6 +729,173 @@ class TestEnrichDocument:
         gen.generate.assert_called_once()
 
 
+# A Home Depot e-receipt body in the layout production indexes (#2526), with the
+# store, people, codes and every number sanitized. Two four-digit tails sit side
+# by side: the masked payment card (4821) and the phone-shaped Pro Xtra loyalty
+# member ID (7305), which is not a card.
+HOME_DEPOT_RECEIPT = (
+    "Subject: Your Electronic Receipt\n\nBody:\n"
+    "The Home Depot 96 96 Please keep this mail for your records. Thank you for "
+    "shopping with The Home Depot. 100 EXAMPLE PIKE ANYTOWN, PA 18000 STORE MGR "
+    "610-555-0142 1000 00002 00001 01/15/26 10:30 AM SALE 045242540389 "
+    "SCRWSETTER4P <A> MKE DRYWALL SCREW SETTER SET 4PC 2@5.00 10.00 019442146849 "
+    "3/4 CAP BLAC <A> 3.00 843382100551 HVYDTY100PK <A> 15.00 049057104934 "
+    "TANK LEVER <A> 12.00 SUBTOTAL 40.00 SALES TAX 2.40 TOTAL $42.40 "
+    "XXXXXXXXXXXX4821 VISA USD$ 42.40 AUTH CODE S00000/0000000 TA AUTH MODE - "
+    "ISSUER Contactless AID A0000000031010 VISA CREDIT PRO XTRA MEMBER STATEMENT "
+    "PRO XTRA ###-###-7305 SUMMARY THIS RECEIPT PO/JOB NAME: 101 2026 PRO XTRA "
+    "SPEND 09/15: $1,234.56 Get the CREDIT LINE your business needs when you "
+    "join Pro Xtra, register, & use your Pro Xtra Credit Card. RETURN POLICY "
+    "DEFINITIONS POLICY ID DAYS POLICY EXPIRES ON A 1 90 04/15/2026"
+)
+
+# The other facts the model wrote for the production receipt, which were right.
+HOME_DEPOT_TRUE_FACTS = [
+    "Total transaction amount is $42.40.",
+    "Purchase occurred on 2026-01-15 at 10:30 AM.",
+    "Items purchased include a 4pc drywall screw setter set, 3/4\" black cap, "
+    "Husky heavy-duty utility blades, and a Strongarm wave tank lever.",
+    "The transaction is associated with PO/Job Name 101 2026.",
+    "Return policy expires on 2026-04-15.",
+]
+
+
+def _receipt_response(card_fact: str, summary: str = "Home Depot receipt for $42.40.") -> str:
+    facts = list(HOME_DEPOT_TRUE_FACTS)
+    facts.insert(3, card_fact)
+    return json.dumps({
+        "summary": summary,
+        "doc_type": ["receipt"],
+        "keywords": ["Home Depot", "receipt", "Pro Xtra", "Visa", "PO/JOB NAME 101"],
+        "key_facts": facts,
+        "importance": 0.5,
+    })
+
+
+class TestCardSuffixGrounding:
+    """#2526: a stored card suffix must be a card the source actually shows."""
+
+    def _enrich(self, response: str, text: str = HOME_DEPOT_RECEIPT, **kwargs) -> dict:
+        gen = MagicMock()
+        gen.generate.return_value = response
+        return enrich_document(text, "Your Electronic Receipt", "email", gen, **kwargs)
+
+    def test_loyalty_member_number_is_not_stored_as_the_payment_card(self):
+        """The exact production failure: the member ID's tail named as the card."""
+        result = self._enrich(
+            _receipt_response("Payment was made via Visa Pro Xtra credit card ending in 7305.")
+        )
+
+        facts = json.loads(result["enr_key_facts"])
+        assert "7305" not in result["enr_key_facts"]
+        assert facts[3] == "Payment was made via Visa Pro Xtra credit card ending in 4821."
+        # Nothing else in the receipt's enrichment moves.
+        assert facts[:3] + facts[4:] == HOME_DEPOT_TRUE_FACTS
+        assert result["enr_summary"] == "Home Depot receipt for $42.40."
+        assert result["enr_keywords"] == "Home Depot, receipt, Pro Xtra, Visa, PO/JOB NAME 101"
+
+    def test_summary_claim_is_grounded_too(self):
+        result = self._enrich(
+            _receipt_response(
+                "Paid by Visa ending in 4821.",
+                summary="Home Depot receipt for $42.40 paid with a Visa card ending in 7305.",
+            )
+        )
+
+        assert result["enr_summary"] == (
+            "Home Depot receipt for $42.40 paid with a Visa card ending in 4821."
+        )
+
+    def test_claim_matching_the_masked_card_is_unchanged(self):
+        response = _receipt_response("Paid by Visa ending in 4821 using contactless payment.")
+
+        result = self._enrich(response)
+
+        assert result["enr_key_facts"] == parse_enrichment_response(response)["enr_key_facts"]
+
+    @pytest.mark.parametrize(
+        ("text", "card_fact"),
+        [
+            # Home Depot's other e-receipt layout: an icon, a dash, the bare tail.
+            (
+                "Order Total: $36.50 Payment: [credit_card_icon_20x13.png]\n— 4821\n"
+                "Pro Xtra ###-###-7305",
+                "Order total is $36.50, paid by credit card ending in 4821.",
+            ),
+            # Payment-processor layout: the tail after a label, sometimes starred.
+            (
+                "Account Number with Aqua: *1357\nBank Account or Card #: *2468\n",
+                "Bank account or card ending in 2468.",
+            ),
+            # Card statement layout: an elided account number.
+            (
+                "Account Chase Credit Card (...9753)\nDue date 09/20/2026",
+                "The credit card statement is for the card ending in 9753.",
+            ),
+        ],
+    )
+    def test_correct_claims_in_other_layouts_are_unchanged(self, text, card_fact):
+        response = _receipt_response(card_fact)
+
+        result = self._enrich(response, text=text)
+
+        assert result["enr_key_facts"] == parse_enrichment_response(response)["enr_key_facts"]
+
+    def test_claim_is_dropped_when_the_real_card_is_ambiguous(self):
+        text = HOME_DEPOT_RECEIPT.replace(
+            "VISA CREDIT", "XXXXXXXXXXXX6650 MASTERCARD USD$ 10.00 VISA CREDIT"
+        )
+
+        result = self._enrich(
+            _receipt_response("Payment was made via Visa Pro Xtra credit card ending in 7305."),
+            text=text,
+        )
+
+        facts = json.loads(result["enr_key_facts"])
+        assert facts[3] == "Payment was made via Visa Pro Xtra credit card."
+        assert facts[:3] + facts[4:] == HOME_DEPOT_TRUE_FACTS
+
+    def test_non_card_identifiers_keep_their_phone_shaped_tail(self):
+        """The member ID really does end in 7305; only card claims are guarded."""
+        response = _receipt_response("The Pro Xtra member number ends in 7305.")
+
+        result = self._enrich(response)
+
+        assert result["enr_key_facts"] == parse_enrichment_response(response)["enr_key_facts"]
+
+    def test_card_seen_only_in_nearby_context_is_grounded(self):
+        response = json.dumps({
+            "summary": "Delivery checklist for a dryer order.",
+            "doc_type": ["delivery_notification"],
+            "key_facts": ["Order total is $500.00."],
+            "context_key_facts": ["The nearby receipt was paid by credit card ending in 4821."],
+            "context_confidence": "medium",
+            "context_relationship": "same order",
+        })
+
+        result = self._enrich(
+            response,
+            text="Your dryer delivery is scheduled. Questions? Call 866-555-4821.",
+            context_text="[BEFORE source_message_id=m1] TOTAL $500.00 XXXXXXXXXXXX4821 VISA",
+        )
+
+        assert json.loads(result["enr_context_key_facts"]) == [
+            "The nearby receipt was paid by credit card ending in 4821."
+        ]
+
+    def test_correction_is_logged_for_counting(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="doc_enrichment"):
+            self._enrich(
+                _receipt_response("Payment was made via Visa Pro Xtra credit card ending in 7305.")
+            )
+
+        corrections = [r.getMessage() for r in caplog.records if "card suffix" in r.getMessage()]
+        assert corrections == [
+            "Ungrounded card suffix in enrichment for 'Your Electronic Receipt': "
+            "enr_key_facts 7305 -> 4821"
+        ]
+
+
 class TestFailedEnrichment:
     """Test the failed_enrichment() helper."""
 
