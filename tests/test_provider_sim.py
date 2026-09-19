@@ -451,6 +451,25 @@ async def test_fault_armed_hangup_cuts_the_connection(client):
 
 
 @pytest.mark.anyio
+async def test_fault_context_fact_as_primary_is_a_complete_enrichment(client, sim_module):
+    """#2562: the canned answer files a nearby message's fact as a primary fact."""
+    resp = await client.post(
+        "/api/v1/chat/completions",
+        json=_chat_payload("delivery slip", {"type": "json_object"}),
+        headers={"X-Sim-Fault": "context_fact_as_primary"},
+    )
+
+    assert resp.status_code == 200
+    enrichment = json.loads(resp.json()["choices"][0]["message"]["content"])
+    assert set(enrichment) == set(ENRICHMENT_KEYS)
+    assert enrichment["key_facts"] == [
+        sim_module.DELIVERY_SLIP_FACT,
+        sim_module.CONTEXT_FACT_AS_PRIMARY_FACT,
+    ]
+    assert sim_module.CONTEXT_FACT_AS_PRIMARY_KEYWORD in enrichment["keywords"]
+
+
+@pytest.mark.anyio
 async def test_fault_header_garbage(client):
     resp = await client.post(
         "/api/v1/embeddings",
