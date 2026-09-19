@@ -45,7 +45,12 @@ def _provider():
 def test_transcribe_audio_clip_live():
     text = _provider().transcribe_audio(FIXTURES / "clip.wav")
     assert isinstance(text, str)
-    assert text.strip(), "expected a non-empty transcript for clip.wav"
+    assert "the quick brown fox jumps over the lazy dog" in text.lower()
+
+
+def test_transcribe_audio_tone_live():
+    text = _provider().transcribe_audio(FIXTURES / "tone.wav")
+    assert isinstance(text, str)
 
 
 def test_analyze_video_clip_live():
