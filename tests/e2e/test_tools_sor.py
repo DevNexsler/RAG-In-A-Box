@@ -53,9 +53,9 @@ async def test_sor_query_select_returns_seeded_rows(mcp_session):
     })
     assert isinstance(out, str), out
     lines = [line for line in out.strip().splitlines() if line.strip()]
-    # header + 6 seeded fixture rows
+    # header + 7 seeded fixture rows
     data_rows = [line for line in lines if "\t" in line][1:]
-    assert len(data_rows) == 6, out
+    assert len(data_rows) == 7, out
     assert "zephyr" in out, out
     assert "Alice Nguyen" in out and "inbound" in out and "outbound" in out
 
@@ -96,6 +96,29 @@ async def test_sor_sweep_indexed_messages_searchable(indexed_corpus, mcp_session
     ]
     assert subject_hits, subject_payload["results"]
     assert "cobalt courthouse filing" in subject_hits[0]["snippet"].lower()
+
+
+async def test_tracking_html_message_is_bounded_in_consumer_visible_lance_rows(
+    indexed_corpus, mcp_session
+):
+    chunks = await mcp_session.call_tool_json(
+        "file_get_doc_chunks", {"doc_id": "sor::zoho_mail/tracking-heavy"}
+    )
+    assert isinstance(chunks, list) and 1 <= len(chunks) <= 3, chunks
+
+    stored = "\n".join(chunk.get("text") or "" for chunk in chunks)
+    assert "Order STAGE-246565" in stored
+    assert "washer and dryer" in stored
+    assert "Track delivery" in stored
+    for discarded in (
+        "tracker.example",
+        "upn=u001",
+        "images.example",
+        "social.example",
+        "Privacy settings",
+        "&#847;",
+    ):
+        assert discarded not in stored
 
 
 def test_sor_unit_title_reaches_raw_lance_metadata_and_chunk_header(indexed_corpus):
