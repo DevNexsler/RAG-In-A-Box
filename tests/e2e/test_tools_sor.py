@@ -141,3 +141,13 @@ async def test_comm_lookup_no_hit_is_small_not_found(indexed_corpus, mcp_session
     assert len(json.dumps(payload)) <= _COMM_LOOKUP_BUDGET, payload
     if payload["verdict"] == "not_found":
         assert payload["sql_needed"] is True, payload
+
+
+def test_email_subject_reaches_raw_lance_title_and_header(indexed_corpus):
+    message_id = '<CF.0D.28275.0E62DAA6@i-052407b4cdf7ba651.mta2vrest.sd.prd.sparkpost>'
+    row = _raw_lance_row(f'sor::email/{message_id}')
+    assert row['metadata']['title'] == 'Obsidian widget invoice'
+    assert row['metadata']['message_id'] == message_id
+    header = row['text'].splitlines()[0]
+    assert header.startswith('[Document: Obsidian widget invoice')
+    assert message_id not in header
