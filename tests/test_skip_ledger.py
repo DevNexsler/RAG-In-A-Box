@@ -11,7 +11,10 @@ never permanently abandoned). A changed file is re-evaluated immediately.
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 import flow_index_vault as fiv
+from core.skip_policy import content_terminal_skip_reasons
 from extractors import (
     Degradation,
     begin_degradation_capture,
@@ -484,3 +487,36 @@ def test_open_circuit_failure_waits_for_next_index_run():
     from core.resilience import CircuitOpenError
 
     assert _retry_decision(CircuitOpenError("provider cooling down")) is False
+
+
+# --- Which skip reasons are a verdict about the content (#2097) -------------
+# The dedupe gate reads the ledger to decide whether a document can ever hold
+# an index row. Its own `duplicate_of:` decision must not come back as evidence
+# about the content, or the gate confirms itself.
+
+
+@pytest.mark.parametrize(
+    "reasons, expected",
+    [
+        (["no_text_extracted"], ["no_text_extracted"]),
+        (["encrypted_pdf", "pdf_unreadable"], ["encrypted_pdf", "pdf_unreadable"]),
+        (["corrupt_mangled_binary"], ["corrupt_mangled_binary"]),
+        (["media_retrieval_stub"], ["media_retrieval_stub"]),
+        (["terminal_error:ValueError"], ["terminal_error:ValueError"]),
+        # A reason nobody has written yet is a verdict too: keeping an unknown
+        # skip out of the canonical election is the safe direction.
+        (["some_future_reason"], ["some_future_reason"]),
+        (["duplicate_of:00001"], []),
+        (["duplicate_of:00001", "no_text_extracted"], ["no_text_extracted"]),
+        ([], []),
+        (["", None, 7], []),
+        ("not-a-list", []),
+    ],
+)
+def test_content_terminal_skip_reasons(reasons, expected):
+    assert content_terminal_skip_reasons({"reasons": reasons}) == expected
+
+
+def test_content_terminal_skip_reasons_tolerates_a_missing_entry():
+    assert content_terminal_skip_reasons({}) == []
+    assert content_terminal_skip_reasons(None) == []
