@@ -96,6 +96,11 @@ _ENRICHMENT_LIST_KEYS = (
 # apart from the one a (wasted) retry would have produced.
 _OVERSHOOT_BUDGET_SUMMARY = "Overshot-budget enrichment marker."
 
+# The #2526 answer: the model names the tail of a receipt's phone-shaped loyalty
+# member ID (printed ###-###-7305) as the payment card. A test that arms it
+# uploads a receipt carrying that member ID next to its real, masked card.
+MEMBER_ID_AS_CARD_FACT = "Payment was made via Visa Pro Xtra credit card ending in 7305."
+
 
 def _fake_enrichment(text: str) -> str:
     """Minimal valid enrichment JSON with values derived from the text hash."""
@@ -218,6 +223,24 @@ def _fault_response(fault: str) -> Response | None:
                     "completion_tokens": 6201,
                     "total_tokens": 6213,
                 },
+            }
+        )
+    if fault == "member_id_as_card":
+        enrichment = json.loads(_fake_enrichment(""))
+        enrichment["key_facts"] = ["Total transaction amount is $42.40.", MEMBER_ID_AS_CARD_FACT]
+        return JSONResponse(
+            {
+                "id": "sim-member-id-as-card",
+                "object": "chat.completion",
+                "model": "sim-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": json.dumps(enrichment)},
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 40, "total_tokens": 52},
             }
         )
     if fault == "hangup":
@@ -463,6 +486,7 @@ _KNOWN_FAULTS = {
     "garbage",
     "reasoning_only",
     "overshoot_budget",
+    "member_id_as_card",
     "hangup",
 }
 
