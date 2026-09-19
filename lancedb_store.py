@@ -2854,31 +2854,51 @@ class LanceDBStore:
         when the tail passes VECTOR_INDEX_STALE_TAIL_ROWS — the merge has
         stopped running. Never raises; a missing table or index reads as absent."""
 
-        def _op():
-            table = self._vs.table
-            for index in table.list_indices():
-                if not self._is_vector_index(index):
-                    continue
-                stats = table.index_stats(index.name)
-                unindexed = int(getattr(stats, "num_unindexed_rows", 0) or 0)
-                return {
-                    "available": True,
-                    "name": index.name,
-                    "index_type": str(
-                        getattr(stats, "index_type", None)
-                        or getattr(index, "index_type", "")
-                    ),
-                    "num_indices": int(getattr(stats, "num_indices", 1) or 1),
-                    "indexed_rows": int(getattr(stats, "num_indexed_rows", 0) or 0),
-                    "unindexed_rows": unindexed,
-                    "stale": unindexed > VECTOR_INDEX_STALE_TAIL_ROWS,
-                }
-            return empty_vector_index_stats()
-
         try:
-            return self._run_read_with_recovery(_op, empty_vector_index_stats())
+            return self._run_read_with_recovery(
+                lambda: self._table_vector_index_stats(self._vs.table),
+                empty_vector_index_stats(),
+            )
         except Exception:
             return empty_vector_index_stats()
+
+    @staticmethod
+    def _table_vector_index_stats(table) -> dict[str, Any]:
+        """Read ANN metadata from an already-open table; never mutate it."""
+        for index in table.list_indices():
+            if not LanceDBStore._is_vector_index(index):
+                continue
+            stats = table.index_stats(index.name)
+            unindexed = int(getattr(stats, "num_unindexed_rows", 0) or 0)
+            return {
+                "available": True,
+                "name": index.name,
+                "index_type": str(
+                    getattr(stats, "index_type", None)
+                    or getattr(index, "index_type", "")
+                ),
+                "num_indices": int(getattr(stats, "num_indices", 1) or 1),
+                "indexed_rows": int(getattr(stats, "num_indexed_rows", 0) or 0),
+                "unindexed_rows": unindexed,
+                "stale": unindexed > VECTOR_INDEX_STALE_TAIL_ROWS,
+            }
+        return empty_vector_index_stats()
+
+    @staticmethod
+    def read_vector_index_stats(index_root: str | Path, table_name: str = "chunks") -> dict[str, Any]:
+        """Probe existing local ANN metadata without store setup, recovery or locks.
+
+        Open a fresh handle so peer rebuilds are visible. An unreadable table is
+        unknown, not evidence that no index exists. Never expose exception text
+        on the unauthenticated health endpoint.
+        """
+        try:
+            if not (Path(index_root) / f"{table_name}.lance").exists():
+                return empty_vector_index_stats()
+            table = lance_session.connect(index_root).open_table(table_name)
+            return LanceDBStore._table_vector_index_stats(table)
+        except Exception:
+            return {**empty_vector_index_stats(), "available": None, "error": "metadata_unavailable"}
 
     def ensure_vector_index(
         self,
@@ -2912,6 +2932,14 @@ class LanceDBStore:
         (test venv) and 0.37 (image) accept.
         """
         if not replace and self.vector_index_available():
+            configured = str(index_type or _DEFAULT_VECTOR_INDEX_TYPE).upper()
+            live = self.vector_index_stats().get("index_type")
+            if live and str(live).upper() != configured:
+                logger.warning(
+                    "Vector index type mismatch for table %r: configured=%s live=%s; "
+                    "existing index retained; operator rebuild: scripts/ensure_vector_index.py --rebuild",
+                    self.table_name, configured, live,
+                )
             return False
         rows = self.count_chunks()
         if rows == 0:

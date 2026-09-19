@@ -349,6 +349,9 @@ def _health_probe(config: dict) -> tuple[dict, int]:
         "status": "ok",
         "indexer": "running" if running else "idle",
         "index_run": index_run,
+        "vector_index": LanceDBStore.read_vector_index_stats(
+            index_root, (config.get("lancedb") or {}).get("table", "chunks"),
+        ),
     }
     payload.update(disk)
     if freshness:
@@ -377,6 +380,7 @@ def _health_probe(config: dict) -> tuple[dict, int]:
             return (
                 {
                     "status": "stalled",
+                    "vector_index": payload["vector_index"],
                     "indexer_pid": pid,
                     "heartbeat_age_s": round(age) if age is not None else None,
                     "max_age_s": max_age,
