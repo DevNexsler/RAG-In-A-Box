@@ -86,7 +86,7 @@ class OpenRouterMediaProvider:
         audio_api_key: str | None = None,
         audio_base_url: str | None = None,
         timeout: float = 300.0,
-        max_file_size_mb: float = 50.0,
+        max_file_size_mb: float = 800.0,
     ) -> None:
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.base_url = base_url.rstrip("/")

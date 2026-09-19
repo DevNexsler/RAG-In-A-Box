@@ -40,7 +40,7 @@ class _LiteLLMMediaProvider:
     modalities, enforcing the same max-file-size guard the OpenRouter provider
     applies before uploading."""
 
-    def __init__(self, video_run, audio_run, *, max_file_size_mb: float = 50.0):
+    def __init__(self, video_run, audio_run, *, max_file_size_mb: float = 800.0):
         self._video_run = video_run
         self._audio_run = audio_run
         self._max_bytes = int(max_file_size_mb * 1024 * 1024)
@@ -85,7 +85,7 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
     endpoint = media_cfg.get("endpoint", "http://192.168.68.87:4000/v1")
     timeout = media_cfg.get("timeout", 300.0)
     api_key = media_cfg.get("api_key")  # else LiteLLMFallback reads LITELLM_*_KEY
-    max_mb = media_cfg.get("max_file_size_mb", 50.0)
+    max_mb = media_cfg.get("max_file_size_mb", 800.0)
 
     video = LiteLLMFallback(
         endpoint, media_cfg.get("video_model", "video"),
@@ -171,7 +171,7 @@ def build_media_provider(config: dict) -> MediaProvider | None:
         audio_models=_dedupe_models(list(audio_models)),
         video_model=media_cfg.get("video_model", DEFAULT_VIDEO_MODEL),
         timeout=media_cfg.get("timeout", 300.0),
-        max_file_size_mb=media_cfg.get("max_file_size_mb", 50.0),
+        max_file_size_mb=media_cfg.get("max_file_size_mb", 800.0),
     )
 
     from providers.media.fallback import MediaFallbackProvider
