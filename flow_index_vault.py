@@ -4543,30 +4543,38 @@ def _build_single_doc_runtime(
             llm_generator = None
 
     exclusive_contexts = _RUNTIME.get("_exclusive_writer_contexts", [])
+    # Keep the sweep's write-seam counters across the rebuild. Mid-sweep queue
+    # service (#2692) indexes through this path; dropping run_progress made
+    # _record_index_write a no-op for every served document while Inserted/
+    # Upserted lines still landed in the log.
+    run_progress = _RUNTIME.get("run_progress")
+    run_progress_lock = _RUNTIME.get("run_progress_lock")
     _RUNTIME.clear()
-    _RUNTIME.update(
-        {
-            "_exclusive_writer_contexts": exclusive_contexts,
-            "store": store,
-            # Same key the full flow sets, so the freshness watermark is stamped
-            # from whichever path indexed the document (#1625).
-            "index_root": Path(config["index_root"]),
-            "memory_observer": memory_observer,
-            "doc_id_store": doc_id_store,
-            "embed_provider": embed_provider,
-            "splitter": splitter,
-            "semantic_splitter": None,
-            "semantic_threshold": 0,
-            "ocr_provider": ocr_provider,
-            "media_provider": media_provider,
-            "llm_generator": llm_generator,
-            "taxonomy_store": None,
-            "config": config,
-            "sources_by_name": {src.name: src},
-            "source_records_by_ns_doc_id": {record["doc_id"]: source_record},
-            "communication_context_provider": communication_context_provider,
-        }
-    )
+    restored: dict[str, Any] = {
+        "_exclusive_writer_contexts": exclusive_contexts,
+        "store": store,
+        # Same key the full flow sets, so the freshness watermark is stamped
+        # from whichever path indexed the document (#1625).
+        "index_root": Path(config["index_root"]),
+        "memory_observer": memory_observer,
+        "doc_id_store": doc_id_store,
+        "embed_provider": embed_provider,
+        "splitter": splitter,
+        "semantic_splitter": None,
+        "semantic_threshold": 0,
+        "ocr_provider": ocr_provider,
+        "media_provider": media_provider,
+        "llm_generator": llm_generator,
+        "taxonomy_store": None,
+        "config": config,
+        "sources_by_name": {src.name: src},
+        "source_records_by_ns_doc_id": {record["doc_id"]: source_record},
+        "communication_context_provider": communication_context_provider,
+    }
+    if isinstance(run_progress, dict) and run_progress_lock is not None:
+        restored["run_progress"] = run_progress
+        restored["run_progress_lock"] = run_progress_lock
+    _RUNTIME.update(restored)
     if repair_context:
         _repair_communication_sidecars(
             [record],
@@ -4857,6 +4865,17 @@ def _service_index_queue(config: dict, table_name: str) -> int:
         _get_logger().info(
             "Served %d queued index request(s) during the sweep", len(results)
         )
+        # Fold served attempts into the same queued/processed accounting the
+        # scan lane uses. Write counts already landed via the preserved
+        # run_progress object inside _build_single_doc_runtime (#2692).
+        progress = _RUNTIME.get("run_progress")
+        if isinstance(progress, dict) and progress.get("queued") is not None:
+            _update_run_progress(queued=int(progress["queued"]) + len(results))
+            for result in results.values():
+                skip_reasons: tuple[str, ...] = ()
+                if result.get("status") == "skipped" and result.get("reason"):
+                    skip_reasons = (str(result["reason"]),)
+                _advance_run_progress(skip_reasons=skip_reasons)
     return len(results)
 
 
