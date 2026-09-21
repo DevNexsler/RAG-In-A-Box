@@ -444,3 +444,54 @@ class TestFolderSync:
         assert "email-attachments/joycelyn-smith/2026-04/" not in names
         folder = store.get("folder:1-Projects/Alpha/")
         assert "1-Projects/Alpha/" in folder["description"]
+
+    def test_unchanged_folder_tree_skips_per_entry_lookups(self, tmp_path, monkeypatch):
+        """Second sync of an unchanged tree must not re-query every folder id.
+
+        Prod paid ~40s/run for 506 LanceDB get() calls that always found
+        existing=N / added=0. The incremental path has to make that no-op
+        free without silently dropping a newly discovered folder.
+        """
+        from core.taxonomy import sync_folder_taxonomy_from_filesystem
+
+        docs = tmp_path / "docs"
+        (docs / "1-Projects" / "Alpha").mkdir(parents=True)
+        (docs / "2-Areas" / "Ops").mkdir(parents=True)
+
+        store = TaxonomyStore(str(tmp_path / "index"), table_name="taxonomy", embed_fn=_fake_embed)
+        first = sync_folder_taxonomy_from_filesystem(store, docs)
+        assert first["added"] >= 4
+        assert first.get("skipped", 0) == 0
+
+        get_calls = {"n": 0}
+        original_get = TaxonomyStore.get
+
+        def counting_get(self, entry_id):
+            get_calls["n"] += 1
+            return original_get(self, entry_id)
+
+        monkeypatch.setattr(TaxonomyStore, "get", counting_get)
+
+        second = sync_folder_taxonomy_from_filesystem(store, docs)
+        assert second["added"] == 0
+        assert second["discovered"] == first["discovered"]
+        assert second["existing"] == first["discovered"]
+        assert second.get("skipped", 0) == 1
+        assert get_calls["n"] == 0
+
+    def test_new_folder_still_added_after_incremental_baseline(self, tmp_path):
+        """Speed-up must not skip a folder that appeared since the last sync."""
+        from core.taxonomy import sync_folder_taxonomy_from_filesystem
+
+        docs = tmp_path / "docs"
+        (docs / "1-Projects" / "Alpha").mkdir(parents=True)
+        store = TaxonomyStore(str(tmp_path / "index"), table_name="taxonomy", embed_fn=_fake_embed)
+        baseline = sync_folder_taxonomy_from_filesystem(store, docs)
+        assert baseline["added"] >= 2
+
+        (docs / "1-Projects" / "Bravo").mkdir(parents=True)
+        again = sync_folder_taxonomy_from_filesystem(store, docs)
+        assert again.get("skipped", 0) == 0
+        assert again["added"] >= 1
+        assert store.get("folder:1-Projects/Bravo/") is not None
+        assert "1-Projects/Bravo/" in store.get("folder:1-Projects/Bravo/")["description"]

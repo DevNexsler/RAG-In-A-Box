@@ -3565,19 +3565,29 @@ def index_vault_flow(
     taxonomy_store = None
     try:
         from core.taxonomy import load_taxonomy_store, sync_folder_taxonomy_from_sources
+        t_tax_load = time.perf_counter()
         taxonomy_store = load_taxonomy_store(config)
+        tax_load_s = time.perf_counter() - t_tax_load
+        t_tax_sync = time.perf_counter()
         sync_stats = sync_folder_taxonomy_from_sources(taxonomy_store, all_sources)
+        tax_sync_s = time.perf_counter() - t_tax_sync
         tax_count = taxonomy_store.count()
         if tax_count > 0:
-            logger.info("Taxonomy store loaded (%d entries)", tax_count)
-            if sync_stats.get("added", 0):
-                logger.info(
-                    "Taxonomy folder sync added=%d existing=%d discovered=%d sources=%d",
-                    sync_stats.get("added", 0),
-                    sync_stats.get("existing", 0),
-                    sync_stats.get("discovered", 0),
-                    sync_stats.get("sources", 0),
-                )
+            logger.info(
+                "Taxonomy store loaded (%d entries) load=%.2fs sync=%.2fs",
+                tax_count,
+                tax_load_s,
+                tax_sync_s,
+            )
+            # Always log sync_stats — a silent added=0 no-op hid a 40s/run cost (#2913).
+            logger.info(
+                "Taxonomy folder sync added=%d existing=%d discovered=%d sources=%d skipped=%d",
+                sync_stats.get("added", 0),
+                sync_stats.get("existing", 0),
+                sync_stats.get("discovered", 0),
+                sync_stats.get("sources", 0),
+                sync_stats.get("skipped", 0),
+            )
         else:
             taxonomy_store = None
             logger.info("Taxonomy store empty, skipping taxonomy-guided enrichment")
