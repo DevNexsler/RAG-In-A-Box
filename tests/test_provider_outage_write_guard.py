@@ -134,6 +134,12 @@ def test_transient_outage_keeps_the_enriched_row(runtime, outage):
     good = _stored_metadata(store, doc["doc_id"])
     assert good["enr_summary"].startswith("Photo of bags")
 
+    # Change enrichment input so the LLM is called again (#3050 input-hash cache).
+    doc = _write_doc(
+        docs_root,
+        "quo-attachments/annie/theft.md",
+        "Bags left by the bins. Neighbor reported overnight.",
+    )
     _index(doc, _DownLLM(outage))
 
     after = _stored_metadata(store, doc["doc_id"])
@@ -148,6 +154,11 @@ def test_transient_outage_is_counted_for_the_run_summary(runtime):
     doc = _write_doc(docs_root, "quo-attachments/annie/theft.md", "Bags left by the bins.")
 
     _index(doc, _GoodLLM())
+    doc = _write_doc(
+        docs_root,
+        "quo-attachments/annie/theft.md",
+        "Bags left by the bins. Neighbor reported overnight.",
+    )
     _index(doc, _DownLLM(httpx.ConnectError("[Errno 111] Connection refused")))
 
     assert doc["doc_id"] in fiv._RUNTIME.get("provider_unavailable", set())
@@ -199,7 +210,12 @@ def test_permanent_enrichment_failure_still_rewrites(runtime):
     doc = _write_doc(docs_root, "quo-attachments/annie/theft.md", "Bags left by the bins.")
 
     _index(doc, _GoodLLM())
-    doc["mtime"] += 1
+    # Enrichment input must change so #3050's hash cache does not skip the LLM.
+    doc = _write_doc(
+        docs_root,
+        "quo-attachments/annie/theft.md",
+        "Bags left by the bins. Updated description for permanent failure path.",
+    )
     _index(doc, _BrokenLLM())
 
     assert _stored_metadata(store, doc["doc_id"])["enr_summary"] == ""

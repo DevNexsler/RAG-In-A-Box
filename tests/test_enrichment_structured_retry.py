@@ -195,6 +195,17 @@ def test_run_telemetry_reports_validity_retries_and_degraded_writes(runtime):
     doc = _write_doc(docs_root)
 
     _index_with_responses(doc, [_response(_enrichment_payload(), completion_tokens=6201)])
+    # Change enrichment input so #3050's input-hash reuse does not skip the LLM;
+    # this test is about provider retry telemetry, not cache hits.
+    path = docs_root / "quo-attachments/annie/boiler.md"
+    path.write_text(
+        path.read_text() + "\nAdditional boiler service notes for retry telemetry.\n"
+    )
+    doc = {
+        **doc,
+        "mtime": path.stat().st_mtime,
+        "size": path.stat().st_size,
+    }
     _index_with_responses(doc, [
         _response("", completion_tokens=5000, finish_reason="length"),
         _response(_enrichment_payload(), completion_tokens=430),

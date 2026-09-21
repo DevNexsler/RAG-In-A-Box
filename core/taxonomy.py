@@ -118,6 +118,13 @@ def sync_folder_taxonomy_from_sources(
     return totals
 
 
+def sync_doc_type_taxonomy(store: TaxonomyStore | None) -> dict[str, int]:
+    """Seed the controlled ``doc_type`` vocabulary into the taxonomy store."""
+    from core.doc_type_vocabulary import sync_doc_type_taxonomy as _sync
+
+    return _sync(store)
+
+
 def validate_tags(store: TaxonomyStore, tags: list[str]) -> tuple[list[str], list[str]]:
     """Check tags against taxonomy. Returns (known, unknown)."""
     known = []

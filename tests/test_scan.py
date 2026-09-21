@@ -1285,6 +1285,7 @@ def test_process_doc_task_queues_taxonomy_usage_without_worker_write(
     if expected_write_mode == "insert":
         assert captured["known_absent"] is True
     assert accumulator.snapshot() == {
+        "doc_type:image": 1,
         "folder:Projects/Renovation": 1,
         "tag:renovation": 1,
         "tag:urgent": 1,

@@ -90,7 +90,13 @@ from core.sensitive_content import (
     sanitize_sensitive_content,
 )
 from core.source_types import SOURCE_TYPE_BY_EXTENSION, canonical_source_type
-from doc_enrichment import ENRICHMENT_FIELDS, enrich_document, empty_enrichment
+from doc_enrichment import (
+    ENRICHMENT_FIELDS,
+    ENRICHMENT_INPUT_HASH_FIELD,
+    enrich_document,
+    empty_enrichment,
+)
+from core.doc_type_vocabulary import enrichment_input_hash, sync_doc_type_taxonomy
 from extractors import (
     Degradation,
     begin_degradation_capture,
@@ -199,7 +205,52 @@ def _taxonomy_usage_ids_from_enrichment(enrichment: dict[str, str]) -> list[str]
     folder = (enrichment.get("enr_suggested_folder") or "").strip()
     if folder:
         ids.append(f"folder:{folder}")
+    for doc_type in (enrichment.get("enr_doc_type") or "").split(","):
+        doc_type = doc_type.strip()
+        if doc_type:
+            ids.append(f"doc_type:{doc_type}")
     return ids
+
+
+def _note_enrichment_counter(name: str, delta: int = 1) -> None:
+    if delta <= 0:
+        return
+    counters = _RUNTIME.setdefault("_enrichment_counters", {})
+    counters[name] = int(counters.get(name, 0)) + int(delta)
+
+
+def _existing_enrichment_from_store(store, doc_id: str) -> dict[str, str]:
+    """Read previously stored enrichment fields for stickiness / input-hash reuse."""
+    if store is None or not doc_id:
+        return {}
+    try:
+        chunks = store.get_doc_chunks(doc_id)
+    except Exception:
+        return {}
+    if not chunks:
+        return {}
+    hit = chunks[0]
+    result: dict[str, str] = {}
+    for field in ENRICHMENT_FIELDS:
+        value = getattr(hit, field, None)
+        if value is None and getattr(hit, "extra_metadata", None):
+            value = hit.extra_metadata.get(field)
+        result[field] = "" if value is None else str(value)
+    hash_value = getattr(hit, ENRICHMENT_INPUT_HASH_FIELD, None)
+    if hash_value is None and getattr(hit, "extra_metadata", None):
+        hash_value = hit.extra_metadata.get(ENRICHMENT_INPUT_HASH_FIELD)
+    if hash_value:
+        result[ENRICHMENT_INPUT_HASH_FIELD] = str(hash_value)
+    return result
+
+
+def _strip_enrichment_internal_keys(enrichment: dict[str, str]) -> dict[str, str]:
+    """Drop counter/diagnostic keys that must not be written into chunk metadata."""
+    return {
+        key: value
+        for key, value in enrichment.items()
+        if not key.startswith("_")
+    }
 
 
 def _queue_taxonomy_usage(enrichment: dict[str, str], accumulator: TaxonomyUsageAccumulator | None) -> None:
@@ -1156,6 +1207,16 @@ def _log_run_completion(
         logger.warning(
             "Index run has permanent actionable skips: %s", actionable_skips
         )
+    enrichment_counters = _RUNTIME.get("_enrichment_counters") or {}
+    if enrichment_counters:
+        logger.info(
+            "Enrichment facet counters: llm_call=%d cache_hit=%d "
+            "doc_type_unknown_labels=%d doc_type_disagreement=%d",
+            int(enrichment_counters.get("llm_call", 0)),
+            int(enrichment_counters.get("cache_hit", 0)),
+            int(enrichment_counters.get("unknown_label", 0)),
+            int(enrichment_counters.get("disagreement", 0)),
+        )
 
 
 # How often the source scan re-stamps the heartbeat, in records. The scan is a
@@ -1963,10 +2024,14 @@ def _build_duplicate_document_indexed_event(
         "status": first_chunk.status or "active",
         "canonical_doc_id": canonical_doc_id,
     }
-    for field in (*ENRICHMENT_FIELDS, "enr_importance_source"):
+    for field in (*ENRICHMENT_FIELDS, "enr_importance_source", ENRICHMENT_INPUT_HASH_FIELD):
         value = getattr(first_chunk, field, "")
         if value:
             metadata[field] = value
+        elif getattr(first_chunk, "extra_metadata", None):
+            extra_value = first_chunk.extra_metadata.get(field)
+            if extra_value:
+                metadata[field] = extra_value
 
     chunks = [
         {
@@ -2627,20 +2692,53 @@ def _process_doc_task(
         enrichment_cfg = _RUNTIME.get("config", {}).get("enrichment", {})
         with _measure_index_memory("enrichment", doc_id):
             if llm_generator:
-                enrichment = enrich_document(
+                max_input_chars = enrichment_cfg.get("max_input_chars", 4000)
+                existing_enrichment = _existing_enrichment_from_store(store, doc_id)
+                input_hash = enrichment_input_hash(
                     text=full_text,
                     title=title,
                     source_type=source_type,
-                    generator=llm_generator,
-                    max_input_chars=enrichment_cfg.get("max_input_chars", 4000),
-                    max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
-                    taxonomy_store=taxonomy_store,
                     context_text=context_text,
-                    record_taxonomy_usage=False,
-                    postprocess_enrichment=bool(enrichment_cfg.get("postprocess_enrichment", False)),
-                    postprocess_rules=enrichment_cfg.get("postprocess_rules"),
+                    max_input_chars=max_input_chars,
                 )
-                enrichment_failed = bool(enrichment.get("_enrichment_failed"))
+                prior_hash = (existing_enrichment.get(ENRICHMENT_INPUT_HASH_FIELD) or "").strip()
+                prior_doc_type = (existing_enrichment.get("enr_doc_type") or "").strip()
+                if prior_hash and prior_hash == input_hash and prior_doc_type:
+                    enrichment = {
+                        field: existing_enrichment.get(field, "")
+                        for field in ENRICHMENT_FIELDS
+                    }
+                    enrichment[ENRICHMENT_INPUT_HASH_FIELD] = input_hash
+                    _note_enrichment_counter("cache_hit")
+                    logger.info(
+                        "Reused enrichment for '%s': input unchanged (doc_type=%s)",
+                        doc_id,
+                        prior_doc_type,
+                    )
+                    enrichment_failed = False
+                else:
+                    enrichment = enrich_document(
+                        text=full_text,
+                        title=title,
+                        source_type=source_type,
+                        generator=llm_generator,
+                        max_input_chars=max_input_chars,
+                        max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
+                        taxonomy_store=taxonomy_store,
+                        context_text=context_text,
+                        record_taxonomy_usage=False,
+                        postprocess_enrichment=bool(
+                            enrichment_cfg.get("postprocess_enrichment", False)
+                        ),
+                        postprocess_rules=enrichment_cfg.get("postprocess_rules"),
+                        existing_doc_type=prior_doc_type,
+                    )
+                    enrichment_failed = bool(enrichment.get("_enrichment_failed"))
+                    unknown = int(enrichment.pop("_doc_type_unknown", "0") or "0")
+                    disagreement = int(enrichment.pop("_doc_type_disagreement", "0") or "0")
+                    _note_enrichment_counter("unknown_label", unknown)
+                    _note_enrichment_counter("disagreement", disagreement)
+                    _note_enrichment_counter("llm_call")
                 if enrichment_failed:
                     reason = enrichment.pop("_enrichment_failed")
                     logger.warning("Enrichment failed for '%s': %s", doc_id, reason)
@@ -2651,13 +2749,13 @@ def _process_doc_task(
                         "enrichment_failed",
                         transient=bool(enrichment.get("_enrichment_transient")),
                     )
-                elif not enrichment.get("enr_summary"):
+                elif not enrichment.get("enr_summary") and prior_hash != input_hash:
                     logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
                 if not enrichment_failed:
                     _queue_taxonomy_usage(enrichment, _RUNTIME.get("taxonomy_usage"))
                 enrichment.pop("_enrichment_failed", None)
                 enrichment.pop("_enrichment_transient", None)
-                doc_meta.update(enrichment)
+                doc_meta.update(_strip_enrichment_internal_keys(enrichment))
             else:
                 doc_meta.update(empty_enrichment())
 
@@ -3567,6 +3665,7 @@ def index_vault_flow(
         from core.taxonomy import load_taxonomy_store, sync_folder_taxonomy_from_sources
         taxonomy_store = load_taxonomy_store(config)
         sync_stats = sync_folder_taxonomy_from_sources(taxonomy_store, all_sources)
+        doc_type_stats = sync_doc_type_taxonomy(taxonomy_store)
         tax_count = taxonomy_store.count()
         if tax_count > 0:
             logger.info("Taxonomy store loaded (%d entries)", tax_count)
@@ -3577,6 +3676,13 @@ def index_vault_flow(
                     sync_stats.get("existing", 0),
                     sync_stats.get("discovered", 0),
                     sync_stats.get("sources", 0),
+                )
+            if doc_type_stats.get("added", 0) or doc_type_stats.get("existing", 0):
+                logger.info(
+                    "Taxonomy doc_type sync added=%d existing=%d discovered=%d",
+                    doc_type_stats.get("added", 0),
+                    doc_type_stats.get("existing", 0),
+                    doc_type_stats.get("discovered", 0),
                 )
         else:
             taxonomy_store = None
