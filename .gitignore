@@ -10,6 +10,10 @@ config_test.yaml
 # Claude Code
 .claude/
 
+# Superpowers SDD session scratch (generated reports, not source).
+# docs/superpowers/ is intentional source and must stay tracked.
+.superpowers/
+
 # Logs
 logs/
 .evals/
