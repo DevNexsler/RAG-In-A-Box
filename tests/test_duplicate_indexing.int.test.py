@@ -227,6 +227,31 @@ def test_concurrent_canonical_metadata_updates_are_single_flight(tmp_path):
     }
 
 
+def test_compact_duplicate_chunk_rows_keeps_newest_physical_row(tmp_path):
+    """Duplicate chunk ids from a raced insert must collapse to one newest row."""
+    store = LanceDBStore(tmp_path, "test_chunks")
+    doc_id = "documents::002V2"
+    vector = [0.1] * 768
+    store.upsert_nodes([_make_node(doc_id, "img:c:0", "request lane", vector)])
+    store._vs.add([_make_node(doc_id, "img:c:0", "sweep lane", vector)])
+
+    census = store.duplicate_chunk_id_census()
+    assert census[f"{doc_id}::img:c:0"] == 2
+
+    result = store.compact_duplicate_chunk_rows()
+    assert result["duplicate_chunk_ids"] == 0
+    assert doc_id in result["compacted_doc_ids"]
+
+    rows = (
+        store._vs.table.search(None)
+        .where(f"doc_id = '{doc_id}'", prefilter=True)
+        .select(["id", "text"])
+        .to_list()
+    )
+    assert len(rows) == 1
+    assert rows[0]["text"] == "sweep lane"
+
+
 def test_upsert_nodes_strips_llama_managed_metadata_keys(tmp_path):
     """Defense in depth: a node whose metadata carries LlamaIndex-managed keys
     from a read-back row (stale _node_content etc.) must not persist them into
