@@ -3277,6 +3277,82 @@ def test_read_survives_a_second_table_swap_landing_inside_its_own_recovery():
         assert len(reader.get_doc_chunks("a.md")) == 3
 
 
+def test_read_survives_a_burst_of_schema_swaps_during_recovery():
+    """A fresh staging index widens once per new metadata sub-field in bursts
+    (six on the corpus sweep, one on dedupe — #1656). A read that starts
+    mid-burst can still be reopening when the next swap lands; the old budget
+    of four recoveries escaped on a seven-swap fresh stack (#2626)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [0.0] * 768
+        writer = LanceDBStore(tmpdir, "test_chunks")
+
+        def widen(**new_fields):
+            writer.upsert_nodes([
+                _make_node_with_meta("a.md", f"c:{i}", f"cobalt vestibule {i}", vec,
+                                     source_type="md", **new_fields)
+                for i in range(3)
+            ])
+
+        widen()
+        reader = LanceDBStore(tmpdir, "test_chunks")
+        assert len(reader.get_doc_chunks("a.md")) == 3
+
+        pending = [
+            {"dup_locations": "c:0"},
+            {"dup_count": "2"},
+            {"dup_sources": "quo"},
+            {"dup_archive_paths": "archives/a"},
+            {"dup_natural_keys": "key-a"},
+        ]
+
+        reopen = reader._reopen_vector_store
+
+        def reopen_then_writer_swaps_again():
+            reopen()
+            if pending:
+                widen(**pending.pop(0))
+
+        reader._reopen_vector_store = reopen_then_writer_swaps_again
+        widen(dimensions="768")
+
+        assert len(reader.get_doc_chunks("a.md")) == 3
+
+
+def test_read_recovery_budget_of_four_is_insufficient_for_five_mid_recovery_swaps(
+    monkeypatch,
+):
+    """RED companion: proves the old four-attempt ceiling was the defect."""
+    monkeypatch.setattr(lancedb_store_module, "_STALE_READ_RECOVERY_ATTEMPTS", 4)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [0.0] * 768
+        writer = LanceDBStore(tmpdir, "test_chunks")
+
+        def widen(**new_fields):
+            writer.upsert_nodes([
+                _make_node_with_meta("a.md", f"c:{i}", f"cobalt vestibule {i}", vec,
+                                     source_type="md", **new_fields)
+                for i in range(3)
+            ])
+
+        widen()
+        reader = LanceDBStore(tmpdir, "test_chunks")
+        assert len(reader.get_doc_chunks("a.md")) == 3
+
+        pending = [{"f1": "1"}, {"f2": "2"}, {"f3": "3"}, {"f4": "4"}, {"f5": "5"}]
+        reopen = reader._reopen_vector_store
+
+        def reopen_then_writer_swaps_again():
+            reopen()
+            if pending:
+                widen(**pending.pop(0))
+
+        reader._reopen_vector_store = reopen_then_writer_swaps_again
+        widen(seed="0")
+
+        with pytest.raises(RuntimeError):
+            reader.get_doc_chunks("a.md")
+
+
 def test_read_failure_over_an_unmoved_table_reaches_the_caller():
     """Recovery is for handles the writer moved out from under. A failure over a
     table that has not moved is a real retrieval failure: retrying it would only
