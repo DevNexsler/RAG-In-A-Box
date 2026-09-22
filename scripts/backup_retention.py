@@ -78,10 +78,9 @@ def rotate(directory: Path, latest: Path) -> None:
             raise ValueError("retention directories must not be symlinks")
         folder.mkdir(exist_ok=True)
     periods = [(monthly, lambda p: stamp(p).strftime("%Y-%m"), 3)]
-    if date.weekday() == 6:
-        week = lambda p: stamp(p).isocalendar()[:2]
-        if not any(week(p) == week(latest) for p in archives(weekly)):
-            link_copy(latest, weekly / latest.name)
+    week = lambda p: stamp(p).isocalendar()[:2]
+    if not any(week(p) == week(latest) for p in archives(weekly)):
+        link_copy(latest, weekly / latest.name)
     month = date.strftime("%Y-%m")
     if not any(stamp(p).strftime("%Y-%m") == month for p in archives(monthly)):
         link_copy(latest, monthly / latest.name)
