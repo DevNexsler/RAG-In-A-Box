@@ -1854,6 +1854,10 @@ class LanceDBStore:
             if not self._exclusive_writer_depth:
                 self._checkout_latest()
             self._write_nodes_unlocked(nodes, operation="upsert")
+            # A mid-sweep queue service upserts into the same exclusive-writer
+            # session that later tries insert_nodes(known_absent=True) for the
+            # same doc_id. Mark the write so the insert path stays idempotent.
+            self._completed_insert_doc_ids.update(doc_ids)
 
     def replace_chunk_text_and_vector(
         self,
@@ -1929,13 +1933,16 @@ class LanceDBStore:
 
     def insert_nodes(
         self, nodes: list[TextNode], *, known_absent: bool = False
-    ) -> None:
+    ) -> bool:
         """Insert documents once, avoiding delete-only transactions.
 
         Full sweeps pass ``known_absent=True`` while holding the table-level
         writer session; their authoritative pre-run snapshot therefore needs
         no per-document Lance refresh. Standalone callers retain a fresh
         existence probe under the document lock.
+
+        Returns True when new rows were committed, False when every document
+        in the batch was already present.
         """
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
         with self._serialize_document_writes(doc_ids):
@@ -1960,7 +1967,7 @@ class LanceDBStore:
                     "Skipped insert for documents already present: %s",
                     sorted(existing_doc_ids),
                 )
-                return
+                return False
             inserted_doc_ids = {
                 node.ref_doc_id for node in nodes_to_insert if node.ref_doc_id
             }
@@ -1982,9 +1989,10 @@ class LanceDBStore:
                         "Insert raised after commit for doc_ids=%s; treating as complete",
                         sorted(committed),
                     )
-                    return
+                    return True
                 raise
             self._completed_insert_doc_ids.update(inserted_doc_ids)
+            return True
 
     def _write_nodes_unlocked(
         self, nodes: list[TextNode], *, operation: str

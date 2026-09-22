@@ -331,6 +331,30 @@ def test_insert_nodes_is_idempotent_across_store_handles():
         assert dataset.version == before_retry
 
 
+def test_known_absent_insert_skips_after_same_session_upsert():
+    """Mid-sweep queue service upserts, then the sweep insert path must no-op."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        with store.exclusive_writer_session():
+            store.upsert_nodes([
+                _make_node("race.md", "c:0", "targeted write", [0.2] * 768)
+            ])
+            before_retry = lance.dataset(_lance_path(tmpdir)).version
+            wrote = store.insert_nodes(
+                [_make_node("race.md", "c:0", "stale sweep write", [0.3] * 768)],
+                known_absent=True,
+            )
+
+        dataset = lance.dataset(_lance_path(tmpdir))
+        assert wrote is False
+        assert dataset.count_rows("doc_id = 'race.md'") == 1
+        assert dataset.version == before_retry
+        row = dataset.to_table(filter="doc_id = 'race.md'").to_pylist()[0]
+        assert row["text"] == "targeted write"
+
+
 def test_concurrent_insert_and_upsert_do_not_leave_duplicate_rows():
     """Two real handles serialize the stale-snapshot insert/upsert race."""
     import lance
