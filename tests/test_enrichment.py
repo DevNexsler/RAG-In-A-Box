@@ -273,6 +273,20 @@ DELIVERY_CONTEXT_FACTS = [
     "Unit price $42.50 was charged to the card ending in 4242.",
 ]
 
+LOWES_DELIVERY_EMAIL = (
+    "Your Item(s) Were Delivered\nDelivered Tuesday, Mar 3, 2026\n"
+    "Address: 100 Example Lane, Anytown, PA 18000\n"
+    "Delivered Items: Tile Adhesive QTY1\n"
+    "Order # 300000000000000001"
+)
+LOWES_DELIVERY_CONTEXT = (
+    "BEFORE MESSAGES\n"
+    "[BEFORE 2026-03-03T09:12:00+00:00 message_id=1001 "
+    "source_message_id=<prepared@example.test>] "
+    "Your order 300000000000000001 is being prepared. "
+    "Military discount applied. Card ending in 5531."
+)
+
 
 class TestContextOnlyFactsLeavePrimaryFields:
     """Facts only a nearby message supports are stored as context facts (#2562)."""
@@ -320,8 +334,9 @@ class TestContextOnlyFactsLeavePrimaryFields:
         # carried by the moved facts, so they are not repeated.
         assert result["enr_keywords"] == (
             "Order #300000000000000001, Invoice #12345, Delivered Tuesday, Mar 3, 2026, "
-            "Subtotal $42.50, Loyalty Discount"
+            "Subtotal $42.50"
         )
+        assert "Loyalty Discount" not in result["enr_keywords"]
         # The model's own provenance is kept as written.
         assert result["enr_context_confidence"] == "high"
         assert result["enr_context_source_message_ids"] == "<prepared@example.test>"
@@ -362,6 +377,38 @@ class TestContextOnlyFactsLeavePrimaryFields:
 
         assert result == parse_enrichment_response(json.dumps(response))
 
+    def test_text_only_context_keyword_moves_without_numbers(self):
+        """#2611: number-only guards left phrases like Military Discount in keywords."""
+        response = {
+            "summary": "Delivery confirmation for order 300000000000000001.",
+            "doc_type": ["delivery confirmation"],
+            "keywords": [
+                "Order #300000000000000001",
+                "Delivered Tuesday, Mar 3, 2026",
+                "Military Discount",
+            ],
+            "key_facts": [
+                "Delivered Tuesday, Mar 3, 2026 to 100 Example Lane, Anytown, PA 18000.",
+                "Military discount applied; card ending in 5531.",
+            ],
+            "context_key_facts": [
+                "Earlier message shows military discount and card ending in 5531.",
+            ],
+            "context_confidence": "high",
+            "context_relationship": "Earlier message about the same order.",
+            "context_source_message_ids": ["<prepared@example.test>"],
+        }
+
+        result = self._enrich(response, LOWES_DELIVERY_EMAIL, LOWES_DELIVERY_CONTEXT)
+
+        assert json.loads(result["enr_key_facts"]) == [
+            "Delivered Tuesday, Mar 3, 2026 to 100 Example Lane, Anytown, PA 18000.",
+        ]
+        assert "Military Discount" not in result["enr_keywords"]
+        context_facts = json.loads(result["enr_context_key_facts"])
+        assert "Military discount applied; card ending in 5531." in context_facts
+        assert any("military discount" in fact.lower() for fact in context_facts)
+
     def test_context_only_keyword_is_kept_as_context_fact_with_provenance(self):
         context_text = (
             "BEFORE MESSAGES\n"
@@ -386,6 +433,78 @@ class TestContextOnlyFactsLeavePrimaryFields:
         assert result["enr_context_source_message_ids"] == "<confirm@example.test>"
         assert result["enr_context_confidence"] == "medium"
         assert "omitted structured context fields" in result["enr_context_warning"]
+
+
+def test_context_provenance_eval_sample_fixtures():
+    """Sanitized production-shaped comm fixtures: fewer context facts in primary fields."""
+    fixtures = [
+        (
+            DELIVERY_EMAIL,
+            DELIVERY_CONTEXT,
+            {
+                "summary": "Delivery confirmation.",
+                "doc_type": ["delivery confirmation"],
+                "keywords": ["Order #300000000000000001", "Card ending 4242"],
+                "key_facts": [
+                    DELIVERY_PRIMARY_FACTS[0],
+                    DELIVERY_CONTEXT_FACTS[1],
+                ],
+            },
+            1,
+        ),
+        (
+            LOWES_DELIVERY_EMAIL,
+            LOWES_DELIVERY_CONTEXT,
+            {
+                "summary": "Delivery confirmation.",
+                "doc_type": ["delivery confirmation"],
+                "keywords": ["Order #300000000000000001", "Military Discount"],
+                "key_facts": [
+                    "Delivered Tuesday, Mar 3, 2026 to 100 Example Lane, Anytown, PA 18000.",
+                    "Military discount applied; card ending in 5531.",
+                ],
+            },
+            1,
+        ),
+        (
+            "Your order is ready for pickup.",
+            (
+                "BEFORE MESSAGES\n"
+                "[BEFORE source_message_id=<confirm@example.test>] "
+                "Order total $88.14."
+            ),
+            {
+                "summary": "Pickup notice.",
+                "doc_type": ["pickup notification"],
+                "keywords": ["ready for pickup", "order total $88.14"],
+                "key_facts": ["The order is ready for pickup."],
+            },
+            1,
+        ),
+    ]
+
+    context_leaks_removed = 0
+    primary_facts_preserved = 0
+
+    for text, context_text, response, expected_primary in fixtures:
+        gen = MagicMock()
+        gen.generate.return_value = json.dumps(response)
+        result = enrich_document(text, "fixture", "pg_message", gen, context_text=context_text)
+
+        primary_facts = json.loads(result["enr_key_facts"] or "[]")
+        assert len(primary_facts) == expected_primary
+        primary_facts_preserved += expected_primary
+
+        for keyword in response.get("keywords", []):
+            if keyword.lower() not in text.lower() and keyword.lower() in context_text.lower():
+                assert keyword not in (result["enr_keywords"] or "")
+                context_leaks_removed += 1
+
+        for fact in response.get("key_facts", [])[expected_primary:]:
+            assert fact not in primary_facts
+
+    assert context_leaks_removed >= 2
+    assert primary_facts_preserved == 3
 
 
 class TestEnrichDocument:

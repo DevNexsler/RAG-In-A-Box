@@ -278,6 +278,8 @@ _MIN_EVIDENCE_DIGITS = 3
 _AMOUNT_RE = re.compile(r"\$\s?(" + _NUMBER_RE.pattern + ")")
 _MAX_SUMMED_AMOUNTS = 3
 _MAX_AMOUNTS_TO_SUM = 20
+# Text-only phrases need enough characters to avoid moving common short tokens.
+_MIN_TEXT_EVIDENCE_LEN = 8
 
 
 def _schema_property_for(raw_key: str) -> dict[str, Any]:
@@ -602,35 +604,50 @@ def _move_context_only_facts(
 ) -> list[str]:
     """Move key facts and keywords only the nearby context supports, in place.
 
-    A value is context-only when it names a number that the context contains
-    and the primary item does not. Moved key facts are appended to
-    context_key_facts; a moved keyword is appended too unless a context fact
-    already carries its numbers. A field with nothing to move keeps its stored
-    text. Returns the numbers that justified each move, for provenance.
+    A value is context-only when it names a number or distinctive phrase that
+    the context contains and the primary item does not. Moved key facts are
+    appended to context_key_facts; a moved keyword is appended too unless a
+    context fact already carries its evidence. Returns the evidence that
+    justified each move, for provenance.
     """
     primary_numbers = _number_haystack(primary_text)
     primary_totals = _amount_totals(primary_text)
     context_numbers = _number_haystack(context_text)
+    primary_text_haystack = _text_haystack(primary_text)
+    context_text_haystack = _text_haystack(context_text)
 
     def context_only(value: str) -> list[str]:
         amounts = set(_amounts(value))
-        return [
+        numbers = [
             number
             for number in _evidence_numbers(value)
             if number not in primary_numbers
             and number in context_numbers
             and not (number in amounts and number in primary_totals)
         ]
+        if numbers:
+            return numbers
+        if _numbers(_DATE_TIME_RE.sub(" ", value)):
+            return []
+
+        normalized = _normalize_text_evidence(value)
+        if (
+            len(normalized) >= _MIN_TEXT_EVIDENCE_LEN
+            and normalized in context_text_haystack
+            and normalized not in primary_text_haystack
+        ):
+            return [normalized]
+        return []
 
     evidence: list[str] = []
     moved_facts: list[str] = []
     facts = _fact_list(enrichment.get("enr_key_facts", "")) or []
     kept_facts = []
     for fact in facts:
-        numbers = context_only(fact)
-        if numbers:
+        fact_evidence = context_only(fact)
+        if fact_evidence:
             moved_facts.append(fact)
-            evidence.extend(numbers)
+            evidence.extend(fact_evidence)
         else:
             kept_facts.append(fact)
 
@@ -639,10 +656,10 @@ def _move_context_only_facts(
     moved_keywords: list[tuple[str, list[str]]] = []
     kept_keywords = []
     for keyword in (enrichment.get("enr_keywords") or "").split(", "):
-        numbers = context_only(keyword)
-        if numbers:
-            moved_keywords.append((keyword, numbers))
-            evidence.extend(numbers)
+        keyword_evidence = context_only(keyword)
+        if keyword_evidence:
+            moved_keywords.append((keyword, keyword_evidence))
+            evidence.extend(keyword_evidence)
         else:
             kept_keywords.append(keyword)
 
@@ -654,10 +671,15 @@ def _move_context_only_facts(
     if context_facts is None:
         context_facts = [existing] if existing else []
     context_facts.extend(fact for fact in moved_facts if fact not in context_facts)
-    for keyword, numbers in moved_keywords:
-        carried = _number_haystack(" ".join(context_facts))
-        if not all(number in carried for number in numbers):
-            context_facts.append(keyword)
+    carried_text = _text_haystack(" ".join(context_facts))
+    carried_numbers = _number_haystack(" ".join(context_facts))
+    for keyword, keyword_evidence in moved_keywords:
+        if all(
+            evidence_item in carried_numbers or evidence_item in carried_text
+            for evidence_item in keyword_evidence
+        ):
+            continue
+        context_facts.append(keyword)
 
     if moved_facts:
         enrichment["enr_key_facts"] = json.dumps(kept_facts)
@@ -666,7 +688,7 @@ def _move_context_only_facts(
     enrichment["enr_context_key_facts"] = json.dumps(context_facts)
     logger.info(
         "Moved %d key fact(s) and %d keyword(s) that only nearby context supports "
-        "to context_key_facts (numbers: %s)",
+        "to context_key_facts (evidence: %s)",
         len(moved_facts),
         len(moved_keywords),
         ", ".join(dict.fromkeys(evidence)),
@@ -728,6 +750,16 @@ def _evidence_numbers(value: str) -> list[str]:
         for number in _numbers(_DATE_TIME_RE.sub(" ", value))
         if sum(char.isdigit() for char in number) >= _MIN_EVIDENCE_DIGITS
     ]
+
+
+def _normalize_text_evidence(value: str) -> str:
+    """Lowercase phrase with collapsed whitespace for substring matching."""
+    return re.sub(r"\s+", " ", (value or "").lower()).strip()
+
+
+def _text_haystack(text: str) -> str:
+    """Searchable lowercase text with dates/times stripped."""
+    return _normalize_text_evidence(_DATE_TIME_RE.sub(" ", text or ""))
 
 
 def _has_context_fields(enrichment: dict[str, str]) -> bool:
