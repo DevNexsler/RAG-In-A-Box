@@ -76,8 +76,8 @@ def test_successful_upsert_keeps_failed_callback_for_later_retry(tmp_path, monke
         event_hooks={"enabled": True, "hooks": [{"name": "cds", "events": ["document.indexed"]}]},
     )
     monkeypatch.setattr(
-        "flow_index_vault.drain_due",
-        lambda outbox, **kwargs: {"accepted": 0, "retry_pending": 1, "redrive_required": 0},
+        "flow_index_vault.send_enqueued",
+        lambda outbox, deliveries, **kwargs: {"accepted": 0, "retry_pending": 1, "redrive_required": 0},
         raising=False,
     )
 
@@ -93,8 +93,8 @@ def test_process_doc_task_records_safe_hook_outcomes_without_failing_index(tmp_p
     logger = MagicMock()
     _setup_runtime(store, index_root=tmp_path)
     monkeypatch.setattr(
-        "flow_index_vault.drain_due",
-        lambda outbox, **kwargs: {"accepted": 0, "retry_pending": 1, "redrive_required": 0},
+        "flow_index_vault.send_enqueued",
+        lambda outbox, deliveries, **kwargs: {"accepted": 0, "retry_pending": 1, "redrive_required": 0},
         raising=False,
     )
 
