@@ -106,6 +106,18 @@ def test_platform_id_miss_does_not_bind_other_contact_identifiers(monkeypatch):
     assert [call["attribute_key"] for call in calls] == ["platform_id"]
 
 
+def test_shared_platform_id_never_resolves_a_person(monkeypatch):
+    def fake_call(name, args, *, token):
+        return {"entities": [{"uuid": "a"}, {"uuid": "b"}],
+                "resolved": False, "ambiguous": True}
+    monkeypatch.setattr(fc, "_call_tool", fake_call)
+
+    out = fc.factbook_source({"platform_id": "zoho_cliq:user:shared",
+                              "name": "Rafael Boundurant"})
+    assert out["status"] == "ambiguous"
+    assert out["entities"] == []
+
+
 def test_miss_falls_back_to_name(monkeypatch):
     monkeypatch.setattr(fc, "_transport", lambda: transport(
         {"find_entity_by_attribute": MISS,
