@@ -60,6 +60,52 @@ def test_hit_by_email(monkeypatch):
     assert out["status"] == "ok" and out["flags"]["resolved"] is True
 
 
+def test_platform_id_lookup_precedes_name_and_requires_exact_person(monkeypatch):
+    calls = []
+    def fake_call(name, args, *, token):
+        calls.append((name, args))
+        return {"entities": [{"uuid": "ra", "name": "Rafael Boundurant"}],
+                "resolved": True, "ambiguous": False}
+    monkeypatch.setattr(fc, "_call_tool", fake_call)
+
+    out = fc.factbook_source({"platform_id": "zoho_cliq:user:928702883",
+                              "name": "Rafael Boundurant"})
+    assert out["entities"][0]["uuid"] == "ra"
+    assert calls == [("find_entity_by_attribute", {
+        "attribute_key": "platform_id",
+        "attribute_value": "zoho_cliq:user:928702883",
+        "entity_type": "Person",
+        "num_results": 2,
+    })]
+
+
+def test_platform_id_miss_cannot_resolve_by_fuzzy_name(monkeypatch):
+    calls = []
+    def fake_call(name, args, *, token):
+        calls.append(name)
+        return MISS
+    monkeypatch.setattr(fc, "_call_tool", fake_call)
+
+    out = fc.factbook_source({"platform_id": "zoho_cliq:user:928702883",
+                              "name": "Rafael Boundurant"})
+    assert out["status"] == "no_match"
+    assert calls == ["find_entity_by_attribute"]
+
+
+def test_platform_id_miss_does_not_bind_other_contact_identifiers(monkeypatch):
+    calls = []
+    def fake_call(name, args, *, token):
+        calls.append(args)
+        return MISS if args["attribute_key"] == "platform_id" else HIT
+    monkeypatch.setattr(fc, "_call_tool", fake_call)
+
+    out = fc.factbook_source({"platform_id": "zoho_cliq:user:928702883",
+                              "email": "someone@example.com", "name": "Rafael"})
+    assert out["status"] == "no_match"
+    assert out["entities"] == []
+    assert [call["attribute_key"] for call in calls] == ["platform_id"]
+
+
 def test_miss_falls_back_to_name(monkeypatch):
     monkeypatch.setattr(fc, "_transport", lambda: transport(
         {"find_entity_by_attribute": MISS,
