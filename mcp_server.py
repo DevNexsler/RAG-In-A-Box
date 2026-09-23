@@ -17,6 +17,7 @@ from core.config import filesystem_source_roots, load_config
 from core import index_freshness
 from core.artifacts import is_communication_sidecar
 from core.logging_setup import configure_logging_from_config
+from core.resilience import CIRCUITS, EndpointCircuits
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.skip_policy import actionable_skip_docs
 from core.storage import SearchHit
@@ -1253,6 +1254,7 @@ def _recent_provider_failures(
     *,
     now: float | None = None,
     lookback_seconds: int = _PROVIDER_FAILURE_LOOKBACK_SECONDS,
+    circuits: EndpointCircuits | None = None,
 ) -> dict:
     now = time.time() if now is None else now
     cutoff = now - lookback_seconds
@@ -1317,6 +1319,24 @@ def _recent_provider_failures(
                 last_seen_by_key[key] = event_ts
                 existing["last_seen_at"] = _utc_iso(event_ts)
                 existing["sample"] = line[:500]
+
+    # The logs cover the indexer subprocess; failures in THIS process — the
+    # query path (reranker, query embeddings) and single-doc indexing — log to
+    # container stdout, which no scan above reads. Their live record is the
+    # endpoint circuit: tripped and not yet recovered by a successful call (#2906).
+    for endpoint, trip in (circuits or CIRCUITS).tripped().items():
+        tripped_at = trip["tripped_at"]
+        if tripped_at is not None:
+            last_seen_at = max(last_seen_at or tripped_at, tripped_at)
+        by_key[f"circuit_open:{endpoint}"] = {
+            "provider": endpoint,
+            "operation": "circuit_open",
+            "severity": _provider_failure_severity("circuit_open", trip["http_status"]),
+            "count": trip["failures"],
+            "http_status": trip["http_status"],
+            "last_seen_at": _utc_iso(tripped_at) if tripped_at is not None else None,
+            "sample": trip["error"][:500],
+        }
 
     overall_status = "ok"
     recovered_count = 0
