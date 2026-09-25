@@ -1,17 +1,23 @@
-"""Bound embedding inputs to the embed model's context window.
+"""Bound embedding inputs to what the embed route will accept.
 
-An embeddings request is all-or-nothing: a single input longer than the model's
-context makes the provider reject the WHOLE batch with a 400, and because the
-input never gets shorter, that failure is deterministic — the doc fails the
-embed step on every run, forever, and is never written to the index (#0569).
-Retry cannot help and quarantine only stops the bleeding; the fix is to never
-send an input the model cannot accept.
+An embeddings request is all-or-nothing: a single unacceptable input makes the
+provider reject the WHOLE batch, and because the input never changes, that
+failure is deterministic — the doc fails the embed step on every run, forever,
+and is never written to the index. Retry cannot help and quarantine only stops
+the bleeding; the fix is to never send an input the route cannot accept.
+
+An input is unacceptable at either end. Too long is #0569: past the model's
+context window the route rejects the batch. Too short is #1687: an input with
+no text is rejected just as hard and just as permanently — OpenRouter's gateway
+refuses an empty string outright, and the upstreams behind it refuse an input
+that normalizes to nothing. One vector per input is part of the EmbedProvider
+contract, so neither end may drop a slot; both reshape it in place.
 
 Chunked text is already bounded by the chunker, but several call sites
 legitimately embed a single un-chunked body (a conversation context block, a
 taxonomy label, a context-only alias node). The guard therefore lives at the
-provider boundary — the one place that knows which model, and so which limit,
-applies — rather than being re-derived at each call site.
+provider boundary — the one place that knows which route, and so which limits,
+apply — rather than being re-derived at each call site.
 
 The token window is not the only such limit: a hosted route may also cap the
 *characters* of one input, independently (#1655). `bound_inputs` therefore
@@ -55,6 +61,16 @@ DEFAULT_MAX_INPUT_TOKENS = 8192
 # advertised window; a model that tokenizes ~10% denser than cl100k still fits.
 TOKENIZER_HEADROOM = 0.9
 
+# Stand-in for an input carrying no text. Measured against
+# openrouter.ai/api/v1/embeddings (qwen/qwen3-embedding-8b) on 2026-08-27: "" is
+# rejected by the gateway itself (zod `too_small`, minimum 1) and whitespace-only
+# inputs are rejected by the upstream behind it ("Prompt must not be empty"), the
+# latter intermittently — `[" "]` answered 400/400/200 over three runs, depending
+# on which provider the gateway routed to. A single printable character is the
+# smallest input no layer treats as absent, and it keeps the slot addressable so
+# vectors stay aligned with inputs.
+EMPTY_INPUT_PLACEHOLDER = "."
+
 
 @lru_cache(maxsize=1)
 def _tokenizer() -> Callable[[str], list]:
@@ -84,7 +100,7 @@ def bound_inputs(
     max_input_chars: int = 0,
     label: str = "embed",
 ) -> list[str]:
-    """Return `texts` with every input truncated to fit the route's limits.
+    """Return `texts` with every input reshaped to something the route accepts.
 
     An input has to satisfy the model's token window *and*, where the route
     declares one, its per-input character cap — the two are independent bounds,
@@ -95,16 +111,21 @@ def bound_inputs(
     caps only tokens.
 
     One vector per input is part of the EmbedProvider contract, so an oversized
-    input is truncated rather than split. Nothing indexed is lost by this in
-    practice: the long un-chunked bodies are whole-document or whole-context
+    input is truncated rather than split, and an input with no text is
+    substituted rather than dropped — dropping the slot would silently misalign
+    every later vector in the batch. Nothing indexed is lost by the truncation
+    in practice: the long un-chunked bodies are whole-document or whole-context
     summaries whose text is also indexed through the normal chunked path.
+
+    `max_input_tokens <= 0` disables the context-window bound only. The route's
+    refusal of a text-free input is not a tunable, so it always applies.
     """
     token_limit = (
         max(1, int(max_input_tokens * TOKENIZER_HEADROOM)) if max_input_tokens > 0 else 0
     )
     char_limit = max(0, max_input_chars)
-    if not token_limit and not char_limit:
-        return list(texts)
+    # No early return when both bounds are off: the route's refusal of a
+    # text-free input is not a tunable, so that check still has to run (#1687).
 
     bounded: list[str] = []
     for text in texts:
@@ -118,6 +139,16 @@ def bound_inputs(
             )
         if token_limit:
             fitted = _bound_to_tokens(fitted, token_limit, max_input_tokens, label)
+        # Checked after both truncations, not before: a text whose only content
+        # sits past a limit is bounded down to whitespace, which the route
+        # refuses for the same reason it refuses "" (#1687).
+        if not fitted.strip():
+            logger.warning(
+                "%s: input carries no text — substituting %r so the route does "
+                "not reject the whole batch",
+                label, EMPTY_INPUT_PLACEHOLDER,
+            )
+            fitted = EMPTY_INPUT_PLACEHOLDER
         bounded.append(fitted)
     return bounded
 
