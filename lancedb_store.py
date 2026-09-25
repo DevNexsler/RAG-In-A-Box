@@ -52,7 +52,11 @@ _OVERCLAIMED_COLUMNS_RE = re.compile(
 # (_evolve_metadata_schema) — so a single reopen can itself be cut off by the
 # next move. Retrying while the table keeps moving is bounded by this; it is a
 # backstop, not a cadence, because the loop stops the moment the table settles.
-_STALE_READ_RECOVERY_ATTEMPTS = 4
+# Fresh staging stacks widen six metadata sub-fields on the first corpus sweep
+# and one more on the dedupe sweep (#1656); a read that starts mid-burst needs
+# headroom for every swap in the burst plus the reopen it may land inside
+# (#2626 escaped at four).
+_STALE_READ_RECOVERY_ATTEMPTS = 8
 
 _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
 _ENRICHMENT_AUX_FIELDS = ("enr_importance_source",)
@@ -1299,8 +1303,10 @@ class LanceDBStore:
             except TableNotFoundError:
                 return default_on_missing
             except Exception as exc:
+                if not self._table_moved_under_open_handle():
+                    raise
                 attempts_left -= 1
-                if attempts_left <= 0 or not self._table_moved_under_open_handle():
+                if attempts_left <= 0:
                     raise
                 logger.warning(
                     "Refreshing LanceDB store: a peer writer moved %r under an "
@@ -2909,7 +2915,8 @@ class LanceDBStore:
         """Drop expired daily tags before pruning; never touch manual tags."""
         days = _daily_restore_point_days()
         try:
-            table.checkout_latest()
+            self._checkout_latest()
+            table = self._vs.table
             tags = table.tags
             existing = set(tags.list())
 
@@ -2936,7 +2943,8 @@ class LanceDBStore:
         try:
             # Tag the true latest version, not a stale cached one — a tag on
             # an old version pins its superseded data files (#0232).
-            table.checkout_latest()
+            self._checkout_latest()
+            table = self._vs.table
             tags = table.tags
             existing = set(tags.list())
             name = _daily_tag_name(today)

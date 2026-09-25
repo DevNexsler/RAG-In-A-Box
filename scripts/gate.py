@@ -170,6 +170,36 @@ def collect_staging_traces(run_dir, env=None):
         print("WARN: could not collect staging traces", flush=True)
 
 
+def collect_staging_container_logs(run_dir, env=None):
+    """Preserve doc-organizer-staging logs before compose teardown on failure.
+
+    Pytest truncates Lance errors in MCP payloads; tearing the stack down
+    immediately afterward made intermittent staging-e2e failures impossible to
+    diagnose (#2626).
+    """
+    log_path = Path(run_dir) / "doc-organizer-staging.log"
+    cmd = [
+        "docker", "compose", "-f", str(COMPOSE_FILE),
+        "logs", "--no-color", "doc-organizer-staging",
+    ]
+    try:
+        completed = subprocess.run(
+            cmd, env=env, check=False, capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        print("WARN: could not collect staging container logs", flush=True)
+        return
+    log_path.write_text(completed.stdout or completed.stderr or "")
+    if completed.returncode != 0:
+        print(
+            f"WARN: docker compose logs exited {completed.returncode}; "
+            f"wrote partial output to {log_path}",
+            flush=True,
+        )
+    else:
+        print(f"  staging container logs: {log_path}", flush=True)
+
+
 def check_tool_coverage(run_dir, env=None):
     # Two-sided tool-coverage enforcement (Task 9). Needs the live MCP endpoint
     # for list_tools, so it must run INSIDE the compose window, after
@@ -251,6 +281,8 @@ def run_compose_tier(tier, run_dir):
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as exc:
         print(f"FAIL {tier.name}: compose up failed: {exc}", flush=True)
     finally:
+        if not ok:
+            collect_staging_container_logs(run_dir, env=env)
         try:
             subprocess.run(down, check=False, env=env)
         except FileNotFoundError:
