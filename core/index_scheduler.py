@@ -6,12 +6,14 @@ when a fresh request or sweep happened to take the write lock, so a targeted
 force-index could sit for many minutes, and thin/degraded docs never re-enriched
 until someone manually kicked a sweep.
 
-Three jobs, three very different cadences:
+Four jobs, distinct cadences:
   * queue drain  — short interval (~60s): keep targeted requests moving.
   * full sweep   — long interval (~hourly): rescan + re-enrich degraded docs.
   * compaction   — long interval (~hourly), at most one rewrite per calendar
     day: the daily Lance data compaction, which forks a full-memory worker and
     is therefore only safe between runs (#1254).
+  * maintenance  — long interval (~hourly): cheap Lance restore-point,
+    version, and orphan-index upkeep between index runs (#1688).
 
 The scheduling decision lives in the pure, clock-injected ``tick`` so interval
 behavior is testable without threads or real time. ``run_forever`` is the thin
@@ -40,20 +42,25 @@ class IndexScheduler:
         run_was_interrupted_fn: Callable[[], bool] | None = None,
         compact_interval_s: float = 0.0,
         compact_fn: Callable[[], Any] | None = None,
+        maintenance_interval_s: float = 0.0,
+        maintenance_fn: Callable[[], Any] | None = None,
         log: logging.Logger | None = None,
     ) -> None:
         self.drain_interval_s = drain_interval_s
         self.sweep_interval_s = sweep_interval_s
         self.compact_interval_s = compact_interval_s if compact_fn else 0.0
+        self.maintenance_interval_s = maintenance_interval_s if maintenance_fn else 0.0
         self._drain_fn = drain_fn
         self._sweep_fn = sweep_fn
         self._sweep_running_fn = sweep_running_fn
         self._run_was_interrupted_fn = run_was_interrupted_fn or (lambda: False)
         self._compact_fn = compact_fn
+        self._maintenance_fn = maintenance_fn
         self._log = log or logger
         self._last_drain: float | None = None
         self._last_sweep: float | None = None
         self._last_compact: float | None = None
+        self._last_maintenance: float | None = None
         self._stop = threading.Event()
 
     def _run_was_interrupted(self) -> bool:
@@ -103,6 +110,16 @@ class IndexScheduler:
                 self._log.warning("scheduled drain failed: %s", exc)
                 actions.append(("drain_error", str(exc)))
 
+        # A restarted interrupted sweep is due immediately. Let cheap
+        # maintenance claim boot's idle writer window before that sweep can.
+        if self._due(self._last_maintenance, self.maintenance_interval_s, now):
+            self._last_maintenance = now
+            try:
+                actions.append(("maintenance", self._maintenance_fn()))
+            except Exception as exc:
+                self._log.warning("scheduled maintenance failed: %s", exc)
+                actions.append(("maintenance_error", str(exc)))
+
         if self._due(self._last_sweep, self.sweep_interval_s, now):
             # Advance the clock even when skipping, so a running sweep does not
             # cause a busy-retry on every tick.
@@ -138,10 +155,11 @@ class IndexScheduler:
     ) -> None:
         self.seed(clock())
         self._log.info(
-            "index scheduler started (drain=%ss, sweep=%ss, compact=%ss)",
+            "index scheduler started (drain=%ss, sweep=%ss, compact=%ss, maintenance=%ss)",
             self.drain_interval_s,
             self.sweep_interval_s,
             self.compact_interval_s,
+            self.maintenance_interval_s,
         )
         while not self._stop.is_set():
             try:
