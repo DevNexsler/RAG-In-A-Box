@@ -4451,7 +4451,7 @@ def index_vault_flow(
         try:
             if needs_full_rebuild:
                 logger.info("Rebuilding FTS index...")
-                store.create_fts_index()
+                store.rebuild_fts_index()
             else:
                 try:
                     store.ensure_fts_index()
@@ -4466,7 +4466,7 @@ def index_vault_flow(
                     _RUNTIME.setdefault("_warnings", []).append(
                         f"fts_incremental_update_failed: {exc}"
                     )
-                    store.create_fts_index()
+                    store.rebuild_fts_index()
         except Exception as exc:
             fts_rebuild_ok = False
             logger.error("FTS index update failed: %s", exc)
@@ -4507,7 +4507,7 @@ def index_vault_flow(
             store.set_memory_observer(memory_observer)
             _RUNTIME["store"] = store
             try:
-                store.create_fts_index()
+                store.rebuild_fts_index()
             except Exception as fts_exc:
                 logger.warning("FTS rebuild after recovery failed: %s", fts_exc)
             doc_count = len(store.list_doc_ids())
