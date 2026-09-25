@@ -2310,11 +2310,24 @@ def _ctx_comm_source(contact: dict) -> dict:
     """
     identifiers = [v for v in (contact.get("email"), contact.get("phone_e164"),
                                contact.get("name")) if v]
+    # Each lookup is an independent semantic search (2-7 s). Run them at once;
+    # one after another they made context_builder 20-34 s and it timed out
+    # under load (2026-09-25). Each worker gets a copy of the caller's context
+    # so tracing spans still parent correctly. Responses merge below in
+    # identifier order, exactly as the serial loop did.
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+
+    responses: list = []
+    if identifiers:
+        with ThreadPoolExecutor(max_workers=len(identifiers)) as pool:
+            futures = [pool.submit(copy_context().run, _comm_lookup_impl, query=identifier, limit=5)
+                       for identifier in identifiers]
+            responses = [future.result() for future in futures]
     by_id: dict = {}
     order: list = []
     degrade_detail: str | None = None
-    for identifier in identifiers:
-        resp = _comm_lookup_impl(query=identifier, limit=5)
+    for resp in responses:
         if resp.get("error"):
             if degrade_detail is None:
                 degrade_detail = resp.get("message") or resp.get("code") or "comm_lookup error"

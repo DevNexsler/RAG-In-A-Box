@@ -197,3 +197,44 @@ async def test_tool_registered_and_delegates(monkeypatch):
         "include": ["cds"],
         "history_since": None, "history_limit": 50, "history_cursor": None,
     }
+
+
+def test_comm_source_looks_up_identifiers_concurrently(monkeypatch):
+    # Each lookup is a 2-7 s semantic search; run one after another they made
+    # context_builder take 20-34 s and time out under load (2026-09-25). The
+    # barrier only opens when all three lookups are in flight at once.
+    import threading
+    barrier = threading.Barrier(3, timeout=5)
+
+    def lookup(query, limit):
+        barrier.wait()
+        return {"hits": []}
+
+    monkeypatch.setattr(srv, "_comm_lookup_impl", lookup)
+    out = srv._ctx_comm_source({"email": "a@b.com", "phone_e164": "+16105550123", "name": "Sam Lee"})
+    assert out == {"status": "no_exact_hit", "hits": []}
+
+
+def test_comm_source_concurrency_keeps_serial_merge_order_and_context(monkeypatch):
+    # Results merge in identifier order regardless of which lookup finishes
+    # first, and each lookup still sees the caller's context (tracing spans).
+    import contextvars
+    import time
+    marker = contextvars.ContextVar("marker", default=None)
+    seen = []
+    hit = {"sender": "Sam Lee", "channel": "+16105550123", "snippet": "hi", "source_id": "AC1",
+           "sent_at": "2026-09-01T00:00:00Z"}
+
+    def lookup(query, limit):
+        seen.append(marker.get())
+        time.sleep({"a@b.com": 0.2, "+16105550123": 0.1}.get(query, 0))
+        return {"hits": [dict(hit, snippet=query)]}
+
+    monkeypatch.setattr(srv, "_comm_lookup_impl", lookup)
+    monkeypatch.setattr(srv.ctxb, "exact_hit", lambda h, c: True)
+    marker.set("caller")
+    out = srv._ctx_comm_source({"email": "a@b.com", "phone_e164": "+16105550123", "name": "Sam Lee"})
+    assert seen == ["caller"] * 3
+    # Same source_id from every identifier: the last identifier (name) wins,
+    # exactly as the serial loop did.
+    assert out["hits"] == [dict(hit, snippet="Sam Lee")]
