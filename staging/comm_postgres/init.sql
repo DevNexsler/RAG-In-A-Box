@@ -40,7 +40,7 @@ VALUES
     ('quo',   'msg-002', 'ops',     'Bob Ramirez',  'outbound', NULL,
      'Thanks Alice — the marmalade budget line still looks off by 3 percent.',
      '2026-06-01T10:01:00Z', '2026-06-01T10:01:00Z'),
-    ('email', 'msg-003', 'billing', 'Carol Idowu',  'inbound', 'Obsidian widget invoice',
+    ('email', '<CF.0D.28275.0E62DAA6@i-052407b4cdf7ba651.mta2vrest.sd.prd.sparkpost>', 'billing', 'Carol Idowu',  'inbound', 'Obsidian widget invoice',
      'Invoice 4417 for the obsidian widgets was paid on Friday.',
      '2026-06-01T10:02:00Z', '2026-06-01T10:02:00Z'),
     ('email', 'msg-004', 'billing', 'Dan Park',     'outbound', 'Re: Obsidian widget invoice',

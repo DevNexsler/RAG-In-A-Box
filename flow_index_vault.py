@@ -2758,7 +2758,21 @@ def _process_doc_task(
 
         # --- Extract document-level metadata ---
         fm, _frontmatter_sensitive_kinds = sanitize_metadata(result.frontmatter)
-        title = fm.get("title") or extract_title(full_text, doc_id)
+        if source_type == "pg_message":
+            # Message natural keys are opaque IDs, not paths: Path.stem would
+            # truncate dotted RFC-822 IDs and embed them as document titles.
+            title = str(fm.get("subject") or "").strip()
+            if not title:
+                title = next(
+                    (value.strip() for key in ("filename", "original_filename")
+                     if isinstance(value := fm.get(key), str)
+                     and value.strip() and not value.strip().startswith("<")),
+                    "",
+                )
+            if not title:
+                title = "Message " + hashlib.sha256(doc_id.encode("utf-8")).hexdigest()[:12]
+        else:
+            title = fm.get("title") or extract_title(full_text, doc_id)
         tags = normalize_tags(fm.get("tags"))
         folder = derive_folder(rel_path)
         status = fm.get("status", "archived" if folder.lower() in ("archive", "archived") else "active")
