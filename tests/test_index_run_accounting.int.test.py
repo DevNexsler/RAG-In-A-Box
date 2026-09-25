@@ -283,3 +283,56 @@ def test_duplicate_skip_is_emitted_by_the_shared_per_document_emitter(tmp_path, 
         if any(reason.startswith("duplicate_of:") for reason in reasons)
     }
     assert len(duplicates) == 1, duplicates
+
+
+def test_terminal_failure_counts_the_same_on_both_skip_roll_ups(tmp_path, caplog):
+    """#2184: `Index stats:` and the skip ledger line must not disagree.
+
+    A terminal (non-transient) processing failure writes a real
+    `terminal_error:<ExcType>` skip ledger entry, so the run's two adjacent
+    skip roll-ups have to count that document — and name its reason — alike.
+    Before the fix the terminal lane left the progress counters untouched, so a
+    run with `k` terminal failures reported `skipped=N` next to
+    `N+k docs added to skip ledger`, with `terminal_error` in one dict only.
+    """
+    root = tmp_path / "documents"
+    root.mkdir()
+    (root / "blank.md").write_text("   \n\n")
+    (root / "broken.md").write_text("body text that never reaches the store\n")
+
+    index_root = tmp_path / "index"
+    caplog.set_level(logging.INFO)
+
+    _run_flow(root, index_root, terminal_failures=("broken",))
+
+    stats_count, stats_reasons = _skip_rollup(_STATS_SKIPPED, _stats_line(caplog))
+    ledger_count, ledger_reasons = _skip_rollup(_LEDGER_SKIPPED, _ledger_line(caplog))
+
+    assert (stats_count, stats_reasons) == (ledger_count, ledger_reasons)
+    assert ledger_reasons == {"no_text_extracted": 1, "terminal_error": 1}
+    assert stats_count == 2
+
+    # The terminal lane's own ERROR line is an external contract — log-patterns.conf
+    # and three Maint-Manager outcome checks match it verbatim.
+    assert any(
+        re.search(r"^Skipping .* after retries exhausted: ", record.getMessage())
+        for record in caplog.records
+    )
+
+
+def test_completion_line_agrees_with_the_skip_ledger_on_terminal_failures(
+    tmp_path, caplog
+):
+    """The third roll-up reads from the same counters, so it moves with them."""
+    root = tmp_path / "documents"
+    root.mkdir()
+    (root / "broken.md").write_text("body text that never reaches the store\n")
+
+    index_root = tmp_path / "index"
+    caplog.set_level(logging.INFO)
+
+    _run_flow(root, index_root, terminal_failures=("broken",))
+
+    ledger_count, _ = _skip_rollup(_LEDGER_SKIPPED, _ledger_line(caplog))
+    line = _completion_line(caplog)
+    assert f"skipped={ledger_count}" in line, line
