@@ -120,7 +120,7 @@ from doc_id_store import (
 from core.tracing import get_tracer, setup_tracing
 from memory_observer import MemoryObserver
 from core.hook_outbox import HookOutbox
-from hooks.delivery import drain_due, queue_event
+from hooks.delivery import drain_due, queue_event, send_enqueued
 from hooks.events import build_document_indexed_event
 from lancedb_store import (
     LanceDBStore,
@@ -2130,8 +2130,8 @@ def _dispatch_document_indexed_event(
     """Persist and attempt one callback without failing the index operation."""
     try:
         outbox = HookOutbox(config["index_root"])
-        queue_event(config.get("event_hooks"), event, outbox)
-        outcomes = drain_due(outbox, limit=64, logger=logger)
+        deliveries = queue_event(config.get("event_hooks"), event, outbox)
+        outcomes = send_enqueued(outbox, deliveries, logger=logger)
         pending = outcomes["retry_pending"]
         redrive = outcomes["redrive_required"]
         if pending or redrive:

@@ -20,9 +20,10 @@ from collections import Counter
 from pathlib import Path
 
 import anyio
+import httpx
 import pytest
 
-from tests.e2e.client import get_hook_events, open_mcp_session, search_hits
+from tests.e2e.client import E2E_SIM_URL, get_hook_events, open_mcp_session, search_hits
 from tests.e2e.conftest import (
     COMPOSE_FILE,
     EXPECTED_CORPUS_DOCS,
@@ -34,6 +35,8 @@ from tests.e2e.conftest import (
 
 COHORTS = 3
 COPIES_PER_COHORT = 2
+EXPECTED_DEDUPE_DOCS = COHORTS * COPIES_PER_COHORT
+EXPECTED_INDEXED_DOCS = EXPECTED_CORPUS_DOCS + EXPECTED_DEDUPE_DOCS
 
 # The two seeded `ops` fixture messages (staging/comm_postgres/init.sql) sit at
 # 10:00:00 and 10:01:00, so a delivery timestamped between them has real
@@ -101,7 +104,7 @@ async def _sweep_and_wait(session) -> dict:
         if (await session.call_tool_json("file_status", {})).get("indexer_running"):
             break
         await anyio.sleep(1)
-    return await wait_for_index(session, min_docs=EXPECTED_CORPUS_DOCS)
+    return await wait_for_index(session, min_docs=EXPECTED_INDEXED_DOCS)
 
 
 async def _doc_ids_by_stem(session, stems: list[str]) -> dict[str, str]:
@@ -128,6 +131,9 @@ async def _doc_ids_by_stem(session, stems: list[str]) -> dict[str, str]:
 async def _index_duplicate_cohorts() -> dict:
     cohorts = _deposit_cohorts(uuid.uuid4().hex[:8])
     stems = [stem for cohort in cohorts for stem in cohort["stems"]]
+    async with httpx.AsyncClient(timeout=10) as sim:
+        # Count only deliveries from this sweep — not the corpus fixture run.
+        await sim.post(f"{E2E_SIM_URL}/admin/reset")
     async with open_mcp_session("duplicate_cohorts") as session:
         await _sweep_and_wait(session)
         doc_ids = await _doc_ids_by_stem(session, stems)

@@ -7,6 +7,7 @@ index metadata and sidecar.
 """
 
 import json
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -678,8 +679,8 @@ def test_duplicate_callback_uses_alias_identity_and_canonical_payload(runtime, m
         }
     )
     monkeypatch.setattr(
-        "flow_index_vault.drain_due",
-        lambda outbox, **kwargs: {
+        "flow_index_vault.send_enqueued",
+        lambda outbox, deliveries, **kwargs: {
             "accepted": 0,
             "retry_pending": 1,
             "redrive_required": 0,
@@ -770,6 +771,78 @@ def test_duplicate_callback_delivers_one_request_per_event_id(runtime):
     assert overlapped.is_set()
     assert sorted(received) == sorted(set(received))
     assert len(received) == 2  # canonical document + duplicate alias, once each
+
+
+def test_concurrent_duplicate_callbacks_deliver_one_per_doc_id(runtime):
+    """Fails when several fast duplicate skips overlap and cross-drain hooks."""
+    docs_root, store, registry = runtime
+    index_root = str(docs_root.parent / "index")
+    received: list[str] = []
+    received_lock = Lock()
+
+    class _Sink(BaseHTTPRequestHandler):
+        def do_POST(self):
+            event = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            with received_lock:
+                received.append(event["doc_id"])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "updated"}')
+
+        def log_message(self, *args):
+            """Keep the sink out of the test log."""
+
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), _Sink)
+    Thread(target=sink.serve_forever, daemon=True).start()
+    fiv._RUNTIME["config"].update(
+        {
+            "index_root": index_root,
+            "event_hooks": {
+                "enabled": True,
+                "hooks": [
+                    {
+                        "name": "cds",
+                        "events": ["document.indexed"],
+                        "url": f"http://127.0.0.1:{sink.server_address[1]}/hook",
+                    }
+                ],
+            },
+        }
+    )
+
+    cohorts = []
+    for cohort_index in range(3):
+        body = f"Concurrent duplicate callback cohort {cohort_index}"
+        canonical = _make_doc(docs_root, f"f/canonical-{cohort_index}.md", body, f"c{cohort_index}0")
+        duplicate = _make_doc(
+            docs_root,
+            f"g/duplicate-{cohort_index}.md",
+            body,
+            f"c{cohort_index}1",
+        )
+        _register(registry, canonical)
+        _register(registry, duplicate)
+        cohorts.append((canonical, duplicate))
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for canonical, duplicate in cohorts:
+                executor.submit(fiv.process_doc_task.fn, canonical)
+                executor.submit(fiv.process_doc_task.fn, duplicate)
+            executor.shutdown(wait=True)
+    finally:
+        sink.shutdown()
+        sink.server_close()
+
+    assert received
+    repeated = {
+        doc_id: count
+        for doc_id, count in Counter(received).items()
+        if count > 1
+    }
+    assert not repeated, f"document.indexed delivered more than once: {repeated}"
+    assert len(received) == len(set(received))
 
 
 def test_duplicate_callback_payload_read_failure_does_not_fail_index(runtime, monkeypatch):
