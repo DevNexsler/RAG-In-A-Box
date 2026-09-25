@@ -68,16 +68,31 @@ def _config(root: Path, index_root: Path) -> dict:
     }
 
 
-def _run_flow(root: Path, index_root: Path) -> None:
+def _run_flow(
+    root: Path, index_root: Path, *, terminal_failures: tuple[str, ...] = ()
+) -> None:
+    """Drive the real flow. `terminal_failures` holds filename stems whose
+    processing raises a deterministic (non-transient) error — the terminal skip
+    lane. Matched as a substring because the filesystem source stamps the doc id
+    into the name it reports (`broken@00002@.md`)."""
     store = LanceDBStore(str(index_root), "chunks")
     taxonomy = MagicMock()
     taxonomy.count.return_value = 0
+    process_doc_task = fiv.process_doc_task
+
+    def _process_doc(doc: dict):
+        if any(stem in doc.get("rel_path", "") for stem in terminal_failures):
+            # The #0569 shape: a deterministic provider rejection that can never
+            # succeed on a re-run, so the doc is quarantined instead of retried.
+            raise RuntimeError('embeddings error 400: {"message":"invalid input"}')
+        return process_doc_task(doc)
     with patch("flow_index_vault.load_config", return_value=_config(root, index_root)), \
          patch("flow_index_vault.get_run_logger", return_value=logging.getLogger("test")), \
          patch("flow_index_vault.open_store_with_recovery", return_value=store), \
          patch("flow_index_vault.build_embed_provider", return_value=_StubEmbedProvider()), \
          patch("flow_index_vault.build_ocr_provider", return_value=None), \
          patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("flow_index_vault.process_doc_task", _process_doc), \
          patch("core.taxonomy.load_taxonomy_store", return_value=taxonomy):
         fiv.index_vault_flow.fn("dummy.yaml")
 
@@ -108,6 +123,27 @@ def _chunk_write_ops(caplog) -> int:
         for record in caplog.records
         if re.match(r"^(Inserted|Upserted) \d+ chunks: ", record.getMessage())
     ])
+
+
+_STATS_SKIPPED = re.compile(r"skipped=(\d+)(?: (\{.*?\}))?, deleted=")
+_LEDGER_SKIPPED = re.compile(r"^(\d+) docs added to skip ledger \(.*?\): (\{.*\})$")
+
+
+def _skip_rollup(pattern: "re.Pattern[str]", line: str) -> tuple[int, dict]:
+    """(document count, reason breakdown) as one summary line reports them."""
+    match = pattern.search(line)
+    assert match, f"unparseable skip roll-up: {line}"
+    return int(match.group(1)), ast.literal_eval(match.group(2) or "{}")
+
+
+def _ledger_line(caplog) -> str:
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "docs added to skip ledger" in record.getMessage()
+    ]
+    assert len(lines) == 1, f"expected one skip ledger line, got {lines}"
+    return lines[0]
 
 
 def test_all_skip_run_reports_zero_indexed_with_skip_reasons(tmp_path, caplog):
