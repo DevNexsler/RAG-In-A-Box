@@ -28,8 +28,9 @@ VALUES
     ('zoho_cliq', '720844989', 'Dan Park'),
     ('zoho_cliq', '918334727', 'Nigel Pine');
 
--- 6 deterministic fixture rows: fixed timestamps, distinct senders/directions,
--- distinctive searchable words in bodies plus one subject-only email.
+-- 7 deterministic fixture rows: fixed timestamps, distinct senders/directions,
+-- distinctive searchable words, one subject-only email, and one tracking-heavy
+-- HTML email that exercises normalization through consumer-visible Lance rows.
 INSERT INTO messages
     (source, source_message_id, channel_name, sender, direction, subject, body, sent_at, updated_at)
 VALUES
@@ -51,6 +52,28 @@ VALUES
     ('email', 'msg-006', 'legal',   'Joycelyn Reed', 'inbound',
      'Cobalt courthouse filing received', NULL,
      '2026-06-01T10:05:00Z', '2026-06-01T10:05:00Z');
+
+INSERT INTO messages
+    (source, source_message_id, channel_name, sender, direction, subject, body, sent_at, updated_at)
+SELECT
+    'zoho_mail', 'tracking-heavy', 'delivery', 'Delivery Robot', 'inbound',
+    'Appliance delivery confirmation',
+    '<html><head><style>.hidden{display:none}</style></head><body>'
+    || '<div hidden>' || repeat('&zwnj;&#847;', 500) || '</div>'
+    || '<h1>Your delivery is scheduled</h1>'
+    || '<p>Order STAGE-246565 includes a washer and dryer.</p>'
+    || '<p>Delivery: September 4, 8 AM-12 PM, 12 Oak Street.</p>'
+    || string_agg(
+         '<a href="https://tracker.example/redirect?upn=u001' || sequence
+         || '&amp;target=' || repeat('x', 900) || '">Track delivery</a>',
+         '' ORDER BY sequence
+       )
+    || '<img src="https://images.example/pixel.gif?recipient=123">'
+    || '<footer><a href="https://social.example/icon.png?campaign=abc">Follow us</a>'
+    || '<p>Privacy settings | Unsubscribe | Terms of use</p></footer>'
+    || '</body></html>',
+    '2026-06-01T10:06:00Z', '2026-06-01T10:06:00Z'
+FROM generate_series(1, 18) AS redirects(sequence);
 
 CREATE TABLE "Buildings" (
     id               integer PRIMARY KEY,
