@@ -21,6 +21,7 @@ import pytest
 
 import flow_index_vault as fiv
 from core import enrichment_telemetry
+from doc_enrichment import structured_response_is_usable
 from extractors import begin_degradation_capture, collect_degradations
 from lancedb_store import LanceDBStore
 from providers.llm.litellm_llm import LiteLLMGenerator
@@ -38,8 +39,31 @@ def _enrichment_payload(**overrides) -> str:
     payload = {
         "summary": "Boiler service visit scheduled for the Ashfield site.",
         "doc_type": ["report"],
+        "entities_people": [],
+        "entities_places": ["Ashfield site"],
+        "entities_orgs": [],
+        "entities_dates": [],
         "topics": ["maintenance"],
         "keywords": ["boiler", "inspection"],
+        "key_facts": ["Boiler service visit is scheduled."],
+        "suggested_tags": ["maintenance"],
+        "suggested_folder": "Properties/Maintenance",
+        "importance": 0.5,
+        "atomic_entities_people": [],
+        "atomic_entities_places": ["Ashfield site"],
+        "atomic_entities_orgs": [],
+        "atomic_entities_dates": [],
+        "atomic_topics": ["maintenance"],
+        "context_entities_people": [],
+        "context_entities_places": [],
+        "context_entities_orgs": [],
+        "context_entities_dates": [],
+        "context_topics": [],
+        "context_key_facts": [],
+        "context_relationship": "",
+        "context_confidence": "",
+        "context_source_message_ids": [],
+        "context_warning": "",
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -131,6 +155,29 @@ def _stored_metadata(store: LanceDBStore, doc_id: str) -> dict:
     return rows[0]["metadata"]
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("summary", ["not a scalar"]),
+        ("entities_people", "not an array"),
+        ("topics", [7]),
+        ("importance", True),
+        ("importance", float("inf")),
+        ("importance", 1.01),
+        ("key_facts", ["summary"]),
+        ("entities_orgs", ["suggested_folder"]),
+    ],
+)
+def test_structured_response_contract_rejects_wrong_types_ranges_and_schema_tokens(
+    field,
+    invalid_value,
+):
+    payload = json.loads(_enrichment_payload())
+    payload[field] = invalid_value
+
+    assert not structured_response_is_usable(json.dumps(payload))
+
+
 def test_malformed_first_response_then_valid_retry_stores_required_metadata(runtime):
     """The reasoning blow-up path: the first response really is truncated, the
     reasoning-disabled retry is good, and the retry's metadata is what lands."""
@@ -150,22 +197,45 @@ def test_malformed_first_response_then_valid_retry_stores_required_metadata(runt
     assert not collect_degradations()
 
 
-def test_double_failure_stores_a_degraded_row_without_required_fields(runtime):
-    """Both responses omit doc_type. The row is still written (a partial row
-    beats no row) but carries no enrichment, and the degradation is permanent —
-    the model answered in full, so re-queueing it forever would be wrong."""
+def test_incomplete_schema_token_response_retries_before_lance_and_callback(runtime):
+    """A parseable partial object is not a successful enrichment outcome."""
     docs_root, store = runtime
     doc = _write_doc(docs_root)
+    incomplete = _enrichment_payload(
+        key_facts=["importance", "suggested_tags", "suggested_folder"]
+    )
+    incomplete_payload = json.loads(incomplete)
+    for field in ("importance", "suggested_tags", "suggested_folder"):
+        incomplete_payload.pop(field)
 
-    calls = _index_with_responses(doc, [
-        _response(_enrichment_payload(doc_type=[]), completion_tokens=430),
-        _response(_enrichment_payload(doc_type=[]), completion_tokens=441),
-    ])
+    with patch("flow_index_vault._dispatch_document_indexed_event") as dispatch:
+        calls = _index_with_responses(doc, [
+            _response(json.dumps(incomplete_payload), completion_tokens=497),
+            _response(_enrichment_payload(), completion_tokens=430),
+        ])
 
     assert len(calls) == 2
     stored = _stored_metadata(store, doc["doc_id"])
-    assert stored["enr_doc_type"] == ""
-    assert stored["enr_summary"] == ""
+    assert json.loads(stored["enr_key_facts"]) == [
+        "Boiler service visit is scheduled."
+    ]
+    dispatch.assert_called_once()
+
+
+def test_double_contract_failure_stores_no_row_or_success_callback(runtime):
+    """Exhausted contract retries produce degradation, never claimed success."""
+    docs_root, store = runtime
+    doc = _write_doc(docs_root)
+
+    with patch("flow_index_vault._dispatch_document_indexed_event") as dispatch:
+        calls = _index_with_responses(doc, [
+            _response(_enrichment_payload(doc_type=[]), completion_tokens=430),
+            _response(_enrichment_payload(doc_type=[]), completion_tokens=441),
+        ])
+
+    assert len(calls) == 2
+    assert store.count_chunks() == 0
+    dispatch.assert_not_called()
     degradations = collect_degradations()
     assert [d.reason for d in degradations] == ["enrichment_failed"]
     assert not any(d.transient for d in degradations), (

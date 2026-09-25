@@ -22,6 +22,25 @@ from doc_enrichment import (
 )
 
 
+def _complete_enrichment_json(**overrides) -> str:
+    payload = {
+        "summary": "test",
+        "doc_type": ["note"],
+        "entities_people": [],
+        "entities_places": [],
+        "entities_orgs": [],
+        "entities_dates": [],
+        "topics": [],
+        "keywords": [],
+        "key_facts": [],
+        "suggested_tags": [],
+        "suggested_folder": "",
+        "importance": 0.5,
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — parsing, normalization, and error handling (no LLM needed)
 # ---------------------------------------------------------------------------
@@ -245,6 +264,13 @@ class TestEnrichDocument:
     """Test enrich_document with mocked LLM generator."""
 
     def _make_generator(self, response: str) -> MagicMock:
+        try:
+            overrides = json.loads(response)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        else:
+            if isinstance(overrides, dict):
+                response = _complete_enrichment_json(**overrides)
         gen = MagicMock()
         gen.generate.return_value = response
         return gen
@@ -415,8 +441,8 @@ class TestEnrichDocument:
                 taxonomy_store=taxonomy,
             )
 
-        assert result["_enrichment_failed"] == (
-            "structured_output_missing_required_fields: summary, doc_type"
+        assert result["_enrichment_failed"].startswith(
+            "structured_output_contract_violation:"
         )
         assert result["_enrichment_transient"] is False
         taxonomy.increment_usage.assert_not_called()
@@ -454,7 +480,9 @@ class TestEnrichDocument:
         assert len(call_args) < len(long_text)
 
     def test_markdown_fences_in_response(self):
-        response = '```json\n{"summary": "A doc", "doc_type": ["note"]}\n```'
+        response = "```json\n" + _complete_enrichment_json(
+            summary="A doc", doc_type=["note"]
+        ) + "\n```"
         gen = self._make_generator(response)
         result = enrich_document("Some text", "note.md", "md", gen)
         assert result["enr_summary"] == "A doc"
@@ -463,7 +491,9 @@ class TestEnrichDocument:
     def test_thinking_tags_in_response(self):
         response = (
             '<think>Let me analyze...</think>\n'
-            '{"summary": "Analyzed", "doc_type": ["note"], "topics": ["AI"]}'
+            + _complete_enrichment_json(
+                summary="Analyzed", doc_type=["note"], topics=["AI"]
+            )
         )
         gen = self._make_generator(response)
         result = enrich_document("Some text", "doc.md", "md", gen)
