@@ -16,6 +16,7 @@ from core.resilience import (
     EndpointCircuits,
     call_with_retry,
     is_transient,
+    raise_for_status,
 )
 
 
@@ -185,3 +186,55 @@ def test_call_with_retry_short_circuits_without_burning_backoff():
         )
     assert calls["n"] == 2  # no socket touched
     assert slept == []      # and no backoff burned on a known-down provider
+
+
+def _payment_required():
+    # DeepInfra's spend cap, verbatim from #2906: the endpoint answered, but it
+    # will give this same answer to every request until a human raises the limit.
+    request = httpx.Request("POST", "https://api.deepinfra.com/v1/inference/m")
+    raise_for_status(httpx.Response(
+        402,
+        request=request,
+        text='{"detail":{"error":"inference prohibited, you have reached user-set limit."}}',
+    ))
+
+
+def test_account_refusal_trips_on_first_failure_and_is_reported():
+    # #2906: a 402 was re-issued on every query for three days (3,286 in 72h)
+    # because only connection-level failures could open the circuit.
+    clock = _Clock()
+    circuits = _circuits(clock, threshold=3)
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        _payment_required()
+
+    with pytest.raises(httpx.HTTPStatusError):
+        with circuits.guard("https://api.deepinfra.com"):
+            fn()
+    with pytest.raises(CircuitOpenError):
+        with circuits.guard("https://api.deepinfra.com"):
+            fn()
+    assert calls["n"] == 1  # the refused endpoint was not asked again
+
+    tripped = circuits.tripped()
+    assert list(tripped) == ["https://api.deepinfra.com"]
+    assert tripped["https://api.deepinfra.com"]["http_status"] == 402
+    assert "user-set limit" in tripped["https://api.deepinfra.com"]["error"]
+
+
+def test_tripped_circuit_stays_reported_until_a_probe_succeeds():
+    # Health must not go green just because no query happened to probe after the
+    # cooldown — only a successful call proves the provider is back.
+    clock = _Clock()
+    circuits = _circuits(clock, cooldown=60.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        with circuits.guard("https://api.deepinfra.com"):
+            _payment_required()
+    clock.advance(10_000)
+    assert "https://api.deepinfra.com" in circuits.tripped()
+
+    with circuits.guard("https://api.deepinfra.com"):
+        pass
+    assert circuits.tripped() == {}

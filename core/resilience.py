@@ -148,9 +148,21 @@ def raise_for_status(response: httpx.Response) -> None:
 # warnings in one 2-minute litellm-proxy recreate). After CIRCUIT_FAILURE_THRESHOLD
 # consecutive connection-level failures to one base_url, calls to it fail fast for
 # CIRCUIT_COOLDOWN_SECONDS; one probe is admitted once the cooldown elapses.
+#
+# An account refusal (HTTP 402: spend cap / out of credits) is the same kind of
+# news from the other direction — the endpoint answered, but it will give that
+# answer to every request until a human acts. It trips on the first occurrence and
+# cools down for longer: #2906 re-issued a DeepInfra 402 on every search query for
+# three days (3,286 refusals in 72h) because only connection failures could trip.
 
 CIRCUIT_FAILURE_THRESHOLD = 3
 CIRCUIT_COOLDOWN_SECONDS = 60.0
+CIRCUIT_REFUSAL_COOLDOWN_SECONDS = 300.0
+
+# Statuses that refuse the account rather than the request. 403 is deliberately
+# absent: OpenRouter answers a moderation-flagged input with 403, which is one bad
+# document, not a dead provider.
+ACCOUNT_REFUSAL_STATUSES = frozenset({402})
 
 # Failures that mean "no one answered at this address". A 5xx or a malformed body
 # is deliberately NOT here: the endpoint answered, so that is per-request news.
@@ -174,6 +186,14 @@ def is_connection_level(exc: BaseException) -> bool:
     return isinstance(exc, _CONNECTION_LEVEL_EXC)
 
 
+def is_account_refusal(exc: BaseException) -> bool:
+    """True if `exc` means the endpoint refuses this account for every request."""
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code in ACCOUNT_REFUSAL_STATUSES
+    )
+
+
 class EndpointCircuits:
     """Circuit state for every endpoint, keyed by base_url. Thread-safe: indexing
     processes documents concurrently against the same providers."""
@@ -183,13 +203,16 @@ class EndpointCircuits:
         *,
         threshold: int = CIRCUIT_FAILURE_THRESHOLD,
         cooldown: float = CIRCUIT_COOLDOWN_SECONDS,
+        refusal_cooldown: float = CIRCUIT_REFUSAL_COOLDOWN_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._threshold = max(1, threshold)
         self._cooldown = cooldown
+        self._refusal_cooldown = refusal_cooldown
         self._clock = clock
         self._lock = threading.Lock()
-        # key -> {"failures": int, "open_until": float | None}
+        # key -> {"failures": int, "open_until": float | None, plus, once tripped,
+        #         "error": str, "http_status": int | None, "tripped_at": epoch}
         self._state: dict[str, dict] = {}
 
     def reset(self) -> None:
@@ -205,6 +228,23 @@ class EndpointCircuits:
             open_until = state and state["open_until"]
             return open_until is not None and self._clock() < open_until
 
+    def tripped(self) -> dict[str, dict]:
+        """Every endpoint whose circuit has opened and not yet seen a successful
+        call, cooldown elapsed or not — no query arriving to probe it is not
+        evidence it recovered. This is what provider health reports for the
+        failures of THIS process, which no log scan reads (#2906)."""
+        with self._lock:
+            return {
+                key: {
+                    "failures": state["failures"],
+                    "error": state.get("error", ""),
+                    "http_status": state.get("http_status"),
+                    "tripped_at": state.get("tripped_at"),
+                }
+                for key, state in self._state.items()
+                if state["open_until"] is not None
+            }
+
     def _enter(self, key: str) -> None:
         with self._lock:
             state = self._state.get(key)
@@ -214,7 +254,8 @@ class EndpointCircuits:
             if self._clock() < open_until:
                 raise CircuitOpenError(
                     f"circuit open for {key} after {state['failures']} consecutive "
-                    f"connection failures — {open_until - self._clock():.0f}s of cooldown left"
+                    f"failures ({state.get('error', '')}) — "
+                    f"{open_until - self._clock():.0f}s of cooldown left"
                 )
             # Cooldown elapsed: admit exactly one probe. Concurrent callers keep
             # failing fast until the probe reports back.
@@ -223,21 +264,33 @@ class EndpointCircuits:
     def _record(self, key: str, exc: BaseException | None) -> None:
         with self._lock:
             state = self._state.setdefault(key, {"failures": 0, "open_until": None})
-            if exc is None or not is_connection_level(exc):
+            refused = exc is not None and is_account_refusal(exc)
+            if exc is None or not (refused or is_connection_level(exc)):
                 # Answered (or succeeded) — the endpoint is reachable.
                 state["failures"] = 0
                 state["open_until"] = None
                 return
             state["failures"] += 1
-            if state["failures"] >= self._threshold and state["open_until"] is None:
-                state["open_until"] = self._clock() + self._cooldown
-                logger.warning(
-                    "%s refused %d consecutive connections — pausing calls to it for %.0fs",
-                    key, state["failures"], self._cooldown,
-                )
+            state["error"] = collapse(exc, MAX_ERROR_CHARS)
+            state["http_status"] = exc.response.status_code if refused else None
+            cooldown = self._refusal_cooldown if refused else self._cooldown
+            threshold = 1 if refused else self._threshold
+            if state["failures"] >= threshold and state["open_until"] is None:
+                state["open_until"] = self._clock() + cooldown
+                state["tripped_at"] = time.time()
+                if refused:
+                    logger.warning(
+                        "%s refused this account (%s) — pausing calls to it for %.0fs",
+                        key, state["error"], cooldown,
+                    )
+                else:
+                    logger.warning(
+                        "%s refused %d consecutive connections — pausing calls to it for %.0fs",
+                        key, state["failures"], cooldown,
+                    )
             elif state["open_until"] is not None:
                 # A failed probe re-arms the cooldown from now.
-                state["open_until"] = self._clock() + self._cooldown
+                state["open_until"] = self._clock() + cooldown
 
     @contextmanager
     def guard(self, key: str | None) -> Iterator[None]:

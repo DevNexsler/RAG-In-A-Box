@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import anyio
+import httpx
 import pytest
 
 from core.storage import SearchHit
@@ -2915,6 +2916,44 @@ def test_provider_health_probe_503s_on_degraded_status(tmp_path):
     assert status_code == 503
     assert payload["status"] == "critical"
     assert payload["provider_failures"] == failures
+
+
+def test_provider_health_probe_503s_on_query_path_reranker_refusal(tmp_path, monkeypatch):
+    """#2906: DeepInfra 402'd every rerank for three days while /health/providers
+    said ok — it only read indexer logs, and the reranker runs on the query path.
+
+    The failure is simulated where it happened (a live rerank call), not seeded
+    as a log line: the index root has no logs at all, so a log scan alone cannot
+    see it.
+    """
+    from search_hybrid import DeepInfraReranker
+
+    posts = {"n": 0}
+
+    def _refused(url, **_kw):
+        posts["n"] += 1
+        return httpx.Response(
+            402,
+            text='{"detail":{"error":"inference prohibited, you have reached user-set limit."}}',
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("httpx.post", _refused)
+    reranker = DeepInfraReranker(api_key="k")
+    hit = SearchHit(doc_id="d", loc="1", snippet="s", text="t", score=1.0)
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            reranker.rerank("q", [hit])
+    assert posts["n"] == 1  # the refusal opened the circuit; later queries don't re-ask
+
+    payload, status_code = mcp_server._provider_health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] != "ok"
+    [entry] = payload["provider_failures"]["by_key"].values()
+    assert entry["provider"] == "https://api.deepinfra.com"
+    assert entry["http_status"] == 402
+    assert entry["recovered"] is False
 
 
 def test_health_probe_disk_threshold_env_override_and_invalid_fallback(tmp_path):
