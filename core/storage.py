@@ -109,7 +109,7 @@ class StorageInterface(Protocol):
 
     def insert_nodes(
         self, nodes: list[TextNode], *, known_absent: bool = False
-    ) -> None:
+    ) -> bool:
         """Insert nodes for documents not already present, idempotently."""
         ...
 

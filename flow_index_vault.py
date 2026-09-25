@@ -2412,6 +2412,14 @@ def _process_doc_task(
             "source": doc.get("source_name", "documents"),
         },
     ):
+        doc_id = doc["doc_id"]
+        if doc_id in _RUNTIME.get("sweep_served_doc_ids", set()):
+            _get_logger().info(
+                "Skipping %s — already indexed by mid-sweep queue service",
+                doc_id,
+            )
+            return
+
         store: LanceDBStore = _RUNTIME["store"]
         embed_provider: EmbedProvider = _RUNTIME["embed_provider"]
         splitter: SentenceSplitter = _RUNTIME["splitter"]
@@ -2426,7 +2434,6 @@ def _process_doc_task(
         # when called standalone — e.g. targeted single-document indexing, which
         # has no active Prefect run context.
         logger = _get_logger()
-        doc_id = doc["doc_id"]
         rel_path = doc.get("rel_path", doc_id)
         mtime = doc["mtime"]
         size = doc["size"]
@@ -3072,11 +3079,18 @@ def _process_doc_task(
         # directly: a no-match Lance delete still commits a metadata version,
         # doubling retained manifests for large new-document batches.
         if doc_id in _RUNTIME.get("storage_insert_doc_ids", set()):
-            store.insert_nodes(nodes, known_absent=True)
-            write_mode = "Inserted"
+            wrote_chunks = store.insert_nodes(nodes, known_absent=True)
+            write_mode = "Inserted" if wrote_chunks else "Skipped"
         else:
             store.upsert_nodes(nodes)
             write_mode = "Upserted"
+            wrote_chunks = True
+        if not wrote_chunks:
+            logger.info(
+                "Skipped write for %s — chunks already present from concurrent indexing",
+                doc_id,
+            )
+            return
         logger.info(f"{write_mode} {len(nodes)} chunks: {doc_id}")
         _record_index_write(len(nodes))
         _record_freshness_watermark(doc_meta, mtime)
@@ -5163,6 +5177,7 @@ def _service_index_queue(config: dict, table_name: str) -> int:
     if store is None or doc_id_store is None or index_root is None:
         return 0
     saved_runtime = dict(_RUNTIME)
+    served_doc_ids: set[str] = set()
     try:
         queue = IndexRequestQueue(index_root)
         if not queue.pending(table_name, limit=1):
@@ -5179,12 +5194,22 @@ def _service_index_queue(config: dict, table_name: str) -> int:
             # freeze threshold and make /health report a false stall (#1876).
             on_progress=lambda: _write_heartbeat(index_root),
         )
+        served_doc_ids = {
+            str(result["doc_id"])
+            for result in results.values()
+            if result.get("status") == "indexed" and result.get("doc_id")
+        }
     except Exception:
         _get_logger().exception("Serving queued index requests mid-sweep failed")
         return 0
     finally:
         _RUNTIME.clear()
         _RUNTIME.update(saved_runtime)
+        if served_doc_ids:
+            _RUNTIME.setdefault("sweep_served_doc_ids", set()).update(served_doc_ids)
+            storage_insert_doc_ids = _RUNTIME.get("storage_insert_doc_ids")
+            if storage_insert_doc_ids is not None:
+                storage_insert_doc_ids.difference_update(served_doc_ids)
     if results:
         _get_logger().info(
             "Served %d queued index request(s) during the sweep", len(results)
