@@ -312,7 +312,9 @@ class TestContextOnlyFactsLeavePrimaryFields:
 
     def _enrich(self, response: dict, text: str, context_text: str) -> dict:
         gen = MagicMock()
-        gen.generate.return_value = json.dumps(response)
+        # Through the shared completer: #1918 rejects a response missing any
+        # contract key before it reaches the code under test here.
+        gen.generate.return_value = _complete_enrichment_json(**response)
         return enrich_document(text, "Your items were delivered", "pg_message", gen,
                                context_text=context_text)
 
@@ -507,7 +509,7 @@ def test_context_provenance_eval_sample_fixtures():
 
     for text, context_text, response, expected_primary in fixtures:
         gen = MagicMock()
-        gen.generate.return_value = json.dumps(response)
+        gen.generate.return_value = _complete_enrichment_json(**response)
         result = enrich_document(text, "fixture", "pg_message", gen, context_text=context_text)
 
         primary_facts = json.loads(result["enr_key_facts"] or "[]")
@@ -1073,13 +1075,13 @@ HOME_DEPOT_TRUE_FACTS = [
 def _receipt_response(card_fact: str, summary: str = "Home Depot receipt for $42.40.") -> str:
     facts = list(HOME_DEPOT_TRUE_FACTS)
     facts.insert(3, card_fact)
-    return json.dumps({
-        "summary": summary,
-        "doc_type": ["receipt"],
-        "keywords": ["Home Depot", "receipt", "Pro Xtra", "Visa", "PO/JOB NAME 101"],
-        "key_facts": facts,
-        "importance": 0.5,
-    })
+    return _complete_enrichment_json(
+        summary=summary,
+        doc_type=["receipt"],
+        keywords=["Home Depot", "receipt", "Pro Xtra", "Visa", "PO/JOB NAME 101"],
+        key_facts=facts,
+        importance=0.5,
+    )
 
 
 class TestCardSuffixGrounding:
@@ -1174,14 +1176,14 @@ class TestCardSuffixGrounding:
         assert result["enr_key_facts"] == parse_enrichment_response(response)["enr_key_facts"]
 
     def test_card_seen_only_in_nearby_context_is_grounded(self):
-        response = json.dumps({
-            "summary": "Delivery checklist for a dryer order.",
-            "doc_type": ["delivery_notification"],
-            "key_facts": ["Order total is $500.00."],
-            "context_key_facts": ["The nearby receipt was paid by credit card ending in 4821."],
-            "context_confidence": "medium",
-            "context_relationship": "same order",
-        })
+        response = _complete_enrichment_json(
+            summary="Delivery checklist for a dryer order.",
+            doc_type=["delivery_notification"],
+            key_facts=["Order total is $500.00."],
+            context_key_facts=["The nearby receipt was paid by credit card ending in 4821."],
+            context_confidence="medium",
+            context_relationship="same order",
+        )
 
         result = self._enrich(
             response,
@@ -1189,8 +1191,13 @@ class TestCardSuffixGrounding:
             context_text="[BEFORE source_message_id=m1] TOTAL $500.00 XXXXXXXXXXXX4821 VISA",
         )
 
+        # #2562's mover also relocates the order total: `$500.00` appears in the
+        # nearby context and not in the primary text, which is exactly its rule.
+        # What #2526 asserts here is the card suffix, and it is still grounded to
+        # the 4821 the context shows rather than the phone tail in the body.
         assert json.loads(result["enr_context_key_facts"]) == [
-            "The nearby receipt was paid by credit card ending in 4821."
+            "The nearby receipt was paid by credit card ending in 4821.",
+            "Order total is $500.00.",
         ]
 
     def test_correction_is_logged_for_counting(self, caplog):

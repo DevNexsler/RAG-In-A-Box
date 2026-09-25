@@ -1295,11 +1295,14 @@ def test_duplicate_callback_is_announced_when_canonical_payload_vanishes(
             },
         }
     )
+    # #2830 moved the in-flight lane off drain_due onto send_enqueued (a worker
+    # must send only its own rows), so the stub that leaves this delivery pending
+    # has to sit on the seam the document path actually calls.
     monkeypatch.setattr(
-        "flow_index_vault.drain_due",
-        lambda outbox, **kwargs: {
+        "flow_index_vault.send_enqueued",
+        lambda outbox, deliveries, **kwargs: {
             "accepted": 0,
-            "retry_pending": 1,
+            "retry_pending": len(deliveries),
             "redrive_required": 0,
         },
     )

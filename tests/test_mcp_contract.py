@@ -1909,6 +1909,10 @@ def test_deep_health_reports_terminal_cap_as_manual_action_not_retry_pending(tmp
         fts_available=True,
         indexer_running=False,
         last_run_at="2026-09-05T00:00:00+00:00",
+        # #2101 predates this parameter, whose default is False; without it the
+        # missing ANN index pins `overall` degraded for a reason that has nothing
+        # to do with the terminal cap this test is about.
+        vector_index_available=True,
     )
     documents = result["sources"]["documents"]
 
