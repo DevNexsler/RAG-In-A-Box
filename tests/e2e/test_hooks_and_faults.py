@@ -284,6 +284,47 @@ async def test_budget_overshoot_enrichment_is_kept_without_a_second_call(
 
 @pytest.mark.skipif(
     E2E_REAL,
+    reason="enrichment is live in real mode; simulator answers cannot be armed",
+)
+async def test_loyalty_member_id_is_not_stored_as_the_payment_card(
+    indexed_corpus,
+    api,
+    mcp_session,
+):
+    """#2526: the model named a receipt's phone-shaped Pro Xtra member ID as the
+    card that paid. The stored enrichment must name the masked card the receipt
+    prints, and keep the rest of the model's answer."""
+    await _arm_fault("/api/v1/chat/completions", "member_id_as_card", times=1)
+
+    # The armed answer claims card 7305: the tail of the member ID below. The
+    # re-run salt is letters only, so it can never print those digits itself.
+    salt = uuid.uuid4().hex.translate(str.maketrans("0123456789", "ghijklmnop"))
+    content = (
+        "# Your Electronic Receipt\n\nThe Home Depot SALE SUBTOTAL 40.00 "
+        "SALES TAX 2.40 TOTAL $42.40 XXXXXXXXXXXX4821 VISA USD$ 42.40 "
+        "VISA CREDIT PRO XTRA MEMBER STATEMENT PRO XTRA ###-###-7305 SUMMARY "
+        f"THIS RECEIPT\nrun-salt: {salt}\n"
+    ).encode()
+    resp = await api.post("/api/upload", files={"file": ("pro-xtra-receipt.md", content)})
+    assert resp.status_code == 201, resp.text
+    result = await mcp_session.call_tool_json(
+        "file_index_document", {"target": "pro-xtra-receipt.md", "source_name": "documents"}
+    )
+    assert result.get("status") == "indexed", result
+
+    chunks = await mcp_session.call_tool_json(
+        "file_get_doc_chunks", {"doc_id": result["doc_id"]}
+    )
+    assert chunks and not (isinstance(chunks, dict) and chunks.get("error")), chunks
+    facts = json.loads(chunks[0]["enr_key_facts"])
+    assert facts == [
+        "Total transaction amount is $42.40.",
+        "Payment was made via Visa Pro Xtra credit card ending in 4821.",
+    ], "the loyalty member ID was stored as the payment card"
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
     reason="the real embeddings API is the thing being simulated here",
 )
 async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_session):

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from typing import NamedTuple
 
 _TOKEN_RE = re.compile(r"[a-z0-9$,.#/-]+", re.IGNORECASE)
 _LABEL_SEPARATOR_RE = re.compile(r"[-_ ]+")
@@ -171,6 +172,116 @@ def _resegment_words(words: list[str]) -> list[str]:
             segmented.append(words[start])
             start += 1
     return segmented
+
+
+# Payment-card suffix grounding (#2526). A receipt can print a card's last four
+# digits right next to another identifier's: Home Depot follows the masked card
+# with the Pro Xtra member ID, printed phone-shaped as ###-###-NNNN, and the
+# enrichment model often names that tail as the card. A prompt hint does not
+# stop it reliably, so a card-suffix claim is checked against the text the
+# model was given instead.
+#
+# A phone-shaped number is three, three and four digit-or-mask groups, e.g.
+# 610-555-0142, (610) 555-0142 or ###-###-7305. Its tail is never a card suffix.
+_PHONE_SHAPED_RE = re.compile(
+    r"(?<![\w#*•·●])(?:\(\s*[\d#*x•·●]{3}\s*\)\s*|[\d#*x•·●]{3}[-.])"
+    r"[\d#*x•·●]{3}[-.]\d{4}(?!\d)",
+    re.IGNORECASE,
+)
+# Any other number whose last four digits these are. Card layouts vary too much
+# to require a mask: production shows correct suffixes printed as "Visa 4821",
+# "— 4821", "Card #: *4821" and "(...4821)" alongside "XXXXXXXXXXXX4821".
+_TRAILING_FOUR_RE = re.compile(r"(\d{4})(?!\d)")
+# A number printed with everything but its last four digits hidden. These are
+# the only candidates a wrong suffix is ever rewritten to.
+_MASKED_NUMBER_RE = re.compile(
+    r"(?<![\w#*•·●.])"
+    r"(?:[x#*•·●]{2,19}(?:[\s-][x#*•·●]{2,6}){0,4}|\*|\.{3,12}|…)"
+    r"[\s-]?(?P<digits>\d{4})(?!\d)",
+    re.IGNORECASE,
+)
+# "<card term> ... ending in NNNN", within one clause. The words between the two
+# may not name a different identifier, so "paid by card at the store whose
+# phone ends in 0142" is not read as a card claim.
+_CARD_SUFFIX_CLAIM_RE = re.compile(
+    r"\b(?:visa|master\s?card|amex|american\s+express|discover|debit|credit|card)\b"
+    r"(?:(?!\b(?:phone|mobile|member|loyalty|order|invoice|confirmation|tracking"
+    r"|policy|loan)\b)[^.;\"\n]){0,60}?"
+    r"(?P<phrase>\s*,?\s*(?P<open>\()?\s*"
+    r"(?:(?:(?:ending|ends)(?:\s+(?:in|with))?"
+    r"|last\s+(?:4|four)(?:\s+digits)?(?:\s+of)?)\s*[:#]?\s*[x*•·.]*"
+    r"|[x*•·]{2,})\s*"
+    r"(?P<digits>\d{4})(?!\d)(?(open)\s*\)))",
+    re.IGNORECASE,
+)
+# Free-text enrichment fields that can carry a card claim.
+_CARD_CLAIM_FIELDS = (
+    "enr_summary",
+    "enr_key_facts",
+    "enr_keywords",
+    "enr_context_key_facts",
+    "enr_context_relationship",
+    "enr_context_warning",
+)
+
+
+class CardSuffixCorrection(NamedTuple):
+    field: str
+    claimed: str
+    corrected: str  # "" when the suffix was dropped
+
+
+def ground_card_suffixes(
+    enrichment: dict[str, str],
+    *,
+    source_text: str,
+) -> tuple[dict[str, str], list[CardSuffixCorrection]]:
+    """Keep card-suffix claims to cards the source text actually shows.
+
+    A claim such as "paid by Visa ending in 7305" is kept when 7305 ends some
+    number in ``source_text`` other than a phone-shaped one. Otherwise its
+    suffix is rewritten to the source's masked card number when there is
+    exactly one, and dropped ("paid by Visa") when there is none or several.
+    Everything else in the enrichment is left exactly as it was. Returns the
+    grounded enrichment and one correction per changed claim, for logging.
+    """
+    visible = _PHONE_SHAPED_RE.sub(" ", source_text or "")
+    grounded = set(_TRAILING_FOUR_RE.findall(visible))
+    masked = {match.group("digits") for match in _MASKED_NUMBER_RE.finditer(visible)}
+    replacement = next(iter(masked)) if len(masked) == 1 else ""
+
+    repaired = dict(enrichment)
+    corrections: list[CardSuffixCorrection] = []
+    for field in _CARD_CLAIM_FIELDS:
+        value = repaired.get(field)
+        if not value:
+            continue
+
+        def ground(match: re.Match[str], field: str = field) -> str:
+            claimed = match.group("digits")
+            if claimed in grounded:
+                return match.group(0)
+            corrections.append(CardSuffixCorrection(field, claimed, replacement))
+            claim = match.group(0)
+            if replacement:
+                start = match.start("digits") - match.start()
+                return claim[:start] + replacement + claim[start + len(claimed):]
+            return claim[: match.start("phrase") - match.start()]
+
+        repaired[field] = _rewrite_claims(value, ground)
+    return repaired, corrections
+
+
+def _rewrite_claims(value: str, ground: Callable[[re.Match[str]], str]) -> str:
+    """Apply ``ground`` to every card claim in a plain or JSON-list field."""
+    try:
+        items = json.loads(value)
+    except json.JSONDecodeError:
+        items = None
+    if not isinstance(items, list):
+        return _CARD_SUFFIX_CLAIM_RE.sub(ground, value)
+    rewritten = [_CARD_SUFFIX_CLAIM_RE.sub(ground, str(item)) for item in items]
+    return value if rewritten == [str(item) for item in items] else json.dumps(rewritten)
 
 
 def repair_enrichment(

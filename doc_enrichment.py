@@ -22,7 +22,11 @@ import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from core.enrichment_postprocess import canonicalize_doc_type, repair_enrichment
+from core.enrichment_postprocess import (
+    canonicalize_doc_type,
+    ground_card_suffixes,
+    repair_enrichment,
+)
 from core.resilience import is_transient
 from core.tracing import get_tracer
 
@@ -801,6 +805,18 @@ def enrich_document(
 
             enrichment = parse_enrichment_response(raw_response)
             enrichment = _repair_context_omissions(enrichment, truncated, context_text)
+            enrichment, card_corrections = ground_card_suffixes(
+                enrichment,
+                source_text=f"{truncated}\n{normalized_context_text}",
+            )
+            for correction in card_corrections:
+                logger.warning(
+                    "Ungrounded card suffix in enrichment for '%s': %s %s -> %s",
+                    title,
+                    correction.field,
+                    correction.claimed,
+                    correction.corrected or "(dropped)",
+                )
             enrichment = repair_enrichment(
                 enrichment,
                 text=truncated,
