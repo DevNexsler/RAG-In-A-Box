@@ -15,6 +15,7 @@ for key_facts) for consistent querying and filtering.
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import logging
 import math
@@ -133,8 +134,12 @@ For "importance": rate the primary item's overall importance/usefulness on a 0.0
 Nearby same-channel context candidates may or may not describe the primary item.
 Treat nearby messages as candidates only. Judge relevance before using them.
 Avoid adding unrelated nearby conversation to any field.
-If you use nearby context in summary, entities, topics, keywords, key_facts, tags, folder, or importance, you MUST also fill the matching context_* fields.
-Do not place context-derived facts only in non-context fields.
+key_facts and keywords describe the PRIMARY ITEM only. Put facts and terms taken
+from nearby context in context_key_facts only, never in key_facts or keywords.
+summary describes what the PRIMARY ITEM itself says. It may name what the item
+replies to, but must not present nearby-context details as the item's content.
+If you use nearby context in entities, topics, tags, folder, or importance, you
+MUST also fill the matching context_* fields.
 Fill context_* fields only when nearby context is relevant to the PRIMARY ITEM.
 When using nearby context, set context_confidence, context_relationship, and
 context_source_message_ids. Use context_warning for ambiguity or rejected context.
@@ -269,6 +274,30 @@ _CONTEXT_AMBIGUITY_TERMS = (
     "possibly",
     "uncertain",
 )
+
+# Numbers are how a fact shows which text it came from: amounts, card and
+# account tails, order ids and phone groups are copied, not paraphrased.
+# A thousands separator only counts between digit groups, so "101, 102" stays
+# two numbers.
+_NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?")
+# Dates, times and years prove nothing about the source: the model rewrites
+# them (the prompt asks for YYYY-MM-DD), and every nearby-context line starts
+# with a timestamp.
+_DATE_TIME_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?"
+    r"|\d{1,2}/\d{1,2}/\d{2,4}"
+    r"|\d{1,2}:\d{2}(?::\d{2})?"
+    r"|\b(?:19|20)\d{2}\b"
+)
+# Shorter numbers (quantities, sizes, "4 burners") occur in almost any text.
+_MIN_EVIDENCE_DIGITS = 3
+# A dollar total the model added up from the primary item's own dollar amounts
+# is supported by the primary item, even when only a nearby message prints it.
+_AMOUNT_RE = re.compile(r"\$\s?(" + _NUMBER_RE.pattern + ")")
+_MAX_SUMMED_AMOUNTS = 3
+_MAX_AMOUNTS_TO_SUM = 20
+# Text-only phrases need enough characters to avoid moving common short tokens.
+_MIN_TEXT_EVIDENCE_LEN = 8
 
 
 def _schema_property_for(raw_key: str) -> dict[str, Any]:
@@ -582,7 +611,11 @@ def _repair_context_omissions(
     primary_text: str,
     context_text: str,
 ) -> dict[str, str]:
-    """Preserve provenance when a model uses context but omits context_* fields."""
+    """Preserve provenance when a model uses context but omits context_* fields.
+
+    Key facts and keywords that only the nearby context supports are moved to
+    context_key_facts, so the row does not claim another message's facts.
+    """
     context_text = (context_text or "").strip()
     if not context_text:
         return enrichment
@@ -607,7 +640,9 @@ def _repair_context_omissions(
             repaired[context_key] = ", ".join(values)
             copied_values.extend(values)
 
-    context_used = bool(copied_values) or _mentions_nearby_context(repaired)
+    moved_numbers = _move_context_only_facts(repaired, primary_text, context_text)
+
+    context_used = bool(copied_values or moved_numbers) or _mentions_nearby_context(repaired)
     if not context_used:
         return _normalize_context_consistency(repaired)
 
@@ -619,7 +654,7 @@ def _repair_context_omissions(
     if not repaired.get("enr_context_relationship"):
         repaired["enr_context_relationship"] = "llm_used_nearby_context"
     if not repaired.get("enr_context_source_message_ids"):
-        ids = _context_source_ids_for_values(context_text, copied_values)
+        ids = _context_source_ids_for_values(context_text, copied_values + moved_numbers)
         repaired["enr_context_source_message_ids"] = ", ".join(ids)
     if not repaired.get("enr_context_warning"):
         repaired["enr_context_warning"] = (
@@ -627,6 +662,171 @@ def _repair_context_omissions(
             "structured context fields; provenance inferred from prompt context."
         )
     return _normalize_context_consistency(repaired)
+
+
+def _move_context_only_facts(
+    enrichment: dict[str, str],
+    primary_text: str,
+    context_text: str,
+) -> list[str]:
+    """Move key facts and keywords only the nearby context supports, in place.
+
+    A value is context-only when it names a number or distinctive phrase that
+    the context contains and the primary item does not. Moved key facts are
+    appended to context_key_facts; a moved keyword is appended too unless a
+    context fact already carries its evidence. Returns the evidence that
+    justified each move, for provenance.
+    """
+    primary_numbers = _number_haystack(primary_text)
+    primary_totals = _amount_totals(primary_text)
+    context_numbers = _number_haystack(context_text)
+    primary_text_haystack = _text_haystack(primary_text)
+    context_text_haystack = _text_haystack(context_text)
+
+    def context_only(value: str) -> list[str]:
+        amounts = set(_amounts(value))
+        numbers = [
+            number
+            for number in _evidence_numbers(value)
+            if number not in primary_numbers
+            and number in context_numbers
+            and not (number in amounts and number in primary_totals)
+        ]
+        if numbers:
+            return numbers
+        if _numbers(_DATE_TIME_RE.sub(" ", value)):
+            return []
+
+        normalized = _normalize_text_evidence(value)
+        if (
+            len(normalized) >= _MIN_TEXT_EVIDENCE_LEN
+            and normalized in context_text_haystack
+            and normalized not in primary_text_haystack
+        ):
+            return [normalized]
+        return []
+
+    evidence: list[str] = []
+    moved_facts: list[str] = []
+    facts = _fact_list(enrichment.get("enr_key_facts", "")) or []
+    kept_facts = []
+    for fact in facts:
+        fact_evidence = context_only(fact)
+        if fact_evidence:
+            moved_facts.append(fact)
+            evidence.extend(fact_evidence)
+        else:
+            kept_facts.append(fact)
+
+    # Split on the separator _normalize_metadata_list joins with, so the
+    # keywords that stay are rejoined exactly as stored.
+    moved_keywords: list[tuple[str, list[str]]] = []
+    kept_keywords = []
+    for keyword in (enrichment.get("enr_keywords") or "").split(", "):
+        keyword_evidence = context_only(keyword)
+        if keyword_evidence:
+            moved_keywords.append((keyword, keyword_evidence))
+            evidence.extend(keyword_evidence)
+        else:
+            kept_keywords.append(keyword)
+
+    if not evidence:
+        return evidence
+
+    existing = (enrichment.get("enr_context_key_facts") or "").strip()
+    context_facts = _fact_list(existing)
+    if context_facts is None:
+        context_facts = [existing] if existing else []
+    context_facts.extend(fact for fact in moved_facts if fact not in context_facts)
+    carried_text = _text_haystack(" ".join(context_facts))
+    carried_numbers = _number_haystack(" ".join(context_facts))
+    for keyword, keyword_evidence in moved_keywords:
+        if all(
+            evidence_item in carried_numbers or evidence_item in carried_text
+            for evidence_item in keyword_evidence
+        ):
+            continue
+        context_facts.append(keyword)
+
+    if moved_facts:
+        enrichment["enr_key_facts"] = json.dumps(kept_facts)
+    if moved_keywords:
+        enrichment["enr_keywords"] = ", ".join(kept_keywords)
+    enrichment["enr_context_key_facts"] = json.dumps(context_facts)
+    logger.info(
+        "Moved %d key fact(s) and %d keyword(s) that only nearby context supports "
+        "to context_key_facts (evidence: %s)",
+        len(moved_facts),
+        len(moved_keywords),
+        ", ".join(dict.fromkeys(evidence)),
+    )
+    return evidence
+
+
+def _fact_list(value: str) -> list[str] | None:
+    """The facts in a stored JSON-array field, or None if it is not one."""
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [str(item) for item in parsed]
+
+
+def _normalize_number(number: str) -> str:
+    """Spell a number one way: no thousands separator, no trailing zero cents."""
+    number = number.replace(",", "")
+    if "." in number:
+        number = number.rstrip("0").rstrip(".")
+    return number
+
+
+def _numbers(text: str) -> list[str]:
+    return [_normalize_number(match.group(0)) for match in _NUMBER_RE.finditer(text)]
+
+
+def _amounts(text: str) -> list[str]:
+    """Dollar amounts in ``text``, normalized like ``_numbers``."""
+    return [_normalize_number(match.group(1)) for match in _AMOUNT_RE.finditer(text)]
+
+
+def _amount_totals(text: str) -> set[str]:
+    """Totals of two or three of the first dollar amounts in ``text``.
+
+    A repeated amount is kept: two $10 fees are part of the total.
+    """
+    cents = [round(float(amount) * 100) for amount in _amounts(text)[:_MAX_AMOUNTS_TO_SUM]]
+    return {
+        _normalize_number(f"{total // 100}.{total % 100:02d}")
+        for size in range(2, _MAX_SUMMED_AMOUNTS + 1)
+        for total in map(sum, itertools.combinations(cents, size))
+    }
+
+
+def _number_haystack(text: str) -> str:
+    """Numbers in ``text`` joined by spaces; ``number in haystack`` also finds a
+    number printed inside a longer one, such as a card tail in a full number."""
+    return " ".join(_numbers(text or ""))
+
+
+def _evidence_numbers(value: str) -> list[str]:
+    """Numbers in ``value`` specific enough to show which text it came from."""
+    return [
+        number
+        for number in _numbers(_DATE_TIME_RE.sub(" ", value))
+        if sum(char.isdigit() for char in number) >= _MIN_EVIDENCE_DIGITS
+    ]
+
+
+def _normalize_text_evidence(value: str) -> str:
+    """Lowercase phrase with collapsed whitespace for substring matching."""
+    return re.sub(r"\s+", " ", (value or "").lower()).strip()
+
+
+def _text_haystack(text: str) -> str:
+    """Searchable lowercase text with dates/times stripped."""
+    return _normalize_text_evidence(_DATE_TIME_RE.sub(" ", text or ""))
 
 
 def _has_context_fields(enrichment: dict[str, str]) -> bool:

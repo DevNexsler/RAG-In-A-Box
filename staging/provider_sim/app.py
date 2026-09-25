@@ -156,6 +156,14 @@ def _lexical_overlap(query: str, doc: str) -> float:
 # Fault injection — implemented once, as middleware
 # --------------------------------------------------------------------------
 
+# The #2562 answer: the model files a nearby message's fact under the primary
+# item's key_facts and keywords. A test that arms it indexes an attachment in
+# the seeded "billing" channel, whose messages carry invoice 4417; the
+# attachment itself does not.
+CONTEXT_FACT_AS_PRIMARY_FACT = "Invoice 4417 for the obsidian widgets was paid on Friday."
+CONTEXT_FACT_AS_PRIMARY_KEYWORD = "invoice 4417"
+DELIVERY_SLIP_FACT = "The obsidian widget delivery slip was signed at the loading dock."
+
 
 def _fault_response(fault: str) -> Response | None:
     if fault == "429":
@@ -167,6 +175,25 @@ def _fault_response(fault: str) -> Response | None:
     if fault == "garbage":
         return Response(
             content="not json {", status_code=200, media_type="application/json"
+        )
+    if fault == "context_fact_as_primary":
+        enrichment = json.loads(_fake_enrichment(""))
+        enrichment["key_facts"] = [DELIVERY_SLIP_FACT, CONTEXT_FACT_AS_PRIMARY_FACT]
+        enrichment["keywords"] = ["obsidian widgets", CONTEXT_FACT_AS_PRIMARY_KEYWORD]
+        return JSONResponse(
+            {
+                "id": "sim-context-fact-as-primary",
+                "object": "chat.completion",
+                "model": "sim-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": json.dumps(enrichment)},
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 40, "total_tokens": 52},
+            }
         )
     if fault == "reasoning_only":
         return JSONResponse(
@@ -482,6 +509,7 @@ async def admin_reset() -> dict:
 
 _KNOWN_FAULTS = {
     "429",
+    "context_fact_as_primary",
     "timeout",
     "garbage",
     "reasoning_only",

@@ -445,3 +445,62 @@ async def test_reindexed_document_has_no_stale_chunks(indexed_corpus, api, mcp_s
     assert len(chunks_v2) == len(chunks_v1), (len(chunks_v1), len(chunks_v2))
     assert all("decommissioned" in (c.get("text") or "") for c in chunks_v2), chunks_v2
     assert not any("seventh tide" in (c.get("text") or "") for c in chunks_v2), chunks_v2
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
+    reason="enrichment is live in real mode; simulator answers cannot be armed",
+)
+async def test_nearby_message_fact_is_stored_as_context_fact(indexed_corpus, mcp_session):
+    """#2562: the model filed a nearby message's invoice under the attachment's
+    own key facts and keywords. The stored row must keep that fact in
+    context_key_facts and leave the attachment's own fact where the model put it."""
+    await _arm_fault("/api/v1/chat/completions", "context_fact_as_primary", times=1)
+
+    # An attachment in the seeded "billing" channel, sent between the two
+    # messages about invoice 4417. The salt is letters only, so the attachment
+    # can never print that number itself.
+    salt = uuid.uuid4().hex.translate(str.maketrans("0123456789", "ghijklmnop"))
+    name = f"delivery-slip-{salt}"
+    sidecar = {
+        "schema_version": 1,
+        "source": "email",
+        "message": {
+            "source_message_id": f"slip-{salt}",
+            "sender": "Carol Idowu",
+            "sent_at": "2026-06-01T10:02:30Z",
+        },
+        "channel": {"source_channel_id": "billing"},
+        "media": {"media_index": 0, "media_type": "document", "original_filename": f"{name}.md"},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = Path(tmp) / f"{name}.md"
+        doc.write_text(
+            "# Delivery slip\n\n"
+            "The obsidian widget delivery slip was signed at the loading dock.\n"
+            f"run-salt: {salt}\n"
+        )
+        (Path(tmp) / f"{name}.json").write_text(json.dumps(sidecar))
+        _compose_cp_into_documents(Path(tmp) / f"{name}.json")
+        _compose_cp_into_documents(doc)
+
+    result = await mcp_session.call_tool_json(
+        "file_index_document", {"target": f"{name}.md", "source_name": "documents"}
+    )
+    assert result.get("status") == "indexed", result
+
+    chunks = await mcp_session.call_tool_json(
+        "file_get_doc_chunks", {"doc_id": result["doc_id"]}
+    )
+    assert chunks and not (isinstance(chunks, dict) and chunks.get("error")), chunks
+    stored = chunks[0]
+    # Positive control: the nearby messages reached the prompt, or nothing
+    # below could have been decided from them.
+    assert "4417" in "\n".join(c.get("text", "") for c in chunks), chunks
+    assert json.loads(stored["enr_key_facts"]) == [
+        "The obsidian widget delivery slip was signed at the loading dock."
+    ], "a nearby message's fact was stored as the attachment's own"
+    assert "Invoice 4417 for the obsidian widgets was paid on Friday." in json.loads(
+        stored["enr_context_key_facts"]
+    ), stored
+    assert "4417" not in stored["enr_keywords"], stored
