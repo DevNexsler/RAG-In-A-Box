@@ -209,6 +209,39 @@ def test_reconcile_source_scoped_run_never_ages_another_source():
     assert ledger["docs"]["documents::img1"] == {"reasons": ["x"], "attempts": 1}
 
 
+def test_reconcile_never_ages_an_entry_whose_source_failed_to_scan():
+    # Ticket #2020: a source whose scan() raised produced no evidence at all.
+    # Ageing its entries against a "full" scan escalates them out of the retry
+    # ledger after _DEGRADED_MAX_UNRESOLVED_RUNS — a provider outage turned
+    # into permanent dead-lettering.
+    ledger = {"docs": {"comm_messages::msg1": {"reasons": ["x"], "attempts": 1}}}
+    for _ in range(_DEGRADED_MAX_UNRESOLVED_RUNS + 2):
+        _, ledger, report = _reconcile(
+            _scanned("documents::img1"), [], ledger,
+            sources=("documents",), full_scan=True,
+            failed_sources={"comm_messages"},
+        )
+    assert report["source_not_scanned"] == ["comm_messages::msg1"]
+    assert report["unresolved"] == []
+    assert ledger["docs"]["comm_messages::msg1"] == {"reasons": ["x"], "attempts": 1}
+
+
+def test_reconcile_still_ages_entries_of_sources_that_scanned_fine():
+    # The isolation above must not blanket-excuse the run: a source that DID
+    # scan is still authoritative about its own missing ids.
+    ledger = {"docs": {
+        "documents::gone": {"reasons": ["x"], "attempts": 1},
+        "comm_messages::msg1": {"reasons": ["x"], "attempts": 1},
+    }}
+    _, ledger, report = _reconcile(
+        _scanned("documents::other"), [], ledger,
+        sources=("documents",), full_scan=True, failed_sources={"comm_messages"},
+    )
+    assert report["unresolved"] == ["documents::gone"]
+    assert report["source_not_scanned"] == ["comm_messages::msg1"]
+    assert ledger["docs"]["documents::gone"]["unresolved_runs"] == 1
+
+
 def test_reconcile_full_scan_ages_entry_from_a_removed_source():
     # A namespace that is no longer configured at all can only be concluded
     # dead by a full scan — and then it must age out, not accumulate forever.
