@@ -111,6 +111,8 @@ def _call_tool(name: str, arguments: dict, *, token: str) -> dict:
         label=f"factbook-rpc:{name}", circuit_key=base_url,
     )
 
+    if not isinstance(data, dict) or data.get("jsonrpc") != "2.0" or data.get("id") != payload["id"]:
+        raise RuntimeError("factbook-rpc: invalid or uncorrelated JSON-RPC response")
     if data.get("error") is not None:
         # JSON-RPC transport-level failure (server.py:4995-5004).
         raise RuntimeError(f"factbook-rpc error: {data['error'].get('message')}")
@@ -175,8 +177,16 @@ def factbook_source(contact: dict) -> dict:
             continue
         flags = {k: out.get(k) for k in _FLAG_KEYS}
         entities = out.get("entities") or []
+        if attribute_key == "platform_id" and (
+            not isinstance(entities, list)
+            or any(not isinstance(entity, dict)
+                   or not isinstance(entity.get("uuid"), str)
+                   or not entity["uuid"].strip() for entity in entities)
+        ):
+            return {"status": "error:platform_id: malformed entities", "entities": [], "flags": flags}
         if attribute_key == "platform_id" and entities and (
             out.get("resolved") is not True or len(entities) != 1
+            or any(out.get(key) for key in _FLAG_KEYS if key != "resolved")
         ):
             return {"status": "ambiguous", "entities": [], "flags": flags}
         if attribute_key == "platform_id" and not entities:
