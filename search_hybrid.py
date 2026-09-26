@@ -342,12 +342,19 @@ class DeepInfraReranker(Reranker):
                 # A permanent 4xx (bad key, retired model) is wrapped below into a
                 # RuntimeError whose text is all the caller gets — keep the reason.
                 raise_for_status(resp)
-            data = resp.json()
+                data = resp.json()
+                raw_scores = data.get("scores") if isinstance(data, dict) else None
+                if (
+                    not isinstance(raw_scores, list)
+                    or len(raw_scores) != len(hits)
+                    or any(isinstance(score, bool) or not isinstance(score, (int, float))
+                           or not math.isfinite(score) for score in raw_scores)
+                ):
+                    raise ValueError("reranker response must contain one finite score per candidate")
         except Exception as e:
             raise RuntimeError(f"DeepInfra reranker failed: {e}") from e
 
         # Normalize reranker scores to [0, 1] for blending
-        raw_scores = data.get("scores", [])
         if raw_scores:
             max_score = max(raw_scores)
             min_score = min(raw_scores)
