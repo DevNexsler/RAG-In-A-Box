@@ -40,8 +40,30 @@ logger = logging.getLogger(__name__)
 # Lazy tracer (resolves provider per call); spans are no-ops when tracing is off.
 _tracer = get_tracer("pipeline")
 
+_MODALITY_INSTRUCTIONS = """\
+Preserve the primary item's speech act and uncertainty in summary, doc_type, and key_facts:
+- Questions remain questions, not proposals or confirmations. Describe what the
+  sender asks; do not assert the answer or infer that a rule exists from a question.
+  A question about whether a rule applies does not request its adoption. For
+  example, "Is that the rule from now on?" asks what applies; it does not mean
+  "I propose making that the rule." Do not substitute "should" for "is", or
+  describe the question as seeking to establish, change, or confirm a policy.
+  Every key fact about the question must retain this distinction too: report
+  "The sender asks whether ...", not a proposed or established rule.
+- Proposals remain proposals, not adopted rules. Require explicit evidence of
+  adoption before describing a proposal as an established policy.
+- Preserve temporal limits: temporary instructions must not become standing policy.
+  Asking whether an instruction applies in future does not extend its duration.
+- Explicitly adopted standing rules remain statements of policy; do not weaken
+  them into questions or proposals.
+- Nearby context must not change the primary item's intent. Attribute contextual
+  instructions or decisions to their source and keep their stated time scope.
+Apply these distinctions to all other metadata too, including context_key_facts.
+"""
+
 _PROMPT_TEMPLATE = """\
 Extract metadata from this document. Respond with ONLY valid JSON, no other text.
+{modality_instructions}
 
 {{
   "summary": "2-3 sentence summary of the document's purpose and key content",
@@ -93,6 +115,7 @@ Document text:
 _CONTEXT_PROMPT_TEMPLATE = """\
 Extract metadata from this document. Respond with ONLY valid JSON, no other text.
 The context_* fields are required output keys; never omit them.
+{modality_instructions}
 
 {{
   "context_entities_people": ["people inferred from relevant nearby context"],
@@ -976,6 +999,7 @@ def enrich_document(
         normalized_context_text = (context_text or "").strip()
         template = _CONTEXT_PROMPT_TEMPLATE if normalized_context_text else _PROMPT_TEMPLATE
         prompt = template.format(
+            modality_instructions=_MODALITY_INSTRUCTIONS,
             title=title,
             source_type=source_type,
             text=truncated,
