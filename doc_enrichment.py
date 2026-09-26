@@ -1108,7 +1108,7 @@ def enrich_document(
                 )
             enrichment = repair_enrichment(
                 enrichment,
-                text=truncated,
+                text=text,
                 title=title,
                 source_type=source_type,
                 enabled=postprocess_enrichment,
