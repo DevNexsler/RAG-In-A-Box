@@ -995,3 +995,157 @@ def test_cohort_reset_record_holds_one_row_per_document(tmp_path):
     rows = _reset_rows(store)
     assert [row[0] for row in rows] == ["documents::00001", "documents::00002"]
     assert {row[1] for row in rows} == {"blake3:123:" + latest_hash.hex()}
+
+
+def _dedupe_rows(store: DocIDStore) -> dict[str, tuple]:
+    return {
+        row[0]: row[1:]
+        for row in store._conn.execute(
+            "SELECT doc_id, dedupe_status, canonical_doc_id, duplicate_of_doc_id, "
+            "duplicate_reason, size_bytes, content_hash, hash_algo "
+            "FROM doc_registry ORDER BY doc_id"
+        )
+    }
+
+
+def test_unindexable_cohort_keeps_identity_and_loses_its_canonical(tmp_path):
+    """An intentionally empty cohort holds no pointer anyone can resolve (#2097)."""
+    store = _cohort_of_two(tmp_path)
+
+    members = store.mark_exact_hash_cohort_unindexable(
+        "documents::00002",
+        123,
+        b"\x07" * 32,
+        hash_algo="blake3",
+        reason="terminal skip: no_text_extracted",
+    )
+
+    assert members == ["documents::00001", "documents::00002"]
+    rows = _dedupe_rows(store)
+    for doc_id in members:
+        status, canonical, duplicate_of, reason, size, digest, algo = rows[doc_id]
+        assert status == "unindexable"
+        assert canonical is None
+        assert duplicate_of is None
+        assert reason == "terminal skip: no_text_extracted"
+        # The members are still known to be byte-identical.
+        assert (size, bytes(digest), algo) == (123, b"\x07" * 32, "blake3")
+    assert store.find_canonical_by_exact_hash(123, b"\x07" * 32, "blake3") is None
+    assert store.duplicate_refs_for_canonical("documents::00001") == []
+
+
+def test_unindexable_cohort_marking_is_idempotent(tmp_path):
+    store = _cohort_of_two(tmp_path)
+    kwargs = dict(hash_algo="blake3", reason="terminal skip: no_text_extracted")
+    store.mark_exact_hash_cohort_unindexable(
+        "documents::00002", 123, b"\x07" * 32, **kwargs
+    )
+    before = _dedupe_rows(store)
+    last_seen = store._conn.execute(
+        "SELECT doc_id, last_seen_at FROM doc_registry ORDER BY doc_id"
+    ).fetchall()
+
+    store.mark_exact_hash_cohort_unindexable(
+        "documents::00002", 123, b"\x07" * 32, **kwargs
+    )
+
+    assert _dedupe_rows(store) == before
+    assert store._conn.execute(
+        "SELECT doc_id, last_seen_at FROM doc_registry ORDER BY doc_id"
+    ).fetchall() == last_seen
+
+
+def test_unindexable_cohort_marking_records_a_first_identity(tmp_path):
+    """A document with no identity yet joins the cohort it is being judged in."""
+    store = DocIDStore(tmp_path / "doc_registry.db")
+    store.register("documents::00001", "a.pdf", source_name="documents")
+
+    store.mark_exact_hash_cohort_unindexable(
+        "documents::00001",
+        99,
+        b"\x05" * 32,
+        hash_algo="blake3",
+        reason="terminal skip: encrypted_pdf",
+    )
+
+    status, canonical, _dup_of, reason, size, digest, algo = _dedupe_rows(store)[
+        "documents::00001"
+    ]
+    assert (status, canonical, reason) == (
+        "unindexable",
+        None,
+        "terminal skip: encrypted_pdf",
+    )
+    assert (size, bytes(digest), algo) == (99, b"\x05" * 32, "blake3")
+
+
+def test_unindexable_cohort_marking_drops_its_reset_suppression(tmp_path):
+    """The cohort has left the absence-triggered reset game (#1258)."""
+    store = _cohort_of_two(tmp_path)
+    with store.reset_exact_hash_cohort_transaction(
+        "documents::00002", skip_repeat_at_same_state=True
+    ):
+        pass
+    for doc_id in ("documents::00001", "documents::00002"):
+        store.claim_canonical_by_exact_hash(
+            doc_id, 123, b"\x07" * 32, hash_algo="blake3"
+        )
+    assert _reset_rows(store)
+
+    store.mark_exact_hash_cohort_unindexable(
+        "documents::00002",
+        123,
+        b"\x07" * 32,
+        hash_algo="blake3",
+        reason="terminal skip: no_text_extracted",
+    )
+
+    assert _reset_rows(store) == []
+
+
+def test_unindexable_row_never_wins_an_election_it_did_not_initiate(tmp_path):
+    """Re-electing an unindexable member is how a phantom canonical re-forms."""
+    store = _cohort_of_two(tmp_path)
+    store.mark_exact_hash_cohort_unindexable(
+        "documents::00002",
+        123,
+        b"\x07" * 32,
+        hash_algo="blake3",
+        reason="terminal skip: no_text_extracted",
+    )
+    store.register("documents::00003", "c.pdf", source_name="documents")
+
+    winner = store.claim_canonical_by_exact_hash(
+        "documents::00003", 123, b"\x07" * 32, hash_algo="blake3"
+    )
+
+    # 00001 is first-seen, but it is a recorded verdict about these bytes.
+    assert winner["doc_id"] == "documents::00003"
+    rows = _dedupe_rows(store)
+    assert rows["documents::00003"][0] == "canonical"
+    # ...and the election does not rewrite the members it skipped: demoting
+    # them to duplicates of a canonical that is not indexed yet is the same
+    # phantom in a new shape.
+    assert rows["documents::00001"][0] == "unindexable"
+    assert rows["documents::00002"][0] == "unindexable"
+    assert store.duplicate_refs_for_canonical("documents::00003") == []
+
+
+def test_unindexable_row_reclaims_canonical_on_its_own_election(tmp_path):
+    """The verdict is revisable — by the member's own pass, with evidence."""
+    store = _cohort_of_two(tmp_path)
+    store.mark_exact_hash_cohort_unindexable(
+        "documents::00002",
+        123,
+        b"\x07" * 32,
+        hash_algo="blake3",
+        reason="terminal skip: no_text_extracted",
+    )
+
+    winner = store.claim_canonical_by_exact_hash(
+        "documents::00002", 123, b"\x07" * 32, hash_algo="blake3"
+    )
+
+    assert winner["doc_id"] == "documents::00002"
+    assert _dedupe_rows(store)["documents::00002"][0] == "canonical"
+    assert _dedupe_rows(store)["documents::00001"][0] == "unindexable"

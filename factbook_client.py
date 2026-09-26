@@ -134,9 +134,9 @@ def _call_tool(name: str, arguments: dict, *, token: str) -> dict:
 def factbook_source(contact: dict) -> dict:
     """Injectable ``factbook`` dep for ``context_builder.build_context``.
 
-    Lookup order: email -> phone via ``find_entity_by_attribute``, stopping
-    at the first call whose response carries entities; a name fallback via
-    ``resolve_entities`` if neither identifier resolved (or was present).
+    A supplied platform_id is authoritative: exact Person lookup only.
+    Otherwise, email then phone use ``find_entity_by_attribute``; a name
+    fallback uses ``resolve_entities`` if neither identifier resolved.
     ``flags`` always reflect the LAST ``find_entity_by_attribute`` response —
     never ``resolve_entities``, which carries none of those keys (see module
     docstring). If no ``find_entity_by_attribute`` call was ever made (e.g.
@@ -156,22 +156,31 @@ def factbook_source(contact: dict) -> dict:
     flags: dict = {}
 
     for attribute_key, value in (
+        ("platform_id", contact.get("platform_id")),
         ("email", contact.get("email")),
         ("phone", contact.get("phone_e164")),
     ):
         if not value:
             continue
         try:
-            out = _call_tool(
-                "find_entity_by_attribute",
-                {"attribute_key": attribute_key, "attribute_value": value},
-                token=token,
-            )
+            args = {"attribute_key": attribute_key, "attribute_value": value}
+            if attribute_key == "platform_id":
+                args.update({"entity_type": "Person", "num_results": 2})
+            out = _call_tool("find_entity_by_attribute", args, token=token)
         except Exception as exc:  # noqa: BLE001 — degrade per identifier
+            if attribute_key == "platform_id":
+                return {"status": f"error:platform_id: {collapse(exc, MAX_ERROR_CHARS)}",
+                        "entities": [], "flags": {}}
             errors.append(f"{attribute_key}: {collapse(exc, MAX_ERROR_CHARS)}")
             continue
         flags = {k: out.get(k) for k in _FLAG_KEYS}
         entities = out.get("entities") or []
+        if attribute_key == "platform_id" and entities and (
+            out.get("resolved") is not True or len(entities) != 1
+        ):
+            return {"status": "ambiguous", "entities": [], "flags": flags}
+        if attribute_key == "platform_id" and not entities:
+            return {"status": "no_match", "entities": [], "flags": flags}
         if entities:
             return {"status": "ok", "entities": entities, "flags": flags}
 

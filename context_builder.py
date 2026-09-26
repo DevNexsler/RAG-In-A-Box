@@ -22,7 +22,7 @@ def _phone_e164(value):
 
 
 def normalize_contact(email=None, phone=None, name=None, lead_id=None,
-                      latest_inbound_at=None) -> dict:
+                      latest_inbound_at=None, platform_id=None) -> dict:
     contact = {
         "email": (str(email).strip().lower() or None) if email else None,
         "phone_e164": _phone_e164(phone),
@@ -30,8 +30,13 @@ def normalize_contact(email=None, phone=None, name=None, lead_id=None,
         "lead_id": str(lead_id) if lead_id not in (None, "") else None,
         "latest_inbound_at": latest_inbound_at or None,
     }
+    if platform_id is not None:
+        qualified = str(platform_id).strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_-]*:[a-z][a-z0-9_-]*:[A-Za-z0-9._-]{1,128}", qualified):
+            raise ValueError("platform_id must be a qualified provider:type:id")
+        contact["platform_id"] = qualified
     if not (contact["email"] or contact["phone_e164"] or contact["name"]
-            or contact["lead_id"]):
+            or contact["lead_id"] or contact.get("platform_id")):
         raise ValueError("at least one identifier required")
     return contact
 

@@ -16,6 +16,7 @@ try:
 except ImportError:
     pass
 
+from core.resilience import TransientError
 from providers.media import build_media_provider
 
 _has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
@@ -45,7 +46,23 @@ def _provider():
 def test_transcribe_audio_clip_live():
     text = _provider().transcribe_audio(FIXTURES / "clip.wav")
     assert isinstance(text, str)
-    assert text.strip(), "expected a non-empty transcript for clip.wav"
+    assert "the quick brown fox jumps over the lazy dog" in text.lower()
+
+
+def test_transcribe_audio_tone_live():
+    """Reachable nonspeech may be text or an explicitly unconfirmed blank."""
+    try:
+        text = _provider().transcribe_audio(FIXTURES / "tone.wav")
+    except TransientError as exc:
+        # Silence can legitimately yield no transcript. The production wrapper
+        # deliberately refuses that blank without a confirming fallback.
+        # Transport/auth/circuit failures must still fail this live check.
+        if type(exc) is not TransientError or str(exc) != (
+            "enrichment empty and no fallback configured (unconfirmed blank)"
+        ):
+            raise
+        return
+    assert isinstance(text, str)
 
 
 def test_analyze_video_clip_live():

@@ -44,6 +44,19 @@ def test_monthly_coverage_uses_distinct_calendar_months(tmp_path):
     assert (tmp_path / "monthly/index-20260801-000000.tar.gz").exists()
 
 
+def test_first_backup_in_iso_week_promoted_when_sunday_is_even_date(tmp_path):
+    """Odd-day schedule skips Sunday on even dates (e.g. 2025-08-10); promote first backup."""
+    m = module()
+    first = backup(tmp_path, "20250805-043000")
+    m.rotate(tmp_path, first)
+    weekly = tmp_path / "weekly" / first.name
+    assert weekly.is_file()
+    assert first.stat().st_ino == weekly.stat().st_ino
+    later = backup(tmp_path, "20250807-043000")
+    m.rotate(tmp_path, later)
+    assert list((tmp_path / "weekly").glob("*.tar.gz")) == [weekly]
+
+
 def test_weekly_and_daily_generations_are_bounded(tmp_path):
     m = module()
     for stamp in ("20260802-000000", "20260809-000000", "20260816-000000", "20260823-000000", "20260830-000000"):

@@ -27,6 +27,19 @@ def test_impl_invalid_input_is_error_dict():
     assert out.get("error") and "identifier" in out["error"]
 
 
+def test_impl_passes_qualified_platform_id_to_factbook(monkeypatch):
+    seen = []
+    monkeypatch.setattr(srv, "_ctx_factbook_source", lambda c: seen.append(c) or {
+        "status": "no_match", "entities": [], "flags": {}})
+    out = srv._context_builder_impl(
+        name="Rafael Boundurant", platform_id="zoho_cliq:user:928702883",
+        include=["factbook"],
+    )
+    assert not out.get("error")
+    assert seen[0]["platform_id"] == "zoho_cliq:user:928702883"
+    assert out["contact"]["name"] == "Rafael Boundurant"
+
+
 def test_comm_source_filters(monkeypatch):
     monkeypatch.setattr(srv, "_comm_lookup_impl", lambda **kw: {"hits": [
         {"sender": "Leslie H", "channel": "+16107095575",

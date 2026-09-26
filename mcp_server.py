@@ -17,7 +17,9 @@ from core.config import filesystem_source_roots, load_config
 from core import index_freshness
 from core.artifacts import is_communication_sidecar
 from core.logging_setup import configure_logging_from_config
+from core.resilience import CIRCUITS, EndpointCircuits
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
+from core.degraded_policy import partition_degraded_docs, terminal_degraded_docs
 from core.skip_policy import actionable_skip_docs
 from core.storage import SearchHit
 from core.tracing import get_tracer
@@ -26,6 +28,7 @@ from lancedb_store import (
     empty_vector_index_stats,
     open_store_with_recovery,
 )
+from extractors import CONTENT_COMPLETE
 from index_run_supervisor import IndexRunSupervisor, index_log_paths
 from providers.embed import build_embed_provider
 from search_hybrid import hybrid_search, build_reranker
@@ -319,7 +322,16 @@ def _index_disk_usage(index_root: Path) -> dict:
 
 async def _run_health_probe(probe, config: dict) -> tuple[dict, int]:
     """Run synchronous probe work without blocking the HTTP event loop."""
-    return await asyncio.to_thread(probe, config)
+    payload, status_code = await asyncio.to_thread(probe, config)
+    if status_code >= 500:
+        logger.error(
+            "Health probe failed: probe=%s http_status=%d status=%s detail=%s",
+            getattr(probe, "__name__", type(probe).__name__),
+            status_code,
+            payload.get("status", "unknown"),
+            payload.get("detail", "unspecified"),
+        )
+    return payload, status_code
 
 
 def _health_probe(config: dict) -> tuple[dict, int]:
@@ -349,6 +361,9 @@ def _health_probe(config: dict) -> tuple[dict, int]:
         "status": "ok",
         "indexer": "running" if running else "idle",
         "index_run": index_run,
+        "vector_index": LanceDBStore.read_vector_index_stats(
+            index_root, (config.get("lancedb") or {}).get("table", "chunks"),
+        ),
     }
     payload.update(disk)
     if freshness:
@@ -377,6 +392,7 @@ def _health_probe(config: dict) -> tuple[dict, int]:
             return (
                 {
                     "status": "stalled",
+                    "vector_index": payload["vector_index"],
                     "indexer_pid": pid,
                     "heartbeat_age_s": round(age) if age is not None else None,
                     "max_age_s": max_age,
@@ -583,6 +599,11 @@ def _slim_hit_to_dict(h: SearchHit) -> dict:
         val = extra.get(meta_key)
         if val not in (None, ""):
             d[out_key] = str(val)
+    # Surface incomplete extraction so a hit is never read as a fully-extracted
+    # document (#0584). Omitted for the complete majority to keep slim slim.
+    content_status = str(extra.get("content_status") or "")
+    if content_status and content_status != CONTENT_COMPLETE:
+        d["content_status"] = content_status
     # Drop identity echoes: comm rows carry a title/rel_path that merely
     # repeats the message id already present in doc_id/source_id (~15%/hit).
     if d.get("rel_path") and h.doc_id.endswith(d["rel_path"]):
@@ -708,6 +729,8 @@ def _get_deps(config_path: str = "config.yaml"):
             _cache = _build_store_and_embed(config_path)
             _cache_index_signature = _index_metadata_signature(_cache[2])
             _cache_identity = _cache
+    store = _cache[0]
+    store.refresh_if_replaced()
     return _cache[0], _cache[1], _cache[2]
 
 
@@ -919,6 +942,31 @@ def _source_health_status(
     return "ok", "observed_source"
 
 
+def _standing_actions(*groups: dict[str, list[str]]) -> dict:
+    """Roll every standing operator action up into one reported facet.
+
+    A standing action is a document no indexer run can advance on its own —
+    parked at the degraded ledger's terminal cap, or skipped as permanently
+    corrupt. Only the source owner or an operator can clear one.
+
+    They are deliberately kept OUT of `overall`: a top-level status pinned at
+    `degraded` by a 25-day-old backlog cannot report the next problem, and a
+    monitor that can only read one value is not a monitor (#1242, #2101). The
+    whole set is reported here instead, by reason and with its document ids, so
+    nothing is hidden by that choice — and `overall` is free to move when
+    something genuinely new breaks.
+    """
+    merged: dict[str, list[str]] = {}
+    for group in groups:
+        for reason, doc_ids in group.items():
+            merged.setdefault(str(reason), []).extend(str(d) for d in doc_ids)
+    by_reason = {
+        reason: sorted(set(doc_ids)) for reason, doc_ids in sorted(merged.items())
+    }
+    doc_ids = {doc_id for ids in by_reason.values() for doc_id in ids}
+    return {"count": len(doc_ids), "by_reason": by_reason}
+
+
 def _overall_deep_health(
     source_statuses: list[str],
     *,
@@ -1050,17 +1098,23 @@ def _not_extractable_doc_ids(index_root: Path) -> tuple[set[str], str | None]:
     return doc_ids, None
 
 
-def _ledger_doc_ids(path: Path) -> tuple[set[str], str | None]:
+def _read_ledger(path: Path) -> tuple[dict, str | None]:
+    """Load a doc ledger ({"docs": {...}}); an unreadable one is an error."""
     if not path.exists():
-        return set(), None
+        return {"docs": {}}, None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         docs = payload.get("docs", {}) if isinstance(payload, dict) else {}
         if not isinstance(docs, dict):
             raise ValueError("ledger docs must be an object")
-        return {str(doc_id) for doc_id in docs}, None
+        return payload, None
     except (OSError, ValueError, TypeError) as exc:
-        return set(), str(exc)
+        return {"docs": {}}, str(exc)
+
+
+def _ledger_doc_ids(path: Path) -> tuple[set[str], str | None]:
+    ledger, error = _read_ledger(path)
+    return {str(doc_id) for doc_id in ledger.get("docs", {})}, error
 
 
 def _group_backing_object_state(root: Path | None, rel_paths: set[str]) -> str:
@@ -1098,7 +1152,10 @@ def _registry_coverage(
     """Classify content groups as indexed, intentionally skipped, retrying,
     deleted, intentionally empty, or missing."""
     skip_ids, skip_error = _ledger_doc_ids(index_root / "skip_docs.json")
-    degraded_ids, degraded_error = _ledger_doc_ids(index_root / "degraded_docs.json")
+    degraded_ledger, degraded_error = _read_ledger(index_root / "degraded_docs.json")
+    # A doc past its retry budget is NOT retry-pending: no run will pick it up
+    # again, so calling it that tells an operator to wait forever (#2101).
+    retrying_ids, terminal_degraded_ids = partition_degraded_docs(degraded_ledger)
     no_text_ids, log_error = _not_extractable_doc_ids(index_root)
     roots = filesystem_source_roots(config)
     errors = [error for error in (skip_error, degraded_error, log_error) if error]
@@ -1110,6 +1167,7 @@ def _registry_coverage(
             "indexed_group_count": 0,
             "not_extractable_group_count": 0,
             "retry_pending_group_count": 0,
+            "manual_action_required_group_count": 0,
             "deleted_object_group_count": 0,
             "intentionally_empty_group_count": 0,
             "missing_group_count": 0,
@@ -1119,7 +1177,8 @@ def _registry_coverage(
             group_ids = set(group.get("doc_ids", set()))
             indexed = bool(group_ids & indexed_doc_ids)
             intentionally_skipped = bool(group_ids & (skip_ids | no_text_ids))
-            retry_pending = bool(group_ids & degraded_ids)
+            retry_pending = bool(group_ids & retrying_ids)
+            manual_action_required = bool(group_ids & terminal_degraded_ids)
             sidecar = False
             if root is not None:
                 sidecar = any(
@@ -1149,6 +1208,9 @@ def _registry_coverage(
                 elif retry_pending:
                     counts["covered_group_count"] += 1
                     counts["retry_pending_group_count"] += 1
+                elif manual_action_required:
+                    counts["covered_group_count"] += 1
+                    counts["manual_action_required_group_count"] += 1
                 else:
                     counts["missing_group_count"] += 1
         coverage[source_name] = counts
@@ -1253,6 +1315,7 @@ def _recent_provider_failures(
     *,
     now: float | None = None,
     lookback_seconds: int = _PROVIDER_FAILURE_LOOKBACK_SECONDS,
+    circuits: EndpointCircuits | None = None,
 ) -> dict:
     now = time.time() if now is None else now
     cutoff = now - lookback_seconds
@@ -1318,6 +1381,24 @@ def _recent_provider_failures(
                 existing["last_seen_at"] = _utc_iso(event_ts)
                 existing["sample"] = line[:500]
 
+    # The logs cover the indexer subprocess; failures in THIS process — the
+    # query path (reranker, query embeddings) and single-doc indexing — log to
+    # container stdout, which no scan above reads. Their live record is the
+    # endpoint circuit: tripped and not yet recovered by a successful call (#2906).
+    for endpoint, trip in (circuits or CIRCUITS).tripped().items():
+        tripped_at = trip["tripped_at"]
+        if tripped_at is not None:
+            last_seen_at = max(last_seen_at or tripped_at, tripped_at)
+        by_key[f"circuit_open:{endpoint}"] = {
+            "provider": endpoint,
+            "operation": "circuit_open",
+            "severity": _provider_failure_severity("circuit_open", trip["http_status"]),
+            "count": trip["failures"],
+            "http_status": trip["http_status"],
+            "last_seen_at": _utc_iso(tripped_at) if tripped_at is not None else None,
+            "sample": trip["error"][:500],
+        }
+
     overall_status = "ok"
     recovered_count = 0
     for key, item in by_key.items():
@@ -1382,6 +1463,12 @@ def _compute_deep_health(
         for doc_ids_for_reason in actionable_skips.values()
         for doc_id in doc_ids_for_reason
     }
+    # A read error here is already reported through registry_coverage_error,
+    # which reads the same file; an unreadable ledger yields no standing set.
+    degraded_ledger, _ = _read_ledger(index_root / "degraded_docs.json")
+    standing_actions = _standing_actions(
+        actionable_skips, terminal_degraded_docs(degraded_ledger)
+    )
     provider_failures = _recent_provider_failures(index_root)
     source_names = sorted(
         set(configured_sources)
@@ -1409,6 +1496,9 @@ def _compute_deep_health(
         retry_pending_doc_count = int(
             source_coverage.get("retry_pending_group_count") or 0
         )
+        manual_action_required_doc_count = int(
+            source_coverage.get("manual_action_required_group_count") or 0
+        )
         deleted_object_group_count = int(
             source_coverage.get("deleted_object_group_count") or 0
         )
@@ -1432,13 +1522,20 @@ def _compute_deep_health(
             not_extractable_doc_count=(
                 not_extractable_doc_count
                 + retry_pending_doc_count
+                + manual_action_required_doc_count
                 + deleted_object_group_count
                 + intentionally_empty_group_count
             ),
         )
         if retry_pending_doc_count > 0 and status == "ok":
+            # A live, self-healing condition outranks a standing one: it is the
+            # one that can still change on its own.
             status = "indexing" if indexer_running else "degraded"
             reason = "retry_pending"
+        elif manual_action_required_doc_count > 0 and status == "ok":
+            # Accounted for, but no run will ever clear it — same class as
+            # `not_extractable`, named so an operator can act on it (#2101).
+            reason = "manual_action_required"
         source_statuses.append(status)
         source_actionable_ids = sorted(
             doc_id
@@ -1461,6 +1558,7 @@ def _compute_deep_health(
             "index_content_group_count": index_content_group_count,
             "not_extractable_doc_count": not_extractable_doc_count,
             "retry_pending_doc_count": retry_pending_doc_count,
+            "manual_action_required_doc_count": manual_action_required_doc_count,
             "deleted_object_group_count": deleted_object_group_count,
             "intentionally_empty_group_count": intentionally_empty_group_count,
             "unindexed_registry_doc_count": unindexed_registry_doc_count,
@@ -1480,15 +1578,13 @@ def _compute_deep_health(
         vector_index_available=vector_index_available,
         vector_index_stale=bool((vector_index or {}).get("stale")),
     )
-    if actionable_ids and overall in {"ok", "unknown"}:
-        overall = "degraded"
-
     return {
         "cached": False,
         "last_ran_at": _utc_iso(time.time()),
         "ttl_seconds": _DEEP_HEALTH_CACHE_TTL_SECONDS,
         "uses_llm": False,
         "overall": overall,
+        "standing_actions": standing_actions,
         "sources": sources,
         "checks": {
             "registry_available": registry_error is None,
@@ -2366,6 +2462,7 @@ def _context_builder_impl(
     event_refs: list[str] | None = None,
     event_cursor: str | None = None,
     history_kind: str = "messages",
+    platform_id: str | None = None,
 ) -> dict:
     """Deterministic contact dossier. Never raises: invalid input (no
     identifiers) becomes ``{"error": ...}``; per-source failures degrade
@@ -2373,7 +2470,7 @@ def _context_builder_impl(
     try:
         if event_refs is not None:
             from cds_exact_events import exact_event_context
-            if any(v is not None for v in (email, phone, name, lead_id, latest_inbound_at, history_since, history_cursor)) or include not in (None, ["cds"]) or history_limit != 50 or history_kind != "messages":
+            if any(v is not None for v in (email, phone, name, lead_id, latest_inbound_at, history_since, history_cursor, platform_id)) or include not in (None, ["cds"]) or history_limit != 50 or history_kind != "messages":
                 raise ValueError("event_refs mode cannot be mixed with contact/history options")
             return exact_event_context(event_refs, event_cursor)
         if event_cursor is not None:
@@ -2382,7 +2479,7 @@ def _context_builder_impl(
         history = history_request(history_since, history_limit, history_cursor, history_kind)
         contact = ctxb.normalize_contact(
             email=email, phone=phone, name=name, lead_id=lead_id,
-            latest_inbound_at=latest_inbound_at,
+            latest_inbound_at=latest_inbound_at, platform_id=platform_id,
         )
         contact["history"] = history
     except ValueError as exc:
@@ -2944,13 +3041,15 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
     on a short interval, spawns the guarded full sweep on a long one, and offers
     the daily Lance compaction its idle window on a long one, reusing the exact
     vetted mechanisms (_file_index_update_impl for the sweep, drain_index_queue
-    for the queue, compact_index_if_idle for the compaction).
+    for the queue, compact_index_if_idle for the compaction, and
+    maintain_index_if_idle for cheap Lance upkeep).
     """
     from core.index_scheduler import IndexScheduler
     from flow_index_vault import (
         compact_index_if_idle,
         drain_hook_outbox,
         drain_index_queue,
+        maintain_index_if_idle,
     )
 
     sched_cfg = config.get("scheduler", {})
@@ -2977,11 +3076,13 @@ def build_index_scheduler(config: dict, config_path: str = "config.yaml"):
         drain_interval_s=float(sched_cfg.get("drain_interval_s", 60)),
         sweep_interval_s=float(sched_cfg.get("sweep_interval_s", 3600)),
         compact_interval_s=float(sched_cfg.get("compact_interval_s", 3600)),
+        maintenance_interval_s=float(sched_cfg.get("maintenance_interval_s", 3600)),
         drain_fn=drain_queues,
         sweep_fn=lambda: _file_index_update_impl(config_path),
         sweep_running_fn=lambda: is_indexer_running(config),
         run_was_interrupted_fn=lambda: index_run_was_interrupted(config),
         compact_fn=lambda: compact_index_if_idle(config_path),
+        maintenance_fn=lambda: maintain_index_if_idle(config_path),
     )
 
 
@@ -3438,11 +3539,12 @@ if HAS_MCP and FastMCP is not None:
         event_refs: list[str] | None = None,
         event_cursor: str | None = None,
         history_kind: str = "messages",
+        platform_id: str | None = None,
     ) -> dict:
         """Deterministic contact dossier: FactBook identity, exact CDS comm
         history + our-outbound evidence, exact-filtered comm context, and a
         derived our_outbound_after_latest_inbound flag. At least one of
-        email/phone/name/lead_id is required. comm_context hits are semantic
+        email/phone/name/lead_id/platform_id is required. comm_context hits are semantic
         context only — never proof of handling.
 
         Args:
@@ -3462,6 +3564,8 @@ if HAS_MCP and FastMCP is not None:
             phone: Contact phone number (any format; normalized to E.164).
             name: Contact display name (used for FactBook + comm fallback).
             lead_id: TenantCloud lead id.
+            platform_id: Qualified person identifier, e.g. zoho_cliq:user:928702883.
+                FactBook matches it exactly; a name alone cannot override a miss.
             latest_inbound_at: ISO-8601 timestamp of the latest known inbound
                 message from this contact; used to compute
                 our_outbound_after_latest_inbound when CDS itself found no
@@ -3505,6 +3609,7 @@ if HAS_MCP and FastMCP is not None:
             latest_inbound_at=latest_inbound_at, include=include,
             history_since=history_since, history_limit=history_limit,
             history_cursor=history_cursor,
+            **({"platform_id": platform_id} if platform_id is not None else {}),
             **({"history_kind": history_kind} if history_kind != "messages" else {}),
             **({"event_refs": event_refs, "event_cursor": event_cursor}
                if event_refs is not None or event_cursor is not None else {}),
@@ -3715,8 +3820,13 @@ if HAS_MCP and FastMCP is not None:
                   the last indexing run (0 = clean).
                 - deep_check: Deterministic source coverage check, cached for 600s
                   and persisted to index_health.json. Includes cached, last_ran_at,
-                  uses_llm=false, overall, and per-source registry/index counts plus
-                  latest registry/index timestamps.
+                  uses_llm=false, overall, standing_actions, and per-source
+                  registry/index counts plus latest registry/index timestamps.
+                - deep_check.standing_actions: documents no indexing run can
+                  advance — parked at the degraded ledger's terminal cap or
+                  permanently unreadable — grouped by reason. These need an
+                  operator or a source change; they do not hold `overall` at
+                  degraded, so `overall` still moves for a NEW problem.
                 - provider_status/provider_failures: Log-derived provider failure
                   summary from recent indexer logs (no live LLM/provider probe).
 

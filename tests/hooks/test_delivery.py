@@ -61,7 +61,7 @@ def test_queue_event_persists_only_matching_http_hooks_and_preserves_event_id(tm
     }
     sent = []
 
-    assert queue_event(config, event, outbox) == 1
+    assert len(queue_event(config, event, outbox)) == 1
     assert drain_due(outbox, limit=2, sender=lambda hook, item: sent.append((hook, item)) or HookSendResult(True, "accepted", False)) == {
         "accepted": 1,
         "retry_pending": 0,
@@ -90,6 +90,35 @@ def test_retryable_failures_redrive_after_five_sends(tmp_path, monkeypatch):
         "redrive_required": 1,
     }
     assert outbox.due(limit=1, now=1_000) == []
+
+
+def test_send_enqueued_only_sends_rows_from_this_dispatch(tmp_path):
+    """Fails if an index worker drains another worker's pending delivery."""
+    from hooks.delivery import queue_event, send_enqueued
+
+    outbox = HookOutbox(tmp_path)
+    config = {"enabled": True, "hooks": [{"name": "cds", "events": ["document.indexed"]}]}
+    own = queue_event(
+        config,
+        {"event": "document.indexed", "event_id": "evt-own", "doc_id": "documents::own"},
+        outbox,
+    )
+    queue_event(
+        config,
+        {"event": "document.indexed", "event_id": "evt-sibling", "doc_id": "documents::sibling"},
+        outbox,
+    )
+    sent: list[str] = []
+
+    send_enqueued(
+        outbox,
+        own,
+        sender=lambda hook, item: sent.append(item["event_id"])
+        or HookSendResult(True, "accepted", False, 200),
+    )
+
+    assert sent == ["evt-own"]
+    assert len(outbox.due(limit=4)) == 1
 
 
 def test_overlapping_drains_send_one_delivery_once(tmp_path):

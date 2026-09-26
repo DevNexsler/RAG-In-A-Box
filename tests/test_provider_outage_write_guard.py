@@ -40,7 +40,16 @@ class _GoodLLM:
         return json.dumps({
             "summary": "Photo of bags left by the bins, reported as a theft risk.",
             "doc_type": ["image", "message"],
+            "entities_people": [],
+            "entities_places": [],
+            "entities_orgs": [],
+            "entities_dates": [],
             "topics": ["property", "theft", "security"],
+            "keywords": ["bags", "bins"],
+            "key_facts": ["Bags were left by the bins."],
+            "suggested_tags": ["security"],
+            "suggested_folder": "Properties/Security",
+            "importance": 0.5,
         })
 
 
@@ -59,6 +68,20 @@ class _BrokenLLM:
 
     def generate(self, prompt, max_tokens=512):
         return json.dumps({"topics": ["whatever"]})  # no summary/doc_type
+
+
+class _ReversedCorrectionLLM:
+    """Returns a syntactically valid but source-contradicting correction."""
+
+    def generate(self, prompt, max_tokens=512):
+        from tests.test_enrichment import _complete_enrichment_json
+        return _complete_enrichment_json(**(
+            {
+                "summary": "A critical correction: Shawn Brown, not Sean.",
+                "doc_type": ["message"],
+                "key_facts": ["Husband's name is Shawn Brown, not Sean."],
+            }
+        ))
 
 
 @pytest.fixture
@@ -134,6 +157,12 @@ def test_transient_outage_keeps_the_enriched_row(runtime, outage):
     good = _stored_metadata(store, doc["doc_id"])
     assert good["enr_summary"].startswith("Photo of bags")
 
+    # Change enrichment input so the LLM is called again (#3050 input-hash cache).
+    doc = _write_doc(
+        docs_root,
+        "quo-attachments/annie/theft.md",
+        "Bags left by the bins. Neighbor reported overnight.",
+    )
     _index(doc, _DownLLM(outage))
 
     after = _stored_metadata(store, doc["doc_id"])
@@ -143,11 +172,50 @@ def test_transient_outage_keeps_the_enriched_row(runtime, outage):
     assert after["enr_topics"] == good["enr_topics"]
 
 
+def test_explicit_correction_is_grounded_before_lancedb_write(runtime):
+    """A reversed generated correction must not reach the stored metadata surface."""
+    docs_root, store = runtime
+    doc = _write_doc(
+        docs_root,
+        "sor/task-2124.md",
+        'Inbound: "Yes Sean Brown is my husband". Correcting husband name from "Shawn" to "Sean" Brown.',
+    )
+
+    _index(doc, _ReversedCorrectionLLM())
+
+    stored = _stored_metadata(store, doc["doc_id"])
+    expected = "Correction: Sean (not Shawn)."
+    assert stored["enr_summary"] == expected
+    assert json.loads(stored["enr_key_facts"]) == [expected]
+
+
+def test_middle_correction_is_grounded_before_lancedb_write(runtime):
+    """Grounding must inspect source text beyond the prompt's head/tail sample."""
+    docs_root, store = runtime
+    doc = _write_doc(
+        docs_root,
+        "sor/task-2124-middle.md",
+        "start " * 600
+        + 'Correction: husband name from "Shawn" to "Sean". '
+        + "end " * 600,
+    )
+
+    _index(doc, _ReversedCorrectionLLM())
+
+    stored = _stored_metadata(store, doc["doc_id"])
+    assert stored["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
 def test_transient_outage_is_counted_for_the_run_summary(runtime):
     docs_root, store = runtime
     doc = _write_doc(docs_root, "quo-attachments/annie/theft.md", "Bags left by the bins.")
 
     _index(doc, _GoodLLM())
+    doc = _write_doc(
+        docs_root,
+        "quo-attachments/annie/theft.md",
+        "Bags left by the bins. Neighbor reported overnight.",
+    )
     _index(doc, _DownLLM(httpx.ConnectError("[Errno 111] Connection refused")))
 
     assert doc["doc_id"] in fiv._RUNTIME.get("provider_unavailable", set())
@@ -192,14 +260,20 @@ def test_first_index_still_writes_during_an_outage(runtime):
     assert stored["enr_summary"] == ""
 
 
-def test_permanent_enrichment_failure_still_rewrites(runtime):
-    """A reachable provider that cannot enrich this document is information
-    about the document — it must not freeze the row forever."""
+def test_contract_failure_preserves_the_existing_enriched_row(runtime):
+    """Malformed enrichment cannot replace consumer-visible good metadata."""
     docs_root, store = runtime
     doc = _write_doc(docs_root, "quo-attachments/annie/theft.md", "Bags left by the bins.")
 
     _index(doc, _GoodLLM())
-    doc["mtime"] += 1
+    # Enrichment input must change so #3050's hash cache does not skip the LLM.
+    doc = _write_doc(
+        docs_root,
+        "quo-attachments/annie/theft.md",
+        "Bags left by the bins. Updated description for permanent failure path.",
+    )
     _index(doc, _BrokenLLM())
 
-    assert _stored_metadata(store, doc["doc_id"])["enr_summary"] == ""
+    assert _stored_metadata(store, doc["doc_id"])["enr_summary"].startswith(
+        "Photo of bags"
+    )

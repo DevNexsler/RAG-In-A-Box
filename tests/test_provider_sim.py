@@ -4,14 +4,18 @@
 # The sim must speak the exact HTTP dialects production provider code speaks:
 # OpenRouter (embeddings + chat), DeepInfra (rerank), DeepSeek OCR2, Ollama.
 
+import asyncio
 import importlib.util
 import json
 import math
 import time
 from pathlib import Path
+from unittest import mock
 
 import httpx
 import pytest
+
+from providers.embed.openrouter_embed import OpenRouterEmbedProvider
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = ROOT / "staging" / "provider_sim" / "app.py"
@@ -132,6 +136,79 @@ async def test_embeddings_shape_and_order(client):
         assert item["index"] == i
         assert len(item["embedding"]) == 768
         assert all(isinstance(v, float) for v in item["embedding"])
+
+
+@pytest.mark.anyio
+async def test_embeddings_rejects_an_empty_input_for_the_whole_batch(client):
+    """An empty input is rejected at the gateway, before the upstream sees it.
+
+    Measured against openrouter.ai/api/v1/embeddings (qwen/qwen3-embedding-8b)
+    on 2026-08-27: ``["first", "", "third"]`` -> 400 with a zod ``too_small``
+    report naming the offending slot. Like the oversize rejections, it takes
+    the WHOLE batch with it and never gets better on retry (#1687).
+    """
+    resp = await client.post(
+        "/api/v1/embeddings",
+        json={"model": "m", "input": ["first document text", "", "third one"]},
+    )
+    assert resp.status_code == 400
+    report = json.loads(resp.json()["error"]["message"])
+    assert report[0]["code"] == "too_small"
+    assert report[0]["minimum"] == 1
+    assert report[0]["path"] == ["input", 1], "the offending slot must be named"
+
+
+@pytest.mark.anyio
+async def test_embeddings_rejects_an_input_with_only_whitespace(client):
+    """Whitespace-only inputs are rejected too — by the upstream, not the gateway.
+
+    Same probe, same day: ``[" "]`` -> 400 ``{"detail": "Prompt must not be
+    empty"}``, and it is *intermittent* upstream (3 runs of ``[" "]`` gave
+    400/400/200 depending on which provider the gateway routed to). The sim
+    rejects it deterministically: a simulator that is stricter than the real
+    route cannot produce a false green, one that is more permissive can (#1658).
+    """
+    resp = await client.post(
+        "/api/v1/embeddings", json={"model": "m", "input": ["   "]}
+    )
+    assert resp.status_code == 400
+    assert "must not be empty" in resp.json()["error"]["message"]
+
+
+def test_openrouter_provider_keeps_alignment_when_a_slot_has_no_text(app):
+    """The #1687 regression guard, driven at the real batch shape.
+
+    The production provider embeds ``["first", "", "third"]`` against the
+    simulated gateway and must still hand back exactly three vectors, in
+    input order — dropping the empty slot would silently misalign every
+    later vector in the batch.
+    """
+    provider = OpenRouterEmbedProvider(
+        model="qwen/qwen3-embedding-8b",
+        api_key="test-key",
+        base_url="http://provider-sim:9999/api/v1",
+    )
+
+    def _post_to_sim(url, json=None, headers=None, timeout=None):
+        async def _call():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://provider-sim:9999"
+            ) as c:
+                return await c.post(url, json=json, headers=headers)
+
+        return asyncio.run(_call())
+
+    with mock.patch(
+        "providers.embed.openrouter_embed.httpx.post", side_effect=_post_to_sim
+    ):
+        vectors = provider.embed_texts(["first document text", "", "third one"])
+        reference = provider.embed_texts(["first document text", "third one"])
+
+    assert len(vectors) == 3
+    assert vectors[0] == reference[0], "slot 0 must still be 'first document text'"
+    assert vectors[2] == reference[1], "slot 2 must still be 'third one'"
+    assert len(vectors[1]) == len(vectors[0])
 
 
 @pytest.mark.anyio
@@ -431,6 +508,60 @@ async def test_fault_armed_429_exhausts(client):
 
 
 @pytest.mark.anyio
+async def test_audio_routes_enforce_recorded_openrouter_contracts(client):
+    audio = {"data": "ZmFrZS1hdWRpbw==", "format": "wav"}
+    media_content = [
+        {"type": "text", "text": "Transcribe"},
+        {"type": "input_audio", "input_audio": audio},
+    ]
+
+    whisper_chat = await client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "openai/whisper-1",
+            "messages": [{"role": "user", "content": media_content}],
+            "temperature": 0.0,
+        },
+    )
+    assert whisper_chat.status_code == 400
+    assert "cannot be used with the chat/completions endpoint" in whisper_chat.text
+
+    whisper_stt = await client.post(
+        "/api/v1/audio/transcriptions",
+        json={"model": "openai/whisper-1", "input_audio": audio},
+    )
+    assert whisper_stt.status_code == 200
+    assert "model openai/whisper-1" in whisper_stt.json()["text"]
+
+    voxtral_bad = await client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "mistralai/voxtral-small-24b-2507",
+            "messages": [{"role": "user", "content": media_content}],
+            "temperature": 0.0,
+        },
+    )
+    assert voxtral_bad.status_code == 400
+    assert voxtral_bad.json()["error"]["message"] == (
+        "top_p must be 1 when using greedy sampling."
+    )
+
+    voxtral_ok = await client.post(
+        "/api/v1/chat/completions",
+        json={
+            "model": "mistralai/voxtral-small-24b-2507",
+            "messages": [{"role": "user", "content": media_content}],
+            "temperature": 0.0,
+            "top_p": 1.0,
+        },
+    )
+    assert voxtral_ok.status_code == 200
+    assert "model mistralai/voxtral-small-24b-2507" in (
+        voxtral_ok.json()["choices"][0]["message"]["content"]
+    )
+
+
+@pytest.mark.anyio
 async def test_fault_armed_hangup_cuts_the_connection(client):
     # Unlike 429/garbage, this fault is not an answer: the provider is gone
     # mid-request (#0619). The caller must get no usable response at all.
@@ -448,6 +579,25 @@ async def test_fault_armed_hangup_cuts_the_connection(client):
     # single-shot: the provider answers normally once the fault exhausts
     resp = await client.post("/api/v1/chat/completions", json=_chat_payload("hello"))
     assert resp.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_fault_context_fact_as_primary_is_a_complete_enrichment(client, sim_module):
+    """#2562: the canned answer files a nearby message's fact as a primary fact."""
+    resp = await client.post(
+        "/api/v1/chat/completions",
+        json=_chat_payload("delivery slip", {"type": "json_object"}),
+        headers={"X-Sim-Fault": "context_fact_as_primary"},
+    )
+
+    assert resp.status_code == 200
+    enrichment = json.loads(resp.json()["choices"][0]["message"]["content"])
+    assert set(enrichment) == set(ENRICHMENT_KEYS)
+    assert enrichment["key_facts"] == [
+        sim_module.DELIVERY_SLIP_FACT,
+        sim_module.CONTEXT_FACT_AS_PRIMARY_FACT,
+    ]
+    assert sim_module.CONTEXT_FACT_AS_PRIMARY_KEYWORD in enrichment["keywords"]
 
 
 @pytest.mark.anyio
@@ -489,6 +639,21 @@ async def test_fault_armed_reasoning_only_exhausts_then_recovers(client):
     assert json.loads(recovered.json()["choices"][0]["message"]["content"])[
         "summary"
     ]
+
+
+@pytest.mark.anyio
+async def test_fault_member_id_as_card_is_a_complete_enrichment(client, sim_module):
+    """#2526: the canned answer names a loyalty ID's tail as the payment card."""
+    resp = await client.post(
+        "/api/v1/chat/completions",
+        json=_chat_payload("Home Depot receipt", {"type": "json_object"}),
+        headers={"X-Sim-Fault": "member_id_as_card"},
+    )
+
+    assert resp.status_code == 200
+    enrichment = json.loads(resp.json()["choices"][0]["message"]["content"])
+    assert set(enrichment) == set(ENRICHMENT_KEYS)
+    assert sim_module.MEMBER_ID_AS_CARD_FACT in enrichment["key_facts"]
 
 
 @pytest.mark.anyio

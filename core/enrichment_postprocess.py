@@ -2,12 +2,36 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from typing import NamedTuple
 
 _TOKEN_RE = re.compile(r"[a-z0-9$,.#/-]+", re.IGNORECASE)
 _LABEL_SEPARATOR_RE = re.compile(r"[-_ ]+")
 _DATE_RE = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b")
 _MONEY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d{2})?")
+_EXPLICIT_CORRECTION_PATTERNS = (
+    re.compile(
+        r"\b(?:correction|corrected|correcting)\b[^\n.]{0,80}?\bfrom\s+"
+        r"[\"'“”‘’](?P<old>[^\"'“”‘’\n]+)[\"'“”‘’]\s+to\s+"
+        r"[\"'“”‘’](?P<new>[^\"'“”‘’\n]+)[\"'“”‘’]",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:correction|corrected|correcting)\b[^\n.]{0,80}?\bfrom\s+"
+        r"(?P<old>\S(?:.*?\S)?)\s+to\s+(?P<new>\S(?:.*?\S)?)"
+        r"(?=(?:\s*(?:[;,]|\.(?:\s|$)|\(|—)|\s*$|\n))",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"[\"'“”‘’](?P<old>[^\"'“”‘’\n]+)[\"'“”‘’]\s*(?:->|=>|→)\s*"
+        r"[\"'“”‘’](?P<new>[^\"'“”‘’\n]+)[\"'“”‘’]"
+    ),
+    re.compile(
+        r"(?m)^\s*(?:[-*]\s*)?(?:[^:\n]{1,80}:\s*){0,2}"
+        r"(?P<old>\S(?:.*?\S)?)\s*(?:->|=>|→)\s*(?P<new>\S(?:.*?\S)?)"
+        r"(?=\s*(?:[;,]|\.(?:\s|$)|\(|—|$))"
+    ),
+)
 
 _STOPWORDS = {
     "a",
@@ -173,6 +197,125 @@ def _resegment_words(words: list[str]) -> list[str]:
     return segmented
 
 
+# Payment-card suffix grounding (#2526). A receipt can print a card's last four
+# digits right next to another identifier's: Home Depot follows the masked card
+# with the Pro Xtra member ID, printed phone-shaped as ###-###-NNNN, and the
+# enrichment model often names that tail as the card. A prompt hint does not
+# stop it reliably, so a card-suffix claim is checked against the text the
+# model was given instead.
+#
+# A phone-shaped number is three, three and four digit-or-mask groups, e.g.
+# 610-555-0142, (610) 555-0142 or ###-###-7305. Its tail is never a card suffix.
+_PHONE_SHAPED_RE = re.compile(
+    r"(?<![\w#*•·●])(?:\(\s*[\d#*x•·●]{3}\s*\)\s*|[\d#*x•·●]{3}[-.])"
+    r"[\d#*x•·●]{3}[-.]\d{4}(?!\d)",
+    re.IGNORECASE,
+)
+# Any other number whose last four digits these are. Card layouts vary too much
+# to require a mask: production shows correct suffixes printed as "Visa 4821",
+# "— 4821", "Card #: *4821" and "(...4821)" alongside "XXXXXXXXXXXX4821".
+_TRAILING_FOUR_RE = re.compile(r"(\d{4})(?!\d)")
+# A number printed with everything but its last four digits hidden. These are
+# the only candidates a wrong suffix is ever rewritten to.
+_MASKED_NUMBER_RE = re.compile(
+    r"(?<![\w#*•·●.])"
+    r"(?:[x#*•·●]{2,19}(?:[\s-][x#*•·●]{2,6}){0,4}|\*|\.{3,12}|…)"
+    r"[\s-]?(?P<digits>\d{4})(?!\d)",
+    re.IGNORECASE,
+)
+# "<card term> ... ending in NNNN", within one clause. The words between the two
+# may not name a different identifier, so "paid by card at the store whose
+# phone ends in 0142" is not read as a card claim.
+_CARD_SUFFIX_CLAIM_RE = re.compile(
+    r"\b(?:visa|master\s?card|amex|american\s+express|discover|debit|credit|card)\b"
+    r"(?:(?!\b(?:phone|mobile|member|loyalty|order|invoice|confirmation|tracking"
+    r"|policy|loan)\b)[^.;\"\n]){0,60}?"
+    r"(?P<phrase>\s*,?\s*(?P<open>\()?\s*"
+    r"(?:(?:(?:ending|ends)(?:\s+(?:in|with))?"
+    r"|last\s+(?:4|four)(?:\s+digits)?(?:\s+of)?)\s*[:#]?\s*[x*•·.]*"
+    r"|[x*•·]{2,})\s*"
+    r"(?P<digits>\d{4})(?!\d)(?(open)\s*\)))",
+    re.IGNORECASE,
+)
+# Free-text enrichment fields that can carry a card claim.
+_CARD_CLAIM_FIELDS = (
+    "enr_summary",
+    "enr_key_facts",
+    "enr_keywords",
+    "enr_context_key_facts",
+    "enr_context_relationship",
+    "enr_context_warning",
+)
+
+
+class CardSuffixCorrection(NamedTuple):
+    field: str
+    claimed: str
+    corrected: str  # "" when the suffix was dropped
+
+
+def ground_card_suffixes(
+    enrichment: dict[str, str],
+    *,
+    source_text: str,
+) -> tuple[dict[str, str], list[CardSuffixCorrection]]:
+    """Keep card-suffix claims to cards the source text actually shows.
+
+    A claim such as "paid by Visa ending in 7305" is kept only when 7305 is
+    attached to a card label in ``source_text``. Otherwise its
+    suffix is rewritten to the source's masked card number when there is
+    exactly one, and dropped ("paid by Visa") when there is none or several.
+    Everything else in the enrichment is left exactly as it was. Returns the
+    grounded enrichment and one correction per changed claim, for logging.
+    """
+    visible = _PHONE_SHAPED_RE.sub(" ", source_text or "")
+    visible = re.sub(r"\[credit_card_icon[^]\n]*\]", "credit card", visible, flags=re.IGNORECASE)
+    card_term = r"(?:visa|master\s?card|amex|american\s+express|discover|debit\s+card|credit\s+card|card)"
+    number = r"(?:[x#*•·●.\d][x#*•·●.\d\s-]{0,40})?\d{4}"
+    evidence = re.findall(
+        rf"\b{card_term}\b[\s:#(—-]*{number}|{number}\s+{card_term}\b",
+        visible, re.IGNORECASE,
+    )
+    card_text = "\n".join(evidence)
+    grounded = set(_TRAILING_FOUR_RE.findall(card_text))
+    grounded.update(match.group("digits") for match in _CARD_SUFFIX_CLAIM_RE.finditer(visible))
+    masked = {match.group("digits") for match in _MASKED_NUMBER_RE.finditer(card_text)}
+    replacement = next(iter(masked)) if len(masked) == 1 else ""
+
+    repaired = dict(enrichment)
+    corrections: list[CardSuffixCorrection] = []
+    for field in _CARD_CLAIM_FIELDS:
+        value = repaired.get(field)
+        if not value:
+            continue
+
+        def ground(match: re.Match[str], field: str = field) -> str:
+            claimed = match.group("digits")
+            if claimed in grounded:
+                return match.group(0)
+            corrections.append(CardSuffixCorrection(field, claimed, replacement))
+            claim = match.group(0)
+            if replacement:
+                start = match.start("digits") - match.start()
+                return claim[:start] + replacement + claim[start + len(claimed):]
+            return claim[: match.start("phrase") - match.start()]
+
+        repaired[field] = _rewrite_claims(value, ground)
+    return repaired, corrections
+
+
+def _rewrite_claims(value: str, ground: Callable[[re.Match[str]], str]) -> str:
+    """Apply ``ground`` to every card claim in a plain or JSON-list field."""
+    try:
+        items = json.loads(value)
+    except json.JSONDecodeError:
+        items = None
+    if not isinstance(items, list):
+        return _CARD_SUFFIX_CLAIM_RE.sub(ground, value)
+    rewritten = [_CARD_SUFFIX_CLAIM_RE.sub(ground, str(item)) for item in items]
+    return value if rewritten == [str(item) for item in items] else json.dumps(rewritten)
+
+
 def repair_enrichment(
     enrichment: dict[str, str],
     *,
@@ -183,11 +326,12 @@ def repair_enrichment(
     enabled_rules: Iterable[str] | None = None,
 ) -> dict[str, str]:
     repaired = dict(enrichment)
+    source_text = _document_text(text)
+    repaired = _repair_explicit_corrections(repaired, source_text)
     if not enabled:
         return repaired
     rules = _rule_set(enabled_rules)
 
-    source_text = _document_text(text)
     corpus = "\n".join(
         part for part in (title, source_type, source_text, _metadata_corpus(repaired)) if part
     )
@@ -209,6 +353,62 @@ def repair_enrichment(
             corpus_lower=corpus_lower,
         )
     return repaired
+
+
+def _repair_explicit_corrections(enrichment: dict[str, str], source_text: str) -> dict[str, str]:
+    """Replace only generated assertions that invert an explicit source correction."""
+    repaired = dict(enrichment)
+    for old, new in _explicit_corrections(source_text):
+        canonical = f"Correction: {new} (not {old})."
+        summary = repaired.get("enr_summary", "")
+        # Preserve unrelated sentences instead of replacing the entire summary.
+        sentences = re.split(r"(?<=[.!?])\s+", summary)
+        repaired["enr_summary"] = " ".join(
+            canonical if _reverses_correction(sentence, old, new) else sentence
+            for sentence in sentences
+        )
+
+        facts = _fact_values(repaired.get("enr_key_facts", ""))
+        reversed_facts = [fact for fact in facts if _reverses_correction(fact, old, new)]
+        if reversed_facts:
+            repaired["enr_key_facts"] = json.dumps(
+                [canonical, *(fact for fact in facts if fact not in reversed_facts)]
+            )
+    return repaired
+
+
+def _explicit_corrections(source_text: str) -> list[tuple[str, str]]:
+    corrections: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, pattern in enumerate(_EXPLICIT_CORRECTION_PATTERNS):
+        for match in pattern.finditer(source_text):
+            line_start = source_text.rfind("\n", 0, match.start()) + 1
+            line_end = source_text.find("\n", match.start())
+            line = source_text[line_start:line_end if line_end >= 0 else len(source_text)]
+            if index >= 2 and not re.search(r"\bcorrect(?:ion|ed|ing)\b", line, re.IGNORECASE):
+                continue
+            old = " ".join(match.group("old").split()).strip()
+            new = " ".join(match.group("new").split()).strip()
+            identity = (old.casefold(), new.casefold())
+            if not old or not new or identity[0] == identity[1] or identity in seen:
+                continue
+            corrections.append((old, new))
+            seen.add(identity)
+    return corrections
+
+
+def _reverses_correction(value: str, old: str, new: str) -> bool:
+    """Return whether text presents old value as correct and new value as wrong."""
+    old_re = re.escape(old)
+    new_re = re.escape(new)
+    return bool(
+        re.search(
+            rf"(?<!\w){old_re}(?!\w)[^\n]{{0,120}}?\b(?:not|rather than|instead of)\b\s*"
+            rf"(?<!\w){new_re}(?!\w)",
+            value,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _document_text(text: str) -> str:

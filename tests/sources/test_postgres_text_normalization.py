@@ -118,6 +118,31 @@ def test_scan_leaves_non_cliq_message_text_and_hash_unchanged():
     assert record.change_hash == expected_hash
 
 
+def test_scan_preserves_plain_text_meaningful_urls():
+    text = "Review the permit at https://permits.example/cases/ABC-123?view=public"
+    source, _ = _source([_message("plain-link", text, source="zoho_mail")], [])
+
+    [record] = list(source.scan())
+
+    assert record.metadata["_text"] == text
+
+
+def test_scan_keeps_html_anchor_text_but_not_link_or_image_targets():
+    text = """
+    <html><body>
+      <p>Review <a href="https://tracker.example/r?token=secret">permit ABC-123</a>.</p>
+      <img src="https://assets.example/pixel.gif?recipient=secret">
+    </body></html>
+    """
+    source, _ = _source([_message("html-link", text, source="zoho_mail")], [])
+
+    [record] = list(source.scan())
+
+    assert "Review permit ABC-123." in record.metadata["_text"]
+    assert "tracker.example" not in record.metadata["_text"]
+    assert "assets.example" not in record.metadata["_text"]
+
+
 def test_scan_preserves_opaque_source_message_ids_verbatim():
     """Ticket #0618: the ledger holds keys like
     `zoho_cliq/1780327866430%2015958014910122`, which looked like an `_` that
@@ -141,3 +166,20 @@ def test_scan_preserves_opaque_source_message_ids_verbatim():
 
     assert [r.doc_id for r in records] == [f"zoho_mail/{i}" for i in opaque]
     assert [r.natural_key for r in records] == [r.doc_id for r in records]
+
+
+def test_html_self_closing_hidden_element_preserves_following_text():
+    from sources.text_normalization import normalize_source_text
+
+    result = normalize_source_text("pg_message", "<div hidden/><p>Visible invoice 1234</p>")
+    assert result.text == "Visible invoice 1234"
+
+
+def test_html_void_or_unmatched_end_tag_cannot_reveal_hidden_text():
+    from sources.text_normalization import normalize_source_text
+
+    for closing in ("</br>", "</span>"):
+        result = normalize_source_text(
+            "pg_message", f"<div hidden><br>{closing}secret</div><p>visible</p>"
+        )
+        assert result.text == "visible"

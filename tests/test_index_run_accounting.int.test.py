@@ -7,12 +7,18 @@ no-text-extracted still reported a non-zero `added/updated` next to
 `completion=100.0%`, so the run's success record could not be used as evidence
 that anything reached LanceDB.
 
+#2100 is the same defect one level down: the skip *reasons* on that line were
+only ever an aggregate count, so a document the run deliberately skipped and one
+it silently dropped both logged `Processing:` and nothing else.
+
 These drive the real flow over a real store, so the emitted line is the one an
 operator (or a dashboard, or an alert) actually reads.
 """
 
+import ast
 import logging
 import re
+from collections import Counter
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -62,16 +68,31 @@ def _config(root: Path, index_root: Path) -> dict:
     }
 
 
-def _run_flow(root: Path, index_root: Path) -> None:
+def _run_flow(
+    root: Path, index_root: Path, *, terminal_failures: tuple[str, ...] = ()
+) -> None:
+    """Drive the real flow. `terminal_failures` holds filename stems whose
+    processing raises a deterministic (non-transient) error — the terminal skip
+    lane. Matched as a substring because the filesystem source stamps the doc id
+    into the name it reports (`broken@00002@.md`)."""
     store = LanceDBStore(str(index_root), "chunks")
     taxonomy = MagicMock()
     taxonomy.count.return_value = 0
+    process_doc_task = fiv.process_doc_task
+
+    def _process_doc(doc: dict):
+        if any(stem in doc.get("rel_path", "") for stem in terminal_failures):
+            # The #0569 shape: a deterministic provider rejection that can never
+            # succeed on a re-run, so the doc is quarantined instead of retried.
+            raise RuntimeError('embeddings error 400: {"message":"invalid input"}')
+        return process_doc_task(doc)
     with patch("flow_index_vault.load_config", return_value=_config(root, index_root)), \
          patch("flow_index_vault.get_run_logger", return_value=logging.getLogger("test")), \
          patch("flow_index_vault.open_store_with_recovery", return_value=store), \
          patch("flow_index_vault.build_embed_provider", return_value=_StubEmbedProvider()), \
          patch("flow_index_vault.build_ocr_provider", return_value=None), \
          patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("flow_index_vault.process_doc_task", _process_doc), \
          patch("core.taxonomy.load_taxonomy_store", return_value=taxonomy):
         fiv.index_vault_flow.fn("dummy.yaml")
 
@@ -102,6 +123,27 @@ def _chunk_write_ops(caplog) -> int:
         for record in caplog.records
         if re.match(r"^(Inserted|Upserted) \d+ chunks: ", record.getMessage())
     ])
+
+
+_STATS_SKIPPED = re.compile(r"skipped=(\d+)(?: (\{.*?\}))?, deleted=")
+_LEDGER_SKIPPED = re.compile(r"^(\d+) docs added to skip ledger \(.*?\): (\{.*\})$")
+
+
+def _skip_rollup(pattern: "re.Pattern[str]", line: str) -> tuple[int, dict]:
+    """(document count, reason breakdown) as one summary line reports them."""
+    match = pattern.search(line)
+    assert match, f"unparseable skip roll-up: {line}"
+    return int(match.group(1)), ast.literal_eval(match.group(2) or "{}")
+
+
+def _ledger_line(caplog) -> str:
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "docs added to skip ledger" in record.getMessage()
+    ]
+    assert len(lines) == 1, f"expected one skip ledger line, got {lines}"
+    return lines[0]
 
 
 def test_all_skip_run_reports_zero_indexed_with_skip_reasons(tmp_path, caplog):
@@ -175,3 +217,158 @@ def test_mixed_queue_indexed_count_matches_chunk_write_ops(tmp_path, caplog):
     assert "indexed_chunks=2" in line, line
     assert "skipped=1" in line, line
     assert "no_text_extracted" in line, line
+
+
+# --- #2100: every processed document's terminal outcome is attributable -------
+#
+# A skip reason only ever reached the per-run aggregate, so "Processing: <path>"
+# followed by nothing was produced both by a document the run deliberately
+# skipped and by one it dropped through a bug. 300 of 1015 vault processings a
+# day were unattributable. These pin the per-document line and its agreement
+# with the aggregate the run already reports.
+
+_SKIP_LINE_RE = re.compile(r"^Skipping (\S+): (.+) \(([^()]*)\)$")
+_STATS_REASONS_RE = re.compile(r"skipped=(\d+) (\{.*?\})")
+
+
+def _skip_lines(caplog) -> dict[str, list[str]]:
+    """doc_id -> reasons, for every per-document skip line the run emitted."""
+    found: dict[str, list[str]] = {}
+    for record in caplog.records:
+        match = _SKIP_LINE_RE.match(record.getMessage())
+        if not match:
+            continue
+        doc_id, reasons, _path = match.groups()
+        assert doc_id not in found, f"{doc_id} logged twice: {found[doc_id]} / {reasons}"
+        found[doc_id] = [reason.strip() for reason in reasons.split(",")]
+    return found
+
+
+def _stats_skip_aggregate(caplog) -> tuple[int, dict[str, int]]:
+    match = _STATS_REASONS_RE.search(_stats_line(caplog))
+    assert match, _stats_line(caplog)
+    return int(match.group(1)), ast.literal_eval(match.group(2))
+
+
+def _skipped_corpus(root: Path) -> None:
+    """One contentless doc and one duplicate pair — the two skip lanes."""
+    (root / "blank.md").write_text("   \n\n")
+    (root / "original.md").write_text("shared body text for the duplicate pair\n")
+    (root / "copy.md").write_text("shared body text for the duplicate pair\n")
+
+
+def test_every_skipped_document_is_named_in_the_log(tmp_path, caplog):
+    """A skip a run took must name the document it took it on."""
+    root = tmp_path / "documents"
+    root.mkdir()
+    _skipped_corpus(root)
+
+    index_root = tmp_path / "index"
+    caplog.set_level(logging.INFO)
+
+    _run_flow(root, index_root)
+
+    ledgered = fiv._load_skip_ledger(index_root)["docs"]
+    assert ledgered, "expected the run to skip something"
+
+    logged = _skip_lines(caplog)
+    assert set(logged) == set(ledgered), (
+        f"skip ledger and log disagree: ledger={sorted(ledgered)} log={sorted(logged)}"
+    )
+    for doc_id, entry in ledgered.items():
+        assert logged[doc_id] == entry["reasons"], doc_id
+
+
+def test_skip_lines_reconcile_with_the_index_stats_aggregate(tmp_path, caplog):
+    """Acceptance #4: the per-document lines add up to the roll-up."""
+    root = tmp_path / "documents"
+    root.mkdir()
+    _skipped_corpus(root)
+
+    index_root = tmp_path / "index"
+    caplog.set_level(logging.INFO)
+
+    _run_flow(root, index_root)
+
+    skipped, aggregate = _stats_skip_aggregate(caplog)
+    logged = _skip_lines(caplog)
+    assert len(logged) == skipped, f"{len(logged)} skip lines vs skipped={skipped}"
+    assert Counter(
+        reason.split(":", 1)[0] for reasons in logged.values() for reason in reasons
+    ) == aggregate
+
+
+def test_duplicate_skip_is_emitted_by_the_shared_per_document_emitter(tmp_path, caplog):
+    """Acceptance #3: the duplicate line is not a second, hand-rolled path."""
+    root = tmp_path / "documents"
+    root.mkdir()
+    _skipped_corpus(root)
+
+    index_root = tmp_path / "index"
+    caplog.set_level(logging.INFO)
+
+    _run_flow(root, index_root)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not [line for line in messages if line.startswith("Duplicate content:")], (
+        "duplicate skips must go through the shared skip emitter"
+    )
+    duplicates = {
+        doc_id: reasons
+        for doc_id, reasons in _skip_lines(caplog).items()
+        if any(reason.startswith("duplicate_of:") for reason in reasons)
+    }
+    assert len(duplicates) == 1, duplicates
+
+
+def test_terminal_failure_counts_the_same_on_both_skip_roll_ups(tmp_path, caplog):
+    """#2184: `Index stats:` and the skip ledger line must not disagree.
+
+    A terminal (non-transient) processing failure writes a real
+    `terminal_error:<ExcType>` skip ledger entry, so the run's two adjacent
+    skip roll-ups have to count that document — and name its reason — alike.
+    Before the fix the terminal lane left the progress counters untouched, so a
+    run with `k` terminal failures reported `skipped=N` next to
+    `N+k docs added to skip ledger`, with `terminal_error` in one dict only.
+    """
+    root = tmp_path / "documents"
+    root.mkdir()
+    (root / "blank.md").write_text("   \n\n")
+    (root / "broken.md").write_text("body text that never reaches the store\n")
+
+    index_root = tmp_path / "index"
+    caplog.set_level(logging.INFO)
+
+    _run_flow(root, index_root, terminal_failures=("broken",))
+
+    stats_count, stats_reasons = _skip_rollup(_STATS_SKIPPED, _stats_line(caplog))
+    ledger_count, ledger_reasons = _skip_rollup(_LEDGER_SKIPPED, _ledger_line(caplog))
+
+    assert (stats_count, stats_reasons) == (ledger_count, ledger_reasons)
+    assert ledger_reasons == {"no_text_extracted": 1, "terminal_error": 1}
+    assert stats_count == 2
+
+    # The terminal lane's own ERROR line is an external contract — log-patterns.conf
+    # and three Maint-Manager outcome checks match it verbatim.
+    assert any(
+        re.search(r"^Skipping .* after retries exhausted: ", record.getMessage())
+        for record in caplog.records
+    )
+
+
+def test_completion_line_agrees_with_the_skip_ledger_on_terminal_failures(
+    tmp_path, caplog
+):
+    """The third roll-up reads from the same counters, so it moves with them."""
+    root = tmp_path / "documents"
+    root.mkdir()
+    (root / "broken.md").write_text("body text that never reaches the store\n")
+
+    index_root = tmp_path / "index"
+    caplog.set_level(logging.INFO)
+
+    _run_flow(root, index_root, terminal_failures=("broken",))
+
+    ledger_count, _ = _skip_rollup(_LEDGER_SKIPPED, _ledger_line(caplog))
+    line = _completion_line(caplog)
+    assert f"skipped={ledger_count}" in line, line

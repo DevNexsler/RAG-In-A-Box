@@ -11,7 +11,7 @@
 # Excluded: chunks__shadow.lance (transient rebuild table), *.corrupt
 # (already-dead data), indexer logs.
 #
-# Retention (GFS): 3 daily; Sunday copies go to weekly/ (keep 4); the first
+# Retention (GFS): 3 daily; first backup each ISO week goes to weekly/ (keep 4); the first
 # backup of each month also goes to monthly/ (keep 3). Granular day-by-day
 # rollback for the last 30 days comes from in-dataset Lance version
 # tags (#0113), which are far cheaper than full tarballs; these independent

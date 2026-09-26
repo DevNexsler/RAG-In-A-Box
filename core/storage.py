@@ -109,7 +109,7 @@ class StorageInterface(Protocol):
 
     def insert_nodes(
         self, nodes: list[TextNode], *, known_absent: bool = False
-    ) -> None:
+    ) -> bool:
         """Insert nodes for documents not already present, idempotently."""
         ...
 
@@ -151,6 +151,10 @@ class StorageInterface(Protocol):
 
     def create_fts_index(self) -> None:
         """Create or rebuild the full-text search index."""
+        ...
+
+    def rebuild_fts_index(self) -> None:
+        """Rebuild FTS and finish index-maintenance lifecycle cleanup."""
         ...
 
     def ensure_fts_index(self) -> None:

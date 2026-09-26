@@ -1,6 +1,13 @@
 import json
 
-from core.enrichment_postprocess import canonicalize_doc_type, repair_enrichment
+import pytest
+
+from core.enrichment_postprocess import (
+    CardSuffixCorrection,
+    canonicalize_doc_type,
+    ground_card_suffixes,
+    repair_enrichment,
+)
 
 
 def test_importance_raises_actionable_payment_documents_above_default():
@@ -95,6 +102,130 @@ def test_repair_disabled_returns_equal_copy():
     assert repaired is not enrichment
 
 
+def test_explicit_bare_correction_repairs_reversed_summary_when_postprocess_disabled():
+    enrichment = {
+        "enr_summary": "The corrected name is Shawn, not Sean.",
+        "enr_key_facts": json.dumps(["The corrected name is Shawn, not Sean."]),
+    }
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Correction: changed from Shawn to Sean.",
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    expected = "Correction: Sean (not Shawn)."
+    assert repaired["enr_summary"] == expected
+    assert json.loads(repaired["enr_key_facts"]) == [expected]
+
+
+def test_labeled_arrow_correction_repairs_reversed_summary_when_postprocess_disabled():
+    enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Correction: Husband name: Shawn -> Sean",
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
+def test_labeled_arrow_with_annotation_repairs_reversed_summary_when_postprocess_disabled():
+    enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Correction: Husband name: Shawn -> Sean; confirmed by sender.",
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
+def test_labeled_arrow_with_parenthetical_annotation_repairs_reversed_summary_when_postprocess_disabled():
+    enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Correction: Husband name: Shawn -> Sean (confirmed)",
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
+def test_explicit_email_correction_and_semicolon_inversion_are_grounded():
+    enrichment = {"enr_summary": "Contact remains old@example.com; not new@example.com."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Correction from old@example.com to new@example.com.",
+        title="Contact correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: new@example.com (not old@example.com)."
+
+
+def test_explicit_labeled_equals_arrow_correction_is_grounded():
+    enrichment = {"enr_summary": "The corrected ID is old-42, not new-43."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Correction: Account ID: old-42 => new-43",
+        title="Account correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: new-43 (not old-42)."
+
+
+def test_update_without_correction_cue_does_not_reverse_valid_summary():
+    enrichment = {"enr_summary": "Departure is Boston, not New York."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text="Updated itinerary: travel from Boston to New York.",
+        title="Travel update",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired == enrichment
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Correction from Shawn to Sean\nConfirmed by sender.",
+        "Correction from Shawn to Sean (confirmed by sender).",
+    ],
+)
+def test_unquoted_correction_annotation_does_not_become_part_of_corrected_value(text):
+    enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text=text,
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
 def test_enabled_rules_can_limit_repair_to_importance_only():
     enrichment = {
         "enr_importance": "0.5",
@@ -149,3 +280,106 @@ def test_doc_type_segmentation_is_idempotent_and_leaves_other_labels_alone():
     assert canonicalize_doc_type("follow_up") == "follow_up"
     assert canonicalize_doc_type("follow_up, followup") == "follow_up"
     assert canonicalize_doc_type("rental_inquiry, mp3") == "rental_inquiry, mp3"
+
+
+def _ground_summary(summary: str, source_text: str):
+    return ground_card_suffixes({"enr_summary": summary}, source_text=source_text)
+
+
+@pytest.mark.parametrize(
+    "phone_shaped",
+    [
+        "###-###-7305",
+        "***-***-7305",
+        "XXX.XXX.7305",
+        "610-555-7305",
+        "1-610-555-7305",
+        "(610) 555-7305",
+        "(###)###-7305",
+    ],
+)
+def test_a_phone_shaped_tail_never_grounds_a_card_suffix(phone_shaped):
+    """#2526: the Pro Xtra member ID is printed like a phone number."""
+    repaired, corrections = _ground_summary(
+        "Paid by Visa ending in 7305.",
+        f"TOTAL $42.40 XXXXXXXXXXXX4821 VISA Member {phone_shaped} Thanks",
+    )
+
+    assert repaired["enr_summary"] == "Paid by Visa ending in 4821."
+    assert corrections == [CardSuffixCorrection("enr_summary", "7305", "4821")]
+
+
+@pytest.mark.parametrize(
+    "masked",
+    [
+        "XXXXXXXXXXXX4821",
+        "xxxx-xxxx-xxxx-4821",
+        "**** **** **** 4821",
+        "############4821",
+        "Card #: *4821",
+        "Visa\u00a0\u00b7\u00b7\u00b7\u00b7\u00a04821",
+    ],
+)
+def test_a_wrong_suffix_is_rewritten_to_the_sole_masked_number(masked):
+    repaired, _ = _ground_summary(
+        "Paid by credit card ending in 7305.",
+        f"Charged Visa {masked}. Pro Xtra ###-###-7305",
+    )
+
+    assert repaired["enr_summary"] == "Paid by credit card ending in 4821."
+
+
+@pytest.mark.parametrize(
+    ("summary", "dropped"),
+    [
+        ("Paid by Visa ending in 7305.", "Paid by Visa."),
+        ("Paid by Visa (ending in 7305) in store.", "Paid by Visa in store."),
+        ("Paid by Mastercard, last four digits 7305.", "Paid by Mastercard."),
+        ("Paid by debit card ****7305.", "Paid by debit card."),
+    ],
+)
+def test_a_wrong_suffix_is_dropped_when_no_single_masked_number_exists(summary, dropped):
+    repaired, corrections = _ground_summary(summary, "Visa 4821 Pro Xtra ###-###-7305")
+
+    assert repaired["enr_summary"] == dropped
+    assert corrections == [CardSuffixCorrection("enr_summary", "7305", "")]
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        # Not a card claim: the member ID and the store phone really end so.
+        "The Pro Xtra member number ends in 7305.",
+        "Paid by credit card at the store whose phone number ends in 7305.",
+        "Paid by Visa. The store phone ends in 7305.",
+        # A card claim whose suffix the source does print, unmasked.
+        "Paid by Visa ending in 4821.",
+    ],
+)
+def test_supported_and_non_card_claims_are_left_alone(summary):
+    repaired, corrections = _ground_summary(
+        summary, "Visa 4821 Ref 4111111111111111 Pro Xtra ###-###-7305"
+    )
+
+    assert repaired["enr_summary"] == summary
+    assert corrections == []
+
+
+def test_card_suffix_grounding_rewrites_list_items_in_place():
+    enrichment = {
+        "enr_key_facts": json.dumps(["Total is $42.40.", "Paid by Visa ending in 7305."]),
+        "enr_keywords": "Home Depot, Visa ending in 7305",
+        "enr_importance": "0.5",
+    }
+
+    repaired, corrections = ground_card_suffixes(
+        enrichment, source_text="XXXXXXXXXXXX4821 VISA PRO XTRA ###-###-7305"
+    )
+
+    assert json.loads(repaired["enr_key_facts"]) == [
+        "Total is $42.40.",
+        "Paid by Visa ending in 4821.",
+    ]
+    assert repaired["enr_keywords"] == "Home Depot, Visa ending in 4821"
+    assert repaired["enr_importance"] == "0.5"
+    assert [c.field for c in corrections] == ["enr_key_facts", "enr_keywords"]
