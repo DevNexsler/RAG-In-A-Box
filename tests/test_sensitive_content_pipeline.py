@@ -42,7 +42,16 @@ class _CapturingLLM:
             {
                 "summary": "A communication message.",
                 "doc_type": ["message"],
+                "entities_people": [],
+                "entities_places": [],
+                "entities_orgs": [],
+                "entities_dates": [],
                 "topics": ["operations"],
+                "keywords": ["operations"],
+                "key_facts": [],
+                "suggested_tags": ["operations"],
+                "suggested_folder": "Operations",
+                "importance": 0.5,
             }
         )
 

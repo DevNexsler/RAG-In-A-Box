@@ -32,7 +32,7 @@ sources:
     tables:
       - source_type: pg_message
         query: |
-          SELECT source, source_message_id, channel_name,
+          SELECT source, source_message_id, source_message_id AS message_id, channel_name,
                  channel_name AS source_channel_id, sender, direction,
                  sent_at, updated_at,
                  CASE
@@ -51,7 +51,7 @@ sources:
         text_column: _text
         text_normalizer: zoho_cliq_mentions
         mtime_column: updated_at
-        metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, subject, sent_at, direction]
+        metadata_columns: [source, source_message_id, message_id, source_channel_id, channel_name, sender, subject, sent_at, direction]
 
       - source_type: sor_unit
         query: |
@@ -125,6 +125,7 @@ chunking:
   max_chars: 1800
   overlap: 200
   min_chars: 150
+  max_chunks_per_document: 64
 
 enrichment:
   enabled: true

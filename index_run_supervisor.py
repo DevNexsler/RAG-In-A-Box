@@ -335,13 +335,33 @@ class IndexRunSupervisor:
             progress["last_heartbeat_at"] = payload["updated_at"]
         return progress
 
-    def _has_foreign_heartbeat(self, run_id: object) -> bool:
-        """Keep an active state with another run's heartbeat fail-closed."""
+    def _has_foreign_heartbeat(self, current: dict[str, Any]) -> bool:
+        """Keep an active state fail-closed when another run stamped progress
+        while this one was supposed to be running.
+
+        One heartbeat file is reused by every run and is never retired, so the
+        predecessor's final stamp outlives it and carries the predecessor's run
+        id. A stamp written before this run started says nothing about this run
+        — the same rule /health applies to heartbeat age (#0515). Only a stamp
+        this run could not have preceded is evidence of a concurrent indexer;
+        treating the predecessor's leftover as one made #1058's no-evidence
+        path unreachable in production (#1827)."""
         try:
             payload = json.loads((self.index_root / "indexer.heartbeat").read_text())
         except (OSError, ValueError, TypeError):
             return False
-        return isinstance(payload, dict) and payload.get("run_id") not in {None, run_id}
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("run_id") in {None, current.get("run_id")}:
+            return False
+        try:
+            stamped_at = datetime.fromisoformat(payload["updated_at"])
+            started_at = datetime.fromisoformat(current["started_at"])
+        except (KeyError, TypeError, ValueError):
+            return True
+        if stamped_at.utcoffset() is None or started_at.utcoffset() is None:
+            return True
+        return stamped_at >= started_at
 
     @staticmethod
     def _progress_text(attempt: dict[str, Any]) -> str:
@@ -514,7 +534,7 @@ class IndexRunSupervisor:
             if (
                 identity_failure == "process_missing_on_reconcile"
                 and not progress
-                and not self._has_foreign_heartbeat(current.get("run_id"))
+                and not self._has_foreign_heartbeat(current)
             ):
                 terminal = self._terminal_unknown(current, identity_failure)
             else:

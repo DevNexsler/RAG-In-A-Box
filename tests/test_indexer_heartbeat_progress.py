@@ -66,7 +66,7 @@ def test_scan_stamps_heartbeat_periodically(tmp_path, monkeypatch):
     src = _FakeSource("documents", count=350)
     store = _FakeDocIDStore()
 
-    records, record_map = flow_index_vault._scan_and_register_sources(
+    records, record_map, failed = flow_index_vault._scan_and_register_sources(
         [src], store, tmp_path
     )
 
@@ -84,6 +84,7 @@ def test_scan_stamps_heartbeat_periodically(tmp_path, monkeypatch):
     assert records[0]["rel_path"] == "documents/doc-0.txt"
     assert store.registered[0] == ("documents::000000", "documents/doc-0.txt", "documents")
     assert len(store.registered) == 350
+    assert failed == []
 
 
 def test_scan_stamps_heartbeat_even_when_empty(tmp_path, monkeypatch):
@@ -93,12 +94,13 @@ def test_scan_stamps_heartbeat_even_when_empty(tmp_path, monkeypatch):
         flow_index_vault, "_write_heartbeat", lambda index_root: stamps.append(1)
     )
 
-    records, record_map = flow_index_vault._scan_and_register_sources(
+    records, record_map, failed = flow_index_vault._scan_and_register_sources(
         [_FakeSource("documents", count=0)], _FakeDocIDStore(), tmp_path
     )
 
     assert records == []
     assert record_map == {}
+    assert failed == []
     assert len(stamps) == 2  # start + complete, no per-record stamps
 
 
@@ -149,6 +151,32 @@ def test_completion_summary_names_queue_progress_and_elapsed():
         31,
         12.5,
         100.0,
+    )
+
+
+def test_completion_summary_marks_a_run_that_missed_a_source_partial():
+    """Ticket #2020: `completion=` is queue drain, not coverage.
+
+    A run whose queue drained fully but whose comm_messages source never
+    scanned reads as a clean 100% run unless the line says otherwise.
+    """
+    logger = Mock(spec=logging.Logger)
+
+    flow_index_vault._log_run_completion(
+        logger,
+        run_id="run-partial",
+        queued=4,
+        processed=4,
+        skipped=0,
+        indexed_docs=4,
+        indexed_chunks=9,
+        elapsed_seconds=3.0,
+        failed_sources=["comm_messages", "sor"],
+    )
+
+    message = logger.info.call_args.args[0] % tuple(logger.info.call_args.args[1:])
+    assert message.endswith(
+        "completion=100.0% partial=true failed_sources=comm_messages,sor"
     )
 
 

@@ -29,3 +29,38 @@ def is_permanent_skip_entry(entry: dict) -> bool:
     return isinstance(reasons, list) and bool(
         ACTIONABLE_PERMANENT_SKIP_REASONS.intersection(reasons)
     )
+
+
+#: Prefix of the skip reason the dedupe gate records for a copy whose content
+#: is carried by another registry row.
+DEDUPE_SKIP_REASON_PREFIX = "duplicate_of:"
+
+
+def content_terminal_skip_reasons(entry: dict) -> list[str]:
+    """Skip reasons that are a verdict about the document's own bytes.
+
+    A skip recorded because the document deduped against a canonical says
+    nothing about whether these bytes can be indexed — the content is in the
+    canonical's rows — so reading it as evidence about the content is circular.
+    Every other skip reason (no text extracted, unreadable or encrypted PDF,
+    retrieval stub, quarantine, corruption, terminal processing error) means
+    the same thing: while these bytes are unchanged this document will not
+    produce an index row.
+
+    Unknown future reasons are therefore treated as verdicts, which is the safe
+    direction — it keeps a document that cannot land content out of the dedupe
+    canonical election (#2097) rather than letting the next new reason
+    reintroduce a canonical no duplicate can ever resolve to.
+    """
+    reasons = entry.get("reasons", []) if isinstance(entry, dict) else []
+    if not isinstance(reasons, list):
+        return []
+    return sorted(
+        {
+            reason
+            for reason in reasons
+            if isinstance(reason, str)
+            and reason
+            and not reason.startswith(DEDUPE_SKIP_REASON_PREFIX)
+        }
+    )

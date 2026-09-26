@@ -47,7 +47,7 @@ from contextvars import ContextVar, copy_context
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Iterator, Mapping, Sequence
 
 from prefect import flow, task
 from prefect.logging import get_run_logger
@@ -83,7 +83,12 @@ from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
 from core.dedupe import compute_file_identity
 from core.resilience import CircuitOpenError, is_transient
-from core.skip_policy import actionable_skip_docs, is_permanent_skip_entry
+from core import degraded_policy, standing_conditions
+from core.skip_policy import (
+    actionable_skip_docs,
+    content_terminal_skip_reasons,
+    is_permanent_skip_entry,
+)
 from core.sensitive_content import (
     redact_sensitive_text,
     sanitize_metadata,
@@ -116,7 +121,7 @@ from doc_id_store import (
 from core.tracing import get_tracer, setup_tracing
 from memory_observer import MemoryObserver
 from core.hook_outbox import HookOutbox
-from hooks.delivery import drain_due, queue_event
+from hooks.delivery import drain_due, queue_event, send_enqueued
 from hooks.events import build_document_indexed_event
 from lancedb_store import (
     LanceDBStore,
@@ -138,6 +143,7 @@ _LOCKED_INDEX_CONFIG: ContextVar[dict | None] = ContextVar(
     "locked_index_config",
     default=None,
 )
+_DEFAULT_MAX_CHUNKS_PER_DOCUMENT = 64
 
 
 def _measure_index_memory(subphase: str, doc_id: str):
@@ -369,6 +375,32 @@ def _split_section(
             chunks.extend(splitter.split_text(sub))
         return chunks
     return splitter.split_text(text)
+
+
+class _DocumentChunkBudget:
+    """Bound one document's embedding/write expansion across all split paths."""
+
+    def __init__(self, doc_id: str, max_chunks: int, logger_obj):
+        self._doc_id = doc_id
+        self._max_chunks = max_chunks
+        self._logger = logger_obj
+        self._kept = 0
+        self._reported = False
+
+    def take(self, chunks: list[str]) -> list[str]:
+        remaining = max(0, self._max_chunks - self._kept)
+        kept = chunks[:remaining]
+        self._kept += len(kept)
+        if len(chunks) > remaining and not self._reported:
+            self._reported = True
+            self._logger.warning(
+                "Chunk expansion limited for %s: generated more than %d chunks; "
+                "embedding and storage capped at configured limit",
+                self._doc_id,
+                self._max_chunks,
+            )
+            note_degradation("chunk_expansion_limited", transient=False)
+        return kept
 
 
 def _matches_any(rel_str: str, patterns: list[str]) -> bool:
@@ -956,17 +988,11 @@ def _refresh_repaired_sidecar_docs(
     return changed, failed
 
 
-# Doc-specific failures charge `attempts`; a doc is abandoned once it reaches
-# this cap. Raised from 5 to 12 alongside exponential backoff (dpark 2026-07-28):
-# with retries now spaced out, more of them span a long time without hammering,
-# so a genuinely-flaky doc gets more chances before we give up.
-_DEGRADED_MAX_ATTEMPTS = 12
-
-# Stored provider-error artifacts cannot heal through another indexer pass: the
-# upstream producer must replace their bytes. Give that producer a short grace
-# window, then park an unchanged artifact instead of retrying it forever.
-_DEGRADED_MAX_BLOCKED_ATTEMPTS = 3
-_BLOCKED_UPSTREAM_REASON_SUFFIX = ":blocked_on_upstream"
+# The retry budgets and the terminal test live in core.degraded_policy: the
+# health probe classifies the same ledger and must not re-derive them (#2101).
+_DEGRADED_MAX_ATTEMPTS = degraded_policy.MAX_ATTEMPTS
+_DEGRADED_MAX_BLOCKED_ATTEMPTS = degraded_policy.MAX_BLOCKED_ATTEMPTS
+_BLOCKED_UPSTREAM_REASON_SUFFIX = degraded_policy.BLOCKED_UPSTREAM_REASON_SUFFIX
 
 # The v1 ledger cap was 5. The v1->v2 migration keys "was this capped under v1"
 # off this historical value, NOT the live cap above — otherwise raising the live
@@ -1135,14 +1161,17 @@ def _log_run_completion(
     indexed_chunks: int,
     elapsed_seconds: float,
     actionable_skips: dict[str, list[str]] | None = None,
+    failed_sources: Sequence[str] = (),
 ) -> None:
     # `completion` is queue drain: a skipped document counts as processed, so
     # 100% is reachable with zero work done. The indexed counts ride on the same
     # line so the percentage can never be read alone as "work happened" (#1173).
     completion = 100.0 if queued == 0 else processed * 100.0 / queued
-    logger.info(
+    message = (
         "Index run completion: run_id=%s queued=%d processed=%d skipped=%d "
-        "indexed_docs=%d indexed_chunks=%d elapsed=%.1fs completion=%.1f%%",
+        "indexed_docs=%d indexed_chunks=%d elapsed=%.1fs completion=%.1f%%"
+    )
+    args: list[Any] = [
         run_id,
         queued,
         processed,
@@ -1151,7 +1180,16 @@ def _log_run_completion(
         indexed_chunks,
         elapsed_seconds,
         completion,
-    )
+    ]
+    if failed_sources:
+        # A cycle that covered only some of its sources is not a full cycle,
+        # and `completion=` measures queue drain, not coverage — so the run
+        # says which sources it never scanned, on the same line (#2020).
+        message += " partial=true failed_sources=%s"
+        args.append(",".join(failed_sources))
+    logger.info(message, *args)
+    # Only passed when the standing-condition announcement is due — an
+    # unchanged permanent-skip set must not re-warn every run (#2101).
     if actionable_skips:
         logger.warning(
             "Index run has permanent actionable skips: %s", actionable_skips
@@ -1294,6 +1332,7 @@ def _reconcile_degraded_docs(
     scanned_sources: set[str],
     full_scan: bool,
     *,
+    failed_sources: Collection[str] = (),
     now: float | None = None,
 ) -> tuple[list[dict], dict, dict]:
     """Re-queue docs that previously indexed with transient degradations
@@ -1316,7 +1355,9 @@ def _reconcile_degraded_docs(
                            immediately.
     - ``requeued``       — resolved against this scan and forced back in
     - ``source_not_scanned`` — its source did not run this pass (a
-                           source-scoped index); untouched, not aged
+                           source-scoped index, or its scan() raised and the
+                           source is in ``failed_sources``); untouched, not
+                           aged
     - ``unresolved``     — its source scanned fine but the id is gone, so
                            nothing can ever resolve it: age it, and after
                            _DEGRADED_MAX_UNRESOLVED_RUNS escalate it out to
@@ -1352,17 +1393,14 @@ def _reconcile_degraded_docs(
 
     for doc_id in sorted(docs):
         entry = dict(docs[doc_id])
+        entry_source = str(doc_id).split("::", 1)[0]
         if doc_id in existing:
             stored_change_key = str(entry.get("change_key") or "")
             unchanged = (
                 bool(stored_change_key)
                 and stored_change_key == _change_key(queued_by_id[doc_id])
             )
-            capped = (
-                int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
-                or int(entry.get("blocked_attempts", 0))
-                >= _DEGRADED_MAX_BLOCKED_ATTEMPTS
-            )
+            capped = degraded_policy.is_terminal_entry(entry)
             backoff_elapsed = (
                 now - float(entry.get("last_attempt_at", 0.0))
             ) >= _degraded_backoff_seconds(entry)
@@ -1374,11 +1412,7 @@ def _reconcile_degraded_docs(
                 bucket = "backoff"
             else:
                 bucket = "already_queued"
-        elif (
-            int(entry.get("attempts", 0)) >= _DEGRADED_MAX_ATTEMPTS
-            or int(entry.get("blocked_attempts", 0))
-            >= _DEGRADED_MAX_BLOCKED_ATTEMPTS
-        ):
+        elif degraded_policy.is_terminal_entry(entry):
             bucket = "capped"
         elif doc_id in by_id:
             # Resolvable — but only re-admit once the backoff window elapsed.
@@ -1387,9 +1421,15 @@ def _reconcile_degraded_docs(
                 bucket = "requeued"
             else:
                 bucket = "backoff"
-        elif str(doc_id).split("::", 1)[0] not in scanned_sources and not full_scan:
-            # Source-scoped run: another source's entries are not evidence of
-            # anything. Only a full scan can conclude a namespace is gone.
+        elif entry_source in failed_sources or (
+            entry_source not in scanned_sources and not full_scan
+        ):
+            # No scan, no evidence — whether because this run was scoped to
+            # another source, or because this source's scan() raised. Only a
+            # scan that actually ran can conclude a namespace is gone; ageing
+            # these would turn a provider outage into permanent dead-lettering
+            # (#2020). A namespace missing from a *complete* full scan is a
+            # different case and still ages below.
             bucket = "source_not_scanned"
         else:
             bucket = "unresolved"
@@ -1417,6 +1457,48 @@ def _reconcile_degraded_docs(
             if str(record.get("doc_id", "")) not in deferred
         ]
     return queue, {**ledger, "docs": docs}, report
+
+
+# Standing-condition keys (core.standing_conditions). Each names one
+# operator-actionable state that no indexer run can clear by itself, so it is
+# reported on transition and on a periodic digest instead of every run (#2101).
+_STANDING_DEGRADED_CAPPED = "degraded_capped"
+_STANDING_ACTIONABLE_SKIPS = "actionable_skips"
+
+
+def _report_terminal_cap(
+    logger: logging.Logger,
+    index_root: Path,
+    degraded_report: dict,
+    ledger: dict,
+) -> None:
+    """Report the terminal-cap set when it appears, changes, clears or is due
+    a digest — never on every run for an unchanged set.
+
+    The prod set had not moved since 2026-08-11 and still produced 117 of a
+    24h window's 118 ERROR lines, which is how the one real event in that
+    window got lost (#2101). The per-run `Degraded ledger: … N capped …` INFO
+    summary and the `degraded_capped:N` index-metadata warning keep carrying
+    the standing count in between.
+    """
+    docs = ledger.get("docs", {}) if isinstance(ledger, dict) else {}
+    capped_reasons = {
+        doc_id: list(docs.get(doc_id, {}).get("reasons", []))
+        for doc_id in degraded_report.get("capped", [])
+    }
+    announcement = standing_conditions.announce(
+        index_root, _STANDING_DEGRADED_CAPPED, capped_reasons
+    )
+    if announcement.announce:
+        logger.error(
+            "%d degraded docs parked at terminal cap (%s); source change or "
+            "manual action required: %s",
+            len(capped_reasons),
+            announcement.transition,
+            capped_reasons,
+        )
+    elif announcement.cleared:
+        logger.info("Terminal cap cleared: no degraded docs remain parked")
 
 
 def _merge_degraded_ledger(
@@ -1656,6 +1738,61 @@ def _merge_skip_ledger(
     return {"docs": docs}
 
 
+def _skip_ledger_entry(doc: dict, reasons: Sequence[str]) -> dict:
+    """Build one processed document's skip-ledger entry and log its outcome.
+
+    Every terminal outcome a document can reach is recorded per document —
+    `Inserted N chunks: <id>` for a write, `Skipping <id>: <reason> (<path>)`
+    for a skip — so a run's log accounts for every document it processed. A
+    skip reason used to exist only inside the per-run aggregate and
+    `skip_docs.json`, which made a deliberate skip and a document dropped by a
+    bug produce identical log output: `Processing:` and then nothing (#2100).
+
+    The entry and the line are built together on purpose. The ledger and the
+    log cannot drift, and a skip reason added anywhere in the document
+    pipeline is attributable per document without touching this function.
+
+    Callers persist the returned entry the way their lane does: the full flow
+    accumulates entries and merges them once at the end of the run, the
+    targeted single-document path merges immediately.
+    """
+    doc_id = str(doc["doc_id"])
+    reason_list = sorted({str(reason) for reason in reasons})
+    _get_logger().info(
+        "Skipping %s: %s (%s)",
+        doc_id,
+        ", ".join(reason_list),
+        doc.get("rel_path") or doc_id,
+    )
+    return {"reasons": reason_list, "change_key": _change_key(doc)}
+
+def _record_permanent_skip(doc: dict, reasons: Sequence[str]) -> list[str]:
+    """Quarantine one in-flight document; return the reasons the ledger stored.
+
+    The single seam for every permanent-skip lane a queued document can take —
+    an explicit skip collected from extraction (duplicate, oversized, no text)
+    and a terminal, non-transient processing failure alike. Both record the doc
+    with its change key so the diff stops re-fetching it every run, so both are
+    skips as far as the run's own accounting is concerned. Returning the stored
+    reasons is what lets the caller feed _advance_run_progress the same
+    breakdown the ledger got: before this seam existed the terminal lane wrote
+    a ledger entry without touching the counters, so a run with k terminal
+    failures reported `skipped=N` on `Index stats:` and `N+k docs added to skip
+    ledger` on the very next line (#2184).
+    """
+
+    # Built through the per-document seam so the terminal-failure lane gets the
+    # same `Skipping <id>: <reason> (<path>)` line an explicit skip gets (#2100);
+    # before, only the explicit lane was attributable per document.
+    entry = _skip_ledger_entry(doc, reasons)
+    # Same lock as the other ledgers: the flow processes documents concurrently.
+    with _RUNTIME.get("degraded_lock") or nullcontext():
+        doc_id = doc["doc_id"]
+        _RUNTIME.setdefault("skip_now", {})[doc_id] = entry
+        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
+    return entry["reasons"]
+
+
 def _persist_scan_skips(index_root: Path, records: list[dict], logger) -> None:
     """Persist terminal scan decisions as one ledger update before extraction."""
     if not records:
@@ -1687,6 +1824,7 @@ def _reap_vanished_registry_rows(
     filesystem_roots: dict[str, Path],
     *,
     source_scope: str | None,
+    failed_sources: Collection[str] = (),
     max_delete_ratio: float,
     min_docs_for_ratio: int,
     logger: logging.Logger,
@@ -1706,7 +1844,8 @@ def _reap_vanished_registry_rows(
     skips — presence means "intentionally excluded", which deep health
     classifies; only absence is lifecycle's job). A filesystem source whose
     root is unavailable (unmounted?) is left entirely alone: absence can't be
-    proven there.
+    proven there — and so is a source in ``failed_sources``, whose scan raised
+    and therefore proved nothing about any of its rows (#2020).
 
     Deletion goes row by row through DocIDStore.delete() with each row's
     exact stored key — legacy bare + namespaced dual rows both die — and
@@ -1731,6 +1870,12 @@ def _reap_vanished_registry_rows(
     reaped: set[str] = set()
     blocked: dict[str, tuple[int, int]] = {}
     for source, rows in sorted(rows_by_source.items()):
+        if source in failed_sources:
+            logger.warning(
+                "Skipping registry reap for source '%s' — its scan failed this run",
+                source,
+            )
+            continue
         root = filesystem_roots.get(source)
         if root is not None and not root.is_dir():
             logger.warning(
@@ -1931,11 +2076,57 @@ def _index_duplicate_delivery_context(
     return True
 
 
+def _build_payloadless_duplicate_event(
+    doc: dict,
+    canonical_doc_id: str,
+) -> dict[str, Any]:
+    """Announce a duplicate delivery whose canonical holds no payload.
+
+    Same event shape as any other ``document.indexed``, carrying the duplicate's
+    own identity and an empty body: a consumer learns the delivery happened and
+    which canonical it belongs to, and can read the content from the canonical
+    when it lands.
+    """
+    doc_id = str(doc["doc_id"])
+    rel_path = str(doc.get("rel_path") or doc_id)
+    source_type = canonical_source_type(doc.get("source_type") or doc.get("ext", ""))
+    return build_document_indexed_event(
+        doc_id=doc_id,
+        source_name=str(doc.get("source_name") or "documents"),
+        source_type=source_type,
+        rel_path=rel_path,
+        abs_path=str(doc.get("abs_path") or ""),
+        text="",
+        metadata={
+            "doc_id": doc_id,
+            "rel_path": rel_path,
+            "source_type": source_type,
+            "source_name": str(doc.get("source_name") or "documents"),
+            "mtime": float(doc.get("mtime") or 0.0),
+            "size": int(doc.get("size") or 0),
+            "title": doc_id,
+            "folder": derive_folder(rel_path),
+            "status": "active",
+            "canonical_doc_id": canonical_doc_id,
+            "canonical_payload_available": "false",
+        },
+        chunks=[],
+    )
+
+
 def _build_duplicate_document_indexed_event(
     doc: dict,
     canonical_doc_id: str,
-) -> dict[str, Any] | None:
-    """Build alias callback data from the canonical document's indexed payload."""
+) -> dict[str, Any]:
+    """Build alias callback data from the canonical document's indexed payload.
+
+    The canonical is checked for content before a copy is ever marked its
+    duplicate, so an empty payload here means the rows went away between that
+    check and this read. The event is still built — from the duplicate's own
+    identity, carrying no text — because dropping it is how a delivery becomes
+    invisible on both sides: consumers are never told the document exists and
+    the outbox has nothing to retry (#2097).
+    """
     store: LanceDBStore = _RUNTIME["store"]
     canonical_chunks = sorted(
         store.get_doc_chunks(canonical_doc_id),
@@ -1945,7 +2136,7 @@ def _build_duplicate_document_indexed_event(
         ),
     )
     if not canonical_chunks:
-        return None
+        return _build_payloadless_duplicate_event(doc, canonical_doc_id)
 
     first_chunk = canonical_chunks[0]
     doc_id = str(doc["doc_id"])
@@ -1996,8 +2187,8 @@ def _dispatch_document_indexed_event(
     """Persist and attempt one callback without failing the index operation."""
     try:
         outbox = HookOutbox(config["index_root"])
-        queue_event(config.get("event_hooks"), event, outbox)
-        outcomes = drain_due(outbox, limit=64, logger=logger)
+        deliveries = queue_event(config.get("event_hooks"), event, outbox)
+        outcomes = send_enqueued(outbox, deliveries, logger=logger)
         pending = outcomes["retry_pending"]
         redrive = outcomes["redrive_required"]
         if pending or redrive:
@@ -2123,11 +2314,11 @@ def _provider_error_artifact(raw_bytes: bytes, ext: str) -> tuple[str, bool] | N
     return reason, transient
 
 
-def _canonical_is_intentionally_unindexed(canonical_ns_doc_id: str) -> bool:
-    """Whether a canonical missing from LanceDB was deliberately never indexed.
+def _terminal_skip_reasons(ns_doc_id: str) -> list[str]:
+    """Recorded verdicts that this document's bytes produce no index row.
 
-    Absence from the table only means the canonical was *lost* if the document
-    was supposed to be there. A doc that extracts no text (or is oversized, or
+    Absence from LanceDB only means a document was *lost* if it was supposed to
+    be there. A doc that extracts no text (or is oversized, encrypted, or
     corrupt) is skipped by design and is legitimately absent forever, so the
     skip ledger — not the table — is what distinguishes "lost" from "never
     indexed on purpose" (#1252). Without that distinction a cohort whose
@@ -2135,27 +2326,34 @@ def _canonical_is_intentionally_unindexed(canonical_ns_doc_id: str) -> bool:
     finds the current canonical absent, dissolves the cohort, elects the other
     member, and is skipped again in turn.
 
-    This run's decisions count too: a canonical skipped a few documents ago is
+    Only reasons that are a verdict about the bytes count — a ``duplicate_of:``
+    entry is the dedupe gate's own decision, so reading it back as evidence
+    about the content would be circular (see ``content_terminal_skip_reasons``).
+
+    This run's decisions count too: a document skipped a few documents ago is
     only in ``skip_now`` until the end-of-run merge persists it, and a cohort
     reset drops its members' ledger entries, so a ledger-only test would still
     ping-pong on the very first pass. Change keys are deliberately not compared
     — a canonical whose bytes moved is re-evaluated by the diff on its own, and
     is handled by the stranded-cohort path, not by reopening here.
 
-    A canonical that becomes indexable later (its file changed, OCR came back)
+    A document that becomes indexable later (its file changed, OCR came back)
     is picked up by the skip ledger's own bounded retry, which re-attempts it
-    and drops its entry once it lands content. Re-electing the cohort is not
-    what recovers that case, so leaving the cohort alone costs nothing.
+    and drops its entry once it lands content.
     """
     with _RUNTIME.get("degraded_lock") or nullcontext():
-        if canonical_ns_doc_id in (_RUNTIME.get("skip_now") or {}):
-            return True
+        pending = (_RUNTIME.get("skip_now") or {}).get(ns_doc_id)
+    if pending is not None:
+        reasons = content_terminal_skip_reasons(pending)
+        if reasons:
+            return reasons
     # index_root is read from config because it is the one source both the full
     # flow and the targeted single-doc path populate.
     index_root = (_RUNTIME.get("config") or {}).get("index_root")
     if not index_root:
-        return False
-    return canonical_ns_doc_id in _load_skip_ledger(Path(index_root)).get("docs", {})
+        return []
+    ledger = _load_skip_ledger(Path(index_root)).get("docs", {})
+    return content_terminal_skip_reasons(ledger.get(ns_doc_id) or {})
 
 
 def _reset_invalid_dedupe_cohort(
@@ -2271,6 +2469,14 @@ def _process_doc_task(
             "source": doc.get("source_name", "documents"),
         },
     ):
+        doc_id = doc["doc_id"]
+        if doc_id in _RUNTIME.get("sweep_served_doc_ids", set()):
+            _get_logger().info(
+                "Skipping %s — already indexed by mid-sweep queue service",
+                doc_id,
+            )
+            return
+
         store: LanceDBStore = _RUNTIME["store"]
         embed_provider: EmbedProvider = _RUNTIME["embed_provider"]
         splitter: SentenceSplitter = _RUNTIME["splitter"]
@@ -2285,7 +2491,6 @@ def _process_doc_task(
         # when called standalone — e.g. targeted single-document indexing, which
         # has no active Prefect run context.
         logger = _get_logger()
-        doc_id = doc["doc_id"]
         rel_path = doc.get("rel_path", doc_id)
         mtime = doc["mtime"]
         size = doc["size"]
@@ -2358,14 +2563,15 @@ def _process_doc_task(
                 if winner is not None and winner.get("doc_id") != bare_id:
                     canonical_ns = f"{source_name}::{winner['doc_id']}"
                     canonical_has_content = store.contains_doc_id(canonical_ns)
-                    if canonical_has_content or _canonical_is_intentionally_unindexed(
-                        canonical_ns
-                    ):
-                        if canonical_has_content:
-                            # The cohort holds content again, so any earlier reset
-                            # of it no longer describes the present state: forget
-                            # it, or a later genuine loss could not reopen (#1258).
-                            registry.clear_cohort_reset(len(raw_bytes), digest, "blake3")
+                    canonical_skip_reasons = (
+                        [] if canonical_has_content
+                        else _terminal_skip_reasons(canonical_ns)
+                    )
+                    if canonical_has_content:
+                        # The cohort holds content again, so any earlier reset
+                        # of it no longer describes the present state: forget
+                        # it, or a later genuine loss could not reopen (#1258).
+                        registry.clear_cohort_reset(len(raw_bytes), digest, "blake3")
                         _run_identity_op_with_stranded_cohort_recovery(
                             lambda: registry.update_dedupe_identity(
                                 bare_id,
@@ -2378,6 +2584,36 @@ def _process_doc_task(
                             ),
                             registry, store, bare_id, source_name, logger,
                         )
+                    elif canonical_skip_reasons:
+                        # The canonical carries a verdict about these exact
+                        # bytes: it will never hold an index row. Deduping
+                        # against it puts the content in no row at all and
+                        # leaves the callback with no payload to send (#2097).
+                        # Record the cohort as intentionally empty instead —
+                        # no canonical pointer for anyone to resolve — and let
+                        # this copy be processed on its own merits.
+                        _run_identity_op_with_stranded_cohort_recovery(
+                            lambda: registry.mark_exact_hash_cohort_unindexable(
+                                bare_id,
+                                len(raw_bytes),
+                                digest,
+                                hash_algo="blake3",
+                                reason=(
+                                    "terminal skip: "
+                                    + ", ".join(canonical_skip_reasons)
+                                ),
+                            ),
+                            registry, store, bare_id, source_name, logger,
+                        )
+                        logger.info(
+                            "Exact-content cohort of %s is intentionally empty "
+                            "(%s); indexing %s on its own merits",
+                            canonical_ns,
+                            ", ".join(canonical_skip_reasons),
+                            doc_id,
+                        )
+                        winner = None
+                        elect_canonical = False
                     else:
                         logger.warning(
                             "Dedupe canonical %s is absent from LanceDB; reopening cohort",
@@ -2401,24 +2637,43 @@ def _process_doc_task(
                             elect_canonical = False
                         winner = None
                 if winner is None and elect_canonical:
-                    winner = _run_identity_op_with_stranded_cohort_recovery(
-                        lambda: registry.claim_canonical_by_exact_hash(
-                            bare_id,
-                            len(raw_bytes),
-                            digest,
-                            hash_algo="blake3",
-                            duplicate_reason="exact content match at index time",
-                        ),
-                        registry, store, bare_id, source_name, logger,
+                    # A document that will not produce an index row must not be
+                    # eligible to be a canonical: the election is the moment a
+                    # phantom becomes permanent, and the verdict is already
+                    # known here (#2097).
+                    own_skip_reasons = (
+                        [] if store.contains_doc_id(doc_id)
+                        else _terminal_skip_reasons(doc_id)
                     )
+                    if own_skip_reasons:
+                        _run_identity_op_with_stranded_cohort_recovery(
+                            lambda: registry.mark_exact_hash_cohort_unindexable(
+                                bare_id,
+                                len(raw_bytes),
+                                digest,
+                                hash_algo="blake3",
+                                reason=(
+                                    "terminal skip: "
+                                    + ", ".join(own_skip_reasons)
+                                ),
+                            ),
+                            registry, store, bare_id, source_name, logger,
+                        )
+                    else:
+                        winner = _run_identity_op_with_stranded_cohort_recovery(
+                            lambda: registry.claim_canonical_by_exact_hash(
+                                bare_id,
+                                len(raw_bytes),
+                                digest,
+                                hash_algo="blake3",
+                                duplicate_reason="exact content match at index time",
+                            ),
+                            registry, store, bare_id, source_name, logger,
+                        )
             except Exception as exc:
                 logger.warning("Dedupe gate failed for %s (indexing normally): %s", doc_id, exc)
             if winner is not None and winner.get("doc_id") != bare_id:
                 canonical_ns = f"{source_name}::{winner['doc_id']}"
-                logger.info(
-                    "Duplicate content: %s matches canonical %s — skipping indexing",
-                    doc_id, canonical_ns,
-                )
                 if dedupe_cfg.get("skip_duplicate_indexing", True):
                     try:
                         store.delete_by_doc_ids([doc_id])
@@ -2434,16 +2689,9 @@ def _process_doc_task(
                         _RUNTIME.setdefault("_warnings", []).append(warning)
                         logger.warning(warning)
                     else:
-                        if duplicate_event is None:
-                            logger.warning(
-                                "Canonical payload unavailable for duplicate callback: %s -> %s",
-                                doc_id,
-                                canonical_ns,
-                            )
-                        else:
-                            _dispatch_document_indexed_event(
-                                config, duplicate_event, logger
-                            )
+                        _dispatch_document_indexed_event(
+                            config, duplicate_event, logger
+                        )
                     # A canonical that was intentionally skipped holds no chunks
                     # to carry the provenance; asking for the rewrite would only
                     # raise (and warn) on every pass.
@@ -2574,7 +2822,21 @@ def _process_doc_task(
 
         # --- Extract document-level metadata ---
         fm, _frontmatter_sensitive_kinds = sanitize_metadata(result.frontmatter)
-        title = fm.get("title") or extract_title(full_text, doc_id)
+        if source_type == "pg_message":
+            # Message natural keys are opaque IDs, not paths: Path.stem would
+            # truncate dotted RFC-822 IDs and embed them as document titles.
+            title = str(fm.get("subject") or "").strip()
+            if not title:
+                title = next(
+                    (value.strip() for key in ("filename", "original_filename")
+                     if isinstance(value := fm.get(key), str)
+                     and value.strip() and not value.strip().startswith("<")),
+                    "",
+                )
+            if not title:
+                title = "Message " + hashlib.sha256(doc_id.encode("utf-8")).hexdigest()[:12]
+        else:
+            title = fm.get("title") or extract_title(full_text, doc_id)
         tags = normalize_tags(fm.get("tags"))
         folder = derive_folder(rel_path)
         status = fm.get("status", "archived" if folder.lower() in ("archive", "archived") else "active")
@@ -2651,6 +2913,8 @@ def _process_doc_task(
                         "enrichment_failed",
                         transient=bool(enrichment.get("_enrichment_transient")),
                     )
+                    if reason.startswith("structured_output_contract_violation:"):
+                        return
                 elif not enrichment.get("enr_summary"):
                     logger.warning("Enrichment returned empty summary for '%s' — LLM may have failed silently", doc_id)
                 if not enrichment_failed:
@@ -2712,6 +2976,14 @@ def _process_doc_task(
         # Every chunk is prepended with a contextual header before embedding
         # so it is self-describing in isolation.
         nodes: list[TextNode] = []
+        chunk_budget = _DocumentChunkBudget(
+            doc_id,
+            config.get("chunking", {}).get(
+                "max_chunks_per_document",
+                _DEFAULT_MAX_CHUNKS_PER_DOCUMENT,
+            ),
+            logger,
+        )
 
         if ext == "pdf" and len(result.pages) > 1:
             for page_text in result.pages:
@@ -2722,8 +2994,10 @@ def _process_doc_task(
                     page_body = _with_communication_caption(page_body, source_metadata)
                 page_body = redact_sensitive_text(page_body)
                 page_body = collapse_runaway_repetition(page_body)
-                raw_chunks = _split_section(
-                    page_body, splitter, semantic_splitter, semantic_threshold
+                raw_chunks = chunk_budget.take(
+                    _split_section(
+                        page_body, splitter, semantic_splitter, semantic_threshold
+                    )
                 )
                 ctx = _build_chunk_context(doc_meta, page=page_text.page)
                 contextualized = [ctx + c for c in raw_chunks]
@@ -2765,6 +3039,10 @@ def _process_doc_task(
                     all_ctx.append(ctx + raw)
                     all_sections.append(heading_ctx)
 
+            all_raw = chunk_budget.take(all_raw)
+            all_ctx = all_ctx[:len(all_raw)]
+            all_sections = all_sections[:len(all_raw)]
+
             with _tracer.start_as_current_span("embed", attributes={"chunk_count": len(all_ctx)}):
                 with _measure_index_memory("embed", doc_id):
                     vectors = embed_provider.embed_texts(all_ctx)
@@ -2789,8 +3067,10 @@ def _process_doc_task(
         else:
             # Images, media, or single-page PDFs
             loc_prefix = source_type if source_type in ("img", "audio", "video") else ""
-            raw_chunks = _split_section(
-                full_text, splitter, semantic_splitter, semantic_threshold
+            raw_chunks = chunk_budget.take(
+                _split_section(
+                    full_text, splitter, semantic_splitter, semantic_threshold
+                )
             )
             ctx = _build_chunk_context(doc_meta)
             contextualized = [ctx + c for c in raw_chunks]
@@ -2825,37 +3105,49 @@ def _process_doc_task(
                 "Conversation messages before and after this attachment.\n\n"
                 f"[Conversation context]\n{context_text}"
             )
-            with _tracer.start_as_current_span(
-                "embed", attributes={"chunk_count": 1}
-            ):
-                with _measure_index_memory("embed", doc_id):
-                    context_vector = embed_provider.embed_texts([context_body])[0]
+            bounded_context = chunk_budget.take([context_body])
+            if bounded_context:
+                with _tracer.start_as_current_span(
+                    "embed", attributes={"chunk_count": 1}
+                ):
+                    with _measure_index_memory("embed", doc_id):
+                        context_vector = embed_provider.embed_texts(bounded_context)[0]
+            else:
+                context_vector = None
             context_loc = "context:c:0"
-            context_node = TextNode(
-                text=context_body,
-                id_=f"{doc_id}::{context_loc}",
-                embedding=context_vector,
-                metadata={
-                    **doc_meta,
-                    "loc": context_loc,
-                    "snippet": context_text[:200],
-                },
-            )
-            context_node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                node_id=doc_id
-            )
-            nodes.append(context_node)
+            if context_vector is not None:
+                context_node = TextNode(
+                    text=context_body,
+                    id_=f"{doc_id}::{context_loc}",
+                    embedding=context_vector,
+                    metadata={
+                        **doc_meta,
+                        "loc": context_loc,
+                        "snippet": context_text[:200],
+                    },
+                )
+                context_node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=doc_id
+                )
+                nodes.append(context_node)
 
         # --- Persist into store ---
         # The scan/diff proves which documents are absent. Insert those
         # directly: a no-match Lance delete still commits a metadata version,
         # doubling retained manifests for large new-document batches.
         if doc_id in _RUNTIME.get("storage_insert_doc_ids", set()):
-            store.insert_nodes(nodes, known_absent=True)
-            write_mode = "Inserted"
+            wrote_chunks = store.insert_nodes(nodes, known_absent=True)
+            write_mode = "Inserted" if wrote_chunks else "Skipped"
         else:
             store.upsert_nodes(nodes)
             write_mode = "Upserted"
+            wrote_chunks = True
+        if not wrote_chunks:
+            logger.info(
+                "Skipped write for %s — chunks already present from concurrent indexing",
+                doc_id,
+            )
+            return
         logger.info(f"{write_mode} {len(nodes)} chunks: {doc_id}")
         _record_index_write(len(nodes))
         _record_freshness_watermark(doc_meta, mtime)
@@ -2987,26 +3279,22 @@ def _process_docs(
             process_doc_task(doc)
             reasons = collect_degradations()
             skips = collect_skips()
-            skip_reasons = list(skips)
-            lock = _RUNTIME.get("degraded_lock")
-            if lock is not None:
-                with lock:
-                    doc_id = doc["doc_id"]
-                    if skips:
-                        # Permanent skip (duplicate/oversized/corrupt): record
-                        # with the file's change key so the diff stops looping.
-                        _RUNTIME.setdefault("skip_now", {})[doc_id] = {
-                            "reasons": sorted(set(skips)),
-                            "change_key": _change_key(doc),
-                        }
-                        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
-                    elif reasons:
-                        _RUNTIME.setdefault("degraded_now", {})[doc_id] = reasons
-                        _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
-                    else:
-                        # Indexed cleanly — drop from both ledgers.
-                        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
-                        _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
+            if skips:
+                # Permanent skip (duplicate/oversized/corrupt): record with the
+                # file's change key so the diff stops looping.
+                skip_reasons = _record_permanent_skip(doc, skips)
+            else:
+                lock = _RUNTIME.get("degraded_lock")
+                if lock is not None:
+                    with lock:
+                        doc_id = doc["doc_id"]
+                        if reasons:
+                            _RUNTIME.setdefault("degraded_now", {})[doc_id] = reasons
+                            _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
+                        else:
+                            # Indexed cleanly — drop from both ledgers.
+                            _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
+                            _RUNTIME.setdefault("skip_clean", set()).add(doc_id)
             return None
         except Exception as exc:
             outcome = "failed"
@@ -3035,15 +3323,11 @@ def _process_docs(
                 # change key exactly like a permanent skip. Without this the doc
                 # is re-fetched, re-OCR'd, re-enriched and re-embedded on every
                 # run, forever (#0569) — the skip ledger's bounded retry turns
-                # that into one attempt per day until the content changes.
-                if lock is not None:
-                    with lock:
-                        doc_id = doc["doc_id"]
-                        _RUNTIME.setdefault("skip_now", {})[doc_id] = {
-                            "reasons": [f"terminal_error:{type(exc).__name__}"],
-                            "change_key": _change_key(doc),
-                        }
-                        _RUNTIME.setdefault("degraded_clean", set()).add(doc_id)
+                # that into one attempt per day until the content changes. It is
+                # a ledgered skip, so it is counted as one (#2184).
+                skip_reasons = _record_permanent_skip(
+                    doc, [f"terminal_error:{type(exc).__name__}"]
+                )
             return doc["doc_id"]
         finally:
             if debug_concurrency:
@@ -3120,6 +3404,26 @@ def _process_docs(
             len(failed_docs),
         )
     return failed_docs
+
+
+def _log_failed_docs(
+    failed_docs: list[str],
+    transient_doc_ids: set[str],
+    logger,
+) -> None:
+    """Log transient deferrals apart from terminal document failures."""
+    transient_failures = [doc_id for doc_id in failed_docs if doc_id in transient_doc_ids]
+    terminal_failures = [doc_id for doc_id in failed_docs if doc_id not in transient_doc_ids]
+    if transient_failures:
+        logger.info(
+            "Deferred %d docs after transient processing failures: %s",
+            len(transient_failures),
+            transient_failures[:20],
+        )
+    if terminal_failures:
+        logger.warning(
+            "Failed to process %d docs: %s", len(terminal_failures), terminal_failures[:20]
+        )
 
 
 @task
@@ -3312,8 +3616,8 @@ def _should_use_shadow_rebuild(
 
 
 def _scan_and_register_sources(
-    all_sources, doc_id_store, index_root
-) -> tuple[list[dict], dict[str, object]]:
+    all_sources, doc_id_store, index_root, *, logger: logging.Logger | None = None
+) -> tuple[list[dict], dict[str, object], list[str]]:
     """Scan every configured source, build the record list + record map, and
     register each namespaced doc_id in the persistent registry.
 
@@ -3321,42 +3625,77 @@ def _scan_and_register_sources(
     {namespaced_id: rel_path} for test/tool use and distinct_source_names()
     enumerate every source that has indexed docs.
 
+    Sources are isolated from each other: a source whose scan() raises is
+    reported in the returned failed-source list and contributes nothing, and
+    the remaining sources are still scanned. One transient dependency blip
+    (a database in crash recovery, an unmounted root) used to propagate out of
+    the flow and cost an entire index cycle, including every source that was
+    perfectly healthy (#2020).
+
+    A failed source's *partial* records are dropped rather than committed. Its
+    scan produced no evidence about the source at all, and every downstream
+    rule that reads "stored but not scanned" as removal — the delete diff, the
+    registry reap, the degraded ledger — must see the source as unscanned
+    rather than as half-emptied.
+
     The scan runs before any doc is processed, so it is one of the flow's two
     per-doc-heartbeat-free windows (the other is the post-processing/FTS phase).
     On a large corpus it can dominate a run's wall-clock, so it re-stamps the
     indexer heartbeat as it progresses — otherwise a healthy but busy scan ages
     the heartbeat past INDEXER_HEARTBEAT_MAX_AGE and /health false-503s (#0127).
+
+    Returns (records, {namespaced doc_id: SourceRecord}, failed source names).
     """
+    log = logger or logging.getLogger(__name__)
     all_records: list[dict] = []
     source_records_by_ns_doc_id: dict[str, object] = {}  # namespaced doc_id → SourceRecord
+    failed_sources: list[str] = []
     _write_heartbeat(index_root)  # scan started — progress, not a freeze
     scanned_count = 0
     for src in all_sources:
-        for rec in src.scan():
-            ns_doc_id = f"{src.name}::{rec.doc_id}"
-            all_records.append({
-                "doc_id": ns_doc_id,
-                "rel_path": rec.natural_key,
-                "abs_path": rec.metadata.get("abs_path", rec.natural_key),
-                "mtime": rec.mtime,
-                "change_hash": getattr(rec, "change_hash", "") or "",
-                "size": rec.size,
-                "ext": rec.metadata.get("ext", ""),
-                "source_type": rec.source_type,
-                "source_name": src.name,
-                **(
-                    {"skip_reason": rec.metadata["skip_reason"]}
-                    if rec.metadata.get("skip_reason")
-                    else {}
-                ),
-            })
-            source_records_by_ns_doc_id[ns_doc_id] = rec
-            doc_id_store.register(ns_doc_id, rec.natural_key, source_name=src.name)
-            scanned_count += 1
-            if scanned_count % _SCAN_HEARTBEAT_EVERY == 0:
-                _write_heartbeat(index_root)
+        src_records: list[dict] = []
+        src_records_by_ns_doc_id: dict[str, object] = {}
+        try:
+            for rec in src.scan():
+                ns_doc_id = f"{src.name}::{rec.doc_id}"
+                src_records.append({
+                    "doc_id": ns_doc_id,
+                    "rel_path": rec.natural_key,
+                    "abs_path": rec.metadata.get("abs_path", rec.natural_key),
+                    "mtime": rec.mtime,
+                    "change_hash": getattr(rec, "change_hash", "") or "",
+                    "size": rec.size,
+                    "ext": rec.metadata.get("ext", ""),
+                    "source_type": rec.source_type,
+                    "source_name": src.name,
+                    **(
+                        {"skip_reason": rec.metadata["skip_reason"]}
+                        if rec.metadata.get("skip_reason")
+                        else {}
+                    ),
+                })
+                src_records_by_ns_doc_id[ns_doc_id] = rec
+                scanned_count += 1
+                if scanned_count % _SCAN_HEARTBEAT_EVERY == 0:
+                    _write_heartbeat(index_root)
+        except Exception as exc:
+            failed_sources.append(src.name)
+            log.error(
+                "Source '%s' failed to scan after %d record(s) (%s: %s) — its "
+                "documents are left untouched this run; the remaining sources "
+                "are still indexed",
+                src.name, len(src_records), type(exc).__name__, exc,
+                exc_info=True,
+            )
+            continue
+        all_records.extend(src_records)
+        source_records_by_ns_doc_id.update(src_records_by_ns_doc_id)
+        for record in src_records:
+            doc_id_store.register(
+                record["doc_id"], record["rel_path"], source_name=src.name
+            )
     _write_heartbeat(index_root)  # scan complete — enter diff/process
-    return all_records, source_records_by_ns_doc_id
+    return all_records, source_records_by_ns_doc_id, failed_sources
 
 
 # --- Flow ---
@@ -3668,9 +4007,29 @@ def index_vault_flow(
     # Multi-source scan: iterate over all configured sources, namespace doc_ids.
     # Re-stamps the heartbeat as it goes so a long scan doesn't false-503 /health.
     memory_observer.sample("phase_start", phase="scan_diff")
-    all_records, source_records_by_ns_doc_id = _scan_and_register_sources(
-        all_sources, doc_id_store, index_root
+    all_records, source_records_by_ns_doc_id, failed_scan_sources = (
+        _scan_and_register_sources(
+            all_sources, doc_id_store, index_root, logger=logger
+        )
     )
+    if failed_scan_sources:
+        if len(failed_scan_sources) == len(all_sources):
+            # Nothing was scanned, so nothing can be concluded: a run that
+            # reported itself partial here would claim a coverage it never had.
+            raise RuntimeError(
+                "Every configured source failed to scan "
+                f"({', '.join(failed_scan_sources)}) — aborting the run"
+            )
+        logger.error(
+            "Partial index run: %d of %d sources failed to scan (%s) — their "
+            "documents, registry rows and degraded entries are left untouched",
+            len(failed_scan_sources), len(all_sources),
+            ", ".join(failed_scan_sources),
+        )
+        for failed_source in failed_scan_sources:
+            _RUNTIME.setdefault("_warnings", []).append(
+                f"source_scan_failed:{failed_source}"
+            )
     _RUNTIME["source_records_by_ns_doc_id"] = source_records_by_ns_doc_id
     scanned = all_records
     communication_context_provider = build_context_provider_from_records(
@@ -3715,8 +4074,9 @@ def index_vault_flow(
         scanned,
         to_add_or_update,
         degraded_ledger,
-        scanned_sources={s.name for s in all_sources},
+        scanned_sources={s.name for s in all_sources} - set(failed_scan_sources),
         full_scan=source_name is None,
+        failed_sources=failed_scan_sources,
     )
     if degraded_report["total"]:
         if degraded_report["requeued"]:
@@ -3777,16 +4137,6 @@ def index_vault_flow(
                     _degraded_unresolved_path(index_root).name,
                 )
         if degraded_report["capped"]:
-            capped_reasons = {
-                doc_id: degraded_ledger["docs"][doc_id].get("reasons", [])
-                for doc_id in degraded_report["capped"]
-            }
-            logger.error(
-                "%d degraded docs parked at terminal cap; source change or manual "
-                "action required: %s",
-                len(degraded_report["capped"]),
-                capped_reasons,
-            )
             _RUNTIME.setdefault("_warnings", []).append(
                 f"degraded_capped:{len(degraded_report['capped'])}"
             )
@@ -3794,6 +4144,11 @@ def index_vault_flow(
         # and escalation above have to land now to survive this run.
         if degraded_report["unresolved"]:
             _save_degraded_ledger(index_root, degraded_ledger)
+    # The terminal cap is a standing state: nothing an indexer run does can
+    # change it, so it is an ERROR when it appears, changes or clears (and a
+    # daily digest) — not on all ~116 runs of a day. The counts stay on every
+    # run's `Degraded ledger:` summary and in index_metadata warnings (#2101).
+    _report_terminal_cap(logger, index_root, degraded_report, degraded_ledger)
     # Drop docs already decided 'do not index' (duplicate/oversized/corrupt)
     # whose file is unchanged — stops the reprocess-every-run loop — and claim
     # the bounded retries this run hands out.
@@ -3840,6 +4195,19 @@ def index_vault_flow(
         force_full_rebuild=bool(safety_cfg.get("force_full_rebuild", False)),
         stored_doc_count=stored_doc_count,
     )
+    if using_shadow_rebuild and failed_scan_sources:
+        # Promoting a shadow replaces the whole corpus, so building one from a
+        # scan that missed a source would delete that source wholesale — the
+        # same mass deletion the per-source guards below exist to prevent. Fall
+        # back to an in-place update and let the operator re-run the rebuild
+        # once every source is reachable (#2020).
+        logger.error(
+            "Skipping shadow rebuild: %s did not scan this run, so the shadow "
+            "would not hold the full corpus — updating in place instead",
+            ", ".join(failed_scan_sources),
+        )
+        _RUNTIME.setdefault("_warnings", []).append("shadow_rebuild_skipped_partial_scan")
+        using_shadow_rebuild = False
 
     # SAFETY: block mass deletion from an anomalous (partial/empty) scan, PER
     # SOURCE. to_delete is everything stored-but-not-scanned. If one source
@@ -3859,7 +4227,17 @@ def index_vault_flow(
     kept_deletes: list[str] = []
     for src_name, dels in deletes_by_source.items():
         src_stored = stored_by_source.get(src_name, 0)
-        if src_stored >= min_docs_for_ratio and len(dels) > src_stored * max_delete_ratio:
+        if src_name in failed_scan_sources:
+            # Its scan raised, so "stored but not scanned" says nothing about
+            # this source at all. The ratio guard below cannot cover this: a
+            # source with fewer than min_docs_for_ratio stored docs would have
+            # every one of them deleted and re-enriched next run (#2020).
+            logger.error(
+                "SKIPPING %d deletions for source '%s' — its scan failed this "
+                "run, so its documents are kept untouched",
+                len(dels), src_name,
+            )
+        elif src_stored >= min_docs_for_ratio and len(dels) > src_stored * max_delete_ratio:
             logger.error(
                 "ABORTING %d deletions for source '%s' (> %.0f%% of %d stored) — "
                 "scan likely partial (source unreachable?). Those docs kept. "
@@ -3972,8 +4350,7 @@ def index_vault_flow(
         failed_count=len(failed_docs),
     )
 
-    if failed_docs:
-        logger.warning("Failed to process %d docs: %s", len(failed_docs), failed_docs[:20])
+    _log_failed_docs(failed_docs, set(_RUNTIME.get("degraded_now", {})), logger)
 
     _flush_taxonomy_usage(taxonomy_store, _RUNTIME.get("taxonomy_usage"), logger)
 
@@ -4007,6 +4384,7 @@ def index_vault_flow(
         set(stored_mtimes),
         filesystem_source_roots(config),
         source_scope=source_name,
+        failed_sources=failed_scan_sources,
         max_delete_ratio=max_delete_ratio,
         min_docs_for_ratio=min_docs_for_ratio,
         logger=logger,
@@ -4073,7 +4451,7 @@ def index_vault_flow(
         try:
             if needs_full_rebuild:
                 logger.info("Rebuilding FTS index...")
-                store.create_fts_index()
+                store.rebuild_fts_index()
             else:
                 try:
                     store.ensure_fts_index()
@@ -4088,7 +4466,7 @@ def index_vault_flow(
                     _RUNTIME.setdefault("_warnings", []).append(
                         f"fts_incremental_update_failed: {exc}"
                     )
-                    store.create_fts_index()
+                    store.rebuild_fts_index()
         except Exception as exc:
             fts_rebuild_ok = False
             logger.error("FTS index update failed: %s", exc)
@@ -4129,7 +4507,7 @@ def index_vault_flow(
             store.set_memory_observer(memory_observer)
             _RUNTIME["store"] = store
             try:
-                store.create_fts_index()
+                store.rebuild_fts_index()
             except Exception as fts_exc:
                 logger.warning("FTS rebuild after recovery failed: %s", fts_exc)
             doc_count = len(store.list_doc_ids())
@@ -4235,6 +4613,15 @@ def index_vault_flow(
     )
     memory_observer.sample("phase_finish", phase="finalize")
     progress = _run_progress_snapshot()
+    # Permanent actionable skips are a standing condition too — the same set
+    # (#1066's corrupt docs) warned byte-identically on 116 of 116 runs — so
+    # they follow the terminal cap's rule: announce transitions, not runs.
+    actionable_skips = actionable_skip_docs(_load_skip_ledger(index_root))
+    skip_announcement = standing_conditions.announce(
+        index_root, _STANDING_ACTIONABLE_SKIPS, actionable_skips
+    )
+    if skip_announcement.cleared:
+        logger.info("Permanent actionable skips cleared: none remain")
     _log_run_completion(
         logger,
         run_id=str(progress.get("run_id", "unmanaged")),
@@ -4244,7 +4631,8 @@ def index_vault_flow(
         indexed_docs=int(progress.get("indexed_docs") or 0),
         indexed_chunks=int(progress.get("indexed_chunks") or 0),
         elapsed_seconds=run_seconds,
-        actionable_skips=actionable_skip_docs(_load_skip_ledger(index_root)),
+        actionable_skips=actionable_skips if skip_announcement.announce else None,
+        failed_sources=failed_scan_sources,
     )
     _update_run_progress(phase="completed")
     _write_heartbeat(index_root)
@@ -4636,7 +5024,7 @@ def _record_single_doc_outcome(index_root: Path, doc: dict) -> None:
     if skips:
         skip_ledger = _merge_skip_ledger(
             _load_skip_ledger(index_root),
-            {doc_id: {"reasons": sorted(set(skips)), "change_key": _change_key(doc)}},
+            {doc_id: _skip_ledger_entry(doc, skips)},
             set(),
         )
         _save_skip_ledger(index_root, skip_ledger)
@@ -4760,6 +5148,7 @@ def _drain_index_requests(
     *,
     limit: int,
     prioritize: tuple[str, str] | None = None,
+    on_progress: Callable[[], Any] | None = None,
 ) -> dict[tuple[str, str], dict]:
     """Process one bounded queue snapshot without retrying failures in-place."""
     results: dict[tuple[str, str], dict] = {}
@@ -4790,6 +5179,8 @@ def _drain_index_requests(
                 "target": request.target,
                 "revision": request.revision,
             }
+            if on_progress is not None:
+                on_progress()
             continue
 
         if result.get("status") == "error" and result.get("reason") != "not_found":
@@ -4801,9 +5192,13 @@ def _drain_index_requests(
                 "target": request.target,
                 "revision": request.revision,
             }
+            if on_progress is not None:
+                on_progress()
             continue
         queue.complete(request)
         results[key] = result
+        if on_progress is not None:
+            on_progress()
     return results
 
 
@@ -4835,6 +5230,7 @@ def _service_index_queue(config: dict, table_name: str) -> int:
     if store is None or doc_id_store is None or index_root is None:
         return 0
     saved_runtime = dict(_RUNTIME)
+    served_doc_ids: set[str] = set()
     try:
         queue = IndexRequestQueue(index_root)
         if not queue.pending(table_name, limit=1):
@@ -4846,13 +5242,27 @@ def _service_index_queue(config: dict, table_name: str) -> int:
             store,
             doc_id_store,
             limit=int(config.get("index_queue", {}).get("sweep_service_limit", 16)),
+            # Targeted work can take minutes per document. Without a stamp
+            # between requests, a healthy batch can exceed the 30-minute
+            # freeze threshold and make /health report a false stall (#1876).
+            on_progress=lambda: _write_heartbeat(index_root),
         )
+        served_doc_ids = {
+            str(result["doc_id"])
+            for result in results.values()
+            if result.get("status") == "indexed" and result.get("doc_id")
+        }
     except Exception:
         _get_logger().exception("Serving queued index requests mid-sweep failed")
         return 0
     finally:
         _RUNTIME.clear()
         _RUNTIME.update(saved_runtime)
+        if served_doc_ids:
+            _RUNTIME.setdefault("sweep_served_doc_ids", set()).update(served_doc_ids)
+            storage_insert_doc_ids = _RUNTIME.get("storage_insert_doc_ids")
+            if storage_insert_doc_ids is not None:
+                storage_insert_doc_ids.difference_update(served_doc_ids)
     if results:
         _get_logger().info(
             "Served %d queued index request(s) during the sweep", len(results)
@@ -4900,6 +5310,36 @@ def compact_index_if_idle(config_path: str = "config.yaml") -> dict:
     except IndexWriteLockBusy:
         logger.info(
             "Daily Lance compaction deferred: an index writer holds table %r; "
+            "retrying in the next idle window",
+            table_name,
+        )
+        return {"status": "writer_busy"}
+
+
+def maintain_index_if_idle(config_path: str = "config.yaml") -> dict:
+    """Run cheap Lance maintenance only while no index writer owns the table."""
+    from datetime import date
+
+    config = load_config(config_path)
+    index_root = Path(config["index_root"])
+    table_name = config.get("lancedb", {}).get("table", "chunks")
+    logger = _get_logger()
+    try:
+        with index_write_lock(index_root, table_name, blocking=False):
+            store = open_store_with_recovery(
+                index_root,
+                table_name,
+                logger_obj=logger,
+                auto_recover=True,
+            )
+            with store.exclusive_writer_session():
+                store._finish_index_maintenance(store._vs.table, date.today())
+        # The finalizer best-effort skips later work after tag failure, so this
+        # reports only that maintenance was attempted, not guaranteed complete.
+        return {"status": "attempted"}
+    except IndexWriteLockBusy:
+        logger.info(
+            "Lance maintenance deferred: an index writer holds table %r; "
             "retrying in the next idle window",
             table_name,
         )

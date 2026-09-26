@@ -22,6 +22,25 @@ from doc_enrichment import (
 )
 
 
+def _complete_enrichment_json(**overrides) -> str:
+    payload = {
+        "summary": "test",
+        "doc_type": ["note"],
+        "entities_people": [],
+        "entities_places": [],
+        "entities_orgs": [],
+        "entities_dates": [],
+        "topics": [],
+        "keywords": [],
+        "key_facts": [],
+        "suggested_tags": [],
+        "suggested_folder": "",
+        "importance": 0.5,
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — parsing, normalization, and error handling (no LLM needed)
 # ---------------------------------------------------------------------------
@@ -241,10 +260,285 @@ def test_parse_context_placeholder_values_as_empty():
     assert parsed["enr_context_topics"] == ""
 
 
+# A store's "items were delivered" email and the earlier same-order message that
+# carried the payment summary, in the layout production indexes (#2562). Only
+# the earlier message has the totals and the card; every value is sanitized.
+DELIVERY_EMAIL = (
+    "Placed March 3, 2026\nOrder # 300000000000000001\nInvoice # 12345\n"
+    "Your Item(s) Were Delivered\nDelivered Tuesday, Mar 3, 2026\n"
+    "Address: 100 Example Lane, Anytown, PA 18000\n"
+    "Delivered Items: Tile Adhesive (25 Pound(s)) QTY1\n"
+    "Item #: 1000001|Model #: 2000002 Unit Price: $42.50|Subtotal: $42.50\n"
+    "Need to make a return? Start a Return/Replacement Online"
+)
+DELIVERY_CONTEXT = (
+    "BEFORE MESSAGES\n"
+    "[BEFORE 2026-03-03T09:12:00+00:00 message_id=1001 "
+    "source_message_id=<prepared@example.test> sender=orders@example.test] "
+    "Your order 300000000000000001 is being prepared. Subtotal $75.59 "
+    "Savings -$18.00 Tax $3.61 Total $61.20 Loyalty Discount applied. "
+    "Paid with Visa ending in 4242."
+)
+DELIVERY_PRIMARY_FACTS = [
+    "Delivered Tuesday, Mar 3, 2026 to 100 Example Lane, Anytown, PA 18000.",
+    "Invoice #12345; order #300000000000000001.",
+    "Return/replacement and billing/help links are provided.",
+]
+# What the model wrote from the earlier message, including a fact that mixes a
+# primary amount with the context-only card.
+DELIVERY_CONTEXT_FACTS = [
+    "Payment summary shows subtotal $75.59, savings $18.00, tax $3.61, and total $61.20.",
+    "Loyalty discount applied; card ending in 4242 was used.",
+    "Unit price $42.50 was charged to the card ending in 4242.",
+]
+
+LOWES_DELIVERY_EMAIL = (
+    "Your Item(s) Were Delivered\nDelivered Tuesday, Mar 3, 2026\n"
+    "Address: 100 Example Lane, Anytown, PA 18000\n"
+    "Delivered Items: Tile Adhesive QTY1\n"
+    "Order # 300000000000000001"
+)
+LOWES_DELIVERY_CONTEXT = (
+    "BEFORE MESSAGES\n"
+    "[BEFORE 2026-03-03T09:12:00+00:00 message_id=1001 "
+    "source_message_id=<prepared@example.test>] "
+    "Your order 300000000000000001 is being prepared. "
+    "Military discount applied. Card ending in 5531."
+)
+
+
+class TestContextOnlyFactsLeavePrimaryFields:
+    """Facts only a nearby message supports are stored as context facts (#2562)."""
+
+    def _enrich(self, response: dict, text: str, context_text: str) -> dict:
+        gen = MagicMock()
+        # Through the shared completer: #1918 rejects a response missing any
+        # contract key before it reaches the code under test here.
+        gen.generate.return_value = _complete_enrichment_json(**response)
+        return enrich_document(text, "Your items were delivered", "pg_message", gen,
+                               context_text=context_text)
+
+    def test_context_payment_details_move_out_of_primary_facts_and_keywords(self):
+        response = {
+            "summary": "Delivery confirmation for order 300000000000000001.",
+            "doc_type": ["delivery confirmation"],
+            "keywords": [
+                "Order #300000000000000001",
+                "Invoice #12345",
+                "Delivered Tuesday, Mar 3, 2026",
+                "Subtotal $42.50",
+                "Total $61.20",
+                "Total Tax $3.61",
+                "Card ending 4242",
+                "Loyalty Discount",
+            ],
+            "key_facts": [
+                DELIVERY_PRIMARY_FACTS[0],
+                DELIVERY_PRIMARY_FACTS[1],
+                *DELIVERY_CONTEXT_FACTS,
+                DELIVERY_PRIMARY_FACTS[2],
+            ],
+            "context_key_facts": ["The earlier message shows the same order being prepared."],
+            "context_confidence": "high",
+            "context_relationship": "Earlier message about the same order.",
+            "context_source_message_ids": ["<prepared@example.test>"],
+        }
+
+        result = self._enrich(response, DELIVERY_EMAIL, DELIVERY_CONTEXT)
+
+        assert json.loads(result["enr_key_facts"]) == DELIVERY_PRIMARY_FACTS
+        assert json.loads(result["enr_context_key_facts"]) == [
+            "The earlier message shows the same order being prepared.",
+            *DELIVERY_CONTEXT_FACTS,
+        ]
+        # Keywords keep their stored spelling; the moved ones are already
+        # carried by the moved facts, so they are not repeated.
+        assert result["enr_keywords"] == (
+            "Order #300000000000000001, Invoice #12345, Delivered Tuesday, Mar 3, 2026, "
+            "Subtotal $42.50"
+        )
+        assert "Loyalty Discount" not in result["enr_keywords"]
+        # The model's own provenance is kept as written.
+        assert result["enr_context_confidence"] == "high"
+        assert result["enr_context_source_message_ids"] == "<prepared@example.test>"
+        assert result["enr_context_warning"] == ""
+
+    def test_facts_the_primary_text_supports_are_unchanged(self):
+        # The context repeats every number, and the model reformatted each one:
+        # thousands separator and cents, phone punctuation, a masked card, an
+        # ISO date that only the context's timestamp header spells that way, and
+        # a total it added up from the receipt's own line amounts.
+        text = (
+            "Receipt. Placed March 3, 2026. Order Total $1,041.00 "
+            "VISA XXXXXXXXXXXX4242. Questions? Call (804) 555-0142. "
+            "Payment received: Rent - $1,250, Water fee - $45."
+        )
+        context_text = (
+            "BEFORE MESSAGES\n"
+            "[BEFORE 2026-03-03T09:12:00+00:00 message_id=1001 "
+            "source_message_id=<confirm@example.test>] Order confirmed. "
+            "Total $1041.00 on Visa ending in 4242. Store phone 804-555-0142. "
+            "Transfer amount $1,295.00."
+        )
+        response = {
+            "summary": "Receipt for an order.",
+            "doc_type": ["receipt"],
+            "keywords": ["Total $1041", "Visa 4242", "804-555-0142", "2026-03-03"],
+            "key_facts": [
+                "Total was $1041.",
+                "Paid with Visa ending in 4242.",
+                "Store phone is 804-555-0142.",
+                "Order placed 2026-03-03.",
+                "Total payment amount was $1,295.",
+            ],
+            "importance": 0.5,
+        }
+
+        result = self._enrich(response, text, context_text)
+
+        assert result == parse_enrichment_response(json.dumps(response))
+
+    def test_text_only_context_keyword_moves_without_numbers(self):
+        """#2611: number-only guards left phrases like Military Discount in keywords."""
+        response = {
+            "summary": "Delivery confirmation for order 300000000000000001.",
+            "doc_type": ["delivery confirmation"],
+            "keywords": [
+                "Order #300000000000000001",
+                "Delivered Tuesday, Mar 3, 2026",
+                "Military Discount",
+            ],
+            "key_facts": [
+                "Delivered Tuesday, Mar 3, 2026 to 100 Example Lane, Anytown, PA 18000.",
+                "Military discount applied; card ending in 5531.",
+            ],
+            "context_key_facts": [
+                "Earlier message shows military discount and card ending in 5531.",
+            ],
+            "context_confidence": "high",
+            "context_relationship": "Earlier message about the same order.",
+            "context_source_message_ids": ["<prepared@example.test>"],
+        }
+
+        result = self._enrich(response, LOWES_DELIVERY_EMAIL, LOWES_DELIVERY_CONTEXT)
+
+        assert json.loads(result["enr_key_facts"]) == [
+            "Delivered Tuesday, Mar 3, 2026 to 100 Example Lane, Anytown, PA 18000.",
+        ]
+        assert "Military Discount" not in result["enr_keywords"]
+        context_facts = json.loads(result["enr_context_key_facts"])
+        assert "Military discount applied; card ending in 5531." in context_facts
+        assert any("military discount" in fact.lower() for fact in context_facts)
+
+    def test_context_only_keyword_is_kept_as_context_fact_with_provenance(self):
+        context_text = (
+            "BEFORE MESSAGES\n"
+            "[BEFORE source_message_id=<confirm@example.test>] Order confirmation. "
+            "Order total $88.14.\n"
+            "AFTER MESSAGES\n"
+            "[AFTER source_message_id=<survey@example.test>] Tell us how we did."
+        )
+        response = {
+            "summary": "Order is ready for pickup.",
+            "doc_type": ["pickup notification"],
+            "keywords": ["ready for pickup", "order total $88.14"],
+            "key_facts": ["The order is ready for pickup."],
+            "importance": 0.5,
+        }
+
+        result = self._enrich(response, "Your order is ready for pickup.", context_text)
+
+        assert result["enr_keywords"] == "ready for pickup"
+        assert json.loads(result["enr_key_facts"]) == ["The order is ready for pickup."]
+        assert json.loads(result["enr_context_key_facts"]) == ["order total $88.14"]
+        assert result["enr_context_source_message_ids"] == "<confirm@example.test>"
+        assert result["enr_context_confidence"] == "medium"
+        assert "omitted structured context fields" in result["enr_context_warning"]
+
+
+def test_context_provenance_eval_sample_fixtures():
+    """Sanitized production-shaped comm fixtures: fewer context facts in primary fields."""
+    fixtures = [
+        (
+            DELIVERY_EMAIL,
+            DELIVERY_CONTEXT,
+            {
+                "summary": "Delivery confirmation.",
+                "doc_type": ["delivery confirmation"],
+                "keywords": ["Order #300000000000000001", "Card ending 4242"],
+                "key_facts": [
+                    DELIVERY_PRIMARY_FACTS[0],
+                    DELIVERY_CONTEXT_FACTS[1],
+                ],
+            },
+            1,
+        ),
+        (
+            LOWES_DELIVERY_EMAIL,
+            LOWES_DELIVERY_CONTEXT,
+            {
+                "summary": "Delivery confirmation.",
+                "doc_type": ["delivery confirmation"],
+                "keywords": ["Order #300000000000000001", "Military Discount"],
+                "key_facts": [
+                    "Delivered Tuesday, Mar 3, 2026 to 100 Example Lane, Anytown, PA 18000.",
+                    "Military discount applied; card ending in 5531.",
+                ],
+            },
+            1,
+        ),
+        (
+            "Your order is ready for pickup.",
+            (
+                "BEFORE MESSAGES\n"
+                "[BEFORE source_message_id=<confirm@example.test>] "
+                "Order total $88.14."
+            ),
+            {
+                "summary": "Pickup notice.",
+                "doc_type": ["pickup notification"],
+                "keywords": ["ready for pickup", "order total $88.14"],
+                "key_facts": ["The order is ready for pickup."],
+            },
+            1,
+        ),
+    ]
+
+    context_leaks_removed = 0
+    primary_facts_preserved = 0
+
+    for text, context_text, response, expected_primary in fixtures:
+        gen = MagicMock()
+        gen.generate.return_value = _complete_enrichment_json(**response)
+        result = enrich_document(text, "fixture", "pg_message", gen, context_text=context_text)
+
+        primary_facts = json.loads(result["enr_key_facts"] or "[]")
+        assert len(primary_facts) == expected_primary
+        primary_facts_preserved += expected_primary
+
+        for keyword in response.get("keywords", []):
+            if keyword.lower() not in text.lower() and keyword.lower() in context_text.lower():
+                assert keyword not in (result["enr_keywords"] or "")
+                context_leaks_removed += 1
+
+        for fact in response.get("key_facts", [])[expected_primary:]:
+            assert fact not in primary_facts
+
+    assert context_leaks_removed >= 2
+    assert primary_facts_preserved == 3
+
+
 class TestEnrichDocument:
     """Test enrich_document with mocked LLM generator."""
 
     def _make_generator(self, response: str) -> MagicMock:
+        try:
+            overrides = json.loads(response)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        else:
+            if isinstance(overrides, dict):
+                response = _complete_enrichment_json(**overrides)
         gen = MagicMock()
         gen.generate.return_value = response
         return gen
@@ -415,8 +709,8 @@ class TestEnrichDocument:
                 taxonomy_store=taxonomy,
             )
 
-        assert result["_enrichment_failed"] == (
-            "structured_output_missing_required_fields: summary, doc_type"
+        assert result["_enrichment_failed"].startswith(
+            "structured_output_contract_violation:"
         )
         assert result["_enrichment_transient"] is False
         taxonomy.increment_usage.assert_not_called()
@@ -454,7 +748,9 @@ class TestEnrichDocument:
         assert len(call_args) < len(long_text)
 
     def test_markdown_fences_in_response(self):
-        response = '```json\n{"summary": "A doc", "doc_type": ["note"]}\n```'
+        response = "```json\n" + _complete_enrichment_json(
+            summary="A doc", doc_type=["note"]
+        ) + "\n```"
         gen = self._make_generator(response)
         result = enrich_document("Some text", "note.md", "md", gen)
         assert result["enr_summary"] == "A doc"
@@ -463,7 +759,9 @@ class TestEnrichDocument:
     def test_thinking_tags_in_response(self):
         response = (
             '<think>Let me analyze...</think>\n'
-            '{"summary": "Analyzed", "doc_type": ["note"], "topics": ["AI"]}'
+            + _complete_enrichment_json(
+                summary="Analyzed", doc_type=["note"], topics=["AI"]
+            )
         )
         gen = self._make_generator(response)
         result = enrich_document("Some text", "doc.md", "md", gen)
@@ -551,7 +849,13 @@ class TestEnrichDocument:
         assert "NEARBY SAME-CHANNEL CONTEXT CANDIDATES" in prompt
         assert "may or may not describe the primary item" in prompt
 
-    def test_context_prompt_requires_context_fields_when_context_is_used(self):
+    def test_context_prompt_keeps_context_facts_out_of_primary_facts_and_keywords(self):
+        """The prompt sends context facts where storage keeps them (#2611).
+
+        Storage moves key facts and keywords that only nearby context supports
+        to context_key_facts (#2562). A prompt that allows a context fact in
+        key_facts or keywords once it is also in context_* contradicts that.
+        """
         response = json.dumps({
             "summary": "Photo context.",
             "doc_type": ["image"],
@@ -568,11 +872,19 @@ class TestEnrichDocument:
 
         prompt = gen.generate.call_args[0][0]
         assert (
-            "If you use nearby context in summary, entities, topics, keywords, "
-            "key_facts, tags, folder, or importance, you MUST also fill the "
-            "matching context_* fields"
+            "key_facts and keywords describe the PRIMARY ITEM only. Put facts and terms taken\n"
+            "from nearby context in context_key_facts only, never in key_facts or keywords."
         ) in prompt
-        assert "Do not place context-derived facts only in non-context fields" in prompt
+        assert "summary describes what the PRIMARY ITEM itself says." in prompt
+        shared = re.search(
+            r"If you use nearby context in (.*?), you\s+MUST also fill the matching "
+            r"context_\* fields",
+            prompt,
+            re.DOTALL,
+        )
+        assert shared is not None
+        shared_fields = set(re.split(r",\s*(?:or\s+)?", shared.group(1)))
+        assert shared_fields == {"entities", "topics", "tags", "folder", "importance"}
 
     def test_context_prompt_prioritizes_context_fields_before_summary(self):
         gen = self._make_generator('{"summary": "test", "doc_type": ["note"]}')
@@ -727,6 +1039,178 @@ class TestEnrichDocument:
         assert "PRIMARY ITEM" not in prompt
         assert "NEARBY SAME-CHANNEL CONTEXT CANDIDATES" not in prompt
         gen.generate.assert_called_once()
+
+
+# A Home Depot e-receipt body in the layout production indexes (#2526), with the
+# store, people, codes and every number sanitized. Two four-digit tails sit side
+# by side: the masked payment card (4821) and the phone-shaped Pro Xtra loyalty
+# member ID (7305), which is not a card.
+HOME_DEPOT_RECEIPT = (
+    "Subject: Your Electronic Receipt\n\nBody:\n"
+    "The Home Depot 96 96 Please keep this mail for your records. Thank you for "
+    "shopping with The Home Depot. 100 EXAMPLE PIKE ANYTOWN, PA 18000 STORE MGR "
+    "610-555-0142 1000 00002 00001 01/15/26 10:30 AM SALE 045242540389 "
+    "SCRWSETTER4P <A> MKE DRYWALL SCREW SETTER SET 4PC 2@5.00 10.00 019442146849 "
+    "3/4 CAP BLAC <A> 3.00 843382100551 HVYDTY100PK <A> 15.00 049057104934 "
+    "TANK LEVER <A> 12.00 SUBTOTAL 40.00 SALES TAX 2.40 TOTAL $42.40 "
+    "XXXXXXXXXXXX4821 VISA USD$ 42.40 AUTH CODE S00000/0000000 TA AUTH MODE - "
+    "ISSUER Contactless AID A0000000031010 VISA CREDIT PRO XTRA MEMBER STATEMENT "
+    "PRO XTRA ###-###-7305 SUMMARY THIS RECEIPT PO/JOB NAME: 101 2026 PRO XTRA "
+    "SPEND 09/15: $1,234.56 Get the CREDIT LINE your business needs when you "
+    "join Pro Xtra, register, & use your Pro Xtra Credit Card. RETURN POLICY "
+    "DEFINITIONS POLICY ID DAYS POLICY EXPIRES ON A 1 90 04/15/2026"
+)
+
+# The other facts the model wrote for the production receipt, which were right.
+HOME_DEPOT_TRUE_FACTS = [
+    "Total transaction amount is $42.40.",
+    "Purchase occurred on 2026-01-15 at 10:30 AM.",
+    "Items purchased include a 4pc drywall screw setter set, 3/4\" black cap, "
+    "Husky heavy-duty utility blades, and a Strongarm wave tank lever.",
+    "The transaction is associated with PO/Job Name 101 2026.",
+    "Return policy expires on 2026-04-15.",
+]
+
+
+def _receipt_response(card_fact: str, summary: str = "Home Depot receipt for $42.40.") -> str:
+    facts = list(HOME_DEPOT_TRUE_FACTS)
+    facts.insert(3, card_fact)
+    return _complete_enrichment_json(
+        summary=summary,
+        doc_type=["receipt"],
+        keywords=["Home Depot", "receipt", "Pro Xtra", "Visa", "PO/JOB NAME 101"],
+        key_facts=facts,
+        importance=0.5,
+    )
+
+
+class TestCardSuffixGrounding:
+    """#2526: a stored card suffix must be a card the source actually shows."""
+
+    def _enrich(self, response: str, text: str = HOME_DEPOT_RECEIPT, **kwargs) -> dict:
+        gen = MagicMock()
+        gen.generate.return_value = response
+        return enrich_document(text, "Your Electronic Receipt", "email", gen, **kwargs)
+
+    def test_loyalty_member_number_is_not_stored_as_the_payment_card(self):
+        """The exact production failure: the member ID's tail named as the card."""
+        result = self._enrich(
+            _receipt_response("Payment was made via Visa Pro Xtra credit card ending in 7305.")
+        )
+
+        facts = json.loads(result["enr_key_facts"])
+        assert "7305" not in result["enr_key_facts"]
+        assert facts[3] == "Payment was made via Visa Pro Xtra credit card ending in 4821."
+        # Nothing else in the receipt's enrichment moves.
+        assert facts[:3] + facts[4:] == HOME_DEPOT_TRUE_FACTS
+        assert result["enr_summary"] == "Home Depot receipt for $42.40."
+        assert result["enr_keywords"] == "Home Depot, receipt, Pro Xtra, Visa, PO/JOB NAME 101"
+
+    def test_summary_claim_is_grounded_too(self):
+        result = self._enrich(
+            _receipt_response(
+                "Paid by Visa ending in 4821.",
+                summary="Home Depot receipt for $42.40 paid with a Visa card ending in 7305.",
+            )
+        )
+
+        assert result["enr_summary"] == (
+            "Home Depot receipt for $42.40 paid with a Visa card ending in 4821."
+        )
+
+    def test_claim_matching_the_masked_card_is_unchanged(self):
+        response = _receipt_response("Paid by Visa ending in 4821 using contactless payment.")
+
+        result = self._enrich(response)
+
+        assert result["enr_key_facts"] == parse_enrichment_response(response)["enr_key_facts"]
+
+    @pytest.mark.parametrize(
+        ("text", "card_fact"),
+        [
+            # Home Depot's other e-receipt layout: an icon, a dash, the bare tail.
+            (
+                "Order Total: $36.50 Payment: [credit_card_icon_20x13.png]\n— 4821\n"
+                "Pro Xtra ###-###-7305",
+                "Order total is $36.50, paid by credit card ending in 4821.",
+            ),
+            # Payment-processor layout: the tail after a label, sometimes starred.
+            (
+                "Account Number with Aqua: *1357\nBank Account or Card #: *2468\n",
+                "Bank account or card ending in 2468.",
+            ),
+            # Card statement layout: an elided account number.
+            (
+                "Account Chase Credit Card (...9753)\nDue date 09/20/2026",
+                "The credit card statement is for the card ending in 9753.",
+            ),
+        ],
+    )
+    def test_correct_claims_in_other_layouts_are_unchanged(self, text, card_fact):
+        response = _receipt_response(card_fact)
+
+        result = self._enrich(response, text=text)
+
+        assert result["enr_key_facts"] == parse_enrichment_response(response)["enr_key_facts"]
+
+    def test_claim_is_dropped_when_the_real_card_is_ambiguous(self):
+        text = HOME_DEPOT_RECEIPT.replace(
+            "VISA CREDIT", "XXXXXXXXXXXX6650 MASTERCARD USD$ 10.00 VISA CREDIT"
+        )
+
+        result = self._enrich(
+            _receipt_response("Payment was made via Visa Pro Xtra credit card ending in 7305."),
+            text=text,
+        )
+
+        facts = json.loads(result["enr_key_facts"])
+        assert facts[3] == "Payment was made via Visa Pro Xtra credit card."
+        assert facts[:3] + facts[4:] == HOME_DEPOT_TRUE_FACTS
+
+    def test_non_card_identifiers_keep_their_phone_shaped_tail(self):
+        """The member ID really does end in 7305; only card claims are guarded."""
+        response = _receipt_response("The Pro Xtra member number ends in 7305.")
+
+        result = self._enrich(response)
+
+        assert result["enr_key_facts"] == parse_enrichment_response(response)["enr_key_facts"]
+
+    def test_card_seen_only_in_nearby_context_is_grounded(self):
+        response = _complete_enrichment_json(
+            summary="Delivery checklist for a dryer order.",
+            doc_type=["delivery_notification"],
+            key_facts=["Order total is $500.00."],
+            context_key_facts=["The nearby receipt was paid by credit card ending in 4821."],
+            context_confidence="medium",
+            context_relationship="same order",
+        )
+
+        result = self._enrich(
+            response,
+            text="Your dryer delivery is scheduled. Questions? Call 866-555-4821.",
+            context_text="[BEFORE source_message_id=m1] TOTAL $500.00 XXXXXXXXXXXX4821 VISA",
+        )
+
+        # #2562's mover also relocates the order total: `$500.00` appears in the
+        # nearby context and not in the primary text, which is exactly its rule.
+        # What #2526 asserts here is the card suffix, and it is still grounded to
+        # the 4821 the context shows rather than the phone tail in the body.
+        assert json.loads(result["enr_context_key_facts"]) == [
+            "The nearby receipt was paid by credit card ending in 4821.",
+            "Order total is $500.00.",
+        ]
+
+    def test_correction_is_logged_for_counting(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="doc_enrichment"):
+            self._enrich(
+                _receipt_response("Payment was made via Visa Pro Xtra credit card ending in 7305.")
+            )
+
+        corrections = [r.getMessage() for r in caplog.records if "card suffix" in r.getMessage()]
+        assert corrections == [
+            "Ungrounded card suffix in enrichment for 'Your Electronic Receipt': "
+            "enr_key_facts 7305 -> 4821"
+        ]
 
 
 class TestFailedEnrichment:

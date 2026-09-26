@@ -2,6 +2,7 @@
 
 No external services needed. Uses mocks and direct function calls."""
 
+import logging
 import os
 import re
 import threading
@@ -10,6 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import anyio
+import httpx
 import pytest
 
 from core.storage import SearchHit
@@ -1863,6 +1865,129 @@ def test_deep_health_reports_retry_pending_source_as_degraded(tmp_path):
     assert result["overall"] == "degraded"
 
 
+def test_deep_health_reports_terminal_cap_as_manual_action_not_retry_pending(tmp_path):
+    """#2101: the ledger parks a doc at its terminal cap ("manual action
+    required") while the probe called the same doc `retry_pending` — telling
+    an operator to wait for a retry the ledger already stopped scheduling."""
+    import json
+    from doc_id_store import DocIDStore
+
+    docs_root = tmp_path / "documents"
+    docs_root.mkdir()
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("001Og", "photo.jpg.vl.json", source_name="documents")
+    registry.close()
+    (docs_root / "photo.jpg.vl.json").write_text('{"error": "provider offline"}')
+    (tmp_path / "degraded_docs.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "docs": {
+                    "documents::001Og": {
+                        "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+                        "attempts": 0,
+                        "blocked_attempts": 3,
+                        "transient_attempts": 233,
+                    }
+                },
+            }
+        )
+    )
+
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [
+                {"type": "filesystem", "name": "documents", "root": str(docs_root)}
+            ],
+        },
+        doc_ids=[],
+        chunk_count=0,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-09-05T00:00:00+00:00",
+        # #2101 predates this parameter, whose default is False; without it the
+        # missing ANN index pins `overall` degraded for a reason that has nothing
+        # to do with the terminal cap this test is about.
+        vector_index_available=True,
+    )
+    documents = result["sources"]["documents"]
+
+    assert documents["reason"] == "manual_action_required"
+    assert documents["manual_action_required_doc_count"] == 1
+    assert documents["retry_pending_doc_count"] == 0
+    # A standing operator to-do must not pin the live signal: a monitor that
+    # can only read `degraded` cannot report the next problem.
+    assert documents["status"] == "ok"
+    assert result["overall"] == "ok"
+    assert result["standing_actions"] == {
+        "count": 1,
+        "by_reason": {
+            "vision_sidecar_failed:blocked_on_upstream": ["documents::001Og"]
+        },
+    }
+
+
+def test_deep_health_still_degrades_on_a_new_failure_beside_a_standing_action(tmp_path):
+    """The standing terminal doc must not hide a genuinely new degradation."""
+    import json
+    from doc_id_store import DocIDStore
+
+    docs_root = tmp_path / "documents"
+    docs_root.mkdir()
+    registry = DocIDStore(tmp_path / "doc_registry.db")
+    registry.register("001Og", "photo.jpg.vl.json", source_name="documents")
+    registry.register("001New", "fresh.jpg.vl.json", source_name="documents")
+    registry.close()
+    (docs_root / "photo.jpg.vl.json").write_text('{"error": "provider offline"}')
+    (docs_root / "fresh.jpg.vl.json").write_text('{"error": "provider offline"}')
+    (tmp_path / "degraded_docs.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "docs": {
+                    "documents::001Og": {
+                        "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+                        "attempts": 0,
+                        "blocked_attempts": 3,
+                    },
+                    "documents::001New": {
+                        "reasons": ["ocr_describe_failed"],
+                        "attempts": 1,
+                    },
+                },
+            }
+        )
+    )
+
+    store = MagicMock()
+    store.list_recent_docs.return_value = []
+    result = mcp_server._compute_deep_health(
+        store=store,
+        config={
+            "index_root": str(tmp_path),
+            "sources": [
+                {"type": "filesystem", "name": "documents", "root": str(docs_root)}
+            ],
+        },
+        doc_ids=[],
+        chunk_count=0,
+        fts_available=True,
+        indexer_running=False,
+        last_run_at="2026-09-05T00:00:00+00:00",
+    )
+    documents = result["sources"]["documents"]
+
+    assert documents["status"] == "degraded"
+    assert documents["reason"] == "retry_pending"
+    assert documents["retry_pending_doc_count"] == 1
+    assert documents["manual_action_required_doc_count"] == 1
+    assert result["overall"] == "degraded"
+
+
 def test_deep_health_surfaces_actionable_corrupt_document_ids(tmp_path):
     import json
     from doc_id_store import DocIDStore
@@ -1907,7 +2032,13 @@ def test_deep_health_surfaces_actionable_corrupt_document_ids(tmp_path):
         last_run_at="2026-08-10T00:00:00+00:00",
     )
 
-    assert result["overall"] == "degraded"
+    # #2101: a permanent corrupt-document skip is a standing operator action —
+    # reported in full, but no longer pinning `overall` at degraded forever.
+    assert result["overall"] == "ok"
+    assert result["standing_actions"] == {
+        "count": 1,
+        "by_reason": {"corrupt_mangled_binary": ["documents::001sp"]},
+    }
     assert result["checks"]["actionable_skips"] == {
         "count": 1,
         "by_reason": {"corrupt_mangled_binary": ["documents::001sp"]},
@@ -2802,6 +2933,27 @@ async def test_slow_provider_probe_does_not_block_liveness_probe():
         release_slow.set()
 
 
+@pytest.mark.anyio
+async def test_failed_health_probe_logs_its_condition(caplog):
+    """Container logs must identify which health condition returned 503."""
+    with caplog.at_level(logging.ERROR, logger="mcp_server"):
+        payload, status_code = await mcp_server._run_health_probe(
+            lambda _config: (
+                {
+                    "status": "stalled",
+                    "detail": "indexer running but not progressing (frozen?)",
+                },
+                503,
+            ),
+            {},
+        )
+
+    assert status_code == 503
+    assert payload["status"] == "stalled"
+    assert "status=stalled" in caplog.text
+    assert "indexer running but not progressing" in caplog.text
+
+
 def test_probe_path_helper_accepts_health_and_subpaths():
     assert mcp_server._is_unauthenticated_probe_path("/health") is True
     assert mcp_server._is_unauthenticated_probe_path("/health/providers") is True
@@ -2893,6 +3045,44 @@ def test_provider_health_probe_503s_on_degraded_status(tmp_path):
     assert status_code == 503
     assert payload["status"] == "critical"
     assert payload["provider_failures"] == failures
+
+
+def test_provider_health_probe_503s_on_query_path_reranker_refusal(tmp_path, monkeypatch):
+    """#2906: DeepInfra 402'd every rerank for three days while /health/providers
+    said ok — it only read indexer logs, and the reranker runs on the query path.
+
+    The failure is simulated where it happened (a live rerank call), not seeded
+    as a log line: the index root has no logs at all, so a log scan alone cannot
+    see it.
+    """
+    from search_hybrid import DeepInfraReranker
+
+    posts = {"n": 0}
+
+    def _refused(url, **_kw):
+        posts["n"] += 1
+        return httpx.Response(
+            402,
+            text='{"detail":{"error":"inference prohibited, you have reached user-set limit."}}',
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("httpx.post", _refused)
+    reranker = DeepInfraReranker(api_key="k")
+    hit = SearchHit(doc_id="d", loc="1", snippet="s", text="t", score=1.0)
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            reranker.rerank("q", [hit])
+    assert posts["n"] == 1  # the refusal opened the circuit; later queries don't re-ask
+
+    payload, status_code = mcp_server._provider_health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] != "ok"
+    [entry] = payload["provider_failures"]["by_key"].values()
+    assert entry["provider"] == "https://api.deepinfra.com"
+    assert entry["http_status"] == 402
+    assert entry["recovered"] is False
 
 
 def test_health_probe_disk_threshold_env_override_and_invalid_fallback(tmp_path):

@@ -273,6 +273,30 @@ def test_full_flow_suppresses_unchanged_empty_file_until_changed(tmp_path, caplo
     store.upsert_nodes.assert_not_called()
 
 
+def _terminal_cap_flow_config(root, index_root) -> dict:
+    """Minimal single-source flow config for the terminal-cap flow tests."""
+    return {
+        "index_root": str(index_root),
+        "sources": [{
+            "type": "filesystem",
+            "name": "documents",
+            "root": str(root),
+            "scan": {"include": ["**/*.json"], "exclude": []},
+        }],
+        "chunking": {
+            "max_chars": 1800,
+            "overlap": 200,
+            "semantic": {"enabled": False},
+        },
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "media": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+
+
 def test_full_flow_surfaces_parked_provider_error_without_self_heal_claim(
     tmp_path, caplog
 ):
@@ -296,26 +320,7 @@ def test_full_flow_surfaces_parked_provider_error_without_self_heal_claim(
             "last_attempt_at": 1.0,
         }
     }})
-    config = {
-        "index_root": str(index_root),
-        "sources": [{
-            "type": "filesystem",
-            "name": "documents",
-            "root": str(root),
-            "scan": {"include": ["**/*.json"], "exclude": []},
-        }],
-        "chunking": {
-            "max_chars": 1800,
-            "overlap": 200,
-            "semantic": {"enabled": False},
-        },
-        "enrichment": {"enabled": False},
-        "ocr": {"enabled": False},
-        "media": {"enabled": False},
-        "lancedb": {"table": "chunks"},
-        "pdf": {},
-        "logging": {"level": "WARNING"},
-    }
+    config = _terminal_cap_flow_config(root, index_root)
     store = MagicMock()
     store.list_doc_ids.return_value = []
     store.list_doc_mtimes.return_value = {}
@@ -344,6 +349,192 @@ def test_full_flow_surfaces_parked_provider_error_without_self_heal_claim(
     assert "parked at terminal cap" in caplog.text
     assert "vision_sidecar_failed:blocked_on_upstream" in caplog.text
     assert "will self-heal next run" not in caplog.text
+
+
+def test_unchanged_terminal_cap_set_is_not_re_reported_every_run(tmp_path, caplog):
+    """#2101: a terminal cap is a standing state, so only its transitions are
+    ERRORs. Two consecutive runs over an unchanged ledger used to emit the
+    byte-identical 'parked at terminal cap' ERROR twice (117 of 118 ERROR
+    lines in a 24h production window)."""
+    root = tmp_path / "documents"
+    root.mkdir()
+    artifact = root / "photo.jpg.vl@001Og@.json"
+    artifact.write_text(
+        '{"server":"qwen3-vl","tool":"vl_describe",'
+        '"error":"provider offline","issue":{"kind":"offline"}}'
+    )
+    scanned = scan_vault_task.fn(root, ["**/*.json"], [])
+    index_root = tmp_path / "index"
+    index_root.mkdir()
+    fiv._save_degraded_ledger(index_root, {"version": 2, "docs": {
+        "documents::001Og": {
+            "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+            "attempts": 0,
+            "blocked_attempts": 3,
+            "change_key": fiv._change_key(scanned[0]),
+            "last_attempt_at": 1.0,
+        }
+    }})
+    config = _terminal_cap_flow_config(root, index_root)
+    store = MagicMock()
+    store.list_doc_ids.return_value = []
+    store.list_doc_mtimes.return_value = {}
+    store.list_doc_change_hashes.return_value = {}
+    store.count_chunks.return_value = 0
+    store.fts_available.return_value = True
+    taxonomy = MagicMock()
+    taxonomy.count.return_value = 0
+
+    caplog.set_level(logging.INFO)
+    with patch("flow_index_vault.load_config", return_value=config), \
+         patch("flow_index_vault.get_run_logger", return_value=logging.getLogger("test")), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=store), \
+         patch("flow_index_vault.build_embed_provider", return_value=MagicMock()), \
+         patch("flow_index_vault.build_ocr_provider", return_value=None), \
+         patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("core.taxonomy.load_taxonomy_store", return_value=taxonomy), \
+         patch("flow_index_vault.process_doc_task"), \
+         patch("flow_index_vault.delete_docs_task"), \
+         patch("flow_index_vault.index_stats_task"), \
+         patch("flow_index_vault.write_index_metadata_task"):
+        fiv.index_vault_flow.fn("dummy.yaml")
+        fiv.index_vault_flow.fn("dummy.yaml")
+
+    parked_errors = [
+        record for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "parked at terminal cap" in record.getMessage()
+    ]
+    assert len(parked_errors) == 1, [r.getMessage() for r in parked_errors]
+    # The per-run INFO summary still carries the standing count.
+    assert len([
+        record for record in caplog.records
+        if "Degraded ledger: 1 entries" in record.getMessage()
+    ]) == 2
+
+
+def test_terminal_cap_set_change_re_reports(tmp_path, caplog):
+    """Entering, changing or leaving the terminal set must still be an ERROR."""
+    root = tmp_path / "documents"
+    root.mkdir()
+    for name in ("photo.jpg.vl@001Og@.json", "scan.jpg.vl@001Oo@.json"):
+        (root / name).write_text(
+            '{"server":"qwen3-vl","tool":"vl_describe",'
+            '"error":"provider offline","issue":{"kind":"offline"}}'
+        )
+    # scan_vault_task yields bare rel_path ids; the flow namespaces them later.
+    scanned = {
+        "documents::" + str(r["doc_id"]).split("@")[1]: r
+        for r in scan_vault_task.fn(root, ["**/*.json"], [])
+    }
+    index_root = tmp_path / "index"
+    index_root.mkdir()
+
+    def park(*doc_ids):
+        fiv._save_degraded_ledger(index_root, {"version": 2, "docs": {
+            doc_id: {
+                "reasons": ["vision_sidecar_failed:blocked_on_upstream"],
+                "attempts": 0,
+                "blocked_attempts": 3,
+                "change_key": fiv._change_key(scanned[doc_id]),
+                "last_attempt_at": 1.0,
+            }
+            for doc_id in doc_ids
+        }})
+
+    config = _terminal_cap_flow_config(root, index_root)
+    store = MagicMock()
+    store.list_doc_ids.return_value = []
+    store.list_doc_mtimes.return_value = {}
+    store.list_doc_change_hashes.return_value = {}
+    store.count_chunks.return_value = 0
+    store.fts_available.return_value = True
+    taxonomy = MagicMock()
+    taxonomy.count.return_value = 0
+
+    caplog.set_level(logging.INFO)
+    with patch("flow_index_vault.load_config", return_value=config), \
+         patch("flow_index_vault.get_run_logger", return_value=logging.getLogger("test")), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=store), \
+         patch("flow_index_vault.build_embed_provider", return_value=MagicMock()), \
+         patch("flow_index_vault.build_ocr_provider", return_value=None), \
+         patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("core.taxonomy.load_taxonomy_store", return_value=taxonomy), \
+         patch("flow_index_vault.process_doc_task"), \
+         patch("flow_index_vault.delete_docs_task"), \
+         patch("flow_index_vault.index_stats_task"), \
+         patch("flow_index_vault.write_index_metadata_task"):
+        park("documents::001Og")
+        fiv.index_vault_flow.fn("dummy.yaml")       # enters  -> ERROR
+        park("documents::001Og", "documents::001Oo")
+        fiv.index_vault_flow.fn("dummy.yaml")       # changes -> ERROR
+        park("documents::001Og", "documents::001Oo")
+        fiv.index_vault_flow.fn("dummy.yaml")       # unchanged -> silent
+        fiv._save_degraded_ledger(index_root, {"version": 2, "docs": {}})
+        fiv.index_vault_flow.fn("dummy.yaml")       # leaves  -> reported
+
+    parked_errors = [
+        record for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "parked at terminal cap" in record.getMessage()
+    ]
+    assert len(parked_errors) == 2
+    assert "documents::001Oo" in parked_errors[1].getMessage()
+    assert any(
+        "Terminal cap cleared" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_unchanged_permanent_skip_set_is_not_re_warned_every_run(tmp_path, caplog):
+    """#2101 acceptance: the `corrupt_mangled_binary` permanent-skip WARNING
+    follows the terminal cap's rule — byte-identical on 116 of 116 runs
+    before, one announcement per transition after."""
+    import json
+
+    root = tmp_path / "documents"
+    root.mkdir()
+    (root / "note.json").write_text('{"body": "fine"}')
+    index_root = tmp_path / "index"
+    index_root.mkdir()
+    (index_root / "skip_docs.json").write_text(json.dumps({"docs": {
+        "documents::001sp": {
+            "reasons": ["corrupt_mangled_binary"],
+            "change_key": "h1",
+            "skipped_at": 1000.0,
+        }
+    }}))
+    config = _terminal_cap_flow_config(root, index_root)
+    store = MagicMock()
+    store.list_doc_ids.return_value = []
+    store.list_doc_mtimes.return_value = {}
+    store.list_doc_change_hashes.return_value = {}
+    store.count_chunks.return_value = 0
+    store.fts_available.return_value = True
+    taxonomy = MagicMock()
+    taxonomy.count.return_value = 0
+
+    caplog.set_level(logging.INFO)
+    with patch("flow_index_vault.load_config", return_value=config), \
+         patch("flow_index_vault.get_run_logger", return_value=logging.getLogger("test")), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=store), \
+         patch("flow_index_vault.build_embed_provider", return_value=MagicMock()), \
+         patch("flow_index_vault.build_ocr_provider", return_value=None), \
+         patch("flow_index_vault.build_media_provider", return_value=None), \
+         patch("core.taxonomy.load_taxonomy_store", return_value=taxonomy), \
+         patch("flow_index_vault.process_doc_task"), \
+         patch("flow_index_vault.delete_docs_task"), \
+         patch("flow_index_vault.index_stats_task"), \
+         patch("flow_index_vault.write_index_metadata_task"):
+        fiv.index_vault_flow.fn("dummy.yaml")
+        fiv.index_vault_flow.fn("dummy.yaml")
+
+    warnings = [
+        record for record in caplog.records
+        if "permanent actionable skips" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "documents::001sp" in warnings[0].getMessage()
 
 
 def test_taxonomy_usage_accumulator_flushes_once_serially():
@@ -556,6 +747,20 @@ def test_split_section_above_threshold():
     assert len(chunks) >= 2
     assert any("animals" in c for c in chunks)
     assert any("machines" in c for c in chunks)
+
+
+def test_document_chunk_budget_caps_and_reports_degradation():
+    logger = MagicMock()
+    fiv.begin_degradation_capture()
+    budget = fiv._DocumentChunkBudget("comm_messages::mail/large", 2, logger)
+
+    assert budget.take(["one", "two", "three"]) == ["one", "two"]
+    assert budget.take(["four"]) == []
+
+    logger.warning.assert_called_once()
+    assert [item.reason for item in fiv.collect_degradations()] == [
+        "chunk_expansion_limited"
+    ]
 
 
 # --- process_doc_task communication context ---
@@ -1414,7 +1619,7 @@ def test_missing_fts_rebuilds_on_noop_index_update(tmp_path):
                                                     with patch("flow_index_vault.write_index_metadata_task"):
                                                         index_vault_flow.fn("dummy.yaml")
 
-    fake_store.create_fts_index.assert_called_once_with()
+    fake_store.rebuild_fts_index.assert_called_once_with()
 
 
 def _run_flow_with_fts_store(
@@ -1676,7 +1881,7 @@ def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
 
     The Lance-native incremental merge (table.optimize()) panics forever once
     the on-disk inverted index is inconsistent (#0106) — retrying it next run
-    can never succeed, so the flow must fall back to create_fts_index() in the
+    can never succeed, so the flow must fall back to rebuild_fts_index() in the
     same run instead of leaving keyword search silently stale.
     """
     fake_store = MagicMock()
@@ -1694,7 +1899,9 @@ def test_incremental_fts_failure_falls_back_to_full_rebuild(tmp_path):
     meta_mock = _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
 
     fake_store.ensure_fts_index.assert_called_once_with()
-    fake_store.create_fts_index.assert_called_once_with()
+    # #1630: the fallback goes through rebuild_fts_index so the full rebuild
+    # finishes the same restore-point/prune lifecycle a merge does.
+    fake_store.rebuild_fts_index.assert_called_once_with()
     warnings = meta_mock.call_args[0][4] or []
     assert any(w.startswith("fts_incremental_update_failed:") for w in warnings)
     # The rebuild succeeded, so the run must NOT count as an FTS failure.
@@ -1714,11 +1921,11 @@ def test_fts_full_rebuild_fallback_failure_records_warning(tmp_path):
     fake_store.ensure_fts_index.side_effect = RuntimeError(
         "rust future panicked: unknown error"
     )
-    fake_store.create_fts_index.side_effect = RuntimeError("still broken")
+    fake_store.rebuild_fts_index.side_effect = RuntimeError("still broken")
 
     meta_mock = _run_flow_with_fts_store(tmp_path, fake_store, _changed_doc_diff())
 
-    fake_store.create_fts_index.assert_called_once_with()
+    fake_store.rebuild_fts_index.assert_called_once_with()
     warnings = meta_mock.call_args[0][4] or []
     assert any(w.startswith("fts_rebuild_failed:") for w in warnings)
 

@@ -96,6 +96,11 @@ _ENRICHMENT_LIST_KEYS = (
 # apart from the one a (wasted) retry would have produced.
 _OVERSHOOT_BUDGET_SUMMARY = "Overshot-budget enrichment marker."
 
+# The #2526 answer: the model names the tail of a receipt's phone-shaped loyalty
+# member ID (printed ###-###-7305) as the payment card. A test that arms it
+# uploads a receipt carrying that member ID next to its real, masked card.
+MEMBER_ID_AS_CARD_FACT = "Payment was made via Visa Pro Xtra credit card ending in 7305."
+
 
 def _fake_enrichment(text: str) -> str:
     """Minimal valid enrichment JSON with values derived from the text hash."""
@@ -151,6 +156,14 @@ def _lexical_overlap(query: str, doc: str) -> float:
 # Fault injection — implemented once, as middleware
 # --------------------------------------------------------------------------
 
+# The #2562 answer: the model files a nearby message's fact under the primary
+# item's key_facts and keywords. A test that arms it indexes an attachment in
+# the seeded "billing" channel, whose messages carry invoice 4417; the
+# attachment itself does not.
+CONTEXT_FACT_AS_PRIMARY_FACT = "Invoice 4417 for the obsidian widgets was paid on Friday."
+CONTEXT_FACT_AS_PRIMARY_KEYWORD = "invoice 4417"
+DELIVERY_SLIP_FACT = "The obsidian widget delivery slip was signed at the loading dock."
+
 
 def _fault_response(fault: str) -> Response | None:
     if fault == "429":
@@ -162,6 +175,25 @@ def _fault_response(fault: str) -> Response | None:
     if fault == "garbage":
         return Response(
             content="not json {", status_code=200, media_type="application/json"
+        )
+    if fault == "context_fact_as_primary":
+        enrichment = json.loads(_fake_enrichment(""))
+        enrichment["key_facts"] = [DELIVERY_SLIP_FACT, CONTEXT_FACT_AS_PRIMARY_FACT]
+        enrichment["keywords"] = ["obsidian widgets", CONTEXT_FACT_AS_PRIMARY_KEYWORD]
+        return JSONResponse(
+            {
+                "id": "sim-context-fact-as-primary",
+                "object": "chat.completion",
+                "model": "sim-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": json.dumps(enrichment)},
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 40, "total_tokens": 52},
+            }
         )
     if fault == "reasoning_only":
         return JSONResponse(
@@ -218,6 +250,24 @@ def _fault_response(fault: str) -> Response | None:
                     "completion_tokens": 6201,
                     "total_tokens": 6213,
                 },
+            }
+        )
+    if fault == "member_id_as_card":
+        enrichment = json.loads(_fake_enrichment(""))
+        enrichment["key_facts"] = ["Total transaction amount is $42.40.", MEMBER_ID_AS_CARD_FACT]
+        return JSONResponse(
+            {
+                "id": "sim-member-id-as-card",
+                "object": "chat.completion",
+                "model": "sim-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": json.dumps(enrichment)},
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 40, "total_tokens": 52},
             }
         )
     if fault == "hangup":
@@ -281,7 +331,56 @@ async def embeddings(request: Request):
     inputs = body.get("input", [])
     if isinstance(inputs, str):
         inputs = [inputs]
-    for text in inputs:
+    for i, text in enumerate(inputs):
+        if not text:
+            # The gateway's own request validation, which runs before any
+            # upstream sees the batch: an empty input is rejected outright and
+            # takes the WHOLE batch with it, naming the offending slot
+            # (measured 2026-08-27, zod `too_small`). Because the input never
+            # gains characters, the rejection is permanent (#1687).
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": 400,
+                        "message": json.dumps(
+                            [
+                                {
+                                    "origin": "string",
+                                    "code": "too_small",
+                                    "minimum": 1,
+                                    "inclusive": True,
+                                    "path": ["input", i],
+                                    "message": (
+                                        "Too small: expected string to have "
+                                        ">=1 characters"
+                                    ),
+                                }
+                            ],
+                            indent=2,
+                        ),
+                    }
+                },
+            )
+        if not text.strip():
+            # One layer further in: an input that normalizes to nothing is
+            # rejected by the upstream provider instead. The real route does
+            # this *intermittently* — `[" "]` measured 400/400/200 across three
+            # runs, depending on which provider the gateway picked. The sim
+            # answers deterministically, and rejects: a simulator stricter than
+            # the real route cannot produce a false green, a more permissive
+            # one can (#1658).
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": 400,
+                        "message": (
+                            'HTTP 400: {"detail":"Prompt must not be empty"}'
+                        ),
+                    }
+                },
+            )
         if len(text) > MAX_EMBED_INPUT_CHARS:
             # Same shape the real route returns when one input overruns the
             # character cap: the WHOLE batch is rejected with a 422, and it
@@ -459,10 +558,12 @@ async def admin_reset() -> dict:
 
 _KNOWN_FAULTS = {
     "429",
+    "context_fact_as_primary",
     "timeout",
     "garbage",
     "reasoning_only",
     "overshoot_budget",
+    "member_id_as_card",
     "hangup",
 }
 

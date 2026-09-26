@@ -12,6 +12,7 @@ exercises concurrent dispatch. Distinct cohorts do, at the configured
 `enrichment.concurrency`.
 """
 import json
+import subprocess
 import tempfile
 import time
 import uuid
@@ -19,11 +20,14 @@ from collections import Counter
 from pathlib import Path
 
 import anyio
+import httpx
 import pytest
 
-from tests.e2e.client import get_hook_events, open_mcp_session, search_hits
+from tests.e2e.client import E2E_SIM_URL, get_hook_events, open_mcp_session, search_hits
 from tests.e2e.conftest import (
+    COMPOSE_FILE,
     EXPECTED_CORPUS_DOCS,
+    ROOT,
     _compose_cp_into_documents,
     indexer_log_lines,
     wait_for_index,
@@ -31,6 +35,8 @@ from tests.e2e.conftest import (
 
 COHORTS = 3
 COPIES_PER_COHORT = 2
+EXPECTED_DEDUPE_DOCS = COHORTS * COPIES_PER_COHORT
+EXPECTED_INDEXED_DOCS = EXPECTED_CORPUS_DOCS + EXPECTED_DEDUPE_DOCS
 
 # The two seeded `ops` fixture messages (staging/comm_postgres/init.sql) sit at
 # 10:00:00 and 10:01:00, so a delivery timestamped between them has real
@@ -98,7 +104,7 @@ async def _sweep_and_wait(session) -> dict:
         if (await session.call_tool_json("file_status", {})).get("indexer_running"):
             break
         await anyio.sleep(1)
-    return await wait_for_index(session, min_docs=EXPECTED_CORPUS_DOCS)
+    return await wait_for_index(session, min_docs=EXPECTED_INDEXED_DOCS)
 
 
 async def _doc_ids_by_stem(session, stems: list[str]) -> dict[str, str]:
@@ -125,6 +131,9 @@ async def _doc_ids_by_stem(session, stems: list[str]) -> dict[str, str]:
 async def _index_duplicate_cohorts() -> dict:
     cohorts = _deposit_cohorts(uuid.uuid4().hex[:8])
     stems = [stem for cohort in cohorts for stem in cohort["stems"]]
+    async with httpx.AsyncClient(timeout=10) as sim:
+        # Count only deliveries from this sweep — not the corpus fixture run.
+        await sim.post(f"{E2E_SIM_URL}/admin/reset")
     async with open_mcp_session("duplicate_cohorts") as session:
         await _sweep_and_wait(session)
         doc_ids = await _doc_ids_by_stem(session, stems)
@@ -256,3 +265,154 @@ def test_staging_sweeps_dispatch_documents_concurrently(duplicate_cohorts):
         "config.staging.yaml is 1, so the concurrent-dispatch shape production "
         "runs is never exercised"
     )
+
+
+# --- A cohort that can never hold content (#2097) ---------------------------
+# The other cohorts here index once and their duplicates carry an alias. A
+# cohort whose members extract no text has no such member: electing one of them
+# canonical anyway marks the rest duplicates of a row that resolves to nothing,
+# so the content is in NO row and the delivery is announced nowhere. Driven from
+# outside, against the candidate container's real registry and index.
+
+BLANK_BODY = "   \n\n\t\n   \n"
+
+# One statement, so a partial read cannot look like an empty registry.
+_DEDUPE_STATE_PROBE = """
+import json, sqlite3, sys
+rows = sqlite3.connect(
+    "file:/data/index/doc_registry.db?mode=ro", uri=True
+).execute(
+    "SELECT doc_id, rel_path, dedupe_status, canonical_doc_id,"
+    " COALESCE(NULLIF(source_name, ''), 'documents') FROM doc_registry"
+).fetchall()
+try:
+    import lance
+    indexed = set()
+    for batch in lance.dataset("/data/index/chunks.lance").to_batches(
+        columns={"doc_id": "doc_id"}
+    ):
+        indexed.update(batch.column("doc_id").to_pylist())
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}))
+    sys.exit(0)
+print(json.dumps({"rows": rows, "indexed": sorted(indexed)}))
+"""
+
+
+def _dedupe_state() -> dict:
+    """The candidate's registry rows plus the doc_ids its chunks table holds."""
+    completed = subprocess.run(
+        [
+            "docker", "compose", "-f", str(COMPOSE_FILE), "exec", "-T",
+            "doc-organizer-staging", "python3", "-c", _DEDUPE_STATE_PROBE,
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    state = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert "error" not in state, state
+    return state
+
+
+def _phantom_canonicals(state: dict) -> dict[str, list[str]]:
+    """Duplicate rows whose canonical holds no chunk rows.
+
+    The assertion the production verifier makes against the deployed service
+    (`1252-1258-dedupe-cohort-bounded.sh`), made here against the candidate.
+    """
+    indexed = set(state["indexed"])
+    phantoms: dict[str, list[str]] = {}
+    for doc_id, _rel_path, status, canonical, source_name in state["rows"]:
+        if status != "duplicate" or not canonical:
+            continue
+        namespaced = canonical if "::" in canonical else f"{source_name}::{canonical}"
+        if namespaced not in indexed:
+            phantoms.setdefault(namespaced, []).append(doc_id)
+    return phantoms
+
+
+def _rows_for_stem(state: dict, stem: str) -> list[tuple]:
+    return [row for row in state["rows"] if stem in str(row[1])]
+
+
+def _identity_rows_for_stem(state: dict, stem: str) -> list[tuple]:
+    """The rows the dedupe gate writes: the bare ids, which carry the identity.
+
+    The registry holds a bare and a namespaced row per document; only the bare
+    one takes part in the exact-content cohort (`_process_doc_task` splits the
+    namespace off before every registry call), so the namespaced twin keeps the
+    default `canonical` status and no hash at all.
+    """
+    return [row for row in _rows_for_stem(state, stem) if "::" not in str(row[0])]
+
+
+def _deposit_blank_copy(stem: str) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / f"{stem}.md"
+        copy.write_text(BLANK_BODY)
+        _compose_cp_into_documents(copy)
+
+
+async def _index_unindexable_cohort() -> dict:
+    """Deposit a second copy of contentless bytes one sweep after the first.
+
+    Two sweeps, not one: the first copy's `no_text_extracted` verdict has to be
+    in the skip ledger before the second copy is judged against it, which is
+    exactly how the production cohorts formed (002JM joined 002JK's cohort
+    weeks later).
+    """
+    run_id = uuid.uuid4().hex[:8]
+    first, second = f"blank-{run_id}-a", f"blank-{run_id}-b"
+    async with open_mcp_session("unindexable_cohort") as session:
+        _deposit_blank_copy(first)
+        await _sweep_and_wait(session)
+        after_first = _dedupe_state()
+        _deposit_blank_copy(second)
+        await _sweep_and_wait(session)
+    return {
+        "stems": (first, second),
+        "after_first": after_first,
+        "after_second": _dedupe_state(),
+        "log": indexer_log_lines(),
+    }
+
+
+@pytest.fixture(scope="session")
+def unindexable_cohort(indexed_corpus):
+    return anyio.run(_index_unindexable_cohort)
+
+
+def test_contentless_copies_reach_the_registry_unindexed(unindexable_cohort):
+    """Guards the assertions below: a copy that never registered, or one that
+    did land content, would make an empty cohort look correct for free."""
+    indexed = set(unindexable_cohort["after_second"]["indexed"])
+    for stem in unindexable_cohort["stems"]:
+        rows = _identity_rows_for_stem(unindexable_cohort["after_second"], stem)
+        assert rows, f"{stem} never reached the registry"
+        assert not [
+            doc_id for doc_id, *_ in rows if f"documents::{doc_id}" in indexed
+        ], f"{stem} holds chunk rows — it is not a contentless copy"
+
+
+def test_contentless_cohort_leaves_no_duplicate_pointing_at_a_phantom(
+    unindexable_cohort,
+):
+    """The #2097 invariant, on the candidate: every duplicate resolves to content."""
+    assert _phantom_canonicals(unindexable_cohort["after_first"]) == {}
+    assert _phantom_canonicals(unindexable_cohort["after_second"]) == {}
+
+
+def test_contentless_cohort_is_recorded_as_intentionally_empty(unindexable_cohort):
+    """The cohort holds no canonical pointer at all, and says so in the log."""
+    for stem in unindexable_cohort["stems"]:
+        rows = _identity_rows_for_stem(unindexable_cohort["after_second"], stem)
+        assert rows, f"{stem} never reached the registry"
+        for doc_id, rel_path, status, canonical, _source in rows:
+            assert status == "unindexable", (doc_id, rel_path, status)
+            assert canonical is None, (doc_id, canonical)
+    assert [
+        line for line in unindexable_cohort["log"]
+        if "is intentionally empty" in line
+    ], "the sweep never recorded the cohort as intentionally empty"

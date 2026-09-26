@@ -52,7 +52,11 @@ _OVERCLAIMED_COLUMNS_RE = re.compile(
 # (_evolve_metadata_schema) — so a single reopen can itself be cut off by the
 # next move. Retrying while the table keeps moving is bounded by this; it is a
 # backstop, not a cadence, because the loop stops the moment the table settles.
-_STALE_READ_RECOVERY_ATTEMPTS = 4
+# Fresh staging stacks widen six metadata sub-fields on the first corpus sweep
+# and one more on the dedupe sweep (#1656); a read that starts mid-burst needs
+# headroom for every swap in the burst plus the reopen it may land inside
+# (#2626 escaped at four).
+_STALE_READ_RECOVERY_ATTEMPTS = 8
 
 _EXTRA_META_FIELDS = ("description", "author", "keywords", "custom_meta")
 _ENRICHMENT_AUX_FIELDS = ("enr_importance_source",)
@@ -1299,8 +1303,10 @@ class LanceDBStore:
             except TableNotFoundError:
                 return default_on_missing
             except Exception as exc:
+                if not self._table_moved_under_open_handle():
+                    raise
                 attempts_left -= 1
-                if attempts_left <= 0 or not self._table_moved_under_open_handle():
+                if attempts_left <= 0:
                     raise
                 logger.warning(
                     "Refreshing LanceDB store: a peer writer moved %r under an "
@@ -1854,6 +1860,10 @@ class LanceDBStore:
             if not self._exclusive_writer_depth:
                 self._checkout_latest()
             self._write_nodes_unlocked(nodes, operation="upsert")
+            # A mid-sweep queue service upserts into the same exclusive-writer
+            # session that later tries insert_nodes(known_absent=True) for the
+            # same doc_id. Mark the write so the insert path stays idempotent.
+            self._completed_insert_doc_ids.update(doc_ids)
 
     def replace_chunk_text_and_vector(
         self,
@@ -1929,13 +1939,16 @@ class LanceDBStore:
 
     def insert_nodes(
         self, nodes: list[TextNode], *, known_absent: bool = False
-    ) -> None:
+    ) -> bool:
         """Insert documents once, avoiding delete-only transactions.
 
         Full sweeps pass ``known_absent=True`` while holding the table-level
         writer session; their authoritative pre-run snapshot therefore needs
         no per-document Lance refresh. Standalone callers retain a fresh
         existence probe under the document lock.
+
+        Returns True when new rows were committed, False when every document
+        in the batch was already present.
         """
         doc_ids = {n.ref_doc_id for n in nodes if n.ref_doc_id}
         with self._serialize_document_writes(doc_ids):
@@ -1960,7 +1973,7 @@ class LanceDBStore:
                     "Skipped insert for documents already present: %s",
                     sorted(existing_doc_ids),
                 )
-                return
+                return False
             inserted_doc_ids = {
                 node.ref_doc_id for node in nodes_to_insert if node.ref_doc_id
             }
@@ -1982,9 +1995,10 @@ class LanceDBStore:
                         "Insert raised after commit for doc_ids=%s; treating as complete",
                         sorted(committed),
                     )
-                    return
+                    return True
                 raise
             self._completed_insert_doc_ids.update(inserted_doc_ids)
+            return True
 
     def _write_nodes_unlocked(
         self, nodes: list[TextNode], *, operation: str
@@ -2079,39 +2093,166 @@ class LanceDBStore:
                         )
                     raise
 
+    @staticmethod
+    def _arrow_row_to_chunk_dict(table: pa.Table, index: int) -> dict[str, Any]:
+        """Convert one Arrow row from a chunks scan into a LanceDB result dict."""
+        row: dict[str, Any] = {}
+        for column in ("id", "doc_id", "text", "vector"):
+            value = table[column][index]
+            if value is None:
+                continue
+            py_value = value.as_py()
+            if column == "vector" and py_value is not None:
+                py_value = list(py_value)
+            row[column] = py_value
+        metadata_value = table["metadata"][index]
+        if metadata_value is not None:
+            row["metadata"] = metadata_value.as_py()
+        return row
+
     def _load_unique_canonical_rows(
         self, table: Any, canonical_doc_id: str
     ) -> tuple[list[dict[str, Any]], int]:
         """Load at most one full row per chunk id, never every physical duplicate."""
         escaped_doc_id = self._sql_escape(canonical_doc_id)
-        batches = (
+        physical_rows = table.count_rows(f"doc_id = '{escaped_doc_id}'")
+        if physical_rows == 0:
+            return [], 0
+
+        chunk_table = (
             table.to_lance()
-            .sql(
-                "SELECT DISTINCT id FROM dataset "
-                f"WHERE doc_id = '{escaped_doc_id}' AND id IS NOT NULL"
+            .scanner(
+                columns=["id", "doc_id", "text", "vector", "metadata"],
+                filter=f"doc_id = '{escaped_doc_id}'",
+                with_row_id=True,
             )
-            .build()
-            .to_batch_records()
+            .to_table()
         )
-        unique_chunk_ids = (
-            pa.Table.from_batches(batches)["id"].to_pylist() if batches else []
-        )
-        rows: list[dict[str, Any]] = []
-        for chunk_id in sorted(str(value) for value in unique_chunk_ids if value):
+        best_by_chunk: dict[str, tuple[int, int]] = {}
+        for index in range(chunk_table.num_rows):
+            chunk_id = chunk_table["id"][index].as_py()
+            if not chunk_id:
+                continue
+            row_id = int(chunk_table["_rowid"][index].as_py())
+            if chunk_id not in best_by_chunk or row_id > best_by_chunk[chunk_id][0]:
+                best_by_chunk[chunk_id] = (row_id, index)
+
+        rows = [
+            self._arrow_row_to_chunk_dict(chunk_table, best_by_chunk[chunk_id][1])
+            for chunk_id in sorted(best_by_chunk)
+        ]
+        return rows, physical_rows
+
+    def duplicate_chunk_id_census(self) -> dict[str, int]:
+        """Return chunk ids with more than one physical row."""
+
+        def _op() -> dict[str, int]:
+            table = self._vs.table
+            counts = Counter(
+                row["id"]
+                for row in table.search().limit(0).select(["id"]).to_list()
+                if row.get("id")
+            )
+            return {chunk_id: count for chunk_id, count in counts.items() if count > 1}
+
+        return self._run_read_with_recovery(_op, {})
+
+    def compact_duplicate_chunk_rows(
+        self,
+        doc_ids: list[str] | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Collapse duplicate physical rows that share a chunk id.
+
+        When multiple rows carry the same chunk ``id``, keep the newest physical
+        row (highest Lance ``_rowid``) and delete the rest via a per-document
+        upsert. This repairs the damage from non-idempotent insert paths without
+        changing enrichment metadata beyond what a normal rewrite would do.
+        """
+        census = self.duplicate_chunk_id_census()
+        if not census:
+            return {
+                "duplicate_chunk_ids": 0,
+                "compacted_doc_ids": [],
+                "rows_before": 0,
+                "rows_removed": 0,
+                "dry_run": dry_run,
+            }
+
+        table = self._vs.table
+        affected_doc_ids: set[str] = set()
+        for chunk_id in census:
             escaped_chunk_id = self._sql_escape(chunk_id)
-            row = (
+            rows = (
                 table.search(None)
-                .where(
-                    f"doc_id = '{escaped_doc_id}' AND id = '{escaped_chunk_id}'",
-                    prefilter=True,
-                )
-                .select(["id", "doc_id", "text", "vector", "metadata"])
+                .where(f"id = '{escaped_chunk_id}'", prefilter=True)
+                .select(["doc_id"])
                 .limit(1)
                 .to_list()
             )
-            if row:
-                rows.append(row[0])
-        return rows, table.count_rows(f"doc_id = '{escaped_doc_id}'")
+            if rows and rows[0].get("doc_id"):
+                affected_doc_ids.add(str(rows[0]["doc_id"]))
+
+        if doc_ids is not None:
+            requested = {doc_id for doc_id in doc_ids if doc_id}
+            affected_doc_ids &= requested
+
+        compacted_doc_ids: list[str] = []
+        rows_before = 0
+        rows_removed = 0
+        for doc_id in sorted(affected_doc_ids):
+            unique_rows, physical_rows = self._load_unique_canonical_rows(table, doc_id)
+            if physical_rows <= len(unique_rows):
+                continue
+            rows_before += physical_rows
+            rows_removed += physical_rows - len(unique_rows)
+            if dry_run:
+                compacted_doc_ids.append(doc_id)
+                continue
+
+            canonical_nodes: list[TextNode] = []
+            for row in unique_rows:
+                metadata = (
+                    row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                )
+                metadata = _strip_llama_managed_keys(metadata)
+                vector = row.get("vector")
+                if hasattr(vector, "tolist"):
+                    vector = vector.tolist()
+                elif vector is None:
+                    vector = []
+                else:
+                    vector = list(vector)
+                loc = metadata.get("loc") or ""
+                node = TextNode(
+                    text=row.get("text", "") or "",
+                    id_=row.get("id") or f"{doc_id}::{loc}",
+                    embedding=vector,
+                    metadata=metadata,
+                )
+                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=doc_id
+                )
+                canonical_nodes.append(node)
+
+            logger.warning(
+                "Compacting duplicate chunk rows for %s: %d physical rows, %d unique chunk ids",
+                doc_id,
+                physical_rows,
+                len(unique_rows),
+            )
+            self.upsert_nodes(canonical_nodes)
+            compacted_doc_ids.append(doc_id)
+
+        remaining = self.duplicate_chunk_id_census() if not dry_run else census
+        return {
+            "duplicate_chunk_ids": len(remaining),
+            "compacted_doc_ids": compacted_doc_ids,
+            "rows_before": rows_before,
+            "rows_removed": rows_removed,
+            "dry_run": dry_run,
+        }
 
     def update_canonical_duplicate_metadata(
         self,
@@ -2460,6 +2601,18 @@ class LanceDBStore:
         table.create_fts_index(text_key, use_tantivy=False, replace=True)
         logger.info("FTS index created/rebuilt on column %r", text_key)
 
+    def rebuild_fts_index(self) -> None:
+        """Rebuild FTS, then run the same cleanup lifecycle as a merge.
+
+        Full rebuild fallbacks also replace native index generations. They must
+        finalize restore points and reclaim orphan directories rather than
+        bypassing the routine index-maintenance path (#1630).
+        """
+        from datetime import date
+
+        self.create_fts_index()
+        self._finish_index_maintenance(self._vs.table, date.today())
+
     def ensure_fts_index(self) -> None:
         """Make sure the native FTS index exists and is optimized.
 
@@ -2774,7 +2927,8 @@ class LanceDBStore:
         """Drop expired daily tags before pruning; never touch manual tags."""
         days = _daily_restore_point_days()
         try:
-            table.checkout_latest()
+            self._checkout_latest()
+            table = self._vs.table
             tags = table.tags
             existing = set(tags.list())
 
@@ -2801,7 +2955,8 @@ class LanceDBStore:
         try:
             # Tag the true latest version, not a stale cached one — a tag on
             # an old version pins its superseded data files (#0232).
-            table.checkout_latest()
+            self._checkout_latest()
+            table = self._vs.table
             tags = table.tags
             existing = set(tags.list())
             name = _daily_tag_name(today)
