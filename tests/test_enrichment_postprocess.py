@@ -102,7 +102,7 @@ def test_repair_disabled_returns_equal_copy():
     assert repaired is not enrichment
 
 
-def test_explicit_bare_correction_repairs_reversed_summary_when_postprocess_disabled():
+def test_explicit_bare_correction_repairs_reversed_summary_when_postprocess_enabled():
     enrichment = {
         "enr_summary": "The corrected name is Shawn, not Sean.",
         "enr_key_facts": json.dumps(["The corrected name is Shawn, not Sean."]),
@@ -113,7 +113,7 @@ def test_explicit_bare_correction_repairs_reversed_summary_when_postprocess_disa
         text="Correction: changed from Shawn to Sean.",
         title="Identity correction",
         source_type="message",
-        enabled=False,
+        enabled=True,
     )
 
     expected = "Correction: Sean (not Shawn)."
@@ -121,7 +121,7 @@ def test_explicit_bare_correction_repairs_reversed_summary_when_postprocess_disa
     assert json.loads(repaired["enr_key_facts"]) == [expected]
 
 
-def test_labeled_arrow_correction_repairs_reversed_summary_when_postprocess_disabled():
+def test_labeled_arrow_correction_repairs_reversed_summary_when_postprocess_enabled():
     enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
 
     repaired = repair_enrichment(
@@ -129,13 +129,13 @@ def test_labeled_arrow_correction_repairs_reversed_summary_when_postprocess_disa
         text="Correction: Husband name: Shawn -> Sean",
         title="Identity correction",
         source_type="message",
-        enabled=False,
+        enabled=True,
     )
 
     assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
 
 
-def test_labeled_arrow_with_annotation_repairs_reversed_summary_when_postprocess_disabled():
+def test_labeled_arrow_with_annotation_repairs_reversed_summary_when_postprocess_enabled():
     enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
 
     repaired = repair_enrichment(
@@ -143,13 +143,13 @@ def test_labeled_arrow_with_annotation_repairs_reversed_summary_when_postprocess
         text="Correction: Husband name: Shawn -> Sean; confirmed by sender.",
         title="Identity correction",
         source_type="message",
-        enabled=False,
+        enabled=True,
     )
 
     assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
 
 
-def test_labeled_arrow_with_parenthetical_annotation_repairs_reversed_summary_when_postprocess_disabled():
+def test_labeled_arrow_with_parenthetical_annotation_repairs_reversed_summary_when_postprocess_enabled():
     enrichment = {"enr_summary": "The corrected name is Shawn, not Sean."}
 
     repaired = repair_enrichment(
@@ -157,7 +157,7 @@ def test_labeled_arrow_with_parenthetical_annotation_repairs_reversed_summary_wh
         text="Correction: Husband name: Shawn -> Sean (confirmed)",
         title="Identity correction",
         source_type="message",
-        enabled=False,
+        enabled=True,
     )
 
     assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
@@ -171,7 +171,7 @@ def test_explicit_email_correction_and_semicolon_inversion_are_grounded():
         text="Correction from old@example.com to new@example.com.",
         title="Contact correction",
         source_type="message",
-        enabled=False,
+        enabled=True,
     )
 
     assert repaired["enr_summary"] == "Correction: new@example.com (not old@example.com)."
@@ -185,7 +185,7 @@ def test_explicit_labeled_equals_arrow_correction_is_grounded():
         text="Correction: Account ID: old-42 => new-43",
         title="Account correction",
         source_type="message",
-        enabled=False,
+        enabled=True,
     )
 
     assert repaired["enr_summary"] == "Correction: new-43 (not old-42)."
@@ -199,7 +199,8 @@ def test_update_without_correction_cue_does_not_reverse_valid_summary():
         text="Updated itinerary: travel from Boston to New York.",
         title="Travel update",
         source_type="message",
-        enabled=False,
+        enabled=True,
+        enabled_rules=["explicit_corrections"],
     )
 
     assert repaired == enrichment
@@ -220,10 +221,63 @@ def test_unquoted_correction_annotation_does_not_become_part_of_corrected_value(
         text=text,
         title="Identity correction",
         source_type="message",
-        enabled=False,
+        enabled=True,
     )
 
     assert repaired["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
+def test_explicit_correction_repair_is_off_when_postprocess_disabled():
+    enrichment = {"enr_summary": "The corrected name is Alan, not Allen."}
+
+    repaired = repair_enrichment(
+        enrichment,
+        text='Correction: name changed from "Alan" to "Allen".',
+        title="Identity correction",
+        source_type="message",
+        enabled=False,
+    )
+
+    assert repaired == enrichment
+
+
+def test_later_correction_supersedes_earlier_explicit_correction():
+    # The first correction is itself corrected later in the same document; the
+    # summary follows the latest correction and must be left alone (#1750).
+    enrichment = {"enr_summary": "The sender's name was corrected: it is Alan, not Allen."}
+    text = (
+        'Inbound: "Yes it is Allen" - correcting name from "Alan" to "Allen".\n'
+        "Sender clarified the name IS Alan, not Allen; our prior reply incorrectly "
+        "corrected Alan\u2192Allen.\n"
+        "CORRECTION: The correct name is Alan, NOT Allen.\n"
+    )
+
+    repaired = repair_enrichment(
+        enrichment,
+        text=text,
+        title="Identity correction",
+        source_type="message",
+        enabled=True,
+        enabled_rules=["explicit_corrections"],
+    )
+
+    assert repaired == enrichment
+
+
+def test_latest_correction_in_document_order_wins_across_syntaxes():
+    enrichment = {"enr_summary": "The name is Alan, not Allen."}
+    text = 'Name: Alan -> Allen (correction)\nCorrection: name from "Allen" to "Alan".'
+
+    repaired = repair_enrichment(
+        enrichment,
+        text=text,
+        title="Identity correction",
+        source_type="message",
+        enabled=True,
+        enabled_rules=["explicit_corrections"],
+    )
+
+    assert repaired == enrichment
 
 
 def test_enabled_rules_can_limit_repair_to_importance_only():
