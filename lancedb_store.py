@@ -1249,6 +1249,11 @@ class LanceDBStore:
         self._vs = self._build_vector_store()
         self._mark_handle_current()
 
+    def refresh_if_replaced(self) -> None:
+        """Refresh a serving handle after a peer replaces the table directory."""
+        if self._table_directory_moved():
+            self._reopen_vector_store()
+
     def _table_directory_moved(self) -> bool:
         """True when ``<table>.lance`` is a different directory than the one this
         handle was opened on (a peer's schema evolution swapped it)."""

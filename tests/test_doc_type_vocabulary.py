@@ -6,7 +6,6 @@ production defect: unbounded labels, re-index churn, and silent overwrite.
 
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock
 
 from core.doc_type_vocabulary import (
@@ -93,7 +92,8 @@ def test_apply_doc_type_vocabulary_records_disagreement_counter():
 def test_enrich_document_rejects_free_text_outside_vocabulary(monkeypatch):
     """Same defect shape as production: model invents a one-off synonym."""
     generator = MagicMock()
-    generator.generate.return_value = json.dumps(
+    from tests.test_enrichment import _complete_enrichment_json
+    generator.generate.return_value = _complete_enrichment_json(**(
         {
             "summary": "Rent collection notes for Mejia-Miguel.",
             "doc_type": [
@@ -103,7 +103,7 @@ def test_enrich_document_rejects_free_text_outside_vocabulary(monkeypatch):
             ],
             "topics": ["collections"],
         }
-    )
+    ))
 
     result = enrich_document(
         text="Collection note: balance due $400.",
@@ -122,13 +122,14 @@ def test_enrich_document_rejects_free_text_outside_vocabulary(monkeypatch):
 
 def test_enrich_document_keeps_existing_label_when_model_disagrees():
     generator = MagicMock()
-    generator.generate.return_value = json.dumps(
+    from tests.test_enrichment import _complete_enrichment_json
+    generator.generate.return_value = _complete_enrichment_json(**(
         {
             "summary": "Same collection record, different secondary label.",
             "doc_type": ["message"],
             "topics": ["collections"],
         }
-    )
+    ))
 
     result = enrich_document(
         text="Collection note: balance due $400.",
@@ -155,7 +156,7 @@ def test_default_alias_map_includes_unclassified_sentinel():
 
 
 def test_process_doc_skips_llm_when_enrichment_input_hash_matches(tmp_path):
-    """#3050: re-index with unchanged enrichment input must not call the LLM."""
+    """Re-index must apply current enrichment policy even with unchanged text."""
     from unittest.mock import MagicMock, patch
 
     import flow_index_vault as fiv
@@ -179,13 +180,14 @@ def test_process_doc_skips_llm_when_enrichment_input_hash_matches(tmp_path):
             return [0.1] * 768
 
     generator = MagicMock()
-    generator.generate.return_value = json.dumps(
+    from tests.test_enrichment import _complete_enrichment_json
+    generator.generate.return_value = _complete_enrichment_json(**(
         {
             "summary": "Rent collection notes.",
             "doc_type": ["collection_record", "payment_log"],
             "topics": ["collections"],
         }
-    )
+    ))
 
     logger_patch = patch("flow_index_vault.get_run_logger", return_value=MagicMock())
     logger_patch.start()
@@ -220,14 +222,14 @@ def test_process_doc_skips_llm_when_enrichment_input_hash_matches(tmp_path):
         doc["mtime"] = path.stat().st_mtime
         doc["size"] = path.stat().st_size
         fiv.process_doc_task.fn(doc)
-        assert generator.generate.call_count == 1, "second pass must reuse enrichment"
+        assert generator.generate.call_count == 2, "second pass must apply current policy"
         second = store.get_doc_chunks(doc["doc_id"])[0]
         assert second.enr_doc_type == first_type
         assert second.extra_metadata.get(ENRICHMENT_INPUT_HASH_FIELD) or getattr(
             second, ENRICHMENT_INPUT_HASH_FIELD, ""
         )
         counters = fiv._RUNTIME.get("_enrichment_counters") or {}
-        assert counters.get("cache_hit", 0) >= 1
+        assert counters.get("cache_hit", 0) == 0
     finally:
         logger_patch.stop()
         fiv._RUNTIME.clear()

@@ -82,7 +82,7 @@ from core.index_request_queue import IndexRequest, IndexRequestQueue
 from core.index_write_lock import IndexWriteLockBusy, index_write_lock
 from core.artifacts import is_communication_sidecar
 from core.dedupe import compute_file_identity
-from core.resilience import CircuitOpenError, is_transient
+from core.resilience import CircuitOpenError, TransientError, is_transient
 from core import degraded_policy, standing_conditions
 from core.skip_policy import (
     actionable_skip_docs,
@@ -101,7 +101,7 @@ from doc_enrichment import (
     enrich_document,
     empty_enrichment,
 )
-from core.doc_type_vocabulary import enrichment_input_hash, sync_doc_type_taxonomy
+from core.doc_type_vocabulary import sync_doc_type_taxonomy
 from extractors import (
     CONTENT_MISSING,
     Degradation,
@@ -2151,57 +2151,11 @@ def _index_duplicate_delivery_context(
     return True
 
 
-def _build_payloadless_duplicate_event(
-    doc: dict,
-    canonical_doc_id: str,
-) -> dict[str, Any]:
-    """Announce a duplicate delivery whose canonical holds no payload.
-
-    Same event shape as any other ``document.indexed``, carrying the duplicate's
-    own identity and an empty body: a consumer learns the delivery happened and
-    which canonical it belongs to, and can read the content from the canonical
-    when it lands.
-    """
-    doc_id = str(doc["doc_id"])
-    rel_path = str(doc.get("rel_path") or doc_id)
-    source_type = canonical_source_type(doc.get("source_type") or doc.get("ext", ""))
-    return build_document_indexed_event(
-        doc_id=doc_id,
-        source_name=str(doc.get("source_name") or "documents"),
-        source_type=source_type,
-        rel_path=rel_path,
-        abs_path=str(doc.get("abs_path") or ""),
-        text="",
-        metadata={
-            "doc_id": doc_id,
-            "rel_path": rel_path,
-            "source_type": source_type,
-            "source_name": str(doc.get("source_name") or "documents"),
-            "mtime": float(doc.get("mtime") or 0.0),
-            "size": int(doc.get("size") or 0),
-            "title": doc_id,
-            "folder": derive_folder(rel_path),
-            "status": "active",
-            "canonical_doc_id": canonical_doc_id,
-            "canonical_payload_available": "false",
-        },
-        chunks=[],
-    )
-
-
 def _build_duplicate_document_indexed_event(
     doc: dict,
     canonical_doc_id: str,
-) -> dict[str, Any]:
-    """Build alias callback data from the canonical document's indexed payload.
-
-    The canonical is checked for content before a copy is ever marked its
-    duplicate, so an empty payload here means the rows went away between that
-    check and this read. The event is still built — from the duplicate's own
-    identity, carrying no text — because dropping it is how a delivery becomes
-    invisible on both sides: consumers are never told the document exists and
-    the outbox has nothing to retry (#2097).
-    """
+) -> dict[str, Any] | None:
+    """Build a callback only when canonical indexed content is available."""
     store: LanceDBStore = _RUNTIME["store"]
     canonical_chunks = sorted(
         store.get_doc_chunks(canonical_doc_id),
@@ -2211,7 +2165,7 @@ def _build_duplicate_document_indexed_event(
         ),
     )
     if not canonical_chunks:
-        return _build_payloadless_duplicate_event(doc, canonical_doc_id)
+        return None
 
     first_chunk = canonical_chunks[0]
     doc_id = str(doc["doc_id"])
@@ -2772,6 +2726,7 @@ def _process_doc_task(
                     except Exception as exc:
                         logger.warning("Failed to drop stale duplicate chunks for %s: %s", doc_id, exc)
                     _index_duplicate_delivery_context(doc, canonical_ns)
+                    duplicate_event = None
                     try:
                         duplicate_event = _build_duplicate_document_indexed_event(
                             doc, canonical_ns
@@ -2780,6 +2735,16 @@ def _process_doc_task(
                         warning = "duplicate callback payload unavailable"
                         _RUNTIME.setdefault("_warnings", []).append(warning)
                         logger.warning(warning)
+                    if duplicate_event is None:
+                        # CDS treats a delivered callback as completed enrichment.
+                        # Retry indexing durably instead of publishing empty success.
+                        try:
+                            IndexRequestQueue(config["index_root"]).enqueue(
+                                config.get("lancedb", {}).get("table", "chunks"),
+                                source_name, doc_id, force=True,
+                            )
+                        except Exception as exc:
+                            raise TransientError("duplicate callback retry persistence failed") from exc
                     else:
                         _dispatch_document_indexed_event(
                             config, duplicate_event, logger
@@ -3003,51 +2968,29 @@ def _process_doc_task(
             elif llm_generator:
                 max_input_chars = enrichment_cfg.get("max_input_chars", 4000)
                 existing_enrichment = _existing_enrichment_from_store(store, doc_id)
-                input_hash = enrichment_input_hash(
+                prior_doc_type = (existing_enrichment.get("enr_doc_type") or "").strip()
+                enrichment = enrich_document(
                     text=full_text,
                     title=title,
                     source_type=source_type,
-                    context_text=context_text,
+                    generator=llm_generator,
                     max_input_chars=max_input_chars,
+                    max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
+                    taxonomy_store=taxonomy_store,
+                    context_text=context_text,
+                    record_taxonomy_usage=False,
+                    postprocess_enrichment=bool(
+                        enrichment_cfg.get("postprocess_enrichment", False)
+                    ),
+                    postprocess_rules=enrichment_cfg.get("postprocess_rules"),
+                    existing_doc_type=prior_doc_type,
                 )
-                prior_hash = (existing_enrichment.get(ENRICHMENT_INPUT_HASH_FIELD) or "").strip()
-                prior_doc_type = (existing_enrichment.get("enr_doc_type") or "").strip()
-                if prior_hash and prior_hash == input_hash and prior_doc_type:
-                    enrichment = {
-                        field: existing_enrichment.get(field, "")
-                        for field in ENRICHMENT_FIELDS
-                    }
-                    enrichment[ENRICHMENT_INPUT_HASH_FIELD] = input_hash
-                    _note_enrichment_counter("cache_hit")
-                    logger.info(
-                        "Reused enrichment for '%s': input unchanged (doc_type=%s)",
-                        doc_id,
-                        prior_doc_type,
-                    )
-                    enrichment_failed = False
-                else:
-                    enrichment = enrich_document(
-                        text=full_text,
-                        title=title,
-                        source_type=source_type,
-                        generator=llm_generator,
-                        max_input_chars=max_input_chars,
-                        max_output_tokens=enrichment_cfg.get("max_output_tokens", 512),
-                        taxonomy_store=taxonomy_store,
-                        context_text=context_text,
-                        record_taxonomy_usage=False,
-                        postprocess_enrichment=bool(
-                            enrichment_cfg.get("postprocess_enrichment", False)
-                        ),
-                        postprocess_rules=enrichment_cfg.get("postprocess_rules"),
-                        existing_doc_type=prior_doc_type,
-                    )
-                    enrichment_failed = bool(enrichment.get("_enrichment_failed"))
-                    unknown = int(enrichment.pop("_doc_type_unknown", "0") or "0")
-                    disagreement = int(enrichment.pop("_doc_type_disagreement", "0") or "0")
-                    _note_enrichment_counter("unknown_label", unknown)
-                    _note_enrichment_counter("disagreement", disagreement)
-                    _note_enrichment_counter("llm_call")
+                enrichment_failed = bool(enrichment.get("_enrichment_failed"))
+                unknown = int(enrichment.pop("_doc_type_unknown", "0") or "0")
+                disagreement = int(enrichment.pop("_doc_type_disagreement", "0") or "0")
+                _note_enrichment_counter("unknown_label", unknown)
+                _note_enrichment_counter("disagreement", disagreement)
+                _note_enrichment_counter("llm_call")
                 if enrichment_failed:
                     reason = enrichment.pop("_enrichment_failed")
                     logger.warning("Enrichment failed for '%s': %s", doc_id, reason)

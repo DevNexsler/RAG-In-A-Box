@@ -1308,6 +1308,7 @@ def test_duplicate_callback_is_announced_when_canonical_payload_vanishes(
     )
 
     fiv.process_doc_task.fn(canonical)
+    original_get_chunks = store.get_doc_chunks
     monkeypatch.setattr(store, "get_doc_chunks", MagicMock(return_value=[]))
     fiv.process_doc_task.fn(duplicate)
 
@@ -1316,8 +1317,22 @@ def test_duplicate_callback_is_announced_when_canonical_payload_vanishes(
         for delivery in HookOutbox(index_root).due(limit=4)
         if delivery.event["doc_id"] == duplicate["doc_id"]
     ]
-    assert len(events) == 1, "the duplicate delivery must reach the outbox"
-    assert events[0]["rel_path"] == duplicate["rel_path"]
-    assert events[0]["metadata"]["canonical_doc_id"] == canonical["doc_id"]
-    assert events[0]["metadata"]["canonical_payload_available"] == "false"
-    assert events[0]["text"] == ""
+    assert events == [], "empty success must never erase CDS enrichment"
+    from core.index_request_queue import IndexRequestQueue
+    pending = IndexRequestQueue(index_root).pending("chunks", limit=10)
+    assert any(request.target == duplicate["doc_id"] and request.force for request in pending)
+    monkeypatch.setattr(store, "get_doc_chunks", original_get_chunks)
+    monkeypatch.setattr(fiv, "resolve_single_record", lambda *args: duplicate)
+    monkeypatch.setattr(fiv, "_build_single_doc_runtime", lambda *args: None)
+    queue = IndexRequestQueue(index_root)
+    fiv._save_skip_ledger(index_root, {"docs": {
+        duplicate["doc_id"]: {"reasons": ["duplicate_content"], "retry_count": 0}
+    }})
+    fiv._drain_index_requests(
+        fiv._RUNTIME["config"], queue, "chunks", store, registry, limit=10
+    )
+    assert queue.pending("chunks", limit=10) == []
+    events = [row.event for row in HookOutbox(index_root).due(limit=10)
+              if row.event["doc_id"] == duplicate["doc_id"]]
+    assert len(events) == 1
+    assert events[0]["text"] and events[0]["chunks"]

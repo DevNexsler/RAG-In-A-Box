@@ -74,13 +74,14 @@ class _ReversedCorrectionLLM:
     """Returns a syntactically valid but source-contradicting correction."""
 
     def generate(self, prompt, max_tokens=512):
-        return json.dumps(
+        from tests.test_enrichment import _complete_enrichment_json
+        return _complete_enrichment_json(**(
             {
                 "summary": "A critical correction: Shawn Brown, not Sean.",
                 "doc_type": ["message"],
                 "key_facts": ["Husband's name is Shawn Brown, not Sean."],
             }
-        )
+        ))
 
 
 @pytest.fixture

@@ -27,7 +27,7 @@ _EXPLICIT_CORRECTION_PATTERNS = (
         r"[\"'“”‘’](?P<new>[^\"'“”‘’\n]+)[\"'“”‘’]"
     ),
     re.compile(
-        r"(?m)^\s*(?:[-*]\s*)?(?:[^:\n]{1,80}:\s*)?"
+        r"(?m)^\s*(?:[-*]\s*)?(?:[^:\n]{1,80}:\s*){0,2}"
         r"(?P<old>\S(?:.*?\S)?)\s*(?:->|=>|→)\s*(?P<new>\S(?:.*?\S)?)"
         r"(?=\s*(?:[;,]|\.(?:\s|$)|\(|—|$))"
     ),
@@ -261,16 +261,25 @@ def ground_card_suffixes(
 ) -> tuple[dict[str, str], list[CardSuffixCorrection]]:
     """Keep card-suffix claims to cards the source text actually shows.
 
-    A claim such as "paid by Visa ending in 7305" is kept when 7305 ends some
-    number in ``source_text`` other than a phone-shaped one. Otherwise its
+    A claim such as "paid by Visa ending in 7305" is kept only when 7305 is
+    attached to a card label in ``source_text``. Otherwise its
     suffix is rewritten to the source's masked card number when there is
     exactly one, and dropped ("paid by Visa") when there is none or several.
     Everything else in the enrichment is left exactly as it was. Returns the
     grounded enrichment and one correction per changed claim, for logging.
     """
     visible = _PHONE_SHAPED_RE.sub(" ", source_text or "")
-    grounded = set(_TRAILING_FOUR_RE.findall(visible))
-    masked = {match.group("digits") for match in _MASKED_NUMBER_RE.finditer(visible)}
+    visible = re.sub(r"\[credit_card_icon[^]\n]*\]", "credit card", visible, flags=re.IGNORECASE)
+    card_term = r"(?:visa|master\s?card|amex|american\s+express|discover|debit\s+card|credit\s+card|card)"
+    number = r"(?:[x#*•·●.\d][x#*•·●.\d\s-]{0,40})?\d{4}"
+    evidence = re.findall(
+        rf"\b{card_term}\b[\s:#(—-]*{number}|{number}\s+{card_term}\b",
+        visible, re.IGNORECASE,
+    )
+    card_text = "\n".join(evidence)
+    grounded = set(_TRAILING_FOUR_RE.findall(card_text))
+    grounded.update(match.group("digits") for match in _CARD_SUFFIX_CLAIM_RE.finditer(visible))
+    masked = {match.group("digits") for match in _MASKED_NUMBER_RE.finditer(card_text)}
     replacement = next(iter(masked)) if len(masked) == 1 else ""
 
     repaired = dict(enrichment)
@@ -351,8 +360,13 @@ def _repair_explicit_corrections(enrichment: dict[str, str], source_text: str) -
     repaired = dict(enrichment)
     for old, new in _explicit_corrections(source_text):
         canonical = f"Correction: {new} (not {old})."
-        if _reverses_correction(repaired.get("enr_summary", ""), old, new):
-            repaired["enr_summary"] = canonical
+        summary = repaired.get("enr_summary", "")
+        # Preserve unrelated sentences instead of replacing the entire summary.
+        sentences = re.split(r"(?<=[.!?])\s+", summary)
+        repaired["enr_summary"] = " ".join(
+            canonical if _reverses_correction(sentence, old, new) else sentence
+            for sentence in sentences
+        )
 
         facts = _fact_values(repaired.get("enr_key_facts", ""))
         reversed_facts = [fact for fact in facts if _reverses_correction(fact, old, new)]
@@ -366,8 +380,13 @@ def _repair_explicit_corrections(enrichment: dict[str, str], source_text: str) -
 def _explicit_corrections(source_text: str) -> list[tuple[str, str]]:
     corrections: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for pattern in _EXPLICIT_CORRECTION_PATTERNS:
+    for index, pattern in enumerate(_EXPLICIT_CORRECTION_PATTERNS):
         for match in pattern.finditer(source_text):
+            line_start = source_text.rfind("\n", 0, match.start()) + 1
+            line_end = source_text.find("\n", match.start())
+            line = source_text[line_start:line_end if line_end >= 0 else len(source_text)]
+            if index >= 2 and not re.search(r"\bcorrect(?:ion|ed|ing)\b", line, re.IGNORECASE):
+                continue
             old = " ".join(match.group("old").split()).strip()
             new = " ".join(match.group("new").split()).strip()
             identity = (old.casefold(), new.casefold())

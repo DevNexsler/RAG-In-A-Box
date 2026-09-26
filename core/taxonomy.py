@@ -2,19 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-import logging
-import os
 import re
-import threading
 from pathlib import Path
 from typing import Any
 
 from taxonomy_store import TaxonomyStore
 
-
-logger = logging.getLogger(__name__)
 
 _DATE_SEGMENT_RE = re.compile(
     r"^(\d{4}|\d{1,2}|\d{4}-\d{2}|\d{4}-\d{2}-\d{2})$"
@@ -24,8 +17,6 @@ _MONTH_NAMES = {
     "july", "august", "september", "october", "november", "december",
 }
 
-_FOLDER_SYNC_STATE_VERSION = 1
-_FOLDER_SYNC_STATE_NAME = "taxonomy_folder_sync.json"
 _STALE_FOLDER_DESCRIPTION = "Folder path discovered from filesystem structure"
 
 
@@ -46,53 +37,6 @@ def load_taxonomy_store(config: dict) -> TaxonomyStore:
 def _is_date_like_segment(segment: str) -> bool:
     s = segment.strip().lower()
     return s in _MONTH_NAMES or bool(_DATE_SEGMENT_RE.fullmatch(s))
-
-
-def _folder_sync_state_path(store: TaxonomyStore) -> Path:
-    return Path(store.index_root) / _FOLDER_SYNC_STATE_NAME
-
-
-def _load_folder_sync_state(store: TaxonomyStore) -> dict[str, Any]:
-    path = _folder_sync_state_path(store)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"version": _FOLDER_SYNC_STATE_VERSION, "roots": {}}
-    if not isinstance(payload, dict):
-        return {"version": _FOLDER_SYNC_STATE_VERSION, "roots": {}}
-    roots = payload.get("roots")
-    if not isinstance(roots, dict):
-        roots = {}
-    return {"version": _FOLDER_SYNC_STATE_VERSION, "roots": roots}
-
-
-def _save_folder_sync_state(store: TaxonomyStore, state: dict[str, Any]) -> bool:
-    """Persist sync fingerprints; False when the write failed."""
-    path = _folder_sync_state_path(store)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    payload = {
-        "version": _FOLDER_SYNC_STATE_VERSION,
-        "roots": state.get("roots") or {},
-    }
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-        return True
-    except OSError as exc:
-        tmp_path.unlink(missing_ok=True)
-        logger.warning("Failed to save taxonomy folder sync state: %s", exc)
-        return False
-
-
-def _folder_set_hash(folder_paths: list[str]) -> str:
-    payload = "\n".join(folder_paths)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _discover_folder_paths(root: Path, *, max_depth: int = 3) -> list[str]:
@@ -130,32 +74,13 @@ def sync_folder_taxonomy_from_filesystem(
     - Keep depth 3 only when the leaf is not date-like.
     - Skip deeper paths to keep taxonomy prompt size bounded.
 
-    When the discovered folder-name set matches the fingerprint from the last
-    successful sync for this root, return immediately without per-entry Lance
-    lookups. That keeps the common "nothing changed" indexer path nearly free.
+    One bulk read avoids per-folder lookups while repairing deleted entries.
     """
     root = Path(root).resolve()
     folder_paths = _discover_folder_paths(root, max_depth=max_depth)
     discovered = len(folder_paths)
     if discovered == 0:
         return {"discovered": 0, "added": 0, "existing": 0, "skipped": 0}
-
-    digest = _folder_set_hash(folder_paths)
-    state = _load_folder_sync_state(store)
-    roots = state.setdefault("roots", {})
-    root_key = str(root)
-    previous = roots.get(root_key)
-    if (
-        isinstance(previous, dict)
-        and previous.get("folder_set_hash") == digest
-        and int(previous.get("discovered") or 0) == discovered
-    ):
-        return {
-            "discovered": discovered,
-            "added": 0,
-            "existing": discovered,
-            "skipped": 1,
-        }
 
     # One list query instead of N get() round-trips (the 40s/run cost in prod).
     existing_by_id = {
@@ -182,12 +107,6 @@ def sync_folder_taxonomy_from_filesystem(
             created_by="indexer",
         )
         added += 1
-
-    roots[root_key] = {
-        "folder_set_hash": digest,
-        "discovered": discovered,
-    }
-    _save_folder_sync_state(store, state)
 
     return {
         "discovered": discovered,

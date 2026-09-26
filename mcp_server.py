@@ -730,8 +730,7 @@ def _get_deps(config_path: str = "config.yaml"):
             _cache_index_signature = _index_metadata_signature(_cache[2])
             _cache_identity = _cache
     store = _cache[0]
-    if store._table_directory_moved():
-        store._reopen_vector_store()
+    store.refresh_if_replaced()
     return _cache[0], _cache[1], _cache[2]
 
 

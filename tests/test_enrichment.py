@@ -411,6 +411,7 @@ class TestContextOnlyFactsLeavePrimaryFields:
 
         result = self._enrich(response, text, context_text)
 
+        result.pop("enr_input_hash", None)
         assert result == parse_enrichment_response(json.dumps(response))
 
     def test_text_only_context_keyword_moves_without_numbers(self):

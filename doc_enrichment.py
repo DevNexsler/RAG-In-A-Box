@@ -1023,8 +1023,9 @@ def apply_doc_type_vocabulary(
             ", ".join(constrained.rejected[:8]),
         )
 
+    existing = constrain_doc_type(existing_doc_type, alias_map)
     final, disagreed = reconcile_doc_type(
-        existing=existing_doc_type,
+        existing=existing.value if not existing.rejected else "",
         proposed=enrichment["enr_doc_type"],
     )
     enrichment["enr_doc_type"] = final

@@ -117,9 +117,9 @@ class ExtractionResult:
         ``complete``: the header is not the photo. A PDF whose page 6 OCR failed
         but whose other pages read fine is ``partial``.
         """
-        if not failures:
-            return CONTENT_COMPLETE
-        return CONTENT_PARTIAL if self.primary_content else CONTENT_MISSING
+        if not self.primary_content:
+            return CONTENT_MISSING
+        return CONTENT_PARTIAL if failures else CONTENT_COMPLETE
 
     @staticmethod
     def from_pages(

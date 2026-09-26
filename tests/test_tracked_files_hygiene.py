@@ -114,7 +114,7 @@ def test_superpowers_scratch_is_untracked() -> None:
     """
     listed = _git(REPO_ROOT, "ls-files", ".superpowers")
     assert listed.stdout == ""
-    ignored = _git(REPO_ROOT, "check-ignore", "-q", ".superpowers", check=False)
+    ignored = _git(REPO_ROOT, "check-ignore", "-q", ".superpowers/", check=False)
     assert ignored.returncode == 0
 
 

@@ -476,7 +476,7 @@ class TestFolderSync:
         assert second["added"] == 0
         assert second["discovered"] == first["discovered"]
         assert second["existing"] == first["discovered"]
-        assert second.get("skipped", 0) == 1
+        assert second.get("skipped", 0) == 0
         assert get_calls["n"] == 0
 
     def test_new_folder_still_added_after_incremental_baseline(self, tmp_path):
