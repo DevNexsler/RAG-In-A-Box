@@ -115,9 +115,14 @@ media:
   provider: "openrouter"
   base_url: "https://openrouter.ai/api/v1"   # REAL — live transcription
   audio_model: "openai/whisper-1"
+  audio_model_endpoint: "audio/transcriptions"
   fallback_audio_models:                     # whisper-1 500s in practice; fall back
     - "mistralai/voxtral-small-24b-2507"
     - "google/gemini-2.5-flash-lite"
+  fallback_audio_model_endpoint: "chat/completions"
+  fallback_audio_model_parameters:
+    temperature: 0.0
+    top_p: 1.0
   video_model: "qwen/qwen3.5-397b-a17b"
   max_file_size_mb: 50
   timeout: 300   # real transcription latency (matches prod, not the sim's 60)
