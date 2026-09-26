@@ -2301,6 +2301,94 @@ def test_index_flow_syncs_folder_taxonomy_from_sources(tmp_path):
     sync_mock.assert_called_once()
 
 
+def test_index_flow_logs_taxonomy_sync_stats_when_added_is_zero(tmp_path):
+    """No-op taxonomy syncs must still log sync_stats (and separate load/sync timings)."""
+    from flow_index_vault import index_vault_flow
+
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = []
+    fake_store.list_doc_mtimes.return_value = {}
+    fake_store.count_chunks.return_value = 0
+    fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {
+        "available": True,
+        "name": "vector_idx",
+        "index_type": "IVF_FLAT",
+        "num_indices": 1,
+        "indexed_rows": 1,
+        "unindexed_rows": 0,
+        "stale": False,
+    }
+
+    fake_registry = MagicMock()
+    fake_registry.count.return_value = 1
+    fake_taxonomy = MagicMock()
+    fake_taxonomy.count.return_value = 506
+
+    class _FakeSource:
+        name = "documents"
+
+        def scan(self):
+            return iter([])
+
+        def set_ocr_provider(self, provider):
+            return None
+
+        def close(self):
+            return None
+
+    config = {
+        "index_root": str(tmp_path / "index"),
+        "sources": [{"type": "filesystem", "name": "documents", "root": str(tmp_path)}],
+        "chunking": {"max_chars": 1800, "overlap": 200, "semantic": {"enabled": False}},
+        "enrichment": {"enabled": False},
+        "ocr": {"enabled": False},
+        "lancedb": {"table": "chunks"},
+        "pdf": {},
+        "logging": {"level": "WARNING"},
+    }
+    logger = MagicMock()
+
+    with patch("flow_index_vault.get_run_logger", return_value=logger):
+        with patch("flow_index_vault.load_config", return_value=config):
+            with patch("flow_index_vault.LanceDBStore", return_value=fake_store):
+                with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
+                    with patch("flow_index_vault.build_embed_provider", return_value=MagicMock()):
+                        with patch("flow_index_vault.build_ocr_provider", return_value=None):
+                            with patch("sources.build_source", return_value=_FakeSource()):
+                                with patch("core.taxonomy.load_taxonomy_store", return_value=fake_taxonomy):
+                                    with patch(
+                                        "core.taxonomy.sync_folder_taxonomy_from_sources",
+                                        return_value={
+                                            "sources": 1,
+                                            "discovered": 506,
+                                            "added": 0,
+                                            "existing": 506,
+                                            "skipped": 1,
+                                        },
+                                    ):
+                                        with patch("flow_index_vault.diff_index_task", return_value=([], [])):
+                                            with patch("flow_index_vault.delete_docs_task"):
+                                                with patch("flow_index_vault.index_stats_task"):
+                                                    with patch("flow_index_vault.write_index_metadata_task"):
+                                                        index_vault_flow.fn("dummy.yaml")
+
+    loaded = [
+        c for c in logger.info.call_args_list
+        if c.args and "Taxonomy store loaded" in c.args[0] and "load=" in c.args[0]
+    ]
+    assert loaded, [c.args[0] for c in logger.info.call_args_list if c.args]
+    assert loaded[0].args[1] == 506
+
+    sync_calls = [
+        c for c in logger.info.call_args_list
+        if c.args and str(c.args[0]).startswith("Taxonomy folder sync added=")
+    ]
+    assert sync_calls, [c.args[0] for c in logger.info.call_args_list if c.args]
+    assert sync_calls[0].args[1:] == (0, 506, 506, 1, 1)
+
+
 def test_index_flow_source_scope_deletes_only_selected_source(tmp_path):
     """Source-scoped indexing must not delete rows from unscanned sources."""
     from sources.base import SourceRecord
