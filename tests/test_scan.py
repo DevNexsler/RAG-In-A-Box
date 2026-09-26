@@ -2743,3 +2743,18 @@ def test_noop_diff_without_a_tail_skips_index_maintenance(tmp_path):
 
     fake_store.ensure_fts_index.assert_not_called()
     fake_store.create_fts_index.assert_not_called()
+
+def test_write_index_metadata_reports_incomplete_doc_count(tmp_path):
+    """Docs indexed without their primary content must be visible in the run
+    summary, not only by tracing individual doc ids through the flow log."""
+    write_index_metadata_task.fn(
+        tmp_path,
+        doc_count=57,
+        chunk_count=57,
+        docs_indexed_incomplete=57,
+    )
+
+    import json
+
+    meta = json.loads((tmp_path / "index_metadata.json").read_text())
+    assert meta["docs_indexed_incomplete"] == 57

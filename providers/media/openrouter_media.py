@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 _AUDIO_TRANSCRIBE_PROMPT = (
     "Transcribe this audio faithfully for document search. If multiple speakers "
     "are clear, label them only as Speaker 1, Speaker 2, and do not infer "
-    "identity. Return plain text only."
+    "identity. If no speech is intelligible, return [No intelligible speech] "
+    "and nothing else. Never invent or reconstruct dialogue. Return plain text only."
 )
 _VIDEO_ANALYZE_PROMPT = (
     "You are reviewing a residential/property walkthrough video for maintenance, "
