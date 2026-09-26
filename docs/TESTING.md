@@ -92,8 +92,17 @@ and the CDS receiver/Postgres staging gate alongside them. CDS replay remains
 at-least-once; receiver-side idempotence needs the CDS database test, not a
 mocked assertion of exactly-once delivery.
 
+The existing PostgreSQL history contracts require `DOC_HISTORY_TEST_DSN` pointing
+to an isolated database named `doc_history_test`; fixtures reject other database
+names. Without this setting, 15 integration cases skip. Provision a disposable
+Postgres service to exercise those cases, and remove its container and volumes
+afterward.
+
 Additional priorities:
 
+- **RAG quality evals:** versioned examples for retrieval relevance, grounded
+  summaries, identity fidelity, and question/proposal preservation. Track real
+  model output regressions separately from deterministic API contracts.
 - **Concurrency and crash recovery:** extend the deterministic schedules here
   with state-machine/property tests for queue revisions, leases, and circuit
   admission. Avoid wall-clock sleeps as race assertions.
