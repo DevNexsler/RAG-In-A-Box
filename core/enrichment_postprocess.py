@@ -33,6 +33,9 @@ _EXPLICIT_CORRECTION_PATTERNS = (
     ),
 )
 
+_QUOTES = "\"'“”‘’"
+_CORRECTION_CUE_RE = re.compile(r"\bcorrect(?:ion|ed|ing)?\b", re.IGNORECASE)
+
 _STOPWORDS = {
     "a",
     "an",
@@ -121,7 +124,7 @@ _GENERIC_DOC_TYPES = {
     "notification",
     "text",
 }
-_DEFAULT_RULES = {"importance", "doc_type", "key_facts"}
+_DEFAULT_RULES = {"importance", "doc_type", "key_facts", "explicit_corrections"}
 
 # Compounds the enrichment model spells both as one word and as two. #1251's
 # separator fold cannot reconcile these — they differ in word count, not in
@@ -326,11 +329,12 @@ def repair_enrichment(
     enabled_rules: Iterable[str] | None = None,
 ) -> dict[str, str]:
     repaired = dict(enrichment)
-    source_text = _document_text(text)
-    repaired = _repair_explicit_corrections(repaired, source_text)
     if not enabled:
         return repaired
     rules = _rule_set(enabled_rules)
+    source_text = _document_text(text)
+    if "explicit_corrections" in rules:
+        repaired = _repair_explicit_corrections(repaired, source_text)
 
     corpus = "\n".join(
         part for part in (title, source_type, source_text, _metadata_corpus(repaired)) if part
@@ -378,23 +382,49 @@ def _repair_explicit_corrections(enrichment: dict[str, str], source_text: str) -
 
 
 def _explicit_corrections(source_text: str) -> list[tuple[str, str]]:
-    corrections: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    """Return the explicit corrections that are still authoritative.
+
+    A source can correct the same value twice ("from A to B", then later "it IS
+    A, not B"). Only the latest correction in document order counts, so a pair
+    is dropped once a later correction line names both of its values: that line
+    either yields its own pair or, if unparseable, leaves generated text alone.
+    """
+    found: list[tuple[int, int, str, str]] = []
     for index, pattern in enumerate(_EXPLICIT_CORRECTION_PATTERNS):
         for match in pattern.finditer(source_text):
             line_start = source_text.rfind("\n", 0, match.start()) + 1
             line_end = source_text.find("\n", match.start())
-            line = source_text[line_start:line_end if line_end >= 0 else len(source_text)]
+            line_end = line_end if line_end >= 0 else len(source_text)
+            line = source_text[line_start:line_end]
             if index >= 2 and not re.search(r"\bcorrect(?:ion|ed|ing)\b", line, re.IGNORECASE):
                 continue
             old = " ".join(match.group("old").split()).strip()
             new = " ".join(match.group("new").split()).strip()
-            identity = (old.casefold(), new.casefold())
-            if not old or not new or identity[0] == identity[1] or identity in seen:
+            if not old or not new or old.casefold() == new.casefold():
                 continue
-            corrections.append((old, new))
-            seen.add(identity)
+            found.append((match.start(), line_end, old, new))
+
+    corrections: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for _, line_end, old, new in sorted(found):
+        identity = (old.casefold(), new.casefold())
+        if identity in seen or _correction_revisited(source_text[line_end:], old, new):
+            continue
+        corrections.append((old, new))
+        seen.add(identity)
     return corrections
+
+
+def _correction_revisited(later_text: str, old: str, new: str) -> bool:
+    """Return whether a later correction line mentions both values of a pair."""
+    mentions = [
+        re.compile(rf"(?<!\w){re.escape(value.strip(_QUOTES))}(?!\w)", re.IGNORECASE)
+        for value in (old, new)
+    ]
+    return any(
+        _CORRECTION_CUE_RE.search(line) and all(mention.search(line) for mention in mentions)
+        for line in later_text.splitlines()
+    )
 
 
 def _reverses_correction(value: str, old: str, new: str) -> bool:

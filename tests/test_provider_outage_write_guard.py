@@ -130,6 +130,10 @@ def _index(doc: dict, generator) -> None:
     fiv.process_doc_task.fn(doc)
 
 
+def _enable_postprocess() -> None:
+    fiv._RUNTIME["config"]["enrichment"]["postprocess_enrichment"] = True
+
+
 def _stored_row(store: LanceDBStore, doc_id: str) -> dict:
     rows = (
         store._vs.table.to_lance()
@@ -175,6 +179,7 @@ def test_transient_outage_keeps_the_enriched_row(runtime, outage):
 def test_explicit_correction_is_grounded_before_lancedb_write(runtime):
     """A reversed generated correction must not reach the stored metadata surface."""
     docs_root, store = runtime
+    _enable_postprocess()
     doc = _write_doc(
         docs_root,
         "sor/task-2124.md",
@@ -192,6 +197,7 @@ def test_explicit_correction_is_grounded_before_lancedb_write(runtime):
 def test_middle_correction_is_grounded_before_lancedb_write(runtime):
     """Grounding must inspect source text beyond the prompt's head/tail sample."""
     docs_root, store = runtime
+    _enable_postprocess()
     doc = _write_doc(
         docs_root,
         "sor/task-2124-middle.md",
@@ -204,6 +210,38 @@ def test_middle_correction_is_grounded_before_lancedb_write(runtime):
 
     stored = _stored_metadata(store, doc["doc_id"])
     assert stored["enr_summary"] == "Correction: Sean (not Shawn)."
+
+
+class _LatestCorrectionLLM:
+    """Returns a summary that follows the document's latest correction."""
+
+    def generate(self, prompt, max_tokens=512):
+        from tests.test_enrichment import _complete_enrichment_json
+        return _complete_enrichment_json(
+            summary="The sender's name was corrected: it is Alan, not Allen.",
+            doc_type=["message"],
+            key_facts=["The sender's name is Alan, not Allen."],
+        )
+
+
+def test_superseded_correction_keeps_correct_summary_in_lancedb(runtime):
+    """A later correction outranks an earlier one in the stored metadata (#1750)."""
+    docs_root, store = runtime
+    _enable_postprocess()
+    doc = _write_doc(
+        docs_root,
+        "sor/task-superseded.md",
+        'Inbound: "Yes it is Allen" - correcting name from "Alan" to "Allen".\n'
+        "Sender clarified the name IS Alan, not Allen; our prior reply incorrectly "
+        "corrected Alan\u2192Allen.\n"
+        "CORRECTION: The correct name is Alan, NOT Allen.\n",
+    )
+
+    _index(doc, _LatestCorrectionLLM())
+
+    stored = _stored_metadata(store, doc["doc_id"])
+    assert stored["enr_summary"] == "The sender's name was corrected: it is Alan, not Allen."
+    assert json.loads(stored["enr_key_facts"]) == ["The sender's name is Alan, not Allen."]
 
 
 def test_transient_outage_is_counted_for_the_run_summary(runtime):
