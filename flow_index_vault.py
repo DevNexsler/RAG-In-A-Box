@@ -1295,14 +1295,16 @@ def _degraded_unresolved_path(index_root: Path) -> Path:
 
 
 def _load_degraded_unresolved(index_root: Path) -> dict:
+    path = _degraded_unresolved_path(index_root)
     try:
-        payload = json.loads(
-            _degraded_unresolved_path(index_root).read_text(encoding="utf-8")
-        )
+        fallback_time = path.stat().st_mtime
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         payload = None
     if not (isinstance(payload, dict) and isinstance(payload.get("docs"), dict)):
         return {"docs": {}}
+    for entry in payload["docs"].values():
+        entry.setdefault("escalated_at", fallback_time)
     return payload
 
 
@@ -1334,6 +1336,7 @@ def _reconcile_degraded_docs(
     *,
     failed_sources: Collection[str] = (),
     now: float | None = None,
+    is_retired: Callable[[str], bool] | None = None,
 ) -> tuple[list[dict], dict, dict]:
     """Re-queue docs that previously indexed with transient degradations
     (OCR/vision timeouts, enrichment failures) even though their mtime is
@@ -1358,6 +1361,7 @@ def _reconcile_degraded_docs(
                            source-scoped index, or its scan() raised and the
                            source is in ``failed_sources``); untouched, not
                            aged
+    - ``retired``        — missing but deliberately deleted by the registry; cleared
     - ``unresolved``     — its source scanned fine but the id is gone, so
                            nothing can ever resolve it: age it, and after
                            _DEGRADED_MAX_UNRESOLVED_RUNS escalate it out to
@@ -1377,6 +1381,7 @@ def _reconcile_degraded_docs(
         "source_not_scanned": [],
         "unresolved": [],
         "terminal": {},
+        "retired": [],
     }
     if not docs:
         return to_add_or_update, ledger, report
@@ -1394,6 +1399,13 @@ def _reconcile_degraded_docs(
     for doc_id in sorted(docs):
         entry = dict(docs[doc_id])
         entry_source = str(doc_id).split("::", 1)[0]
+        if (
+            doc_id not in existing and doc_id not in by_id
+            and is_retired is not None and is_retired(doc_id)
+        ):
+            docs.pop(doc_id)
+            report["retired"].append(doc_id)
+            continue
         if doc_id in existing:
             stored_change_key = str(entry.get("change_key") or "")
             unchanged = (
@@ -1439,6 +1451,7 @@ def _reconcile_degraded_docs(
             entry["unresolved_runs"] = runs
             report["unresolved"].append(doc_id)
             if runs >= _DEGRADED_MAX_UNRESOLVED_RUNS:
+                entry.setdefault("escalated_at", now)
                 report["terminal"][doc_id] = entry
                 docs.pop(doc_id, None)
             else:
@@ -4070,6 +4083,7 @@ def index_vault_flow(
         scanned, stored_mtimes, stored_change_hashes
     )
     degraded_ledger = _load_degraded_ledger(index_root)
+    unresolved_ledger = _load_degraded_unresolved(index_root)
     to_add_or_update, degraded_ledger, degraded_report = _reconcile_degraded_docs(
         scanned,
         to_add_or_update,
@@ -4077,6 +4091,7 @@ def index_vault_flow(
         scanned_sources={s.name for s in all_sources} - set(failed_scan_sources),
         full_scan=source_name is None,
         failed_sources=failed_scan_sources,
+        is_retired=doc_id_store.is_retired,
     )
     if degraded_report["total"]:
         if degraded_report["requeued"]:
@@ -4084,19 +4099,6 @@ def index_vault_flow(
                 "Re-queued %d degraded docs for self-heal",
                 len(degraded_report["requeued"]),
             )
-        # Every entry is accounted for, so a stuck item can no longer hide in
-        # the gap between the ledger's size and the re-queued count (#0618).
-        logger.info(
-            "Degraded ledger: %d entries — %d re-queued, %d already queued, "
-            "%d capped, %d awaiting backoff, %d source not scanned, %d unresolved",
-            degraded_report["total"],
-            len(degraded_report["requeued"]),
-            len(degraded_report["already_queued"]),
-            len(degraded_report["capped"]),
-            len(degraded_report["backoff"]),
-            len(degraded_report["source_not_scanned"]),
-            len(degraded_report["unresolved"]),
-        )
         if degraded_report["unresolved"]:
             logger.warning(
                 "%d degraded entries unresolvable against a successful scan "
@@ -4109,11 +4111,11 @@ def index_vault_flow(
             # Persist the escalation BEFORE dropping the entries from the
             # active ledger: a crash between the two writes duplicates an
             # entry (the next run re-converges it) instead of losing it.
-            unresolved_ledger = _load_degraded_unresolved(index_root)
-            unresolved_ledger.setdefault("docs", {}).update(
-                degraded_report["terminal"]
-            )
-            if _save_degraded_unresolved(index_root, unresolved_ledger):
+            candidate = {**unresolved_ledger, "docs": {
+                **unresolved_ledger["docs"], **degraded_report["terminal"],
+            }}
+            if _save_degraded_unresolved(index_root, candidate):
+                unresolved_ledger = candidate
                 logger.error(
                     "%d degraded entries stuck unresolved for %d runs — escalated "
                     "to %s and removed from the retry ledger: %s",
@@ -4121,9 +4123,6 @@ def index_vault_flow(
                     _DEGRADED_MAX_UNRESOLVED_RUNS,
                     _degraded_unresolved_path(index_root).name,
                     sorted(degraded_report["terminal"]),
-                )
-                _RUNTIME.setdefault("_warnings", []).append(
-                    f"degraded_unresolved:{len(degraded_report['terminal'])}"
                 )
             else:
                 # The terminal ledger did not land. Keep the entries in the
@@ -4142,13 +4141,46 @@ def index_vault_flow(
             )
         # The end-of-run merge re-loads the ledger from disk, so the ageing
         # and escalation above have to land now to survive this run.
-        if degraded_report["unresolved"]:
+        if degraded_report["unresolved"] or degraded_report["retired"]:
             _save_degraded_ledger(index_root, degraded_ledger)
     # The terminal cap is a standing state: nothing an indexer run does can
     # change it, so it is an ERROR when it appears, changes or clears (and a
     # daily digest) — not on all ~116 runs of a day. The counts stay on every
     # run's `Degraded ledger:` summary and in index_metadata warnings (#2101).
     _report_terminal_cap(logger, index_root, degraded_report, degraded_ledger)
+    # Disposition legacy terminal residue using the same registry evidence as
+    # active entries. A live scan wins over stale retirement history.
+    scanned_ids = {str(r.get("doc_id", "")) for r in scanned + to_add_or_update}
+    retired_terminal = {
+        doc_id for doc_id in unresolved_ledger["docs"]
+        if doc_id not in scanned_ids and doc_id_store.is_retired(doc_id)
+    }
+    if retired_terminal:
+        candidate = {**unresolved_ledger, "docs": {
+            doc_id: entry for doc_id, entry in unresolved_ledger["docs"].items()
+            if doc_id not in retired_terminal
+        }}
+        if _save_degraded_unresolved(index_root, candidate):
+            unresolved_ledger = candidate
+            logger.info("Cleared %d registry-retired terminal degraded entries: %s",
+                        len(retired_terminal), sorted(retired_terminal))
+    terminal_count = len(unresolved_ledger["docs"])
+    oldest_days = max(
+        (max(0.0, time.time() - float(entry["escalated_at"])) / 86400
+         for entry in unresolved_ledger["docs"].values()), default=0.0,
+    )
+    logger.info(
+        "Degraded ledger: %d entries — %d re-queued, %d already queued, "
+        "%d capped, %d awaiting backoff, %d source not scanned, "
+        "%d registry-retired, %d unresolved (%d terminal, oldest %.1fd)",
+        degraded_report["total"], len(degraded_report["requeued"]),
+        len(degraded_report["already_queued"]), len(degraded_report["capped"]),
+        len(degraded_report["backoff"]), len(degraded_report["source_not_scanned"]),
+        len(degraded_report["retired"]), len(degraded_report["unresolved"]),
+        terminal_count, oldest_days,
+    )
+    if terminal_count:
+        _RUNTIME.setdefault("_warnings", []).append(f"degraded_unresolved:{terminal_count}")
     # Drop docs already decided 'do not index' (duplicate/oversized/corrupt)
     # whose file is unchanged — stops the reprocess-every-run loop — and claim
     # the bounded retries this run hands out.

@@ -808,3 +808,108 @@ def test_prod_cadence_is_capped_at_six_hours_not_the_scheduler_tick():
 
     assert processed <= 4, f"6h cap allows <=4 attempts/day, got {processed}"
     assert processed >= 1, "backoff must not become a permanent block"
+
+
+# #2022: standing terminal state must survive runs with no new escalation.
+def test_terminal_ledger_remains_visible_on_next_run(tmp_path):
+    from tests.test_scan import _run_flow_over_scan
+    from flow_index_vault import _RUNTIME, _load_degraded_unresolved
+
+    missing = "documents::missing"
+    _save_degraded_ledger(tmp_path, {"version": 2, "docs": {
+        missing: {"attempts": 1, "unresolved_runs": 2},
+    }})
+    _run_flow_over_scan(tmp_path, tmp_path, [])
+    assert missing in _load_degraded_unresolved(tmp_path)["docs"]
+    logger = _run_flow_over_scan(tmp_path, tmp_path, [])
+    summaries = [call.args[0] % call.args[1:] for call in logger.info.call_args_list
+                 if call.args[0].startswith("Degraded ledger:")]
+    assert summaries and "1 terminal, oldest" in summaries[-1]
+    assert "degraded_unresolved:1" in _RUNTIME["_warnings"]
+    metadata = json.loads((tmp_path / "index_metadata.json").read_text())
+    assert "degraded_unresolved:1" in metadata["warnings"]
+
+
+def test_retired_degraded_id_is_cleared_without_escalation(tmp_path):
+    from tests.test_scan import _run_flow_over_scan
+    from flow_index_vault import _load_degraded_unresolved
+
+    retired = "documents::retired"
+    _save_degraded_ledger(tmp_path, {"version": 2, "docs": {
+        retired: {"attempts": 1, "unresolved_runs": 2},
+    }})
+    logger = _run_flow_over_scan(tmp_path, tmp_path, [], retired_ids=[retired])
+    assert retired not in _load_degraded_ledger(tmp_path)["docs"]
+    assert not _load_degraded_unresolved(tmp_path)["docs"]
+    assert not logger.error.called
+
+
+def test_legacy_terminal_age_uses_file_timestamp(tmp_path):
+    import os
+    from flow_index_vault import _load_degraded_unresolved
+
+    _save_degraded_unresolved(tmp_path, {"docs": {"documents::lost": {}}})
+    os.utime(tmp_path / "degraded_unresolved.json", (1000, 1000))
+    assert _load_degraded_unresolved(tmp_path)["docs"]["documents::lost"]["escalated_at"] == 1000
+
+
+def test_retired_terminal_residue_clears_but_unknown_entry_stays(tmp_path):
+    from tests.test_scan import _run_flow_over_scan
+    from flow_index_vault import _load_degraded_unresolved
+
+    retired = [f"documents::retired-{i}" for i in range(16)]
+    _save_degraded_unresolved(tmp_path, {"docs": {
+        doc_id: {"escalated_at": 1000} for doc_id in retired + ["documents::unknown"]
+    }})
+    logger = _run_flow_over_scan(tmp_path, tmp_path, [], retired_ids=retired)
+    assert set(_load_degraded_unresolved(tmp_path)["docs"]) == {"documents::unknown"}
+    assert not logger.error.called
+
+
+def test_retirement_does_not_override_a_live_scan(tmp_path):
+    from doc_id_store import DocIDStore
+
+    registry = DocIDStore(tmp_path / "registry.db")
+    doc_id = "documents::returned"
+    registry.register(doc_id, "returned.txt")
+    registry.delete(doc_id)
+    queue, ledger, report = _reconcile(
+        _scanned(doc_id), [], {"docs": {doc_id: {"attempts": 1}}},
+        is_retired=registry.is_retired,
+    )
+    assert queue == _scanned(doc_id)
+    assert doc_id in ledger["docs"]
+    assert report["retired"] == []
+    registry.close()
+
+
+def test_namespaced_ledger_clears_legacy_bare_retirement(tmp_path):
+    from doc_id_store import DocIDStore
+
+    registry = DocIDStore(tmp_path / "registry.db")
+    registry.register("abc12", "gone.txt")
+    registry.delete("documents::abc12")
+    _, ledger, report = _reconcile(
+        [], [], {"docs": {"documents::abc12": {"attempts": 1}}},
+        is_retired=registry.is_retired,
+    )
+    assert not ledger["docs"]
+    assert report["retired"] == ["documents::abc12"]
+    registry.close()
+
+
+def test_failed_terminal_write_keeps_active_entry_and_reports_durable_count(tmp_path, monkeypatch):
+    import flow_index_vault as fiv
+    from tests.test_scan import _run_flow_over_scan
+
+    _save_degraded_unresolved(tmp_path, {"docs": {"documents::old": {"escalated_at": 1000}}})
+    _save_degraded_ledger(tmp_path, {"version": 2, "docs": {
+        "documents::new": {"attempts": 1, "unresolved_runs": 2},
+    }})
+    monkeypatch.setattr(fiv, "_save_degraded_unresolved", lambda *args: False)
+    _run_flow_over_scan(tmp_path, tmp_path, [])
+    assert "documents::new" in _load_degraded_ledger(tmp_path)["docs"]
+    assert set(fiv._load_degraded_unresolved(tmp_path)["docs"]) == {"documents::old"}
+    metadata = json.loads((tmp_path / "index_metadata.json").read_text())
+    assert "degraded_unresolved:1" in metadata["warnings"]
+    assert "degraded_unresolved:2" not in metadata["warnings"]

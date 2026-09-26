@@ -446,11 +446,13 @@ class DocIDStore:
         """Return True if this ID was previously used and then deleted.
 
         Retired IDs must not be reused — a copy-pasted file carrying a
-        retired @XXXXX@ suffix should get a fresh ID instead.
+        retired @XXXXX@ suffix should get a fresh ID instead. Match delete()'s
+        legacy bare-ID fallback when called with an all_mappings() key.
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT 1 FROM retired_ids WHERE doc_id = ?", (doc_id,)
+                "SELECT 1 FROM retired_ids WHERE doc_id IN (?, ?)",
+                (doc_id, doc_id.split("::", 1)[-1]),
             ).fetchone()
             return row is not None
 

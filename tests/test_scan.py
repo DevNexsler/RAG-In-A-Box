@@ -2122,14 +2122,14 @@ def test_large_degraded_requeue_does_not_trigger_shadow_rebuild(tmp_path):
     active_store.promote_table.assert_not_called()
 
 
-def _run_flow_over_scan(tmp_path, index_root, scanned_doc_ids, source_name="documents"):
+def _run_flow_over_scan(tmp_path, index_root, scanned_doc_ids, source_name="documents", retired_ids=()):
     """Drive index_vault_flow over a fake source that yields `scanned_doc_ids`.
 
     Every doc is already stored at the same mtime, so the genuine diff is
     empty and the run exercises the degraded-ledger reconciliation only.
     """
     from sources.base import SourceRecord
-    from flow_index_vault import index_vault_flow
+    from flow_index_vault import index_vault_flow, write_index_metadata_task
 
     stored = {f"{source_name}::{d}": 1.0 for d in scanned_doc_ids}
 
@@ -2141,8 +2141,11 @@ def _run_flow_over_scan(tmp_path, index_root, scanned_doc_ids, source_name="docu
     active_store.vector_index_available.return_value = True
     active_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
 
-    fake_registry = MagicMock()
-    fake_registry.count.return_value = 1
+    from doc_id_store import DocIDStore
+    fake_registry = DocIDStore(index_root / "doc_registry.db")
+    for doc_id in retired_ids:
+        fake_registry.register(doc_id, doc_id, source_name=source_name)
+        fake_registry.delete(doc_id)
     fake_taxonomy = MagicMock()
     fake_taxonomy.count.return_value = 0
 
@@ -2176,7 +2179,8 @@ def _run_flow_over_scan(tmp_path, index_root, scanned_doc_ids, source_name="docu
         "logging": {"level": "WARNING"},
     }
 
-    with patch("flow_index_vault.get_run_logger", return_value=MagicMock()):
+    logger = MagicMock()
+    with patch("flow_index_vault.get_run_logger", return_value=logger):
         with patch("flow_index_vault.load_config", return_value=config):
             with patch("flow_index_vault.open_store_with_recovery", return_value=active_store):
                 with patch("flow_index_vault.DocIDStore", return_value=fake_registry):
@@ -2187,8 +2191,11 @@ def _run_flow_over_scan(tmp_path, index_root, scanned_doc_ids, source_name="docu
                                     with patch("flow_index_vault._process_docs", return_value=[]):
                                         with patch("flow_index_vault.delete_docs_task"):
                                             with patch("flow_index_vault.index_stats_task"):
-                                                with patch("flow_index_vault.write_index_metadata_task"):
+                                                with patch("flow_index_vault.write_index_metadata_task",
+                                                           side_effect=write_index_metadata_task.fn):
                                                     index_vault_flow.fn("dummy.yaml")
+
+    return logger
 
 
 def test_flow_records_degraded_entries_missing_from_successful_scan(tmp_path):
