@@ -72,7 +72,9 @@ def _openrouter_audio_routes(
         primary = _audio_model_route(
             media_cfg.get("audio_model", "openai/whisper-1"),
             default_endpoint=media_cfg.get(
-                "audio_model_endpoint", "audio/transcriptions"
+                "audio_model_endpoint",
+                "chat/completions" if media_cfg.get("audio_provider") in {"litellm", "openai_compatible"}
+                else "audio/transcriptions"
             ),
             parameter_overrides=media_cfg.get("audio_model_parameters"),
         )

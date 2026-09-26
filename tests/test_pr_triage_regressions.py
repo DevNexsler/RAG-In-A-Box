@@ -77,3 +77,38 @@ def test_unrelated_correction_cannot_turn_route_arrow_into_correction():
         original, text="Correction: changed from Shawn to Sean.\nRoute: A -> B",
         title="Message", source_type="message", enabled=False,
     ) == original
+
+
+def test_retirement_cannot_override_failed_or_unscanned_source():
+    from flow_index_vault import _reconcile_degraded_docs
+
+    ledger = {"docs": {"broken::x": {"reasons": ["ocr_describe_failed"], "attempts": 1}}}
+    for full_scan, failed_sources in ((True, {"broken"}), (False, set())):
+        _, remaining, report = _reconcile_degraded_docs(
+            [], [], ledger, scanned_sources={"other"}, full_scan=full_scan,
+            failed_sources=failed_sources, is_retired=lambda _: True,
+        )
+        assert "broken::x" in remaining["docs"]
+        assert report["retired"] == []
+
+
+def test_legacy_split_audio_factory_keeps_chat_endpoint(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    import httpx
+    from providers.media import build_media_provider
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "video-key")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "audio-key")
+    provider = build_media_provider({"media": {
+        "enabled": True, "provider": "openrouter", "audio_provider": "litellm",
+        "audio_base_url": "http://audio.example/v1", "audio_model": "transcribe-diarized",
+        "fallback_audio_models": [],
+    }})
+    audio = tmp_path / "voice.mp3"
+    audio.write_bytes(b"test audio")
+    response = httpx.Response(200, json={"choices": [{"message": {"content": "hello"}}]},
+                              request=httpx.Request("POST", "http://audio.example"))
+    with patch("providers.media.openrouter_media.httpx.post", return_value=response) as post:
+        assert provider.transcribe_audio(audio) == "hello"
+    assert post.call_args.args[0] == "http://audio.example/v1/chat/completions"
+    assert post.call_args.kwargs["headers"]["Authorization"] == "Bearer audio-key"

@@ -146,6 +146,7 @@ def test_mid_sweep_served_writes_appear_on_completion_line(
             passed_config, store, registry, request.source_name, record
         )
         fiv._record_index_write(5)
+        fiv._note_indexed_incomplete(record["doc_id"])
         return {
             "status": "indexed",
             "doc_id": record["doc_id"],
@@ -172,6 +173,7 @@ def test_mid_sweep_served_writes_appear_on_completion_line(
 
     # Sweep runtime restored, with served write folded into the same counters.
     assert fiv._RUNTIME["store"] is sweep_with_progress["store"]
+    assert fiv._RUNTIME["indexed_incomplete"] == {"documents::served"}
     snap = fiv._run_progress_snapshot()
     assert snap["indexed_docs"] == 2, snap
     assert snap["indexed_chunks"] == 7, snap

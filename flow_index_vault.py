@@ -1463,6 +1463,8 @@ def _reconcile_degraded_docs(
         entry_source = str(doc_id).split("::", 1)[0]
         if (
             doc_id not in existing and doc_id not in by_id
+            and entry_source not in failed_sources
+            and (full_scan or entry_source in scanned_sources)
             and is_retired is not None and is_retired(doc_id)
         ):
             docs.pop(doc_id)
@@ -4258,6 +4260,8 @@ def index_vault_flow(
     retired_terminal = {
         doc_id for doc_id in unresolved_ledger["docs"]
         if doc_id not in scanned_ids and doc_id_store.is_retired(doc_id)
+        and str(doc_id).split("::", 1)[0] not in failed_scan_sources
+        and (source_name is None or str(doc_id).split("::", 1)[0] == source_name)
     }
     if retired_terminal:
         candidate = {**unresolved_ledger, "docs": {
@@ -5083,6 +5087,8 @@ def _build_single_doc_runtime(
     # Upserted lines still landed in the log.
     run_progress = _RUNTIME.get("run_progress")
     run_progress_lock = _RUNTIME.get("run_progress_lock")
+    indexed_incomplete = _RUNTIME.get("indexed_incomplete")
+    degraded_lock = _RUNTIME.get("degraded_lock")
     _RUNTIME.clear()
     restored: dict[str, Any] = {
         "_exclusive_writer_contexts": exclusive_contexts,
@@ -5108,6 +5114,9 @@ def _build_single_doc_runtime(
     if isinstance(run_progress, dict) and run_progress_lock is not None:
         restored["run_progress"] = run_progress
         restored["run_progress_lock"] = run_progress_lock
+    if isinstance(indexed_incomplete, set):
+        restored["indexed_incomplete"] = indexed_incomplete
+        restored["degraded_lock"] = degraded_lock
     _RUNTIME.update(restored)
     if repair_context:
         _repair_communication_sidecars(
@@ -5383,6 +5392,7 @@ def _service_index_queue(config: dict, table_name: str) -> int:
     index_root = _RUNTIME.get("index_root")
     if store is None or doc_id_store is None or index_root is None:
         return 0
+    _RUNTIME.setdefault("indexed_incomplete", set())
     saved_runtime = dict(_RUNTIME)
     served_doc_ids: set[str] = set()
     try:
