@@ -53,6 +53,19 @@ async def test_context_builder_requires_identifier(mcp_session):
     assert "identifier" in out.get("error", ""), out
 
 
+async def test_context_builder_accepts_qualified_platform_id_through_mcp(mcp_session):
+    platform_id = "zoho_cliq:user:928702883"
+    out = await mcp_session.call_tool_json("context_builder", {
+        "platform_id": platform_id, "name": "Rafael Boundurant",
+        "include": ["factbook"],
+    })
+    assert not out.get("error"), out
+    assert out["contact"]["platform_id"] == platform_id
+    # Staging deliberately has no Factbook RPC credentials. The public tool
+    # must accept the identifier and degrade the source explicitly.
+    assert out["factbook"]["status"].startswith("error:"), out
+
+
 async def test_context_builder_exact_event_mode_validates_public_arguments(mcp_session):
     out = await mcp_session.call_tool_json('context_builder', {'event_refs': []})
     assert 'event_refs' in out.get('error', ''), out

@@ -2462,6 +2462,7 @@ def _context_builder_impl(
     event_refs: list[str] | None = None,
     event_cursor: str | None = None,
     history_kind: str = "messages",
+    platform_id: str | None = None,
 ) -> dict:
     """Deterministic contact dossier. Never raises: invalid input (no
     identifiers) becomes ``{"error": ...}``; per-source failures degrade
@@ -2469,7 +2470,7 @@ def _context_builder_impl(
     try:
         if event_refs is not None:
             from cds_exact_events import exact_event_context
-            if any(v is not None for v in (email, phone, name, lead_id, latest_inbound_at, history_since, history_cursor)) or include not in (None, ["cds"]) or history_limit != 50 or history_kind != "messages":
+            if any(v is not None for v in (email, phone, name, lead_id, latest_inbound_at, history_since, history_cursor, platform_id)) or include not in (None, ["cds"]) or history_limit != 50 or history_kind != "messages":
                 raise ValueError("event_refs mode cannot be mixed with contact/history options")
             return exact_event_context(event_refs, event_cursor)
         if event_cursor is not None:
@@ -2478,7 +2479,7 @@ def _context_builder_impl(
         history = history_request(history_since, history_limit, history_cursor, history_kind)
         contact = ctxb.normalize_contact(
             email=email, phone=phone, name=name, lead_id=lead_id,
-            latest_inbound_at=latest_inbound_at,
+            latest_inbound_at=latest_inbound_at, platform_id=platform_id,
         )
         contact["history"] = history
     except ValueError as exc:
@@ -3538,11 +3539,12 @@ if HAS_MCP and FastMCP is not None:
         event_refs: list[str] | None = None,
         event_cursor: str | None = None,
         history_kind: str = "messages",
+        platform_id: str | None = None,
     ) -> dict:
         """Deterministic contact dossier: FactBook identity, exact CDS comm
         history + our-outbound evidence, exact-filtered comm context, and a
         derived our_outbound_after_latest_inbound flag. At least one of
-        email/phone/name/lead_id is required. comm_context hits are semantic
+        email/phone/name/lead_id/platform_id is required. comm_context hits are semantic
         context only — never proof of handling.
 
         Args:
@@ -3562,6 +3564,8 @@ if HAS_MCP and FastMCP is not None:
             phone: Contact phone number (any format; normalized to E.164).
             name: Contact display name (used for FactBook + comm fallback).
             lead_id: TenantCloud lead id.
+            platform_id: Qualified person identifier, e.g. zoho_cliq:user:928702883.
+                FactBook matches it exactly; a name alone cannot override a miss.
             latest_inbound_at: ISO-8601 timestamp of the latest known inbound
                 message from this contact; used to compute
                 our_outbound_after_latest_inbound when CDS itself found no
@@ -3605,6 +3609,7 @@ if HAS_MCP and FastMCP is not None:
             latest_inbound_at=latest_inbound_at, include=include,
             history_since=history_since, history_limit=history_limit,
             history_cursor=history_cursor,
+            **({"platform_id": platform_id} if platform_id is not None else {}),
             **({"history_kind": history_kind} if history_kind != "messages" else {}),
             **({"event_refs": event_refs, "event_cursor": event_cursor}
                if event_refs is not None or event_cursor is not None else {}),
