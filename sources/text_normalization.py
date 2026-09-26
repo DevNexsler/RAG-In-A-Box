@@ -39,7 +39,7 @@ class _VisibleEmailHTMLParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self._pieces: list[str] = []
-        self._suppressed_depth = 0
+        self._suppressed_tags: list[str] = []
 
     def _break(self) -> None:
         if self._pieces and self._pieces[-1] != "\n":
@@ -54,26 +54,33 @@ class _VisibleEmailHTMLParser(HTMLParser):
             or bool(_HIDDEN_STYLE_RE.search(attributes.get("style", "")))
             or attributes.get("role", "").lower() in {"contentinfo", "navigation"}
         )
-        suppress = self._suppressed_depth > 0 or tag in self._SUPPRESSED_TAGS or hidden
+        suppress = bool(self._suppressed_tags) or tag in self._SUPPRESSED_TAGS or hidden
         if suppress:
             if tag not in self._VOID_TAGS:
-                self._suppressed_depth += 1
+                self._suppressed_tags.append(tag)
             return
         if tag in self._BLOCK_TAGS:
             self._break()
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
+        if tag.lower() not in self._VOID_TAGS:
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
-        if self._suppressed_depth:
-            self._suppressed_depth -= 1
+        tag = tag.lower()
+        if tag in self._VOID_TAGS:
+            return
+        if self._suppressed_tags:
+            if tag in self._suppressed_tags:
+                index = len(self._suppressed_tags) - 1 - self._suppressed_tags[::-1].index(tag)
+                del self._suppressed_tags[index:]
             return
         if tag.lower() in self._BLOCK_TAGS:
             self._break()
 
     def handle_data(self, data: str) -> None:
-        if not self._suppressed_depth:
+        if not self._suppressed_tags:
             self._pieces.append(data)
 
     def text(self) -> str:

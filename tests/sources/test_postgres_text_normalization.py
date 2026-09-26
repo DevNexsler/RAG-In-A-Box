@@ -166,3 +166,20 @@ def test_scan_preserves_opaque_source_message_ids_verbatim():
 
     assert [r.doc_id for r in records] == [f"zoho_mail/{i}" for i in opaque]
     assert [r.natural_key for r in records] == [r.doc_id for r in records]
+
+
+def test_html_self_closing_hidden_element_preserves_following_text():
+    from sources.text_normalization import normalize_source_text
+
+    result = normalize_source_text("pg_message", "<div hidden/><p>Visible invoice 1234</p>")
+    assert result.text == "Visible invoice 1234"
+
+
+def test_html_void_or_unmatched_end_tag_cannot_reveal_hidden_text():
+    from sources.text_normalization import normalize_source_text
+
+    for closing in ("</br>", "</span>"):
+        result = normalize_source_text(
+            "pg_message", f"<div hidden><br>{closing}secret</div><p>visible</p>"
+        )
+        assert result.text == "visible"

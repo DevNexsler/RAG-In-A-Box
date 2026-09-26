@@ -2119,28 +2119,30 @@ class LanceDBStore:
         if physical_rows == 0:
             return [], 0
 
-        chunk_table = (
+        batches = (
             table.to_lance()
             .scanner(
                 columns=["id", "doc_id", "text", "vector", "metadata"],
                 filter=f"doc_id = '{escaped_doc_id}'",
                 with_row_id=True,
+                batch_size=256,
+                batch_readahead=1,
             )
-            .to_table()
+            .to_batches()
         )
-        best_by_chunk: dict[str, tuple[int, int]] = {}
-        for index in range(chunk_table.num_rows):
-            chunk_id = chunk_table["id"][index].as_py()
-            if not chunk_id:
-                continue
-            row_id = int(chunk_table["_rowid"][index].as_py())
-            if chunk_id not in best_by_chunk or row_id > best_by_chunk[chunk_id][0]:
-                best_by_chunk[chunk_id] = (row_id, index)
+        best_by_chunk: dict[str, tuple[int, dict[str, Any]]] = {}
+        for batch in batches:
+            for index in range(batch.num_rows):
+                chunk_id = batch["id"][index].as_py()
+                if not chunk_id:
+                    continue
+                row_id = int(batch["_rowid"][index].as_py())
+                if chunk_id not in best_by_chunk or row_id > best_by_chunk[chunk_id][0]:
+                    best_by_chunk[chunk_id] = (
+                        row_id, self._arrow_row_to_chunk_dict(batch, index)
+                    )
 
-        rows = [
-            self._arrow_row_to_chunk_dict(chunk_table, best_by_chunk[chunk_id][1])
-            for chunk_id in sorted(best_by_chunk)
-        ]
+        rows = [best_by_chunk[chunk_id][1] for chunk_id in sorted(best_by_chunk)]
         return rows, physical_rows
 
     def duplicate_chunk_id_census(self) -> dict[str, int]:
