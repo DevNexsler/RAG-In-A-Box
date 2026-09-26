@@ -28,6 +28,12 @@ from core.enrichment_postprocess import (
     ground_card_suffixes,
     repair_enrichment,
 )
+from core.doc_type_vocabulary import (
+    constrain_doc_type,
+    enrichment_input_hash,
+    reconcile_doc_type,
+    vocabulary_alias_map,
+)
 from core.resilience import is_transient
 from core.tracing import get_tracer
 
@@ -182,10 +188,17 @@ NEARBY SAME-CHANNEL CONTEXT CANDIDATES
 {context_text}"""
 
 _TAXONOMY_INSTRUCTION = """
+For "doc_type": select ONLY from Available Document Types below. Use the exact
+names. Prefer one primary type; add a second only when both clearly apply. If
+none fit, use ["unclassified"]. Do not invent new type labels.
 For "suggested_tags" and "suggested_folder": use the taxonomy below.
 Pick the most relevant tags from Available Tags (you may also add new ones).
 Pick the single best matching folder path from Available Folders (use the exact path).
 """
+
+# Written beside enrichment fields so a later pass can skip the LLM when the
+# enrichment inputs (not the broader change_hash) are unchanged.
+ENRICHMENT_INPUT_HASH_FIELD = "enr_input_hash"
 
 # Raw keys the LLM prompt asks for (unprefixed)
 _ENRICHMENT_KEYS_RAW = (
@@ -952,6 +965,45 @@ def _context_message_ids(text: str) -> list[str]:
     ]
 
 
+def apply_doc_type_vocabulary(
+    enrichment: dict[str, str],
+    taxonomy_store: "TaxonomyStore | None" = None,
+    *,
+    existing_doc_type: str = "",
+) -> tuple[dict[str, str], dict[str, int]]:
+    """Constrain ``enr_doc_type`` to the taxonomy vocabulary and keep sticky labels.
+
+    Returns the updated enrichment plus counters:
+    ``unknown`` (labels mapped away) and ``disagreement`` (kept existing over new).
+    """
+    counters = {"unknown": 0, "disagreement": 0}
+    alias_map = vocabulary_alias_map(taxonomy_store)
+    constrained = constrain_doc_type(enrichment.get("enr_doc_type", ""), alias_map)
+    enrichment = dict(enrichment)
+    enrichment["enr_doc_type"] = constrained.value
+    counters["unknown"] = constrained.unknown_count
+    if constrained.rejected:
+        logger.info(
+            "doc_type vocabulary rejected %d label(s): %s",
+            len(constrained.rejected),
+            ", ".join(constrained.rejected[:8]),
+        )
+
+    final, disagreed = reconcile_doc_type(
+        existing=existing_doc_type,
+        proposed=enrichment["enr_doc_type"],
+    )
+    enrichment["enr_doc_type"] = final
+    if disagreed:
+        counters["disagreement"] = 1
+        logger.info(
+            "doc_type disagreement kept existing=%r rejected_new=%r",
+            final,
+            constrained.value,
+        )
+    return enrichment, counters
+
+
 def enrich_document(
     text: str,
     title: str,
@@ -964,16 +1016,29 @@ def enrich_document(
     record_taxonomy_usage: bool = True,
     postprocess_enrichment: bool = False,
     postprocess_rules: Iterable[str] | None = None,
+    existing_doc_type: str = "",
 ) -> dict[str, str]:
     """Extract structured metadata from document text using an LLM.
 
     Returns a dict with all ENRICHMENT_FIELDS populated (or empty strings
     on failure).  Never raises — logs warnings on parse errors.
+
+    ``existing_doc_type`` is the previously stored facet value: when a fresh
+    enrichment disagrees, the existing label is kept and a disagreement
+    counter is recorded on the result (``_doc_type_disagreement``).
     """
     with _tracer.start_as_current_span("enrich"):
         if not text or not text.strip():
             logger.debug("Skipping enrichment for empty document: %s", title)
             return empty_enrichment()
+
+        input_hash = enrichment_input_hash(
+            text=text,
+            title=title,
+            source_type=source_type,
+            context_text=context_text,
+            max_input_chars=max_input_chars,
+        )
 
         if len(text) <= max_input_chars:
             truncated = text
@@ -1049,6 +1114,15 @@ def enrich_document(
                 enabled=postprocess_enrichment,
                 enabled_rules=postprocess_rules,
             )
+            enrichment, vocab_counters = apply_doc_type_vocabulary(
+                enrichment,
+                taxonomy_store,
+                existing_doc_type=existing_doc_type,
+            )
+            if vocab_counters["unknown"]:
+                enrichment["_doc_type_unknown"] = str(vocab_counters["unknown"])
+            if vocab_counters["disagreement"]:
+                enrichment["_doc_type_disagreement"] = "1"
 
             missing_required = missing_required_fields(enrichment)
             if missing_required:
@@ -1072,9 +1146,14 @@ def enrich_document(
                     folder = (enrichment.get("enr_suggested_folder") or "").strip()
                     if folder:
                         taxonomy_store.increment_usage(f"folder:{folder}")
+                    for doc_type in (enrichment.get("enr_doc_type") or "").split(","):
+                        doc_type = doc_type.strip()
+                        if doc_type:
+                            taxonomy_store.increment_usage(f"doc_type:{doc_type}")
                 except Exception as exc:
                     logger.warning("Failed to increment taxonomy usage: %s", exc)
 
+            enrichment[ENRICHMENT_INPUT_HASH_FIELD] = input_hash
             logger.info(
                 "Enriched '%s': doc_type=%s, topics=%s",
                 title,
