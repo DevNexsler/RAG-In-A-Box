@@ -31,3 +31,50 @@ def test_process_crash_cannot_reuse_stale_junit(tmp_path):
     report = tmp_path / 'result.xml'
     report.write_text('<testsuites><testsuite tests="1" failures="1" errors="0" skipped="0"/></testsuites>')
     assert run_test_process(tmp_path, ('test_sample.py',), 10, report)['status'] == 'error'
+
+
+def test_mutation_cli_termination_reaps_child_and_removes_copy(tmp_path):
+    import os
+    from pathlib import Path
+    import signal
+    import sys
+    import time
+    import shutil
+    root = Path(__file__).resolve().parents[1]
+    child = None
+    with (tmp_path / 'mutation.log').open('w') as log:
+        parent = subprocess.Popen([sys.executable, str(root / 'scripts/mutation_gate.py'),
+                                   '--output', str(tmp_path / 'report.json')],
+                                  env={**os.environ, 'TMPDIR': str(tmp_path)},
+                                  stdout=log, stderr=log, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                children = Path(f'/proc/{parent.pid}/task/{parent.pid}/children').read_text().split()
+                # Wait for pytest, not the short-lived git ls-files subprocess.
+                for value in children:
+                    try:
+                        if b'pytest' in Path(f'/proc/{value}/cmdline').read_bytes():
+                            child = int(value)
+                            break
+                    except FileNotFoundError:
+                        pass
+                if child is not None:
+                    break
+                time.sleep(.02)
+            assert child is not None, 'mutation baseline did not start'
+            parent.send_signal(signal.SIGTERM)
+            parent.wait(timeout=10)
+            assert not Path(f'/proc/{child}').exists(), 'orphaned mutation test process'
+            assert not list(tmp_path.glob('rag-mutations-*')), 'mutation copy leaked'
+        finally:
+            if child is not None and Path(f'/proc/{child}').exists():
+                try:
+                    os.killpg(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if parent.poll() is None:
+                parent.kill()
+            parent.wait(timeout=10)
+            for directory in tmp_path.glob('rag-mutations-*'):
+                shutil.rmtree(directory)

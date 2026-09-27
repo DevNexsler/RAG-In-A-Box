@@ -32,7 +32,8 @@ A longer, bounded local soak:
 ```
 
 Soak owns a temporary index and loopback callback receiver. Parent process removes
-its temporary index after reaping worker on completion, deadline, SIGINT, or SIGTERM. No production index,
+its temporary index after reaping worker on completion, deadline, SIGINT, or SIGTERM. Callback retry timestamps advance between attempts so delay/backoff does not
+dominate the test. Write p95 excludes callback transmission. No production index,
 configured LLM, or external API participates. Budgets are explicit regression
 limits, not production service-level objectives; review hardware and workload when
 changing them. Storage-byte samples are observational; retained-version budget is
