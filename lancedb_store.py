@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -453,13 +454,17 @@ def _run_worker_under_memory_ceiling(command: list[str], *, label: str) -> None:
     finished = threading.Event()
     tripped_at: list[int] = []
 
-    worker = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        close_fds=True,
-        text=True,
-    )
+    worker = None
+    watcher = None
+    spawning = True
+    pending_signals: list[int] = []
+    original_handlers = {}
+
+    def _interrupted(signum, _frame):
+        if spawning:
+            pending_signals.append(signum)
+        else:
+            raise SystemExit(128 + signum)
 
     def _watch_cgroup() -> None:
         while not finished.wait(_WORKER_MEMORY_POLL_SECONDS):
@@ -472,15 +477,47 @@ def _run_worker_under_memory_ceiling(command: list[str], *, label: str) -> None:
             worker.kill()
             return
 
-    watcher = threading.Thread(
-        target=_watch_cgroup, name="worker-memory-ceiling", daemon=True
-    )
-    watcher.start()
     try:
+        # Own a child even if cancellation lands inside Popen before its
+        # handle is returned. Background callers cannot install signal handlers;
+        # their child stays in the indexer's process group for group shutdown.
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                original_handlers[sig] = signal.getsignal(sig)
+                signal.signal(sig, _interrupted)
+        worker = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            close_fds=True, text=True,
+        )
+        spawning = False
+        if pending_signals:
+            raise SystemExit(128 + pending_signals[0])
+        watcher = threading.Thread(
+            target=_watch_cgroup, name="worker-memory-ceiling", daemon=True
+        )
+        watcher.start()
         stdout, stderr = worker.communicate()
     finally:
+        spawning = True  # defer a second signal until the child is reaped
         finished.set()
-        watcher.join(timeout=1)
+        try:
+            try:
+                if watcher is not None and watcher.ident is not None:
+                    watcher.join(timeout=1)
+            finally:
+                # A failed/cancelled Thread.start must not bypass child cleanup.
+                if worker is not None:
+                    if worker.poll() is None:
+                        worker.kill()
+                    try:
+                        worker.communicate()
+                    finally:
+                        worker.wait()
+        finally:
+            for sig, handler in original_handlers.items():
+                signal.signal(sig, handler)
+        if pending_signals:
+            raise SystemExit(128 + pending_signals[0])
 
     if tripped_at:
         raise MemoryError(
@@ -1627,6 +1664,16 @@ class LanceDBStore:
                 if temp_path.exists():
                     shutil.rmtree(temp_path)
                 raise
+
+            # Search must be ready before this table becomes visible. Training
+            # in a guarded child bounds native memory lifetime; any failure
+            # aborts before the original table is moved or deleted.
+            if dataset.list_indices():
+                _run_worker_under_memory_ceiling(
+                    [sys.executable, "-m", "core.schema_index_rebuild",
+                     str(table_path), str(temp_path)],
+                    label="Schema replacement index rebuild",
+                )
 
             # Held across both renames so a concurrently opening store cannot
             # mistake the gap between them for an abandoned swap and restore the

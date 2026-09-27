@@ -4,6 +4,22 @@ import subprocess
 from scripts.mutation_gate import Mutation, run_mutations
 
 
+def test_losing_collected_cases_cannot_count_as_a_mutation_kill(tmp_path):
+    (tmp_path / 'sample.py').write_text('CASES = [1, 2]\n')
+    (tmp_path / 'test_sample.py').write_text(
+        'import pytest\nfrom sample import CASES\n'
+        '@pytest.mark.parametrize("value", CASES)\n'
+        'def test_case(value):\n    assert value > 0\n'
+    )
+    subprocess.run(['git', 'init', '-q', str(tmp_path)], check=True)
+    subprocess.run(['git', '-C', str(tmp_path), 'add', '.'], check=True)
+    mutation = Mutation('lost-case', 'sample.py', '[1, 2]', '[-1]', ('test_sample.py',))
+    report = run_mutations(tmp_path, [mutation], timeout=30)
+    assert not report['passed']
+    assert report['mutations'][0]['status'] == 'error'
+    assert report['mutations'][0]['reason'] == 'test inventory changed'
+
+
 def test_mutations_report_killed_survived_and_invalid_without_editing_checkout(tmp_path):
     repo = tmp_path / 'repo'
     repo.mkdir()
