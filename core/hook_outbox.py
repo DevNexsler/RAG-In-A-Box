@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import sqlite3
 import time
@@ -170,7 +171,7 @@ class HookOutbox:
         event_json = json.dumps(event, separators=(",", ":"))
         hook_json = json.dumps(_sanitize_hook(hook), separators=(",", ":"))
         now = time.time()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
@@ -193,7 +194,7 @@ class HookOutbox:
         if limit <= 0:
             return []
         due_at = time.time() if now is None else float(now)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             rows = connection.execute(
                 """
                 SELECT * FROM hook_deliveries
@@ -225,7 +226,7 @@ class HookOutbox:
 
     def complete(self, delivery: HookDelivery) -> HookDelivery | None:
         now = time.time()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 """
@@ -287,7 +288,7 @@ class HookOutbox:
     ) -> HookDelivery | None:
         now = time.time()
         next_due = delivery.next_attempt_at if next_attempt_at is None else next_attempt_at
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 """

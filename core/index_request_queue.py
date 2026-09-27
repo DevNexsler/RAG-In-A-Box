@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import posixpath
 import sqlite3
 import uuid
@@ -173,7 +174,7 @@ class IndexRequestQueue:
             raise ValueError("table_name and source_name must not be empty")
         target = normalize_target(target)
         now = _utc_now()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
@@ -205,7 +206,7 @@ class IndexRequestQueue:
         if limit <= 0:
             return []
         priority_source, priority_target = prioritize or ("", "")
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             rows = connection.execute(
                 """
                 SELECT * FROM index_requests
@@ -226,7 +227,7 @@ class IndexRequestQueue:
         return [self._from_row(row) for row in rows]
 
     def complete(self, request: IndexRequest) -> bool:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
                 "DELETE FROM index_requests WHERE id = ? AND revision = ? AND incarnation = ?",
                 (request.id, request.revision, request.incarnation),
@@ -235,7 +236,7 @@ class IndexRequestQueue:
 
     def fail(self, request: IndexRequest, error: str) -> bool:
         now = _utc_now()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
                 """
                 UPDATE index_requests
