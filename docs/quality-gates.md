@@ -97,3 +97,19 @@ Normal cases must have healthy retrieval diagnostics; only the explicit outage
 case may degrade to keyword fallback. The live tier also runs `test_rag_quality_live.py` against `config_test.yaml` after
 its normal preflight. These are small relevance judgments, not a comprehensive
 semantic benchmark or generated-answer evaluation.
+
+## September 26 baseline finding
+
+A 100-round run (1,600 logical writes, four persistent workers) completed every
+write and callback retry without loss, with p95 write latency 2.20 seconds. RSS
+grew 297.8 MiB, exceeding the unchanged 128 MiB growth budget. The same harness
+against merged baseline `2ad899d` grew 299.4 MiB (p95 2.39 seconds), establishing
+that this growth predates the incarnation fixes. These runs used the normal
+512 MiB index / 128 MiB metadata cache caps; they do not prove an unbounded leak.
+
+Forty-round diagnostic comparisons found reader reuse did not materially reduce
+growth; smaller cache caps did. Production cache settings were not changed.
+Treat long-soak RSS failure as a performance investigation trigger. Do not infer
+production capacity from the small default run or relax its threshold merely to
+get a passing report. Follow-up should establish memory plateau under production
+cache/maintenance settings and representative concurrent provider load.
