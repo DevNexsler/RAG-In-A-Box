@@ -20,7 +20,8 @@ def test_invalid_stored_doc_type_cannot_override_current_vocabulary():
 def test_route_arrow_is_not_an_identity_correction():
     original = {"enr_summary": "Route goes from A to B, not B to A."}
     assert repair_enrichment(
-        original, text="A -> B", title="Route", source_type="message", enabled=False
+        original, text="A -> B", title="Route", source_type="message", enabled=True,
+        enabled_rules=["explicit_corrections"],
     ) == original
 
 
@@ -28,7 +29,7 @@ def test_correction_preserves_unrelated_summary_sentences():
     result = repair_enrichment(
         {"enr_summary": "Invoice due Friday. The name is Shawn, not Sean."},
         text="Correction: changed from Shawn to Sean.",
-        title="Correction", source_type="message", enabled=False,
+        title="Correction", source_type="message", enabled=True,
     )
     assert result["enr_summary"] == "Invoice due Friday. Correction: Sean (not Shawn)."
 
@@ -75,7 +76,8 @@ def test_unrelated_correction_cannot_turn_route_arrow_into_correction():
     original = {"enr_summary": "Route goes from A to B, not B to A."}
     assert repair_enrichment(
         original, text="Correction: changed from Shawn to Sean.\nRoute: A -> B",
-        title="Message", source_type="message", enabled=False,
+        title="Message", source_type="message", enabled=True,
+        enabled_rules=["explicit_corrections"],
     ) == original
 
 
