@@ -59,6 +59,8 @@ MUTATIONS = (
 
 
 def run_test_process(repo: Path, selectors: tuple[str, ...], timeout: float, report_path: Path) -> dict:
+    # pytest runs with cwd=repo; anchor the report to our cwd so both sides agree.
+    report_path = report_path.absolute()
     report_path.unlink(missing_ok=True)
     env = {key: value for key, value in os.environ.items() if key not in {'PYTHONPATH', 'PYTEST_ADDOPTS'}}
     env['PYTHONPATH'] = str(repo)
