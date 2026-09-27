@@ -70,6 +70,50 @@ So a new test file is a unit test by default; putting it in the right
 place/name is all the wiring a tier needs. Markers are registered in
 `pyproject.toml` (`[tool.pytest.ini_options] markers`).
 
+## Cross-boundary regression contracts
+
+The post-merge hardening suite covers six boundaries through public operations.
+Run `make gate-fast`; HTTP contracts use loopback peers, temporary storage, fake
+credentials, and the integration filename convention. No new test uses a live
+provider. `tests/contracts/conftest.py` owns and closes each HTTP peer.
+
+| Boundary | Added coverage | Test files |
+|---|---|---|
+| Indexing / queue / storage | Process death after committed storage but before queue ACK; real queue drain recovery; stale revision cannot ACK new forced work; no duplicate chunks | `tests/test_queue_storage_recovery.int.test.py`, `tests/contracts/test_index_pipeline_recovery.int.test.py` |
+| Failed-source retirement | Full indexing with a late scan failure or a scoped scan preserves active and terminal failure evidence; healthy source progresses; later successful full scan retires evidence | `tests/contracts/test_source_retirement.int.test.py` |
+| Enrichment correctness | Card evidence excludes invoice/account identifiers; correction scope and HTML visibility invariants; idempotence; grounded metadata survives storage and callback serialization | `tests/test_enrichment_invariants.py`, pipeline recovery contract |
+| Factbook identity | Qualified ID case, Person filter, ambiguity window, response correlation, malformed entities, contradictory flags, HTTP/RPC/tool failures, retry, no fuzzy fallback | `tests/contracts/test_factbook_identity.int.test.py` |
+| CDS callback delivery | Real HTTP, environment URL, secret header, restart/retry, crash after receiver acceptance, stable replay payload, `updated`/`duplicate` ACKs, semantic mismatch redrive | `tests/contracts/test_cds_delivery.int.test.py`, pipeline recovery contract |
+| Provider failures / health | Account refusal, failed and slow probes, stale completions across trip/reset, one in-flight probe, malformed reranker responses, production health route changes from 503 to 200 only after valid recovery | `tests/test_provider_recovery_contract.py`, `tests/contracts/test_provider_health.int.test.py` |
+
+These are consumer contracts. They do not prove the deployed Factbook or CDS
+server implements the contract. Keep the Factbook exact-identity database tests
+and the CDS receiver/Postgres staging gate alongside them. CDS replay remains
+at-least-once; receiver-side idempotence needs the CDS database test, not a
+mocked assertion of exactly-once delivery.
+
+The existing PostgreSQL history contracts require `DOC_HISTORY_TEST_DSN` pointing
+to an isolated database named `doc_history_test`; fixtures reject other database
+names. Without this setting, 15 integration cases skip. Provision a disposable
+Postgres service to exercise those cases, and remove its container and volumes
+afterward.
+
+Additional priorities:
+
+- **RAG quality evals:** versioned examples for retrieval relevance, grounded
+  summaries, identity fidelity, and question/proposal preservation. Track real
+  model output regressions separately from deterministic API contracts.
+- **Concurrency and crash recovery:** extend the deterministic schedules here
+  with state-machine/property tests for queue revisions, leases, and circuit
+  admission. Avoid wall-clock sleeps as race assertions.
+- **Mutation testing:** verify identity rejection, scan-success guards, and ACK
+  revision checks fail when each protection is removed.
+- **Performance/soak:** repeated incremental sweeps and concurrent search with
+  explicit RSS, latency, retained Lance-version, and callback-backlog budgets.
+- **Deployment smoke:** verify running source/image revision before calling a
+  merged release healthy; check provider health, run completion, both durable
+  queues, and active/terminal degradation separately from liveness.
+
 ## The staging stack
 
 `docker-compose.staging.yml`, project name `doc-organizer-staging`,
@@ -419,3 +463,9 @@ across restarts, stop with `down` (NOT `down -v`); `down -v` wipes it.
 - Reads back: the doc is **vector-searchable immediately**; keyword/FTS
   visibility waits for a full sweep (which this stack may never run), so
   assert via semantic search.
+
+### Extended quality, mutation, soak, and deployment checks
+
+See [quality-gates.md](quality-gates.md) for versioned RAG judgments, reproducible
+queue histories, curated mutation coverage, bounded local soak, and read-only
+revision smoke commands, thresholds, evidence, and limits.

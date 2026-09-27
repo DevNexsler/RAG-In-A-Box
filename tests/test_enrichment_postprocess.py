@@ -280,6 +280,30 @@ def test_latest_correction_in_document_order_wins_across_syntaxes():
     assert repaired == enrichment
 
 
+def test_same_line_correction_preserves_latest_name():
+    enrichment = {"enr_summary": "The name is Alan, not Allen."}
+    text = (
+        "Correction: changed from Alan to Allen. "
+        "Correction: the correct name is Alan, not Allen."
+    )
+    assert repair_enrichment(
+        enrichment, text=text, title="Identity correction", source_type="message",
+        enabled=True, enabled_rules=["explicit_corrections"],
+    ) == enrichment
+
+
+def test_retracted_correction_preserves_original_name_without_repeating_names():
+    enrichment = {"enr_summary": "The name is Alan, not Allen."}
+    text = (
+        "Correction: changed from Alan to Allen.\n"
+        "Correction: disregard the previous correction; the original name was correct."
+    )
+    assert repair_enrichment(
+        enrichment, text=text, title="Identity correction", source_type="message",
+        enabled=True, enabled_rules=["explicit_corrections"],
+    ) == enrichment
+
+
 def test_enabled_rules_can_limit_repair_to_importance_only():
     enrichment = {
         "enr_importance": "0.5",

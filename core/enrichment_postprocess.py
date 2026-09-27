@@ -35,6 +35,11 @@ _EXPLICIT_CORRECTION_PATTERNS = (
 
 _QUOTES = "\"'“”‘’"
 _CORRECTION_CUE_RE = re.compile(r"\bcorrect(?:ion|ed|ing)?\b", re.IGNORECASE)
+_CORRECTION_RETRACTION_RE = re.compile(
+    r"\b(?:disregard|ignore|retract|withdraw|undo|cancel)\s+"
+    r"(?:(?:the|a|my|our|that)\s+)?(?:previous|prior|earlier|last|above)\s+"
+    r"(?:correction|change)\b", re.IGNORECASE,
+)
 
 _STOPWORDS = {
     "a",
@@ -386,8 +391,8 @@ def _explicit_corrections(source_text: str) -> list[tuple[str, str]]:
 
     A source can correct the same value twice ("from A to B", then later "it IS
     A, not B"). Only the latest correction in document order counts, so a pair
-    is dropped once a later correction line names both of its values: that line
-    either yields its own pair or, if unparseable, leaves generated text alone.
+    is dropped once a later correction names both values or explicitly retracts
+    the preceding correction. Ambiguous retractions leave generated text alone.
     """
     found: list[tuple[int, int, str, str]] = []
     for index, pattern in enumerate(_EXPLICIT_CORRECTION_PATTERNS):
@@ -402,13 +407,13 @@ def _explicit_corrections(source_text: str) -> list[tuple[str, str]]:
             new = " ".join(match.group("new").split()).strip()
             if not old or not new or old.casefold() == new.casefold():
                 continue
-            found.append((match.start(), line_end, old, new))
+            found.append((match.start(), match.end(), old, new))
 
     corrections: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for _, line_end, old, new in sorted(found):
+    for _, match_end, old, new in sorted(found):
         identity = (old.casefold(), new.casefold())
-        if identity in seen or _correction_revisited(source_text[line_end:], old, new):
+        if identity in seen or _correction_revisited(source_text[match_end:], old, new):
             continue
         corrections.append((old, new))
         seen.add(identity)
@@ -416,7 +421,9 @@ def _explicit_corrections(source_text: str) -> list[tuple[str, str]]:
 
 
 def _correction_revisited(later_text: str, old: str, new: str) -> bool:
-    """Return whether a later correction line mentions both values of a pair."""
+    """Abstain after a later restatement or explicit retraction of a correction."""
+    if _CORRECTION_RETRACTION_RE.search(later_text):
+        return True
     mentions = [
         re.compile(rf"(?<!\w){re.escape(value.strip(_QUOTES))}(?!\w)", re.IGNORECASE)
         for value in (old, new)

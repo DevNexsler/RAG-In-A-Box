@@ -245,12 +245,16 @@ class EndpointCircuits:
                 if state["open_until"] is not None
             }
 
-    def _enter(self, key: str) -> None:
+    def _enter(self, key: str) -> object:
         with self._lock:
-            state = self._state.get(key)
-            open_until = state and state["open_until"]
+            state = self._state.setdefault(
+                key, {"failures": 0, "open_until": None, "generation": object()},
+            )
+            open_until = state["open_until"]
             if open_until is None:
-                return
+                return state["generation"]
+            if state.get("probe_in_flight"):
+                raise CircuitOpenError(f"recovery probe in flight for {key}")
             if self._clock() < open_until:
                 raise CircuitOpenError(
                     f"circuit open for {key} after {state['failures']} consecutive "
@@ -259,14 +263,34 @@ class EndpointCircuits:
                 )
             # Cooldown elapsed: admit exactly one probe. Concurrent callers keep
             # failing fast until the probe reports back.
+            state["probe_in_flight"] = True
             state["open_until"] = self._clock() + self._cooldown
+            state["generation"] = object()
+            return state["generation"]
 
-    def _record(self, key: str, exc: BaseException | None) -> None:
+    def _record(self, key: str, exc: BaseException | None, generation: object) -> None:
         with self._lock:
-            state = self._state.setdefault(key, {"failures": 0, "open_until": None})
+            state = self._state.get(key)
+            # Requests admitted before a trip/reset cannot recover a newer
+            # outage or release its probe. Tokens also survive key reuse safely.
+            if state is None or state["generation"] is not generation:
+                return
+            state["probe_in_flight"] = False
             refused = exc is not None and is_account_refusal(exc)
             if exc is None or not (refused or is_connection_level(exc)):
-                # Answered (or succeeded) — the endpoint is reachable.
+                if exc is not None and state["open_until"] is not None:
+                    # An answered but unsuccessful recovery probe cannot prove
+                    # the provider recovered. Keep health degraded and bound
+                    # further probes, without tripping healthy endpoints for
+                    # ordinary per-request errors.
+                    state["failures"] += 1
+                    state["error"] = collapse(exc, MAX_ERROR_CHARS)
+                    state["http_status"] = (
+                        exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                    )
+                    state["open_until"] = self._clock() + self._cooldown
+                    return
+                # Success, or a per-request error on a previously healthy peer.
                 state["failures"] = 0
                 state["open_until"] = None
                 return
@@ -276,6 +300,7 @@ class EndpointCircuits:
             cooldown = self._refusal_cooldown if refused else self._cooldown
             threshold = 1 if refused else self._threshold
             if state["failures"] >= threshold and state["open_until"] is None:
+                state["generation"] = object()
                 state["open_until"] = self._clock() + cooldown
                 state["tripped_at"] = time.time()
                 if refused:
@@ -299,16 +324,14 @@ class EndpointCircuits:
         if not key:
             yield
             return
-        self._enter(key)
+        generation = self._enter(key)
         try:
             yield
-        except CircuitOpenError:
-            raise
         except BaseException as exc:  # noqa: BLE001 — classify, then re-raise
-            self._record(key, exc)
+            self._record(key, exc, generation)
             raise
         else:
-            self._record(key, None)
+            self._record(key, None, generation)
 
 
 CIRCUITS = EndpointCircuits()
