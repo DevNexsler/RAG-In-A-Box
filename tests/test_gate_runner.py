@@ -34,7 +34,7 @@ def _run_gate(args, tmp_path, env=None):
 
 
 def test_tier_order():
-    assert [t.name for t in TIERS] == ["static", "unit", "integration", "staging-e2e", "live"]
+    assert [t.name for t in TIERS] == ["static", "unit", "integration", "mutation", "soak", "staging-e2e", "live"]
 
 
 def test_fail_fast():
@@ -43,7 +43,8 @@ def test_fail_fast():
 
 
 def test_live_requires_all_prior():
-    results = {"static": True, "unit": True, "integration": True, "staging-e2e": True}
+    results = {"static": True, "unit": True, "integration": True,
+               "mutation": True, "soak": True, "staging-e2e": True}
     assert next_tier_allowed("live", results) is True
 
 
@@ -100,7 +101,7 @@ def test_only_live_blocked_when_preflight_fails(tmp_path):
 
 # --- result.json ---------------------------------------------------------------
 
-ALL_TIERS = ["static", "unit", "integration", "staging-e2e", "live"]
+ALL_TIERS = ["static", "unit", "integration", "mutation", "soak", "staging-e2e", "live"]
 # e2e-real is opt-in (--with-real-e2e); it stays not_run in a default gate run.
 
 
@@ -178,6 +179,7 @@ def test_result_json_marks_skipped_after_failure(tmp_path, monkeypatch):
     assert data["overall"] == "fail"
     assert data["tiers"] == {
         "static": "pass", "unit": "fail", "integration": "skipped",
+        "mutation": "skipped", "soak": "skipped",
         "staging-e2e": "skipped", "live": "skipped", "e2e-real": "not_run",
     }
 
@@ -194,6 +196,7 @@ def test_result_json_only_mode_marks_unselected_not_run(tmp_path):
     assert data["overall"] == "fail"
     assert data["tiers"] == {
         "static": "not_run", "unit": "not_run", "integration": "not_run",
+        "mutation": "not_run", "soak": "not_run",
         "staging-e2e": "fail", "live": "not_run", "e2e-real": "not_run",
     }
 

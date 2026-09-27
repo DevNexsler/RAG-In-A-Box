@@ -45,6 +45,10 @@ TIERS = [
                   "--junitxml={run_dir}/unit.xml"]),
     Tier("integration", [sys.executable, "-m", "pytest", "-m", "integration", "-q",
                          "--junitxml={run_dir}/integration.xml"]),
+    Tier("mutation", [sys.executable, "scripts/mutation_gate.py",
+                      "--output", "{run_dir}/mutation.json"]),
+    Tier("soak", [sys.executable, "scripts/pipeline_soak.py",
+                  "--output", "{run_dir}/soak.json"]),
     Tier(
         "staging-e2e",
         [

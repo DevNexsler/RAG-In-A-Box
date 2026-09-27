@@ -20,8 +20,12 @@ outside a worktree; default is `.evals/quality`.
 | `make smoke-deployed EXPECTED_REVISION=<commit>` | Read-only Docker source-hash comparison plus `/health`, `/health/providers`, OOM/container state, pending SQLite queues, and terminal callbacks requiring redrive. `DEPLOYED_CONTAINER` defaults to `doc-organizer`. |
 
 Small evaluator, property, smoke-assessment, and soak regressions participate in
-normal unit/integration tiers (`make gate-fast`). Full mutation campaign and long
-soak are explicit commands. Stage and live tiers remain required before release.
+normal unit/integration tiers (`make gate-fast`). Full curated mutation campaign
+and the default 160-write soak are mandatory release tiers, after integration
+and before staging/live. A failure stops later tiers. Use gate `--only mutation`
+or `--only soak` for a standalone run with `result.json` and `report.md`.
+Long-duration soak remains an explicit command; no nightly job is installed by
+these targets. Stage and live tiers remain required before release.
 
 A longer, bounded local soak:
 
@@ -54,7 +58,8 @@ Generated histories use a separate logical model and fixed seeds, with no added
 runtime dependency. They do not shrink failing traces automatically. Fixed replay
 regressions protect issues discovered by these histories. Mutations cover queue
 revision/incarnation, callback incarnation, card grounding, failed-source
-retirement, Factbook response correlation, and exclusive provider probes. This is
+retirement, Factbook response correlation, exclusive provider probes, and the
+PR-specific faults mapped in [PR_TEST_COVERAGE.md](PR_TEST_COVERAGE.md). This is
 a targeted sensitivity gate, not a whole-repository mutation score.
 
 Subsystem soak validates persistence and replay under concurrent local load. It
