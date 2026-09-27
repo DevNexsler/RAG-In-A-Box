@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
-import os
 from pathlib import Path
 import signal
 import subprocess
@@ -23,6 +22,7 @@ if str(ROOT) not in sys.path:
 from core.hook_outbox import HookOutbox
 from core.index_request_queue import IndexRequestQueue
 from hooks.http import send_http_event
+from scripts.owned_process import owned_process
 from scripts.rag_quality import make_node
 
 
@@ -169,24 +169,18 @@ def main(argv=None) -> int:
         with tempfile.TemporaryDirectory(prefix='rag-soak-') as directory:
             command = [sys.executable, __file__, *(argv if argv is not None else sys.argv[1:]),
                        '--worker', '--index-root', directory]
-            process = subprocess.Popen(command, start_new_session=True)
             try:
-                code = process.wait(timeout=args.deadline)
+                with owned_process(command) as process:
+                    code = process.wait(timeout=args.deadline)
                 if code and not args.output.exists():
                     args.output.write_text(json.dumps({'passed': False, 'error': 'worker_failed', 'returncode': code}) + '\n')
                 return code
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
                 args.output.write_text(json.dumps({'passed': False, 'error': 'deadline_exceeded'}) + '\n')
                 return 1
             except BaseException:
                 args.output.write_text(json.dumps({'passed': False, 'error': 'interrupted'}) + '\n')
                 raise
-            finally:
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
     if args.index_root is None:
         parser.error('worker requires owned index root')
     report = run_soak(args.index_root, rounds=args.rounds, documents=args.documents, workers=args.workers,

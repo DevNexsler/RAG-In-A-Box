@@ -16,6 +16,10 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.owned_process import owned_process
 
 
 @dataclass(frozen=True)
@@ -53,19 +57,13 @@ def run_test_process(repo: Path, selectors: tuple[str, ...], timeout: float, rep
     # No project .env/config files are copied. Selectors are hermetic tests only.
     log_path = report_path.with_suffix('.log')
     with log_path.open('w') as log:
-        process = subprocess.Popen([sys.executable, '-m', 'pytest', *selectors, '-q',
-                                    f'--junitxml={report_path}'], cwd=repo, env=env,
-                                   stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            code = process.wait(timeout=timeout)
+            with owned_process([sys.executable, '-m', 'pytest', *selectors, '-q',
+                                f'--junitxml={report_path}'], cwd=repo, env=env,
+                               stdout=log, stderr=subprocess.STDOUT) as process:
+                code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
             return {'status': 'timeout'}
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
     if not report_path.exists():
         return {'status': 'error', 'returncode': code}
     suites = ET.parse(report_path).getroot().iter('testsuite')
