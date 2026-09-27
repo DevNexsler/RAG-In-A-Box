@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import posixpath
 import sqlite3
-import threading
-import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core.sqlite_init import initializing_database
+
 _QUEUE_FILENAME = "index-requests.sqlite3"
 _BUSY_TIMEOUT_MS = 5_000
-_INITIALIZE_RETRY_DELAYS = (0.01, 0.05, 0.1, 0.25, 0.5)
-_INITIALIZE_LOCK = threading.Lock()
 
 
 def _utc_now() -> str:
@@ -81,6 +80,7 @@ class IndexRequest:
     created_at: str
     updated_at: str
     last_error: str | None
+    incarnation: str
 
 
 class IndexRequestQueue:
@@ -97,48 +97,48 @@ class IndexRequestQueue:
             self.path,
             timeout=_BUSY_TIMEOUT_MS / 1_000,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA synchronous=FULL")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA synchronous=FULL")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     def _initialize(self) -> None:
-        with _INITIALIZE_LOCK:
-            for attempt in range(len(_INITIALIZE_RETRY_DELAYS) + 1):
-                try:
-                    with self._connect() as connection:
-                        connection.execute("PRAGMA journal_mode=WAL")
-                        connection.execute(
-                            """
-                            CREATE TABLE IF NOT EXISTS index_requests (
-                                id INTEGER PRIMARY KEY,
-                                table_name TEXT NOT NULL,
-                                source_name TEXT NOT NULL,
-                                target TEXT NOT NULL,
-                                force INTEGER NOT NULL DEFAULT 0,
-                                status TEXT NOT NULL DEFAULT 'pending',
-                                attempts INTEGER NOT NULL DEFAULT 0,
-                                revision INTEGER NOT NULL DEFAULT 1,
-                                created_at TEXT NOT NULL,
-                                updated_at TEXT NOT NULL,
-                                last_error TEXT,
-                                UNIQUE (table_name, source_name, target)
-                            )
-                            """
-                        )
-                        connection.execute(
-                            """
-                            CREATE INDEX IF NOT EXISTS idx_index_requests_pending
-                            ON index_requests (table_name, status, created_at, id)
-                            """
-                        )
-                    return
-                except sqlite3.OperationalError as exc:
-                    if "locked" not in str(exc).lower() or attempt >= len(
-                        _INITIALIZE_RETRY_DELAYS
-                    ):
-                        raise
-                    time.sleep(_INITIALIZE_RETRY_DELAYS[attempt])
+        with initializing_database(self._connect) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS index_requests (
+                    id INTEGER PRIMARY KEY,
+                    table_name TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    force INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT,
+                    incarnation TEXT NOT NULL DEFAULT '',
+                    UNIQUE (table_name, source_name, target)
+                )
+                """
+            )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(index_requests)")}
+            if "incarnation" not in columns:
+                connection.execute("ALTER TABLE index_requests ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''")
+            connection.execute(
+                "UPDATE index_requests SET incarnation = lower(hex(randomblob(16))) WHERE incarnation = ''"
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_index_requests_pending
+                ON index_requests (table_name, status, created_at, id)
+                """
+            )
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> IndexRequest:
@@ -156,6 +156,7 @@ class IndexRequestQueue:
             last_error=(
                 None if row["last_error"] is None else str(row["last_error"])
             ),
+            incarnation=str(row["incarnation"]),
         )
 
     def enqueue(
@@ -178,8 +179,8 @@ class IndexRequestQueue:
                 """
                 INSERT INTO index_requests (
                     table_name, source_name, target, force, status,
-                    attempts, revision, created_at, updated_at, last_error
-                ) VALUES (?, ?, ?, ?, 'pending', 0, 1, ?, ?, NULL)
+                    attempts, revision, created_at, updated_at, last_error, incarnation
+                ) VALUES (?, ?, ?, ?, 'pending', 0, 1, ?, ?, NULL, ?)
                 ON CONFLICT (table_name, source_name, target) DO UPDATE SET
                     force = MAX(index_requests.force, excluded.force),
                     status = 'pending',
@@ -188,7 +189,7 @@ class IndexRequestQueue:
                     last_error = NULL
                 RETURNING *
                 """,
-                (table_name, source_name, target, int(force), now, now),
+                (table_name, source_name, target, int(force), now, now, uuid.uuid4().hex),
             ).fetchone()
             connection.commit()
         assert row is not None
@@ -227,8 +228,8 @@ class IndexRequestQueue:
     def complete(self, request: IndexRequest) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
-                "DELETE FROM index_requests WHERE id = ? AND revision = ?",
-                (request.id, request.revision),
+                "DELETE FROM index_requests WHERE id = ? AND revision = ? AND incarnation = ?",
+                (request.id, request.revision, request.incarnation),
             )
         return cursor.rowcount == 1
 
@@ -242,8 +243,8 @@ class IndexRequestQueue:
                     updated_at = ?,
                     last_error = ?,
                     status = 'pending'
-                WHERE id = ? AND revision = ?
+                WHERE id = ? AND revision = ? AND incarnation = ?
                 """,
-                (now, str(error), request.id, request.revision),
+                (now, str(error), request.id, request.revision, request.incarnation),
             )
         return cursor.rowcount == 1

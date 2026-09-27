@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from core.sqlite_init import initializing_database
 
 
 RETRY_DELAYS_SECONDS = (1, 5, 30, 120)
@@ -44,6 +47,7 @@ class HookDelivery:
     created_at: float
     updated_at: float
     revision: int
+    incarnation: str
 
 
 def _sanitize_hook(value: dict[str, Any]) -> dict[str, Any]:
@@ -88,14 +92,17 @@ class HookOutbox:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA busy_timeout=5000")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA busy_timeout=5000")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
+        with initializing_database(self._connect) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS hook_deliveries (
@@ -112,9 +119,16 @@ class HookOutbox:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     revision INTEGER NOT NULL,
+                    incarnation TEXT NOT NULL DEFAULT '',
                     UNIQUE (event_id, hook_name)
                 )
                 """
+            )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(hook_deliveries)")}
+            if "incarnation" not in columns:
+                connection.execute("ALTER TABLE hook_deliveries ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''")
+            connection.execute(
+                "UPDATE hook_deliveries SET incarnation = lower(hex(randomblob(16))) WHERE incarnation = ''"
             )
             connection.execute(
                 """
@@ -139,6 +153,7 @@ class HookOutbox:
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
             revision=int(row["revision"]),
+            incarnation=str(row["incarnation"]),
         )
 
     @staticmethod
@@ -161,10 +176,10 @@ class HookOutbox:
                 """
                 INSERT OR IGNORE INTO hook_deliveries (
                     event_id, hook_name, event_json, hook_json, status, attempts,
-                    next_attempt_at, last_outcome, last_error, created_at, updated_at, revision
-                ) VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, ?, 1)
+                    next_attempt_at, last_outcome, last_error, created_at, updated_at, revision, incarnation
+                ) VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, ?, 1, ?)
                 """,
-                (event_id, hook_name, event_json, hook_json, now, now, now),
+                (event_id, hook_name, event_json, hook_json, now, now, now, uuid.uuid4().hex),
             )
             row = connection.execute(
                 "SELECT * FROM hook_deliveries WHERE event_id = ? AND hook_name = ?",
@@ -215,9 +230,9 @@ class HookOutbox:
             cursor = connection.execute(
                 """
                 DELETE FROM hook_deliveries
-                WHERE id = ? AND revision = ? AND status = 'pending'
+                WHERE id = ? AND revision = ? AND incarnation = ? AND status = 'pending'
                 """,
-                (delivery.id, delivery.revision),
+                (delivery.id, delivery.revision, delivery.incarnation),
             )
             connection.commit()
         if cursor.rowcount != 1:
@@ -279,7 +294,7 @@ class HookOutbox:
                 UPDATE hook_deliveries
                 SET status = ?, attempts = ?, next_attempt_at = ?, last_outcome = ?,
                     last_error = ?, updated_at = ?, revision = revision + 1
-                WHERE id = ? AND revision = ? AND status = 'pending'
+                WHERE id = ? AND revision = ? AND incarnation = ? AND status = 'pending'
                 """,
                 (
                     status,
@@ -290,6 +305,7 @@ class HookOutbox:
                     now,
                     delivery.id,
                     delivery.revision,
+                    delivery.incarnation,
                 ),
             )
             if cursor.rowcount != 1:

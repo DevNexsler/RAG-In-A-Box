@@ -463,3 +463,9 @@ across restarts, stop with `down` (NOT `down -v`); `down -v` wipes it.
 - Reads back: the doc is **vector-searchable immediately**; keyword/FTS
   visibility waits for a full sweep (which this stack may never run), so
   assert via semantic search.
+
+### Extended quality, mutation, soak, and deployment checks
+
+See [quality-gates.md](quality-gates.md) for versioned RAG judgments, reproducible
+queue histories, curated mutation coverage, bounded local soak, and read-only
+revision smoke commands, thresholds, evidence, and limits.
