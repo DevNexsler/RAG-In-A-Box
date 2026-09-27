@@ -15,10 +15,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_makefile_uses_overridable_project_python():
-    text = (REPO_ROOT / "Makefile").read_text()
-    assert "PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)" in text
-    assert "\tpython " not in text
-    assert text.count("\t$(PYTHON) ") == 8
+    for target in ("gate", "gate-fast", "gate-real", "test-unit", "test-integration",
+                   "test-e2e", "test-e2e-real", "test-live", "test-quality",
+                   "test-properties", "test-mutation", "test-soak", "smoke-deployed"):
+        result = subprocess.run(
+            ["make", "-n", target, "PYTHON=/sentinel/python", "EXPECTED_REVISION=HEAD"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        )
+        assert any(line.startswith("/sentinel/python ") for line in result.stdout.splitlines()), target
 
 
 def _run_gate(args, tmp_path, env=None):

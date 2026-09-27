@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "description": "Synthetic, manually judged retrieval and deterministic enrichment safety cases. No private production documents or model-generated gold.",
+  "documents": [
+    {"id":"finance/receipt", "text":"Receipt invoice 1234. Paid with Visa ****5678. Total 42 dollars.", "source_type":"md"},
+    {"id":"finance/membership", "text":"Member account 5678. Annual renewal fee 1234 dollars.", "source_type":"md"},
+    {"id":"routes/correction", "text":"Correction: changed from Shawn to Sean. Route: A -> B. Route remains A to B.", "source_type":"md"},
+    {"id":"mail/question", "text":"Could we postpone the launch until Friday? This is a question awaiting approval.", "source_type":"message"},
+    {"id":"decisions/launch", "text":"Approved launch schedule: Monday. Friday postponement was rejected.", "source_type":"md"},
+    {"id":"people/alex-work", "text":"Alex Chen work identity slack:user:U123 handles Acme roof insurance claims.", "source_type":"message"},
+    {"id":"people/alex-personal", "text":"Alex Chen personal identity telegram:user:U123 shares kimchi fermentation recipes.", "source_type":"message"},
+    {"id":"recipes/kimchi", "text":"Kimchi fermentation recipe uses cabbage and salt in a sealed jar.", "source_type":"md"}
+  ],
+  "queries": [
+    {"id":"receipt", "query":"Visa receipt invoice", "relevant":["finance/receipt"], "min_recall":1.0, "min_rr":1.0, "k":2},
+    {"id":"source-filter", "query":"launch Friday question", "source_type":"message", "relevant":["mail/question"], "forbidden":["decisions/launch"], "min_recall":1.0, "min_rr":1.0, "k":2},
+    {"id":"scope-filter", "query":"Alex Chen identity", "doc_id_prefix":"people/alex-work", "relevant":["people/alex-work"], "forbidden":["people/alex-personal"], "min_recall":1.0, "min_rr":1.0, "k":2},
+    {"id":"recipe", "query":"kimchi cabbage salt recipe", "relevant":["recipes/kimchi"], "min_recall":1.0, "min_rr":1.0, "k":2},
+    {"id":"embedding-outage", "query":"Visa receipt invoice", "embedding_failure":true, "relevant":["finance/receipt"], "min_recall":1.0, "min_rr":1.0, "k":2},
+    {"id":"missing-scope", "query":"insurance", "doc_id_prefix":"missing/", "relevant":[], "forbidden":["people/alex-work"], "min_recall":1.0, "min_rr":1.0, "k":2}
+  ],
+  "grounding": [
+    {"id":"card-label", "source":"Invoice 1234. Paid with Visa ****5678.", "prediction":{"enr_summary":"Paid by Visa ending in 1234."}, "expected":{"enr_summary":"Paid by Visa ending in 5678."}},
+    {"id":"unsupported-card", "source":"Invoice 1234. Payment method not recorded.", "prediction":{"enr_summary":"Paid by Visa ending in 1234."}, "expected":{"enr_summary":"Paid by Visa."}},
+    {"id":"question-intent", "source":"Could we postpone the launch until Friday?", "prediction":{"enr_summary":"Question: could we postpone the launch until Friday?"}, "expected":{"enr_summary":"Question: could we postpone the launch until Friday?"}},
+    {"id":"correction-boundary", "source":"Correction: changed from Shawn to Sean.\nRoute: A -> B.", "prediction":{"enr_summary":"Route goes from A to B, not B to A."}, "expected":{"enr_summary":"Route goes from A to B, not B to A."}}
+  ]
+}
