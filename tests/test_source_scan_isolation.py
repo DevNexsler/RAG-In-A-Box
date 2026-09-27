@@ -6,7 +6,7 @@ whole cycle — a 21-second Comm-Data-Store Postgres recovery on 2026-09-03 cost
 a complete index run, with `queued=unknown processed=0`.
 
 The flow-level guarantees (documents kept, ledger untouched, run marked
-partial) are covered by tests/test_source_scan_isolation.int.test.py; these
+partial) are covered by tests/test_source_scan_recovery.int.test.py; these
 pin the seam itself.
 """
 

@@ -70,6 +70,13 @@ So a new test file is a unit test by default; putting it in the right
 place/name is all the wiring a tier needs. Markers are registered in
 `pyproject.toml` (`[tool.pytest.ini_options] markers`).
 
+Give dotted integration filenames distinct stems from unit files in the same
+package: `test_worker_process.int.test.py` alongside `test_worker.py`.
+Importlib can otherwise silently hide the unit module. The collection identity
+guard rejects that mismatch, including during static collection and tier runs.
+See [merged PR coverage](PR_TEST_COVERAGE.md) for restored cases and the targeted
+mutation campaign covering the PR cleanup.
+
 ## Cross-boundary regression contracts
 
 The post-merge hardening suite covers six boundaries through public operations.

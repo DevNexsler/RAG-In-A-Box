@@ -32,6 +32,14 @@ class Mutation:
     occurrences: int = 1
 
 
+def load_pr_mutations() -> tuple[Mutation, ...]:
+    rows = json.loads((ROOT / 'tests/fixtures/pr_regression_mutations.json').read_text())
+    return tuple(Mutation(
+        name=row['name'], path=row['path'], before=row['before'], after=row['after'],
+        tests=tuple(row['tests']), occurrences=row.get('occurrences', 1),
+    ) for row in rows)
+
+
 MUTATIONS = (
     Mutation('queue-incarnation', 'core/index_request_queue.py', 'AND incarnation = ?', 'AND (? IS NOT NULL)',
              ('tests/test_queue_properties.int.test.py',), 2),
@@ -47,7 +55,7 @@ MUTATIONS = (
              ('tests/contracts/test_source_retirement.int.test.py::test_retirement_requires_successful_scan_of_own_source[failed_scan]',)),
     Mutation('single-probe', 'core/resilience.py', 'if state.get("probe_in_flight"):', 'if False:',
              ('tests/test_provider_recovery_contract.py',)),
-)
+) + load_pr_mutations()
 
 
 def run_test_process(repo: Path, selectors: tuple[str, ...], timeout: float, report_path: Path) -> dict:
@@ -66,7 +74,8 @@ def run_test_process(repo: Path, selectors: tuple[str, ...], timeout: float, rep
             return {'status': 'timeout'}
     if not report_path.exists():
         return {'status': 'error', 'returncode': code}
-    suites = ET.parse(report_path).getroot().iter('testsuite')
+    root = ET.parse(report_path).getroot()
+    suites = root.iter('testsuite')
     totals = {key: 0 for key in ('tests', 'failures', 'errors', 'skipped')}
     for suite in suites:
         for key in totals:
@@ -75,7 +84,8 @@ def run_test_process(repo: Path, selectors: tuple[str, ...], timeout: float, rep
         status = 'error'
     else:
         status = 'killed' if code == 1 and totals['failures'] else 'survived'
-    return {'status': status, 'returncode': code, **totals}
+    inventory = sorted(f'{case.get("classname")}::{case.get("name")}' for case in root.iter('testcase'))
+    return {'status': status, 'returncode': code, 'test_ids': inventory, **totals}
 
 
 def run_mutations(root: Path, mutations=MUTATIONS, *, timeout: float = 180, artifacts: Path | None = None) -> dict:
@@ -119,7 +129,9 @@ def run_mutations(root: Path, mutations=MUTATIONS, *, timeout: float = 180, arti
                 continue
             path.write_text(changed)
             result = run_test_process(candidate, selectors, timeout, evidence / f'mutant-{index}.xml')
-            rows.append({'name': mutation.name, **result})
+            if result.get('test_ids') != checked[selectors].get('test_ids') or result.get('skipped'):
+                result.update(status='error', reason='test inventory changed')
+            rows.append({'name': mutation.name, 'path': mutation.path, 'selectors': selectors, **result})
     return {'mutations': rows, 'passed': all(row['status'] == 'killed' for row in rows)}
 
 

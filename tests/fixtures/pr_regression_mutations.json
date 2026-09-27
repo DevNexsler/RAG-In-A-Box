@@ -1,0 +1,412 @@
+[
+  {
+    "prs": [
+      198
+    ],
+    "name": "platform-id-authority",
+    "path": "factbook_client.py",
+    "before": "if attribute_key == \"platform_id\" and not entities:",
+    "after": "if False:",
+    "tests": [
+      "tests/contracts/test_factbook_identity.int.test.py"
+    ]
+  },
+  {
+    "prs": [
+      197
+    ],
+    "name": "account-refusal-circuit",
+    "path": "core/resilience.py",
+    "before": "ACCOUNT_REFUSAL_STATUSES = frozenset({402})",
+    "after": "ACCOUNT_REFUSAL_STATUSES = frozenset()",
+    "tests": [
+      "tests/test_endpoint_circuit.py::test_account_refusal_trips_on_first_failure_and_is_reported"
+    ]
+  },
+  {
+    "prs": [
+      196
+    ],
+    "name": "callback-dispatch-ownership",
+    "path": "hooks/delivery.py",
+    "before": "for pending in deliveries:",
+    "after": "for pending in outbox.due(limit=64, now=now):",
+    "tests": [
+      "tests/hooks/test_delivery.py::test_send_enqueued_only_sends_rows_from_this_dispatch"
+    ]
+  },
+  {
+    "prs": [
+      195
+    ],
+    "name": "schema-burst-recovery",
+    "path": "lancedb_store.py",
+    "before": "_STALE_READ_RECOVERY_ATTEMPTS = 8",
+    "after": "_STALE_READ_RECOVERY_ATTEMPTS = 4",
+    "tests": [
+      "tests/test_store.py::test_read_survives_a_burst_of_schema_swaps_during_recovery"
+    ]
+  },
+  {
+    "prs": [
+      194
+    ],
+    "name": "duplicate-newest-row",
+    "path": "lancedb_store.py",
+    "before": "row_id > best_by_chunk[chunk_id][0]",
+    "after": "row_id < best_by_chunk[chunk_id][0]",
+    "tests": [
+      "tests/test_duplicate_indexing.int.test.py::test_compact_duplicate_chunk_rows_keeps_newest_physical_row"
+    ]
+  },
+  {
+    "prs": [
+      193
+    ],
+    "name": "sweep-insert-idempotence",
+    "path": "lancedb_store.py",
+    "before": "existing_doc_ids = doc_ids & self._completed_insert_doc_ids",
+    "after": "existing_doc_ids = set()",
+    "tests": [
+      "tests/test_store.py::test_known_absent_insert_skips_after_same_session_upsert"
+    ]
+  },
+  {
+    "prs": [
+      192,
+      182
+    ],
+    "name": "context-fact-provenance",
+    "path": "doc_enrichment.py",
+    "before": "moved_numbers = _move_context_only_facts(repaired, primary_text, context_text)",
+    "after": "moved_numbers = []",
+    "tests": [
+      "tests/test_enrichment.py::TestContextOnlyFactsLeavePrimaryFields"
+    ]
+  },
+  {
+    "prs": [
+      191
+    ],
+    "name": "first-weekly-backup",
+    "path": "scripts/backup_retention.py",
+    "before": "if not any(week(p) == week(latest) for p in archives(weekly)):",
+    "after": "if date.weekday() == 6 and not any(week(p) == week(latest) for p in archives(weekly)):",
+    "tests": [
+      "tests/test_backup_retention.py::test_first_backup_in_iso_week_promoted_when_sunday_is_even_date"
+    ]
+  },
+  {
+    "prs": [
+      189
+    ],
+    "name": "controlled-doc-type",
+    "path": "core/doc_type_vocabulary.py",
+    "before": "canonical = mapping.get(label)",
+    "after": "canonical = mapping.get(label, label)",
+    "tests": [
+      "tests/test_doc_type_vocabulary.py::test_constrain_doc_type_all_unknown_becomes_unclassified_sentinel"
+    ]
+  },
+  {
+    "prs": [
+      188
+    ],
+    "name": "bulk-taxonomy-sync",
+    "path": "core/taxonomy.py",
+    "before": "existing_entry = existing_by_id.get(entry_id)",
+    "after": "existing_entry = store.get(entry_id)",
+    "tests": [
+      "tests/test_taxonomy_store.py::TestFolderSync::test_unchanged_folder_tree_skips_per_entry_lookups"
+    ]
+  },
+  {
+    "prs": [
+      187
+    ],
+    "name": "queue-write-accounting",
+    "path": "flow_index_vault.py",
+    "before": "restored[\"run_progress\"] = run_progress",
+    "after": "restored[\"run_progress\"] = {}",
+    "tests": [
+      "tests/test_index_run_served_accounting.py"
+    ]
+  },
+  {
+    "prs": [
+      186
+    ],
+    "name": "live-index-health",
+    "path": "lancedb_store.py",
+    "before": "return LanceDBStore._table_vector_index_stats(table)",
+    "after": "return empty_vector_index_stats()",
+    "tests": [
+      "tests/test_vector_index_observability.py::test_health_reports_live_index_without_store_init_or_writer_lock"
+    ]
+  },
+  {
+    "prs": [
+      185,
+      167
+    ],
+    "name": "retired-ledger-reconciliation",
+    "path": "flow_index_vault.py",
+    "before": "and is_retired is not None and is_retired(doc_id)",
+    "after": "and False",
+    "tests": [
+      "tests/test_degraded_ledger.py::test_namespaced_ledger_clears_legacy_bare_retirement"
+    ]
+  },
+  {
+    "prs": [
+      184
+    ],
+    "name": "human-message-title",
+    "path": "flow_index_vault.py",
+    "before": "if source_type == \"pg_message\":",
+    "after": "if False:",
+    "tests": [
+      "tests/test_message_titles.py"
+    ]
+  },
+  {
+    "prs": [
+      179
+    ],
+    "name": "question-modality-contract",
+    "path": "doc_enrichment.py",
+    "before": "modality_instructions=_MODALITY_INSTRUCTIONS",
+    "after": "modality_instructions=\"\"",
+    "tests": [
+      "tests/test_enrichment_modality.py::test_modality_contract_reaches_generator"
+    ]
+  },
+  {
+    "prs": [
+      171
+    ],
+    "name": "terminal-skip-rollup",
+    "path": "flow_index_vault.py",
+    "before": "skip_reasons = _record_permanent_skip(\n                    doc, [f\"terminal_error:{type(exc).__name__}\"]",
+    "after": "_record_permanent_skip(\n                    doc, [f\"terminal_error:{type(exc).__name__}\"]",
+    "tests": [
+      "tests/test_index_run_accounting.int.test.py::test_terminal_failure_counts_the_same_on_both_skip_roll_ups"
+    ]
+  },
+  {
+    "prs": [
+      170
+    ],
+    "name": "terminal-retry-budget",
+    "path": "core/degraded_policy.py",
+    "before": "_counter(entry, \"attempts\") >= MAX_ATTEMPTS",
+    "after": "_counter(entry, \"attempts\") > MAX_ATTEMPTS",
+    "tests": [
+      "tests/test_degraded_ledger.py::test_terminal_entry_covers_both_budgets"
+    ]
+  },
+  {
+    "prs": [
+      169
+    ],
+    "name": "per-document-skip-log",
+    "path": "flow_index_vault.py",
+    "before": "_get_logger().info(\n        \"Skipping %s: %s (%s)\",",
+    "after": "_get_logger().debug(\n        \"Skipping %s: %s (%s)\",",
+    "tests": [
+      "tests/test_index_run_accounting.int.test.py::test_every_skipped_document_is_named_in_the_log"
+    ]
+  },
+  {
+    "prs": [
+      168
+    ],
+    "name": "terminal-dedupe-canonical",
+    "path": "flow_index_vault.py",
+    "before": "if own_skip_reasons:",
+    "after": "if False:",
+    "tests": [
+      "tests/test_content_dedupe_flow.py::test_terminal_skip_document_is_not_elected_dedupe_canonical"
+    ]
+  },
+  {
+    "prs": [
+      166
+    ],
+    "name": "failed-source-partial-records",
+    "path": "flow_index_vault.py",
+    "before": "exc_info=True,\n            )\n            continue\n        all_records.extend(src_records)",
+    "after": "exc_info=True,\n            )\n            pass\n        all_records.extend(src_records)",
+    "tests": [
+      "tests/test_source_scan_isolation.py::test_failed_source_contributes_no_partial_records"
+    ]
+  },
+  {
+    "prs": [
+      164
+    ],
+    "name": "empty-enrichment-retry",
+    "path": "providers/llm/openrouter_llm.py",
+    "before": "if _has_enrichment_summary(initial[\"content\"]):",
+    "after": "if True:",
+    "tests": [
+      "tests/test_benchmark_runner.py::test_openrouter_retries_an_empty_enrichment_summary"
+    ]
+  },
+  {
+    "prs": [
+      163
+    ],
+    "name": "audio-route-capability",
+    "path": "providers/media/openrouter_media.py",
+    "before": "if route.endpoint == \"audio/transcriptions\":",
+    "after": "if False:",
+    "tests": [
+      "tests/test_media.py::test_openrouter_whisper_uses_transcription_endpoint"
+    ]
+  },
+  {
+    "prs": [
+      162
+    ],
+    "name": "structured-response-validation",
+    "path": "doc_enrichment.py",
+    "before": "return not enrichment_contract_errors(raw_response)",
+    "after": "return True",
+    "tests": [
+      "tests/test_enrichment_structured_retry.py::test_structured_response_contract_rejects_wrong_types_ranges_and_schema_tokens"
+    ]
+  },
+  {
+    "prs": [
+      161
+    ],
+    "name": "queue-progress-heartbeat",
+    "path": "flow_index_vault.py",
+    "before": "on_progress=lambda: _write_heartbeat(index_root),",
+    "after": "on_progress=None,",
+    "tests": [
+      "tests/test_index_queue_fairness.py::test_sweep_queue_service_refreshes_heartbeat_between_requests"
+    ]
+  },
+  {
+    "prs": [
+      160
+    ],
+    "name": "document-chunk-bound",
+    "path": "flow_index_vault.py",
+    "before": "kept = chunks[:remaining]",
+    "after": "kept = chunks",
+    "tests": [
+      "tests/test_scan.py::test_document_chunk_budget_caps_and_reports_degradation"
+    ]
+  },
+  {
+    "prs": [
+      159
+    ],
+    "name": "predecessor-heartbeat-age",
+    "path": "index_run_supervisor.py",
+    "before": "return stamped_at >= started_at",
+    "after": "return True",
+    "tests": [
+      "tests/test_index_run_supervisor.py::test_startup_reconciles_counterless_run_behind_predecessor_heartbeat"
+    ]
+  },
+  {
+    "prs": [
+      158,
+      201
+    ],
+    "name": "explicit-correction-grounding",
+    "path": "core/enrichment_postprocess.py",
+    "before": "repaired = _repair_explicit_corrections(repaired, source_text)",
+    "after": "repaired = dict(repaired)",
+    "tests": [
+      "tests/test_enrichment_postprocess.py::test_explicit_email_correction_and_semicolon_inversion_are_grounded"
+    ]
+  },
+  {
+    "prs": [
+      157
+    ],
+    "name": "transient-deferral-severity",
+    "path": "flow_index_vault.py",
+    "before": "logger.info(\n            \"Deferred %d docs after transient processing failures: %s\",",
+    "after": "logger.warning(\n            \"Deferred %d docs after transient processing failures: %s\",",
+    "tests": [
+      "tests/test_skip_ledger.py::test_transient_processing_failures_are_logged_as_deferred"
+    ]
+  },
+  {
+    "prs": [
+      156
+    ],
+    "name": "independent-idle-maintenance",
+    "path": "core/index_scheduler.py",
+    "before": "if self._due(self._last_maintenance, self.maintenance_interval_s, now):",
+    "after": "if False:",
+    "tests": [
+      "tests/test_index_scheduler.py::test_maintenance_runs_after_seeded_clean_boot_without_a_sweep_completion"
+    ]
+  },
+  {
+    "prs": [
+      155
+    ],
+    "name": "empty-embedding-substitution",
+    "path": "providers/embed/limits.py",
+    "before": "if not fitted.strip():",
+    "after": "if False:",
+    "tests": [
+      "tests/test_embed_input_limit.py::test_text_free_input_is_substituted_not_dropped"
+    ]
+  },
+  {
+    "prs": [
+      141
+    ],
+    "name": "fts-rebuild-maintenance",
+    "path": "lancedb_store.py",
+    "before": "self._finish_index_maintenance(self._vs.table, date.today())",
+    "after": "pass",
+    "tests": [
+      "tests/test_store.py::test_full_fts_rebuild_finishes_index_maintenance"
+    ]
+  },
+  {
+    "prs": [
+      79
+    ],
+    "name": "missing-primary-content",
+    "path": "extractors.py",
+    "before": "if not self.primary_content:",
+    "after": "if False:",
+    "tests": [
+      "tests/test_incomplete_indexing.int.test.py::test_failed_image_description_is_consumer_visible_and_stable"
+    ]
+  },
+  {
+    "prs": [],
+    "name": "schema-index-preservation",
+    "path": "lancedb_store.py",
+    "before": "if dataset.list_indices():",
+    "after": "if False:",
+    "tests": [
+      "tests/test_schema_search_availability.int.test.py::test_schema_write_keeps_concurrent_and_fresh_readers_indexed"
+    ]
+  },
+  {
+    "prs": [
+      185,
+      167
+    ],
+    "name": "retired-terminal-residue",
+    "path": "flow_index_vault.py",
+    "before": "if doc_id not in scanned_ids and doc_id_store.is_retired(doc_id)",
+    "after": "if False",
+    "tests": [
+      "tests/test_degraded_ledger.py::test_retired_terminal_residue_clears_but_unknown_entry_stays"
+    ]
+  }
+]

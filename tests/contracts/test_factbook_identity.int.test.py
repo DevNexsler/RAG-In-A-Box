@@ -119,3 +119,22 @@ def test_malformed_identity_cannot_bind_person(identity_peer, entities):
     assert result["status"] != "ok"
     assert result["entities"] == []
     assert len(identity_peer.requests) == 1
+
+
+@pytest.mark.parametrize("other_identity", [
+    {"name": "Alex"}, {"email": "other@example.test"},
+    {"name": "Alex", "email": "other@example.test"},
+])
+def test_missing_authoritative_id_never_binds_another_identity(identity_peer, other_identity):
+    def response(request):
+        arguments = request["body"]["params"]["arguments"]
+        payload = {"resolved": False, "entities": []} if arguments.get("attribute_key") == "platform_id" else {
+            "resolved": True, "entities": [{"uuid": "unrelated-person"}],
+        }
+        return 200, _envelope(request, payload)
+
+    identity_peer.respond = response
+    result = factbook_source({"platform_id": "zoho_cliq:user:missing", **other_identity})
+    assert result["status"] == "no_match"
+    assert result["entities"] == []
+    assert len(identity_peer.requests) == 1
