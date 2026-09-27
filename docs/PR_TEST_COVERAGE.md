@@ -2,7 +2,7 @@
 
 Baseline: `f6a8264c223652fa728dd6f3739b1bb905ff6dbd`, following the 37-PR cleanup and enrichment correction PR #201. Every original PR is accounted for below. A targeted mutation proves sensitivity to its named fault, not every possible regression in that PR.
 
-Run `make test-mutation` for the seven safety mutations plus the PR-specific cases in `tests/fixtures/pr_regression_mutations.json`. The runner uses disposable copies of tracked working-tree files: stage new files first. Every selector must pass without skips before mutation; changed test inventories, collection errors, crashes, timeouts, syntax errors, and invalid anchors fail the campaign. JSON/JUnit/log evidence identifies the selector and observed failure.
+The release gate runs the seven safety mutations plus the PR-specific cases in `tests/fixtures/pr_regression_mutations.json` as its mandatory `mutation` tier. `make test-mutation` runs the campaign alone. The runner uses disposable copies of tracked working-tree files: stage new files first. Every selector must pass without skips before mutation; changed test inventories, collection errors, crashes, timeouts, syntax errors, and invalid anchors fail the campaign. JSON/JUnit/log evidence identifies the selector and observed failure.
 
 | PR | Regression checked | Mutation or other verification | Tests |
 |---|---|---|---|

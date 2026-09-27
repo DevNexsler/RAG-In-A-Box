@@ -26,6 +26,7 @@ from check_tool_coverage import _iter_jsonl  # noqa: E402
 
 # canonical tier order; static emits no junit artifact so it has no row
 TIER_FILES = [("unit", "unit.xml"), ("integration", "integration.xml"),
+              ("mutation", "mutation.json"), ("soak", "soak.json"),
               ("staging-e2e", "e2e.xml"), ("live", "live.xml"),
               ("e2e-real", "e2e-real.xml")]
 DOC_CAP = 20
@@ -65,6 +66,32 @@ def _parse_junit(path: Path):
     return totals
 
 
+def _parse_campaign(path: Path):
+    """Normalize campaign evidence to report counts; invalid evidence fails."""
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict) or type(data.get("passed")) is not bool:
+            raise ValueError("missing boolean verdict")
+        failing = []
+        if path.stem == "mutation":
+            rows = data["mutations"]
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("empty mutation campaign")
+            tests = len(rows)
+            failing = [f"mutation: {row['name']} ({row['status']})"
+                       for row in rows if row["status"] != "killed"]
+        else:
+            tests = 1
+        if not data["passed"] and not failing:
+            failing.append(f"{path.stem}: {data.get('error', 'budget or invariant failed')}")
+        elapsed = float(data["elapsed_s"]) if "elapsed_s" in data else None
+        return {"tests": tests, "failures": len(failing), "errors": 0, "skipped": 0,
+                "time": elapsed, "failing": failing}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"tests": 0, "failures": 0, "errors": 1, "skipped": 0, "time": None,
+                "failing": [f"{path.stem}: invalid or unreadable campaign evidence"]}
+
+
 def _render_tiers(run_dir: Path, result=None):
     lines = ["## Tiers", "",
              "| tier | result | tests | failures | skipped | duration |",
@@ -78,22 +105,33 @@ def _render_tiers(run_dir: Path, result=None):
         lines.append(f"| static | {display} | - | - | - | - |")
     for tier, fname in TIER_FILES:
         path = run_dir / fname
+        campaign = path.suffix == ".json"
+        state = (result.get("tiers") or {}).get(tier) if result else None
+        if campaign and state in ("skipped", "not_run"):
+            # A reused run directory can contain older artifacts. Runner state
+            # wins when this campaign was not part of the current run.
+            display = "not run" if state == "not_run" else state
+            lines.append(f"| {tier} | {display} | - | - | - | - |")
+            continue
         if not path.exists():
-            lines.append(f"| {tier} | not run | - | - | - | - |")
+            display = "FAIL" if campaign and state in ("pass", "fail") else "not run"
+            any_failed = any_failed or display == "FAIL"
+            lines.append(f"| {tier} | {display} | - | - | - | - |")
             continue
         files_found += 1
-        t = _parse_junit(path)
+        t = _parse_campaign(path) if campaign else _parse_junit(path)
         if t is None:
             lines.append(f"| {tier} | not available | - | - | - | - |")
             continue
         bad = t["failures"] + t["errors"]
-        result = "FAIL" if bad else "pass"
-        any_failed = any_failed or bool(bad)
-        lines.append(f"| {tier} | {result} | {t['tests']} | {bad} | "
-                     f"{t['skipped']} | {t['time']:.1f}s |")
+        verdict = "FAIL" if bad or (campaign and state == "fail") else "pass"
+        any_failed = any_failed or verdict == "FAIL"
+        duration = f"{t['time']:.1f}s" if t["time"] is not None else "-"
+        lines.append(f"| {tier} | {verdict} | {t['tests']} | {bad} | "
+                     f"{t['skipped']} | {duration} |")
         failing.extend(f"- {name}" for name in t["failing"])
     if failing:
-        lines += ["", "Failing tests:", ""] + failing
+        lines += ["", "Failing checks:", ""] + failing
     return lines, any_failed, files_found
 
 

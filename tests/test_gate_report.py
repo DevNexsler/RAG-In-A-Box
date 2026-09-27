@@ -2,6 +2,8 @@
 # insert + namespace packages. Do not "fix" by adding __init__.py.
 import json
 
+import pytest
+
 import scripts.gate_report as gate_report
 from scripts.gate_report import build_report
 
@@ -346,3 +348,59 @@ def test_unreadable_result_json_falls_back_to_artifact_inference(tmp_path):
     md = build_report(run_dir)
     assert "| static |" not in md
     assert "— PASS" in md.splitlines()[0]
+
+
+def test_campaign_evidence_shows_mutation_kills_and_soak_failure(tmp_path):
+    run_dir = make_run(tmp_path)
+    (run_dir / "mutation.json").write_text(json.dumps({
+        "passed": True, "mutations": [{"name": "identity", "status": "killed"},
+                                     {"name": "queue", "status": "killed"}],
+    }))
+    (run_dir / "soak.json").write_text(json.dumps({"passed": False, "error": "deadline_exceeded"}))
+    md = build_report(run_dir)
+    assert "| mutation | pass | 2 | 0 | 0 | - |" in md
+    assert "| soak | FAIL | 1 | 1 | 0 | - |" in md
+    assert "soak: deadline_exceeded" in md
+    assert md.splitlines()[0].endswith("— FAIL")
+
+
+@pytest.mark.parametrize("evidence", [
+    "not json",
+    '{"passed": true, "mutations": []}',
+    '{"passed": true, "mutations": [{"name": "identity", "status": "survived"}]}',
+    '{"passed": true, "mutations": [{"name": "identity", "status": "error"}]}',
+])
+def test_invalid_or_surviving_mutants_veto_report_pass(tmp_path, evidence):
+    run_dir = make_run(tmp_path)
+    (run_dir / "mutation.json").write_text(evidence)
+    write_result(run_dir, "pass", mutation="pass")
+    md = build_report(run_dir)
+    assert "| mutation | FAIL |" in md
+    assert md.splitlines()[0].endswith("— FAIL")
+
+
+def test_unrun_campaign_ignores_stale_evidence(tmp_path):
+    run_dir = make_run(tmp_path)
+    (run_dir / "mutation.json").write_text('{"passed": false}')
+    (run_dir / "soak.json").write_text('{"passed": true, "elapsed_s": 12.5}')
+    write_result(run_dir, "fail", mutation="skipped", soak="not_run")
+    md = build_report(run_dir)
+    assert "| mutation | skipped | - | - | - | - |" in md
+    assert "| soak | not run | - | - | - | - |" in md
+
+
+def test_claimed_campaign_pass_without_evidence_is_reported_failed(tmp_path):
+    run_dir = make_run(tmp_path)
+    write_result(run_dir, "pass", mutation="pass")
+    md = build_report(run_dir)
+    assert "| mutation | FAIL | - | - | - | - |" in md
+    assert md.splitlines()[0].endswith("— FAIL")
+
+
+def test_successful_soak_reports_duration(tmp_path):
+    run_dir = make_run(tmp_path)
+    (run_dir / "soak.json").write_text('{"passed": true, "elapsed_s": 12.5}')
+    write_result(run_dir, "pass", soak="pass")
+    md = build_report(run_dir)
+    assert "| soak | pass | 1 | 0 | 0 | 12.5s |" in md
+    assert md.splitlines()[0].endswith("— PASS")
