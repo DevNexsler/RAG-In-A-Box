@@ -857,6 +857,29 @@ def test_dispatch_pptx():
     assert "Slide 1" in result.full_text
 
 
+def test_dispatch_android_mms_media_reaches_media_provider(tmp_path):
+    """.amr (MMS voice note) and .3gp (MMS video) are transcribed/analysed (#3711).
+
+    They are Android's default MMS formats and Quo tenants send them. Before,
+    both fell through to the unknown-extension branch: no provider call, empty
+    text, so the attachment was never described."""
+    from extractors import extract_text
+
+    media = _FakeMedia(transcript="voice note transcript", notes="video walkthrough")
+    voice = tmp_path / "voice.amr"
+    voice.write_bytes(b"#!AMR\n" + b"\x3c" + bytes(31))
+    video = tmp_path / "clip.3gp"
+    video.write_bytes(b"\x00\x00\x00\x14ftyp3gp4" + bytes(64))
+
+    audio_result = extract_text(voice, ext="amr", media_provider=media)
+    video_result = extract_text(video, ext=".3gp", media_provider=media)
+
+    assert "voice note transcript" in audio_result.full_text
+    assert audio_result.frontmatter["media_type"] == "audio"
+    assert "video walkthrough" in video_result.full_text
+    assert video_result.frontmatter["media_type"] == "video"
+
+
 def test_dispatch_unknown_ext(tmp_path):
     """Unknown extension returns empty text."""
     from extractors import extract_text

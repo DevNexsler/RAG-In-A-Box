@@ -27,6 +27,25 @@ def test_source_type_maps_audio_and_video_extensions():
     assert canonical_source_type(".mov") == "video"
 
 
+def test_every_extractor_media_extension_has_its_canonical_source_type():
+    """The extractor's routing sets and the search source_type map are one list.
+
+    An extension the extractor transcribes but source_types does not know would
+    index under a raw ``source_type`` like "amr" and never match an audio/video
+    filter or the media-intent boost (#3711: Android MMS .amr/.3gp)."""
+    from core.source_types import canonical_source_type
+    from extractors import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
+
+    assert {"amr"} <= AUDIO_EXTENSIONS
+    assert {"3gp"} <= VIDEO_EXTENSIONS
+    assert {ext: canonical_source_type(ext) for ext in AUDIO_EXTENSIONS} == {
+        ext: "audio" for ext in AUDIO_EXTENSIONS
+    }
+    assert {ext: canonical_source_type(ext) for ext in VIDEO_EXTENSIONS} == {
+        ext: "video" for ext in VIDEO_EXTENSIONS
+    }
+
+
 def test_build_media_provider_uses_whisper_then_fallbacks(monkeypatch):
     from providers.media import build_media_provider
 

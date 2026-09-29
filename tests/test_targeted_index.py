@@ -151,6 +151,37 @@ def test_resolve_single_record_missing_file_returns_none(tmp_path):
     assert fiv.resolve_single_record(cfg, "documents", "email-attachments/nope.pdf", store) is None
 
 
+@pytest.mark.parametrize(
+    ("rel", "source_type"),
+    [
+        ("quo-attachments/tenant/2026-06/voice-note.amr", "audio"),
+        ("quo-attachments/tenant/2026-04/leak.3gp", "video"),
+    ],
+)
+def test_resolve_single_record_accepts_android_mms_media_under_template_include(
+    tmp_path, rel, source_type
+):
+    """The shipped scan include admits Android's default MMS voice/video formats.
+
+    A per-attachment index of a Quo .amr/.3gp deposit resolved to None (not in
+    the source's include), so it was never described (#3711)."""
+    import yaml
+
+    template = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config.yaml.example").read_text()
+    )
+    root, _ = _make_attachment(tmp_path, rel, data=b"\x00\x00\x00\x14ftyp media")
+    store = DocIDStore(tmp_path / "reg.db")
+    cfg = _fs_config(root, tmp_path / "index")
+    cfg["sources"][0]["scan"]["include"] = template["scan"]["include"]
+
+    rec = fiv.resolve_single_record(cfg, "documents", rel, store)
+
+    assert rec is not None
+    assert rec["rel_path"] == rel
+    assert rec["source_type"] == source_type
+
+
 def test_resolve_single_record_unknown_source_raises(tmp_path):
     root, _ = _make_attachment(tmp_path, "email-attachments/real.pdf")
     store = DocIDStore(tmp_path / "reg.db")
