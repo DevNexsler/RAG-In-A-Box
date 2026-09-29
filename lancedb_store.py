@@ -16,7 +16,7 @@ import threading
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pyarrow as pa
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
@@ -851,6 +851,16 @@ def restore_interrupted_schema_swap(
             shutil.rmtree(temp_path)
         marker.unlink(missing_ok=True)
         return restored
+
+
+class ChunkTextReplacement(NamedTuple):
+    """One chunk rewrite, applied only if the stored text still equals ``expected_text``."""
+
+    doc_id: str
+    loc: str
+    expected_text: str
+    new_text: str
+    vector: list[float]
 
 
 class LanceDBStore:
@@ -1926,68 +1936,92 @@ class LanceDBStore:
         vector: list[float],
     ) -> bool:
         """Atomically replace one chunk after verifying caller read current text."""
-        chunk_uid = f"{doc_id}::{loc}"
-        with self._serialize_document_writes({doc_id}):
+        return self.replace_chunk_texts_and_vectors(
+            [ChunkTextReplacement(doc_id, loc, expected_text, new_text, vector)]
+        )[0]
+
+    def replace_chunk_texts_and_vectors(
+        self, replacements: list[ChunkTextReplacement]
+    ) -> list[bool]:
+        """Replace chunks in one Lance commit, each only if its caller read current text.
+
+        A commit per chunk made a bulk refresh pay one table version per row
+        (#3775). Returns, per replacement, whether that row was rewritten.
+        """
+        if not replacements:
+            return []
+        chunk_uids = [f"{item.doc_id}::{item.loc}" for item in replacements]
+        with self._serialize_document_writes({item.doc_id for item in replacements}):
             if not self._exclusive_writer_depth:
                 self._checkout_latest()
-            rows = (
-                self._vs.table.search(None)
-                .where(
-                    f"id = '{self._sql_escape(chunk_uid)}'",
-                    prefilter=True,
+            id_list = ", ".join(f"'{self._sql_escape(uid)}'" for uid in chunk_uids)
+            current_rows = {
+                row["id"]: row
+                for row in (
+                    self._vs.table.search(None)
+                    .where(f"id IN ({id_list})", prefilter=True)
+                    .select(["id", "doc_id", "text", "metadata"])
+                    .limit(len(chunk_uids))
+                    .to_list()
                 )
-                .select(["id", "doc_id", "text", "metadata"])
-                .limit(1)
-                .to_list()
-            )
-            if not rows or (rows[0].get("text") or "") != expected_text:
-                return False
+            }
+            applied = [
+                uid in current_rows
+                and (current_rows[uid].get("text") or "") == item.expected_text
+                for uid, item in zip(chunk_uids, replacements)
+            ]
+            if not any(applied):
+                return applied
 
-            metadata = rows[0].get("metadata") or {}
-            metadata = _strip_llama_managed_keys(metadata)
-            node = TextNode(
-                text=new_text,
-                id_=chunk_uid,
-                embedding=vector,
-                metadata=metadata,
-            )
-            node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
-                node_id=doc_id
-            )
-            refreshed_metadata = node_to_metadata_dict(
-                node,
-                remove_text=False,
-                flat_metadata=self._vs.flat_metadata,
-            )
-            replacement = pa.Table.from_pylist(
-                [
+            replacement_rows = []
+            swap_conditions = []
+            for uid, item, apply in zip(chunk_uids, replacements, applied):
+                if not apply:
+                    continue
+                row = current_rows[uid]
+                metadata = _strip_llama_managed_keys(row.get("metadata") or {})
+                node = TextNode(
+                    text=item.new_text,
+                    id_=uid,
+                    embedding=item.vector,
+                    metadata=metadata,
+                )
+                node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(
+                    node_id=item.doc_id
+                )
+                replacement_rows.append(
                     {
-                        "id": chunk_uid,
-                        "doc_id": rows[0].get("doc_id") or doc_id,
-                        "text": new_text,
-                        "vector": vector,
-                        "metadata": refreshed_metadata,
+                        "id": uid,
+                        "doc_id": row.get("doc_id") or item.doc_id,
+                        "text": item.new_text,
+                        "vector": item.vector,
+                        "metadata": node_to_metadata_dict(
+                            node,
+                            remove_text=False,
+                            flat_metadata=self._vs.flat_metadata,
+                        ),
                     }
-                ],
-                schema=self._vs.table.schema,
-            )
+                )
+                swap_conditions.append(
+                    f"(target.id = '{self._sql_escape(uid)}' AND "
+                    f"target.text = '{self._sql_escape(item.expected_text)}')"
+                )
             result = (
                 self._vs.table.merge_insert("id")
-                .when_matched_update_all(
-                    where=(
-                        "target.text = "
-                        f"'{self._sql_escape(expected_text)}'"
+                .when_matched_update_all(where=" OR ".join(swap_conditions))
+                .execute(
+                    pa.Table.from_pylist(
+                        replacement_rows, schema=self._vs.table.schema
                     )
                 )
-                .execute(replacement)
             )
-            if result.num_updated_rows != 1:
+            if result.num_updated_rows != len(replacement_rows):
                 raise RuntimeError(
-                    "Expected one updated chunk for "
-                    f"{chunk_uid}; got {result.num_updated_rows}"
+                    f"Expected {len(replacement_rows)} updated chunks; "
+                    f"got {result.num_updated_rows}"
                 )
             self._vs._fts_index_ready = False
-            return True
+            return applied
 
     def insert_nodes(
         self, nodes: list[TextNode], *, known_absent: bool = False

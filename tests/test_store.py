@@ -18,7 +18,7 @@ import pytest
 
 import lancedb_store as lancedb_store_module
 from llama_index.core.schema import TextNode, NodeRelationship, RelatedNodeInfo
-from lancedb_store import LanceDBStore, open_store_with_recovery
+from lancedb_store import ChunkTextReplacement, LanceDBStore, open_store_with_recovery
 
 
 def _make_node(doc_id: str, loc: str, text: str, vector: list[float]) -> TextNode:
@@ -182,6 +182,41 @@ def test_replace_chunk_text_and_vector_rejects_stale_expected_text():
 
         assert changed is False
         assert store.get_chunk("photo.jpg", "img:c:0").text == "current"
+
+
+def test_replace_chunk_texts_and_vectors_commits_batch_once_and_skips_stale_rows():
+    """#3775: a batch is one Lance commit; each row keeps its own compare-and-swap."""
+    import lance
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes(
+            [
+                _make_node("a.jpg", "img:c:0", "a old", [0.1] * 768),
+                _make_node("b.jpg", "img:c:0", "b current", [0.1] * 768),
+                _make_node("c.jpg", "img:c:0", "c old 'quoted'", [0.1] * 768),
+            ]
+        )
+        before = lance.dataset(_lance_path(tmpdir)).version
+
+        applied = store.replace_chunk_texts_and_vectors(
+            [
+                ChunkTextReplacement("a.jpg", "img:c:0", "a old", "a new", [0.2] * 768),
+                ChunkTextReplacement("b.jpg", "img:c:0", "b stale", "b new", [0.2] * 768),
+                ChunkTextReplacement(
+                    "c.jpg", "img:c:0", "c old 'quoted'", "c new", [0.3] * 768
+                ),
+                ChunkTextReplacement("gone.jpg", "img:c:0", "x", "y", [0.2] * 768),
+            ]
+        )
+
+        assert applied == [True, False, True, False]
+        assert lance.dataset(_lance_path(tmpdir)).version == before + 1
+        assert store.get_chunk("a.jpg", "img:c:0").text == "a new"
+        assert store.get_chunk("b.jpg", "img:c:0").text == "b current"
+        assert store.get_chunk("c.jpg", "img:c:0").text == "c new"
+        assert store.get_vector("c.jpg::img:c:0") == pytest.approx([0.3] * 768)
+        assert set(store.list_doc_ids()) == {"a.jpg", "b.jpg", "c.jpg"}
 
 
 def test_insert_nodes_commits_once_without_noop_delete():
