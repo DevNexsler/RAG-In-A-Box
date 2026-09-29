@@ -1366,9 +1366,9 @@ def test_refresh_repaired_sidecar_docs_uses_embedding_only_path(tmp_path, monkey
     store = MagicMock()
     embed = MagicMock()
     context = MagicMock(return_value="BEFORE MESSAGES\n[BEFORE] 482 #6")
-    refresh = MagicMock(return_value=True)
+    refresh = MagicMock(return_value={"documents::photo"})
     monkeypatch.setattr(fiv, "context_text_from_sidecar", context, raising=False)
-    monkeypatch.setattr(fiv, "refresh_document_context", refresh, raising=False)
+    monkeypatch.setattr(fiv, "refresh_documents_context", refresh, raising=False)
 
     changed, failed = fiv._refresh_repaired_sidecar_docs(
         scanned,
@@ -1387,9 +1387,180 @@ def test_refresh_repaired_sidecar_docs_uses_embedding_only_path(tmp_path, monkey
     refresh.assert_called_once_with(
         store,
         embed,
-        "documents::photo",
-        "BEFORE MESSAGES\n[BEFORE] 482 #6",
+        {"documents::photo": "BEFORE MESSAGES\n[BEFORE] 482 #6"},
     )
+
+
+def test_refresh_repaired_sidecar_docs_stops_at_budget_and_defers_rest(
+    tmp_path, monkeypatch, caplog
+):
+    """#3760: an upstream sender-name flip repaired 558 sidecars at once and the
+    serial re-embed (8-12 s/doc) held new-message processing for ~2 h. The phase
+    stops at its time budget and hands the unrefreshed docs to the next run."""
+    import flow_index_vault as fiv
+    from sources.base import SourceRecord
+
+    doc_ids = [f"documents::photo-{index}" for index in range(5)]
+    scanned = [{"doc_id": doc_id, "source_type": "img"} for doc_id in doc_ids]
+    records = {}
+    for doc_id in doc_ids:
+        sidecar = tmp_path / f"{doc_id.split('::')[1]}.json"
+        sidecar.write_text("{}")
+        records[doc_id] = SourceRecord(
+            doc_id=doc_id.split("::")[1],
+            source_type="img",
+            natural_key=f"{doc_id}.jpg",
+            mtime=1.0,
+            size=1,
+            metadata={"sidecar_path": str(sidecar), "source": "chat"},
+        )
+
+    now = [0.0]
+    refreshed = []
+
+    def slow_refresh(store, embed, contexts):
+        refreshed.extend(contexts)
+        now[0] += 120.0  # default budget is 300 s
+        return set(contexts)
+
+    monkeypatch.setattr(fiv.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        fiv, "context_text_from_sidecar", MagicMock(return_value="BEFORE MESSAGES")
+    )
+    monkeypatch.setattr(fiv, "refresh_documents_context", slow_refresh)
+    monkeypatch.setitem(fiv._RUNTIME, "context_refresh_deferred", set())
+
+    with caplog.at_level(logging.INFO):
+        changed, failed = fiv._refresh_repaired_sidecar_docs(
+            scanned,
+            records,
+            set(doc_ids),
+            MagicMock(),
+            MagicMock(),
+            batch_size=1,
+        )
+
+    assert (changed, failed) == (3, 0)
+    assert refreshed == doc_ids[:3]
+    assert fiv._RUNTIME["context_refresh_deferred"] == set(doc_ids[3:])
+    assert "deferring 2 to the next run" in caplog.text
+
+
+def test_refresh_repaired_sidecar_docs_embeds_and_commits_once_per_batch(
+    tmp_path, monkeypatch
+):
+    """#3775: the refresh paid one embedding round trip and one Lance commit
+    per doc. On the live route a single-input embed costs 0.6-8.8 s while a
+    50-input call costs ~7 s, so 558 docs took ~2 h. A batch of docs is
+    embedded in one call and written in one Lance commit."""
+    import lance
+    from lancedb_store import LanceDBStore
+    from sources.base import SourceRecord
+    from tests.test_store import _make_node
+
+    index_root = tmp_path / "index"
+    store = LanceDBStore(index_root, "chunks")
+    doc_ids = [f"documents::photo-{index}" for index in range(5)]
+    store.upsert_nodes(
+        [_make_node(doc_id, "img:c:0", f"photo {doc_id}", [0.1] * 768) for doc_id in doc_ids]
+    )
+    records = {}
+    for doc_id in doc_ids:
+        sidecar = tmp_path / f"{doc_id.split('::')[1]}.json"
+        sidecar.write_text("{}")
+        records[doc_id] = SourceRecord(
+            doc_id=doc_id.split("::")[1],
+            source_type="img",
+            natural_key=f"{doc_id}.jpg",
+            mtime=1.0,
+            size=1,
+            metadata={"sidecar_path": str(sidecar), "source": "chat"},
+        )
+    embed = MagicMock()
+    embed.embed_texts.side_effect = lambda texts: [[0.2] * 768 for _ in texts]
+    monkeypatch.setattr(
+        fiv, "context_text_from_sidecar", MagicMock(return_value="BEFORE: 482 #6")
+    )
+    version_before = lance.dataset(str(index_root / "chunks.lance")).version
+
+    changed, failed = fiv._refresh_repaired_sidecar_docs(
+        [{"doc_id": doc_id, "source_type": "img"} for doc_id in doc_ids],
+        records,
+        set(doc_ids),
+        store,
+        embed,
+    )
+
+    assert (changed, failed) == (5, 0)
+    assert embed.embed_texts.call_count == 1
+    assert len(embed.embed_texts.call_args.args[0]) == 5
+    assert lance.dataset(str(index_root / "chunks.lance")).version == version_before + 1
+    for doc_id in doc_ids:
+        assert store.get_chunk(doc_id, "img:c:0").text == (
+            f"photo {doc_id}\n\n[Conversation context]\nBEFORE: 482 #6"
+        )
+
+
+def test_refresh_repaired_sidecar_docs_isolates_a_failing_doc_in_its_batch(
+    tmp_path, monkeypatch
+):
+    """One doc that the provider rejects must not fail the rest of its batch."""
+    import flow_index_vault as fiv
+    from sources.base import SourceRecord
+
+    doc_ids = ["documents::a", "documents::bad", "documents::c"]
+    records = {}
+    for doc_id in doc_ids:
+        sidecar = tmp_path / f"{doc_id.split('::')[1]}.json"
+        sidecar.write_text("{}")
+        records[doc_id] = SourceRecord(
+            doc_id=doc_id.split("::")[1],
+            source_type="img",
+            natural_key=f"{doc_id}.jpg",
+            mtime=1.0,
+            size=1,
+            metadata={"sidecar_path": str(sidecar), "source": "chat"},
+        )
+
+    def refresh(store, embed, contexts):
+        if "documents::bad" in contexts:
+            raise RuntimeError("provider rejected input")
+        return set(contexts)
+
+    monkeypatch.setattr(
+        fiv, "context_text_from_sidecar", MagicMock(return_value="BEFORE MESSAGES")
+    )
+    monkeypatch.setattr(fiv, "refresh_documents_context", refresh)
+
+    changed, failed = fiv._refresh_repaired_sidecar_docs(
+        [{"doc_id": doc_id, "source_type": "img"} for doc_id in doc_ids],
+        records,
+        set(doc_ids),
+        MagicMock(),
+        MagicMock(),
+    )
+
+    assert (changed, failed) == (2, 1)
+
+
+def test_context_refresh_candidates_carry_deferred_docs_to_next_run(tmp_path):
+    import flow_index_vault as fiv
+
+    fiv._save_context_refresh_pending(tmp_path, {"documents::a", "documents::gone"})
+    pending = fiv._load_context_refresh_pending(tmp_path)
+
+    assert pending == {"documents::a", "documents::gone"}
+    # Carried-over docs join this run's repairs; docs that left the store or
+    # are fully reprocessed this run (fresh context) drop out.
+    assert fiv._context_refresh_candidates(
+        repaired={"documents::b", "documents::c"},
+        pending=pending,
+        stored_doc_ids={"documents::a", "documents::b", "documents::c"},
+        full_processing_doc_ids={"documents::c"},
+    ) == {"documents::a", "documents::b"}
+
+    (tmp_path / "context_refresh_pending.json").write_text("not json")
+    assert fiv._load_context_refresh_pending(tmp_path) == set()
 
 
 @pytest.mark.parametrize(

@@ -73,7 +73,7 @@ from communication_context import (
 )
 from attachment_context_refresh import (
     context_text_from_sidecar,
-    refresh_document_context,
+    refresh_documents_context,
 )
 from core import enrichment_telemetry, lance_session
 from core.config import filesystem_source_roots, load_config
@@ -984,6 +984,62 @@ def _repair_communication_sidecars(
     return repaired
 
 
+# The context-only refresh runs ahead of document processing. An upstream
+# sender-name flip once repaired 558 sidecars in a single run and held
+# new-message indexing for ~2 h (#3760), so the phase stops at this budget and
+# hands the rest to the next run. Docs are refreshed in batches of one embed
+# call and one Lance commit: an embed round trip costs about the same for one
+# input as for fifty, and paying it per doc was the 8-12 s/doc (#3775).
+_CONTEXT_REFRESH_BUDGET_SECONDS = 300.0
+_CONTEXT_REFRESH_BATCH_SIZE = 50
+
+
+def _context_refresh_pending_path(index_root: Path) -> Path:
+    return Path(index_root) / "context_refresh_pending.json"
+
+
+def _load_context_refresh_pending(index_root: Path) -> set[str]:
+    """Docs whose repaired sidecar context a budgeted run did not re-embed yet."""
+    try:
+        payload = json.loads(
+            _context_refresh_pending_path(index_root).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return set()
+    docs = payload.get("docs") if isinstance(payload, dict) else None
+    return {str(doc_id) for doc_id in docs} if isinstance(docs, list) else set()
+
+
+def _save_context_refresh_pending(index_root: Path, doc_ids: set[str]) -> None:
+    path = _context_refresh_pending_path(index_root)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(
+            json.dumps({"docs": sorted(doc_ids)}, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        tmp_path.unlink(missing_ok=True)
+        logging.getLogger(__name__).warning(
+            "Failed to save context refresh pending ledger: %s", exc
+        )
+
+
+def _context_refresh_candidates(
+    *,
+    repaired: set[str],
+    pending: set[str],
+    stored_doc_ids: set[str],
+    full_processing_doc_ids: set[str],
+) -> set[str]:
+    """Stored docs needing a context-only re-embed this run.
+
+    A sidecar is repaired once, so a doc deferred by the budget is only found
+    again through the pending ledger. Fully reprocessed docs get fresh context
+    from the normal path and need no refresh."""
+    return (repaired | pending) & stored_doc_ids - full_processing_doc_ids
+
+
 def _refresh_repaired_sidecar_docs(
     scanned: list[dict],
     source_records_by_ns_doc_id: dict[str, object],
@@ -992,52 +1048,112 @@ def _refresh_repaired_sidecar_docs(
     embed_provider: EmbedProvider,
     *,
     max_time_window_minutes: float = 15,
+    budget_seconds: float = _CONTEXT_REFRESH_BUDGET_SECONDS,
+    batch_size: int = _CONTEXT_REFRESH_BATCH_SIZE,
     logger: logging.Logger | None = None,
 ) -> tuple[int, int]:
-    """Re-embed repaired context without re-extracting attachment media."""
+    """Re-embed repaired context without re-extracting attachment media.
+
+    Stops once `budget_seconds` have elapsed; the unrefreshed doc ids go to
+    `_RUNTIME["context_refresh_deferred"]` for the next run."""
     logger = logger or logging.getLogger(__name__)
     records_by_doc_id = {
         str(record.get("doc_id", "")): record for record in scanned
     }
     changed = 0
     failed = 0
-    for doc_id in sorted(repaired_doc_ids):
-        doc = records_by_doc_id.get(doc_id)
-        source_record = source_records_by_ns_doc_id.get(doc_id)
-        if doc is None or source_record is None:
-            continue
-        metadata = getattr(source_record, "metadata", {})
-        metadata = metadata if isinstance(metadata, dict) else {}
-        item = communication_item_from_record(doc, metadata)
-        if item is None or not item.sidecar_path:
-            continue
-        try:
-            context_text = context_text_from_sidecar(
-                Path(item.sidecar_path),
-                doc_id=doc_id,
-                max_time_window_minutes=max_time_window_minutes,
+    ordered_doc_ids = sorted(repaired_doc_ids)
+    started = time.monotonic()
+    for position in range(0, len(ordered_doc_ids), batch_size):
+        elapsed = time.monotonic() - started
+        if elapsed >= budget_seconds:
+            deferred = ordered_doc_ids[position:]
+            _RUNTIME.setdefault("context_refresh_deferred", set()).update(deferred)
+            logger.info(
+                "Attachment context-only refresh budget %.0fs reached after "
+                "%d/%d docs; deferring %d to the next run",
+                budget_seconds, position, len(ordered_doc_ids), len(deferred),
             )
-            if not context_text:
+            break
+        if position:
+            logger.info(
+                "Attachment context-only refresh progress %d/%d changed=%d "
+                "failed=%d elapsed=%.0fs",
+                position, len(ordered_doc_ids), changed, failed, elapsed,
+            )
+        contexts: dict[str, str] = {}
+        for doc_id in ordered_doc_ids[position:position + batch_size]:
+            doc = records_by_doc_id.get(doc_id)
+            source_record = source_records_by_ns_doc_id.get(doc_id)
+            if doc is None or source_record is None:
                 continue
-            if refresh_document_context(
-                store,
-                embed_provider,
-                doc_id,
-                context_text,
-            ):
-                changed += 1
-                _record_index_write(1)
-        except Exception as exc:
-            failed += 1
-            logger.warning(
-                "Attachment context refresh failed for '%s': %s",
-                doc_id,
-                exc,
-            )
-            _RUNTIME.setdefault("_warnings", []).append(
-                f"attachment_context_refresh_failed:{doc_id}:{exc}"
-            )
+            metadata = getattr(source_record, "metadata", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            item = communication_item_from_record(doc, metadata)
+            if item is None or not item.sidecar_path:
+                continue
+            try:
+                context_text = context_text_from_sidecar(
+                    Path(item.sidecar_path),
+                    doc_id=doc_id,
+                    max_time_window_minutes=max_time_window_minutes,
+                )
+            except Exception as exc:
+                failed += 1
+                _warn_context_refresh_failed(logger, doc_id, exc)
+                continue
+            if context_text:
+                contexts[doc_id] = context_text
+        batch_changed, batch_failed = _refresh_context_batch(
+            store, embed_provider, contexts, logger
+        )
+        changed += batch_changed
+        failed += batch_failed
     return changed, failed
+
+
+def _refresh_context_batch(
+    store: Any,
+    embed_provider: EmbedProvider,
+    contexts: dict[str, str],
+    logger: logging.Logger,
+) -> tuple[int, int]:
+    """Refresh one batch; if it fails, retry each doc alone so one bad doc
+    cannot fail its neighbours. Returns (changed, failed)."""
+    if not contexts:
+        return 0, 0
+    try:
+        changed = len(refresh_documents_context(store, embed_provider, contexts))
+    except Exception as exc:
+        if len(contexts) == 1:
+            _warn_context_refresh_failed(logger, next(iter(contexts)), exc)
+            return 0, 1
+        logger.warning(
+            "Attachment context refresh batch of %d failed, retrying per doc: %s",
+            len(contexts),
+            exc,
+        )
+        results = [
+            _refresh_context_batch(store, embed_provider, {doc_id: text}, logger)
+            for doc_id, text in contexts.items()
+        ]
+        return sum(c for c, _ in results), sum(f for _, f in results)
+    for _ in range(changed):
+        _record_index_write(1)
+    return changed, 0
+
+
+def _warn_context_refresh_failed(
+    logger: logging.Logger, doc_id: str, exc: Exception
+) -> None:
+    logger.warning(
+        "Attachment context refresh failed for '%s': %s",
+        doc_id,
+        exc,
+    )
+    _RUNTIME.setdefault("_warnings", []).append(
+        f"attachment_context_refresh_failed:{doc_id}:{exc}"
+    )
 
 
 # The retry budgets and the terminal test live in core.degraded_policy: the
@@ -4317,10 +4433,12 @@ def index_vault_flow(
     full_processing_doc_ids = {
         str(record.get("doc_id", "")) for record in to_add_or_update
     }
-    context_refresh_doc_ids = (
-        repaired_sidecar_doc_ids
-        & set(stored_mtimes)
-        - full_processing_doc_ids
+    pending_context_refresh = _load_context_refresh_pending(index_root)
+    context_refresh_doc_ids = _context_refresh_candidates(
+        repaired=repaired_sidecar_doc_ids,
+        pending=pending_context_refresh,
+        stored_doc_ids=set(stored_mtimes),
+        full_processing_doc_ids=full_processing_doc_ids,
     )
     stored_doc_count = len(stored_mtimes)
     changed_doc_count = len(to_add_or_update) + len(to_delete)
@@ -4442,6 +4560,8 @@ def index_vault_flow(
             _write_heartbeat(index_root)
             memory_observer.sample("phase_finish", phase="pre_index_maintenance")
 
+    communication_cfg = config.get("communication_context", {})
+    _RUNTIME["context_refresh_deferred"] = set()
     context_refresh_changed, context_refresh_failed = (
         _refresh_repaired_sidecar_docs(
             scanned,
@@ -4449,14 +4569,29 @@ def index_vault_flow(
             context_refresh_doc_ids,
             store,
             embed_provider,
-            max_time_window_minutes=config.get("communication_context", {}).get(
+            max_time_window_minutes=communication_cfg.get(
                 "max_time_window_minutes", 15
+            ),
+            budget_seconds=float(
+                communication_cfg.get(
+                    "refresh_budget_seconds", _CONTEXT_REFRESH_BUDGET_SECONDS
+                )
             ),
             logger=logger,
         )
         if context_refresh_doc_ids
         else (0, 0)
     )
+    # A source-scoped run only sees its own docs; keep the other sources' pending.
+    still_pending = set(_RUNTIME["context_refresh_deferred"])
+    if source_name:
+        still_pending |= {
+            doc_id
+            for doc_id in pending_context_refresh
+            if not doc_id.startswith(f"{source_name}::")
+        }
+    if still_pending != pending_context_refresh:
+        _save_context_refresh_pending(index_root, still_pending)
     if context_refresh_changed or context_refresh_failed:
         logger.info(
             "Attachment context-only refresh changed=%d failed=%d",

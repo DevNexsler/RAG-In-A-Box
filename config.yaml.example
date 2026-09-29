@@ -129,6 +129,9 @@ communication_context:
   max_time_window_minutes: 15
   same_channel_only: true
   include_batch: true
+  # Per-run cap on the context-only re-embed of repaired attachment sidecars;
+  # the rest carries over to the next run so new messages are not held behind it.
+  refresh_budget_seconds: 300
 
 enrichment:
   enabled: true
