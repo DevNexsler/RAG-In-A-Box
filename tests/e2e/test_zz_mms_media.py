@@ -67,7 +67,7 @@ async def test_mms_attachment_indexes_with_media_description(
         event
         for event in await get_hook_events()
         if event.get("event") == "document.indexed"
-        and event.get("rel_path") == rel_path
+        and event.get("doc_id") == result["doc_id"]
     ]
     assert events and events[0].get("chunks"), events
 
