@@ -131,6 +131,11 @@ _GENERIC_DOC_TYPES = {
 }
 _DEFAULT_RULES = {"importance", "doc_type", "key_facts", "explicit_corrections"}
 
+
+def is_generic_doc_type(label: str) -> bool:
+    """Whether one ``enr_doc_type`` label names only the medium, not a type."""
+    return canonicalize_doc_type(label) in _GENERIC_DOC_TYPES
+
 # Compounds the enrichment model spells both as one word and as two. #1251's
 # separator fold cannot reconcile these — they differ in word count, not in
 # punctuation — so `followup` and `follow_up` stay two buckets no single LIKE

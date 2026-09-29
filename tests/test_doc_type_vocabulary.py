@@ -55,6 +55,60 @@ def test_reconcile_doc_type_accepts_first_write():
     assert disagreed is False
 
 
+def test_reconcile_doc_type_lets_a_specific_label_refine_a_medium_only_label():
+    """#3637: 'notification, email' names the medium, not the document type.
+
+    Production kept it (and its order variant) over the model's
+    ``email_notification`` on every re-index, so the corpus never converged.
+    """
+    for existing in ("notification, email", "email, notification", UNCLASSIFIED_DOC_TYPE):
+        final, disagreed = reconcile_doc_type(
+            existing=existing, proposed="email_notification"
+        )
+        assert final == "email_notification", existing
+        assert disagreed is False, existing
+
+
+def test_reconcile_doc_type_keeps_stickiness_between_equally_specific_labels():
+    # Medium-only to medium-only is a coin flip, not a refinement.
+    assert reconcile_doc_type(existing="email", proposed="message") == ("email", True)
+    # A medium-only or unclassified proposal never displaces anything.
+    assert reconcile_doc_type(
+        existing="notification, email", proposed=UNCLASSIFIED_DOC_TYPE
+    ) == ("notification, email", True)
+    assert reconcile_doc_type(
+        existing="order_confirmation, invoice", proposed="email"
+    ) == ("order_confirmation, invoice", True)
+    # Specific existing labels stay sticky against specific proposals.
+    assert reconcile_doc_type(
+        existing="order_confirmation, invoice", proposed="order_confirmation"
+    ) == ("order_confirmation, invoice", True)
+
+
+def test_enrich_document_replaces_medium_only_existing_label():
+    """Production trace: stored 'notification, email', model says email_notification."""
+    generator = MagicMock()
+    from tests.test_enrichment import _complete_enrichment_json
+    generator.generate.return_value = _complete_enrichment_json(**(
+        {
+            "summary": "New mail is waiting in your digital mailbox.",
+            "doc_type": ["email_notification"],
+            "topics": ["mail notification"],
+        }
+    ))
+
+    result = enrich_document(
+        text="You have new mail at The UPS Store.",
+        title="New Mail",
+        source_type="zoho_mail",
+        generator=generator,
+        existing_doc_type="notification, email",
+    )
+
+    assert result["enr_doc_type"] == "email_notification"
+    assert "_doc_type_disagreement" not in result
+
+
 def test_enrichment_input_hash_stable_for_identical_inputs():
     kwargs = dict(
         text="Tenant paid rent on 2026-09-20.",

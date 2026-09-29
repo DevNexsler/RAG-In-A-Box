@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from core.enrichment_postprocess import canonicalize_doc_type
+from core.enrichment_postprocess import canonicalize_doc_type, is_generic_doc_type
 
 
 def _csv_values(value: str) -> list[str]:
@@ -220,7 +220,10 @@ def reconcile_doc_type(*, existing: str, proposed: str) -> tuple[str, bool]:
     """Keep a stored label when a fresh enrichment disagrees.
 
     Reclassification is a deliberate event, not a side effect of re-indexing.
-    Returns ``(final_value, disagreed)``.
+    A stored label that names no type — only the medium (``email,
+    notification``) or the ``unclassified`` sentinel — is not a classification
+    to protect: a proposal naming a type refines it (#3637). Returns
+    ``(final_value, disagreed)``.
     """
     existing_norm = canonicalize_doc_type(existing or "")
     proposed_norm = canonicalize_doc_type(proposed or "")
@@ -230,7 +233,16 @@ def reconcile_doc_type(*, existing: str, proposed: str) -> tuple[str, bool]:
         return existing_norm, False
     if existing_norm == proposed_norm:
         return existing_norm, False
+    if not _names_a_type(existing_norm) and _names_a_type(proposed_norm):
+        return proposed_norm, False
     return existing_norm, True
+
+
+def _names_a_type(value: str) -> bool:
+    return any(
+        label != UNCLASSIFIED_DOC_TYPE and not is_generic_doc_type(label)
+        for label in _csv_values(value)
+    )
 
 
 def enrichment_input_hash(
