@@ -23,6 +23,8 @@ sources:
         - "**/*.wav"
         - "**/*.mp3"
         - "**/*.mp4"
+        - "**/*.amr"
+        - "**/*.3gp"
       exclude:
         - "**/.DS_Store"
 

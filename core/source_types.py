@@ -28,12 +28,14 @@ SOURCE_TYPE_BY_EXTENSION = {
     "ogg": "audio",
     "aac": "audio",
     "aiff": "audio",
+    "amr": "audio",
     "mp4": "video",
     "mov": "video",
     "mkv": "video",
     "webm": "video",
     "avi": "video",
     "m4v": "video",
+    "3gp": "video",
 }
 
 BUILTIN_SOURCE_TYPES = set(SOURCE_TYPE_BY_EXTENSION.values()) | {"other"}

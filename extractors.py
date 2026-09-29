@@ -78,8 +78,9 @@ def note_skip(reason: str) -> None:
     if skips is not None:
         skips.append(reason)
 
-AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "flac", "ogg", "aac", "aiff"}
-VIDEO_EXTENSIONS = {"mp4", "mov", "mkv", "webm", "avi", "m4v"}
+# amr/3gp are Android's default MMS voice-note/video formats (#3711).
+AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "flac", "ogg", "aac", "aiff", "amr"}
+VIDEO_EXTENSIONS = {"mp4", "mov", "mkv", "webm", "avi", "m4v", "3gp"}
 
 
 @dataclass
