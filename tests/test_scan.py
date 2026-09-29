@@ -1849,6 +1849,45 @@ def test_existing_changed_store_prunes_before_processing_and_finalizes_without_r
     fake_store.ensure_fts_index.assert_called_once_with()
 
 
+def test_flow_carries_budget_deferred_context_refresh_to_next_run(tmp_path):
+    """#3760: a sidecar is repaired once, so a doc the budget defers is only
+    refreshed later if the flow persists it and feeds it into the next run."""
+    fake_store = MagicMock()
+    fake_store.list_doc_ids.return_value = ["documents::a", "documents::b"]
+    fake_store.list_doc_mtimes.return_value = {
+        "documents::a": 1.0,
+        "documents::b": 1.0,
+    }
+    fake_store.list_doc_change_hashes.return_value = {}
+    fake_store.count_chunks.return_value = 2
+    fake_store.fts_available.return_value = True
+    fake_store.vector_index_available.return_value = True
+    fake_store.vector_index_stats.return_value = {"available": True, "name": "vector_idx", "index_type": "IVF_FLAT", "num_indices": 1, "indexed_rows": 1, "unindexed_rows": 0, "stale": False}
+
+    repairs = iter([{"documents::a", "documents::b"}, set(), set()])
+    refreshed_per_run: list[set[str]] = []
+
+    def budgeted_refresh(_scanned, _records, doc_ids, *_args, **_kwargs):
+        refreshed_per_run.append(set(doc_ids))
+        # The first run's budget runs out after one doc.
+        if len(refreshed_per_run) == 1:
+            fiv._RUNTIME["context_refresh_deferred"].add("documents::b")
+        return len(doc_ids), 0
+
+    with patch(
+        "flow_index_vault._repair_communication_sidecars",
+        side_effect=lambda *_args, **_kwargs: next(repairs),
+    ), patch(
+        "flow_index_vault._refresh_repaired_sidecar_docs",
+        side_effect=budgeted_refresh,
+    ):
+        for _ in range(3):
+            _run_flow_with_fts_store(tmp_path, fake_store, ([], []))
+
+    assert refreshed_per_run == [{"documents::a", "documents::b"}, {"documents::b"}]
+    assert fiv._load_context_refresh_pending(tmp_path / "index") == set()
+
+
 def test_fresh_store_skips_pre_index_maintenance_and_creates_fts_after_processing(tmp_path):
     events: list[str] = []
     fake_store = MagicMock()
