@@ -18,6 +18,37 @@ CASES = json.loads(
 )
 
 
+# A faithful proposal summary may deny adoption ("rather than an already adopted
+# policy"), so judge each clause's claim: an adoption word counts only when no
+# negation precedes it in the same clause.
+_CLAUSE_BREAK = re.compile(r'[.;:,!?]|\bbut\b')
+_ADOPTION = re.compile(r'\b(adopted|established|enacted)\b')
+_NEGATION = re.compile(r"\b(not|no|never|nor|rather than|instead of|yet to be)\b|n't\b")
+
+
+def _claims_adoption(text):
+    return any(not _NEGATION.search(clause[:match.start()])
+               for clause in _CLAUSE_BREAK.split(text)
+               for match in _ADOPTION.finditer(clause))
+
+
+@pytest.mark.parametrize('summary, claims', [
+    # Observed live (#3581): a faithful proposal summary that denies adoption.
+    ('the sender proposes establishing 11 pm as a permanent cutoff time for fires. '
+     'this proposal is presented as a suggestion for a standing rule rather than '
+     'an already adopted policy.', False),
+    ('the proposed cutoff has not been adopted yet.', False),
+    ("the rule isn't established; the tenant only suggests it.", False),
+    ('this is a proposal, not an enacted rule.', False),
+    ('the policy was adopted.', True),
+    ('the sender proposes 11 pm, and the cutoff was established as a permanent rule.', True),
+    ('the tenant did not merely propose it but adopted the rule.', True),
+    ('management enacted the proposal; it is not optional.', True),
+])
+def test_adoption_claim_distinguishes_denial(summary, claims):
+    assert _claims_adoption(summary) is claims
+
+
 @pytest.mark.parametrize('context', [False, True], ids=['atomic', 'with_context'])
 def test_modality_contract_reaches_generator(context):
     generator = Mock()
@@ -80,7 +111,7 @@ def test_live_enrichment_preserves_modality(case):
     elif case['id'] == 'proposal':
         assert re.search(r'\b(propos\w*|suggest\w*)\b', summary), result
         assert re.search(r'\b(propos\w*|suggest\w*)\b', ' '.join(facts).lower()), result
-        assert not re.search(r'\b(adopted|established|enacted)\b', summary), result
+        assert not _claims_adoption(summary), result
     else:
         assert re.search(r'\b(adopt\w*|establish\w*|implement\w*|rule|policy)\b', summary), result
         assert re.search(r'\b(permanent|standing|every night|nightly)\b',
