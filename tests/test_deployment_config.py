@@ -4,7 +4,10 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
+
+from search_hybrid import RERANK_TIMEOUT_SECONDS, build_reranker
 
 
 def test_docker_compose_uses_env_vars_for_database_dsns():
@@ -209,3 +212,28 @@ def test_dockerignore_excludes_generated_repository_directories():
     }
 
     assert {".worktrees", ".gitnexus", "logs", "test_index"} <= ignored_roots
+
+
+@pytest.mark.parametrize(
+    "config_path", ["config.yaml.example", "config.vps.yaml.example", "config_test.yaml.example"],
+)
+def test_shipped_reranker_timeout_stays_within_search_budget(config_path, monkeypatch):
+    """The reranker runs inline on every hybrid search; its timeout is how long a
+    slow DeepInfra endpoint holds each query before the cosine fallback runs.
+    #3953: the shipped 120 s let a degraded endpoint add 38-120 s per search."""
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "test-key")
+    config = yaml.safe_load(Path(config_path).read_text())
+
+    reranker = build_reranker(config)
+
+    assert reranker is not None
+    assert reranker.timeout <= RERANK_TIMEOUT_SECONDS, (
+        f"{config_path}: search.reranker.timeout={reranker.timeout}s lets a slow "
+        f"reranker add that long to every search (budget {RERANK_TIMEOUT_SECONDS}s)"
+    )
+
+
+def test_reranker_timeout_defaults_to_search_budget():
+    reranker = build_reranker({"search": {"reranker": {"enabled": True, "api_key": "test-key"}}})
+
+    assert reranker.timeout == RERANK_TIMEOUT_SECONDS
