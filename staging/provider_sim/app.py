@@ -102,6 +102,10 @@ _OVERSHOOT_BUDGET_SUMMARY = "Overshot-budget enrichment marker."
 # uploads a receipt carrying that member ID next to its real, masked card.
 MEMBER_ID_AS_CARD_FACT = "Payment was made via Visa Pro Xtra credit card ending in 7305."
 
+# The #3903 answer: a daily digest's grounded keyword that also names a schema
+# field. A test that arms it indexes a document printing every one of them.
+GROUNDED_SCHEMA_WORD_KEYWORDS = ["Ticket Resolution", "Summary", "Daily Report"]
+
 
 def _fake_enrichment(text: str) -> str:
     """Minimal valid enrichment JSON with values derived from the text hash."""
@@ -259,6 +263,24 @@ def _fault_response(fault: str) -> Response | None:
         return JSONResponse(
             {
                 "id": "sim-member-id-as-card",
+                "object": "chat.completion",
+                "model": "sim-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": json.dumps(enrichment)},
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 40, "total_tokens": 52},
+            }
+        )
+    if fault == "grounded_schema_word":
+        enrichment = json.loads(_fake_enrichment(""))
+        enrichment["keywords"] = GROUNDED_SCHEMA_WORD_KEYWORDS
+        return JSONResponse(
+            {
+                "id": "sim-grounded-schema-word",
                 "object": "chat.completion",
                 "model": "sim-model",
                 "choices": [
@@ -602,6 +624,7 @@ _KNOWN_FAULTS = {
     "reasoning_only",
     "overshoot_budget",
     "member_id_as_card",
+    "grounded_schema_word",
     "hangup",
 }
 
