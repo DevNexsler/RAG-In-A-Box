@@ -284,11 +284,14 @@ _SCHEMA_FIELD_DESCRIPTIONS = {
 _SCHEMA_PLACEHOLDER_VALUES = {
     description.lower() for description in _SCHEMA_FIELD_DESCRIPTIONS.values()
 }
+# A field name is copied schema only in identifier form ("suggested_folder",
+# "enr_summary"). Single-word names ("summary", "topics", "keywords",
+# "importance") are ordinary vocabulary a document can contain (#3903).
 _SCHEMA_PLACEHOLDER_VALUES.update(
     {
         "type1",
         "type2",
-        *(_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW),
+        *(key for key in (_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW) if "_" in key),
         *(f"enr_{key}" for key in (_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW)),
     }
 )
