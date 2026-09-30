@@ -17,11 +17,15 @@ from providers.media.base import MediaPolicyError
 
 logger = logging.getLogger(__name__)
 
+# No speech maps to an empty reply, never a placeholder: core.fallback treats
+# reachable-empty as "confirm with the fallback or retry", whereas placeholder text
+# is stored as a final transcript. A placeholder offer is also an escape hatch the
+# non-thinking Omni `audio` alias took on audible voice notes (#3835).
 _AUDIO_TRANSCRIBE_PROMPT = (
-    "Transcribe this audio faithfully for document search. If multiple speakers "
-    "are clear, label them only as Speaker 1, Speaker 2, and do not infer "
-    "identity. If no speech is intelligible, return [No intelligible speech] "
-    "and nothing else. Never invent or reconstruct dialogue. Return plain text only."
+    "Transcribe all speech in this audio faithfully for document search. If "
+    "multiple speakers are clear, label them only as Speaker 1, Speaker 2, and do "
+    "not infer identity. Never invent or reconstruct dialogue; if there is no "
+    "speech at all, return nothing. Return plain text only."
 )
 _VIDEO_ANALYZE_PROMPT = (
     "You are reviewing a residential/property walkthrough video for maintenance, "

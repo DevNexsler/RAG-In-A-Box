@@ -157,11 +157,57 @@ def test_media_provider_routes_audio_and_video_to_separate_chat_endpoints(tmp_pa
     assert audio_call.kwargs["headers"]["Authorization"] == "Bearer litellm-key"
     assert audio_call.kwargs["json"]["model"] == "transcribe-diarized"
     audio_prompt = audio_call.kwargs["json"]["messages"][0]["content"][0]["text"]
-    assert "No intelligible speech" in audio_prompt
+    assert "no speech at all, return nothing" in audio_prompt
     assert "Never invent" in audio_prompt
     assert video_call.args[0] == "https://openrouter.example/v1/chat/completions"
     assert video_call.kwargs["headers"]["Authorization"] == "Bearer openrouter-key"
     assert video_call.kwargs["json"]["model"] == "qwen/video"
+
+
+def test_litellm_audio_prompt_asks_for_all_speech_and_empty_on_none(
+    tmp_path: Path, monkeypatch
+):
+    """#3835: the prompt the production `audio` alias receives offers no placeholder.
+
+    The alias serves Nemotron Omni under a LiteLLM `/no_think` system append.
+    Measured on the live engine, "If no speech is intelligible, return
+    [No intelligible speech]" was taken for audible speech (a 26 s voice note
+    as 16 kHz WAV, 8 kHz WAV and MP3: 12/12 calls), and the indexer stored the
+    placeholder as a final transcript. "No speech" must come back empty, so
+    core.fallback's reachable-empty rule decides between retry, fallback and
+    a confirmed blank.
+    """
+    from providers.media import build_media_provider
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("LITELLM_API_KEY", "litellm-key")
+    audio = tmp_path / "voice.wav"
+    audio.write_bytes(b"fake-audio")
+    provider = build_media_provider(
+        {
+            "media": {
+                "enabled": True,
+                "provider": "litellm",
+                "endpoint": "http://litellm.example/v1",
+                "audio_model": "audio",
+            }
+        }
+    )
+
+    with patch(
+        "providers.fallback.litellm_fallback.httpx.post",
+        return_value=_ok_response(),
+    ) as post:
+        assert provider.transcribe_audio(audio) == "transcribed text"
+
+    payload = post.call_args.kwargs["json"]
+    assert payload["model"] == "audio"
+    prompt = payload["messages"][0]["content"][0]["text"]
+    assert "[" not in prompt and "]" not in prompt, prompt
+    assert "intelligible" not in prompt.lower(), prompt
+    assert "transcribe all speech" in prompt.lower(), prompt
+    assert "no speech at all, return nothing" in prompt.lower(), prompt
+    assert "Never invent" in prompt
 
 
 def test_build_media_provider_resolves_litellm_audio_credentials(monkeypatch):
