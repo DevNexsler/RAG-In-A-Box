@@ -193,7 +193,7 @@ search:
     enabled: true
     provider: "deepinfra"                 # Qwen3-Reranker-8B via DeepInfra (always-on, no cold start)
     model: "Qwen/Qwen3-Reranker-8B"
-    timeout: 120
+    timeout: 10                           # per-search wait before the cosine fallback; added to every query when DeepInfra is slow
     # base_url: "https://api.deepinfra.com"  # override for staging/self-hosted gateways
 
 lancedb:
