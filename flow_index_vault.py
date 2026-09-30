@@ -1118,13 +1118,22 @@ def _refresh_context_batch(
     contexts: dict[str, str],
     logger: logging.Logger,
 ) -> tuple[int, int]:
-    """Refresh one batch; if it fails, retry each doc alone so one bad doc
-    cannot fail its neighbours. Returns (changed, failed)."""
+    """Refresh one batch. Returns (changed, failed).
+
+    A transient failure (provider down, rate-limited) would fail every doc
+    alike, so the batch goes to the next run's ledger. Any other failure
+    retries each doc alone so one bad doc cannot fail its neighbours; the
+    retry stops at the first transient failure and defers the rest, keeping
+    an outage to one retry ladder instead of one per doc."""
     if not contexts:
         return 0, 0
+    failed = 0
     try:
         changed = len(refresh_documents_context(store, embed_provider, contexts))
     except Exception as exc:
+        if is_transient(exc):
+            _defer_context_refresh(logger, contexts, exc)
+            return 0, 0
         if len(contexts) == 1:
             _warn_context_refresh_failed(logger, next(iter(contexts)), exc)
             return 0, 1
@@ -1133,14 +1142,40 @@ def _refresh_context_batch(
             len(contexts),
             exc,
         )
-        results = [
-            _refresh_context_batch(store, embed_provider, {doc_id: text}, logger)
-            for doc_id, text in contexts.items()
-        ]
-        return sum(c for c, _ in results), sum(f for _, f in results)
+        changed = 0
+        doc_ids = list(contexts)
+        for position, doc_id in enumerate(doc_ids):
+            try:
+                changed += len(
+                    refresh_documents_context(
+                        store, embed_provider, {doc_id: contexts[doc_id]}
+                    )
+                )
+            except Exception as doc_exc:
+                if is_transient(doc_exc):
+                    _defer_context_refresh(
+                        logger,
+                        {rest: contexts[rest] for rest in doc_ids[position:]},
+                        doc_exc,
+                    )
+                    break
+                failed += 1
+                _warn_context_refresh_failed(logger, doc_id, doc_exc)
     for _ in range(changed):
         _record_index_write(1)
-    return changed, 0
+    return changed, failed
+
+
+def _defer_context_refresh(
+    logger: logging.Logger, contexts: dict[str, str], exc: Exception
+) -> None:
+    _RUNTIME.setdefault("context_refresh_deferred", set()).update(contexts)
+    logger.warning(
+        "Attachment context refresh deferred %d docs to the next run after a "
+        "transient failure: %s",
+        len(contexts),
+        exc,
+    )
 
 
 def _warn_context_refresh_failed(

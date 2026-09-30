@@ -1543,6 +1543,96 @@ def test_refresh_repaired_sidecar_docs_isolates_a_failing_doc_in_its_batch(
     assert (changed, failed) == (2, 1)
 
 
+def _context_refresh_inputs(tmp_path, names):
+    from sources.base import SourceRecord
+
+    doc_ids = [f"documents::{name}" for name in names]
+    records = {}
+    for doc_id in doc_ids:
+        sidecar = tmp_path / f"{doc_id.split('::')[1]}.json"
+        sidecar.write_text("{}")
+        records[doc_id] = SourceRecord(
+            doc_id=doc_id.split("::")[1],
+            source_type="img",
+            natural_key=f"{doc_id}.jpg",
+            mtime=1.0,
+            size=1,
+            metadata={"sidecar_path": str(sidecar), "source": "chat"},
+        )
+    scanned = [{"doc_id": doc_id, "source_type": "img"} for doc_id in doc_ids]
+    return doc_ids, scanned, records
+
+
+def test_refresh_repaired_sidecar_docs_defers_batches_during_provider_outage(
+    tmp_path, monkeypatch
+):
+    """A transient failure fails every doc alike: retrying each doc alone would
+    pay one retry ladder per doc and blow the #3760 budget, then drop the docs.
+    The batch goes to the next run's ledger instead."""
+    from core.resilience import TransientError
+
+    doc_ids, scanned, records = _context_refresh_inputs(
+        tmp_path, [f"d{index}" for index in range(7)]
+    )
+    calls = []
+
+    def refresh(store, embed, contexts):
+        calls.append(set(contexts))
+        raise TransientError("provider 503")
+
+    monkeypatch.setattr(fiv, "_RUNTIME", {})
+    monkeypatch.setattr(
+        fiv, "context_text_from_sidecar", MagicMock(return_value="BEFORE MESSAGES")
+    )
+    monkeypatch.setattr(fiv, "refresh_documents_context", refresh)
+
+    changed, failed = fiv._refresh_repaired_sidecar_docs(
+        scanned, records, set(doc_ids), MagicMock(), MagicMock(), batch_size=3
+    )
+
+    assert (changed, failed) == (0, 0)
+    assert len(calls) == 3
+    assert fiv._RUNTIME["context_refresh_deferred"] == set(doc_ids)
+
+
+def test_refresh_repaired_sidecar_docs_per_doc_retry_stops_at_transient_failure(
+    tmp_path, monkeypatch
+):
+    """A permanent batch failure retries docs one by one; once the provider
+    fails transiently, the untried rest of the batch is deferred, not failed."""
+    from core.resilience import TransientError
+
+    doc_ids, scanned, records = _context_refresh_inputs(
+        tmp_path, ["a", "bad", "c", "d"]
+    )
+    calls = []
+
+    def refresh(store, embed, contexts):
+        calls.append(set(contexts))
+        if "documents::bad" in contexts:
+            raise RuntimeError("provider rejected input")
+        if contexts.keys() == {"documents::c"}:
+            raise TransientError("provider 503")
+        return set(contexts)
+
+    monkeypatch.setattr(fiv, "_RUNTIME", {})
+    monkeypatch.setattr(
+        fiv, "context_text_from_sidecar", MagicMock(return_value="BEFORE MESSAGES")
+    )
+    monkeypatch.setattr(fiv, "refresh_documents_context", refresh)
+
+    changed, failed = fiv._refresh_repaired_sidecar_docs(
+        scanned, records, set(doc_ids), MagicMock(), MagicMock()
+    )
+
+    assert (changed, failed) == (1, 1)
+    assert {"documents::d"} not in calls
+    assert fiv._RUNTIME["context_refresh_deferred"] == {
+        "documents::c",
+        "documents::d",
+    }
+
+
 def test_context_refresh_candidates_carry_deferred_docs_to_next_run(tmp_path):
     import flow_index_vault as fiv
 
