@@ -331,6 +331,33 @@ async def test_budget_overshoot_enrichment_is_kept_without_a_second_call(
     E2E_REAL,
     reason="enrichment is live in real mode; simulator answers cannot be armed",
 )
+async def test_grounded_keyword_naming_a_schema_field_is_stored(
+    indexed_corpus,
+    api,
+    mcp_session,
+):
+    """#3903: "Summary" in a daily digest's title is also a schema field name,
+    and the placeholder guard rejected every answer that kept it as a keyword.
+    The armed answer is reachable only from the first response: a retry would
+    store the sim's ordinary keywords instead."""
+    await _arm_fault("/api/v1/chat/completions", "grounded_schema_word", times=1)
+
+    content = b"# Ticket Resolution Summary for the Day\n\nDaily Report: 4 tickets resolved.\n"
+    result = await _upload_and_index(api, mcp_session, "ticket-digest.md", content)
+
+    chunks = await mcp_session.call_tool_json(
+        "file_get_doc_chunks", {"doc_id": result["doc_id"]}
+    )
+    assert chunks and not (isinstance(chunks, dict) and chunks.get("error")), chunks
+    assert chunks[0]["enr_keywords"] == "Ticket Resolution, Summary, Daily Report", (
+        "a grounded keyword naming a schema field was rejected or stripped"
+    )
+
+
+@pytest.mark.skipif(
+    E2E_REAL,
+    reason="enrichment is live in real mode; simulator answers cannot be armed",
+)
 async def test_loyalty_member_id_is_not_stored_as_the_payment_card(
     indexed_corpus,
     api,
