@@ -21,6 +21,8 @@ SOURCE_TYPE_BY_EXTENSION = {
     "jpeg": "img",
     "gif": "img",
     "webp": "img",
+    "heic": "img",
+    "heif": "img",
     "mp3": "audio",
     "wav": "audio",
     "m4a": "audio",
@@ -28,12 +30,16 @@ SOURCE_TYPE_BY_EXTENSION = {
     "ogg": "audio",
     "aac": "audio",
     "aiff": "audio",
+    "amr": "audio",
+    "awb": "audio",
     "mp4": "video",
     "mov": "video",
     "mkv": "video",
     "webm": "video",
     "avi": "video",
     "m4v": "video",
+    "3gp": "video",
+    "3g2": "video",
 }
 
 BUILTIN_SOURCE_TYPES = set(SOURCE_TYPE_BY_EXTENSION.values()) | {"other"}

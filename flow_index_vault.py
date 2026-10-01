@@ -2805,6 +2805,11 @@ def _process_doc_task(
                         ocr_page_limit=pdf_cfg.get("ocr_page_limit", 200),
                     )
 
+        # Byte-detected media can differ from the collector's filename suffix.
+        detected_type = result.frontmatter.get("media_type")
+        if detected_type in {"audio", "video", "img"}:
+            source_type = detected_type
+
         # Extraction provenance. The degradation capture is opened per document
         # immediately before this task runs, and enrichment failures are noted
         # later, so everything captured so far came from extraction — whichever
