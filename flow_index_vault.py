@@ -2105,6 +2105,11 @@ def _index_duplicate_delivery_context(
             return False
 
     source_type = canonical_source_type(doc.get("source_type") or doc.get("ext", ""))
+    canonical_chunks = _RUNTIME["store"].get_doc_chunks(canonical_doc_id)
+    if canonical_chunks:
+        canonical_type = canonical_source_type(getattr(canonical_chunks[0], "source_type", ""))
+        if canonical_type in {"img", "audio", "video"}:
+            source_type = canonical_type
     rel_path = str(doc.get("rel_path") or doc_id)
     body = (
         f"{source_type.capitalize()} attachment delivery. "
@@ -2173,6 +2178,9 @@ def _build_duplicate_document_indexed_event(
     doc_id = str(doc["doc_id"])
     rel_path = str(doc.get("rel_path") or doc_id)
     source_type = canonical_source_type(doc.get("source_type") or doc.get("ext", ""))
+    canonical_type = canonical_source_type(getattr(first_chunk, "source_type", ""))
+    if canonical_type in {"img", "audio", "video"}:
+        source_type = canonical_type
     metadata = {
         "doc_id": doc_id,
         "rel_path": rel_path,
@@ -2185,6 +2193,10 @@ def _build_duplicate_document_indexed_event(
         "status": first_chunk.status or "active",
         "canonical_doc_id": canonical_doc_id,
     }
+    canonical_extra = getattr(first_chunk, "extra_metadata", None) or {}
+    for field in ("content_status", "content_failure_reasons"):
+        if field in canonical_extra:
+            metadata[field] = canonical_extra[field]
     for field in (*ENRICHMENT_FIELDS, "enr_importance_source", ENRICHMENT_INPUT_HASH_FIELD):
         value = getattr(first_chunk, field, "")
         if value:
