@@ -24,7 +24,7 @@ from typing import NamedTuple, Optional
 
 from core.media_formats import (
     AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaConversionError,
-    detect_media_format, provider_media_path,
+    detect_media_format, provider_image_paths, provider_media_path,
 )
 from core.resilience import is_transient
 from core.skip_policy import CORRUPT_MANGLED_BINARY
@@ -603,8 +603,16 @@ def extract_image(
         return ExtractionResult.from_text(header, frontmatter=fm, primary_content=False)
 
     try:
-        with provider_media_path(file_path, image_format, "img") as prepared:
-            vision_text = ocr_provider.describe(str(prepared))
+        with provider_image_paths(file_path, image_format) as pages:
+            descriptions = []
+            for page_number, prepared in enumerate(pages, start=1):
+                description = ocr_provider.describe(str(prepared))
+                if not description.strip():
+                    continue
+                if len(pages) > 1:
+                    description = f"Page {page_number}:\n{description}"
+                descriptions.append(description)
+            vision_text = "\n\n".join(descriptions)
     except Exception as e:
         logger.warning("OCR describe failed for %s: %s", file_path, e)
         note_degradation("ocr_describe_failed", transient=is_transient(e))

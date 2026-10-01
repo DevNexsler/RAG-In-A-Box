@@ -12,7 +12,7 @@ import subprocess
 from tempfile import TemporaryDirectory
 from typing import Iterator
 
-IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'heif'}
+IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'heif', 'tif', 'tiff'}
 AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac', 'aiff', 'amr', 'awb', 'mka'}
 VIDEO_EXTENSIONS = {'mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', '3gp', '3g2', 'ogv'}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS | {'bin'}
@@ -56,6 +56,8 @@ def detect_media_format(file_path: str | Path, extension: str) -> str:
         return 'jpg'
     if header.startswith((b'GIF87a', b'GIF89a')):
         return 'gif'
+    if header.startswith((b'II\x2a\x00', b'MM\x00\x2a', b'II\x2b\x00', b'MM\x00\x2b')):
+        return 'tiff'
     if header.startswith(b'RIFF'):
         kind = header[8:12]
         if kind == b'WAVE':
@@ -134,3 +136,25 @@ def provider_media_path(file_path: str | Path, detected_format: str, media_type:
         except (ImportError, OSError, subprocess.SubprocessError, ValueError) as exc:
             raise MediaConversionError('media conversion failed') from exc
         yield output
+
+
+@contextmanager
+def provider_image_paths(file_path: str | Path, detected_format: str) -> Iterator[list[Path]]:
+    """Render every TIFF page separately; other images use existing conversion."""
+    if detected_format not in {'tif', 'tiff'}:
+        with provider_media_path(file_path, detected_format, 'img') as prepared:
+            yield [prepared]
+        return
+    with TemporaryDirectory(prefix='organizer-media-') as directory:
+        try:
+            from PIL import Image
+            pages = []
+            with Image.open(file_path) as image:
+                for index in range(image.n_frames):
+                    image.seek(index)
+                    output = Path(directory) / f'page-{index + 1}.png'
+                    image.convert('RGB').save(output, format='PNG')
+                    pages.append(output)
+        except (ImportError, OSError, ValueError) as exc:
+            raise MediaConversionError('image conversion failed') from exc
+        yield pages

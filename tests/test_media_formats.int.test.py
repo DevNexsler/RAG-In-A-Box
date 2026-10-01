@@ -68,6 +68,42 @@ def test_heic_bytes_converted_before_vision(tmp_path, suffix):
     assert result.primary_content
 
 
+@pytest.mark.parametrize('suffix', ['tiff', 'tif', 'bin', 'jpg'])
+def test_tiff_bytes_converted_before_vision(tmp_path, suffix):
+    path = tmp_path / f'scan.{suffix}'
+    Image.new('RGB', (32, 32), 'blue').save(path, format='TIFF')
+    original = path.read_bytes()
+    result = extract_text(path, suffix, ocr_provider=InspectingProvider())
+    assert 'Visible maintenance photo' in result.full_text
+    assert result.primary_content
+    assert result.frontmatter['media_type'] == 'img'
+    assert path.read_bytes() == original
+
+
+def test_multipage_tiff_extracts_every_page_and_removes_temporaries(tmp_path):
+    path = tmp_path / 'scan.bin'
+    Image.new('RGB', (32, 32), 'red').save(
+        path, format='TIFF', save_all=True,
+        append_images=[Image.new('RGB', (32, 32), 'blue')],
+    )
+    original = path.read_bytes()
+    paths = []
+
+    class PageProvider:
+        def describe(self, prepared):
+            paths.append(Path(prepared))
+            with Image.open(prepared) as page:
+                assert page.format == 'PNG'
+                return 'Red page' if page.getpixel((0, 0)) == (255, 0, 0) else 'Blue page'
+
+    result = extract_text(path, 'bin', ocr_provider=PageProvider())
+    assert 'Page 1:\nRed page' in result.full_text
+    assert 'Page 2:\nBlue page' in result.full_text
+    assert result.primary_content
+    assert len(paths) == 2 and all(not page.exists() for page in paths)
+    assert path.read_bytes() == original
+
+
 def test_unknown_bin_is_missing_with_diagnostic(tmp_path):
     path = tmp_path / 'unknown.bin'
     path.write_bytes(b'not recognized media')
@@ -76,6 +112,23 @@ def test_unknown_bin_is_missing_with_diagnostic(tmp_path):
     assert not result.full_text
     assert not result.primary_content
     assert 'unrecognized_media_format' in [item.reason for item in collect_degradations()]
+
+
+def test_multipage_tiff_confirmed_blank_has_no_primary_content(tmp_path):
+    path = tmp_path / 'blank.bin'
+    Image.new('RGB', (32, 32), 'white').save(
+        path, format='TIFF', save_all=True,
+        append_images=[Image.new('RGB', (32, 32), 'white')],
+    )
+
+    class BlankProvider:
+        def describe(self, prepared):
+            return ''
+
+    begin_degradation_capture()
+    result = extract_text(path, 'bin', ocr_provider=BlankProvider())
+    assert not result.primary_content
+    assert collect_degradations() == []
 
 
 def test_real_amr_normalizes_before_transcription(tmp_path):

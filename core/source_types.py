@@ -23,6 +23,8 @@ SOURCE_TYPE_BY_EXTENSION = {
     "webp": "img",
     "heic": "img",
     "heif": "img",
+    "tif": "img",
+    "tiff": "img",
     "mp3": "audio",
     "wav": "audio",
     "m4a": "audio",

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 _ALLOWED_EXTENSIONS = {
-    ".md", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif",
+    ".md", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif", ".tif", ".tiff",
     ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".aiff", ".amr", ".awb",
     ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".3gp", ".3g2", ".bin",
     ".docx", ".doc", ".pptx", ".rtf", ".epub",
