@@ -3282,6 +3282,68 @@ def test_health_probe_stalls_when_the_current_run_stops_progressing(tmp_path):
     assert payload["heartbeat_age_s"] == pytest.approx(4000, abs=10)
 
 
+def _write_freshness_watermark(index_root, written_ago_s: float) -> None:
+    import json
+    from datetime import datetime, timezone
+
+    from core import index_freshness
+
+    (index_root / index_freshness.WATERMARK_FILENAME).write_text(json.dumps({
+        "last_indexed_at": datetime.fromtimestamp(
+            time.time() - written_ago_s, tz=timezone.utc
+        ).isoformat(),
+        "last_indexed_doc_id": "documents::00001",
+    }))
+
+
+def test_health_probe_run_waiting_on_a_progressing_writer_is_not_stalled(
+    tmp_path, healthy_disk,
+):
+    """A run queued behind the writer lock is waiting, not frozen.
+
+    A scheduled queue drain holds the table writer lock for up to 64 requests,
+    so a sweep started meanwhile blocks before it can stamp its heartbeat. On
+    2026-10-01 a sweep waited 30+ min on the lock while the drain indexed a
+    document every couple of minutes, and the probe called it frozen. Index
+    writes need that lock, so a fresh write is progress the run is waiting on.
+    """
+    import json
+
+    hb = tmp_path / "indexer.heartbeat"
+    hb.write_text("beat")  # left behind by the previous run
+    stale = time.time() - 4000
+    os.utime(hb, (stale, stale))
+    (tmp_path / "index_run_state.json").write_text(json.dumps(_live_index_run_state(2000)))
+    _write_freshness_watermark(tmp_path, written_ago_s=60)
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["indexer"] == "running"
+    assert payload["heartbeat_age_s"] == pytest.approx(60, abs=10)
+    assert payload["progress_evidence"] == "index_write"
+
+
+def test_health_probe_stalls_when_neither_the_run_nor_the_writer_progresses(tmp_path):
+    """An old index write is no alibi: with no heartbeat and no write inside the
+    max age, the frozen-indexer 503 still fires."""
+    import json
+
+    hb = tmp_path / "indexer.heartbeat"
+    hb.write_text("beat")
+    stale = time.time() - 4000
+    os.utime(hb, (stale, stale))
+    (tmp_path / "index_run_state.json").write_text(json.dumps(_live_index_run_state(4200)))
+    _write_freshness_watermark(tmp_path, written_ago_s=3000)
+
+    payload, status_code = mcp_server._health_probe({"index_root": str(tmp_path)})
+
+    assert status_code == 503
+    assert payload["status"] == "stalled"
+    assert payload["heartbeat_age_s"] == pytest.approx(3000, abs=10)
+
+
 def test_health_probe_long_run_with_fresh_heartbeat_is_ok(tmp_path, healthy_disk):
     """Newest progress evidence wins: a long-running run that keeps stamping is
     healthy, however old its start time is."""

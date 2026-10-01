@@ -239,16 +239,20 @@ def _index_run_started_ts(current_run: object, pid_file: Path) -> float | None:
     run start and must not be trusted once supervisor state exists.
     """
     if isinstance(current_run, dict):
-        started_at = current_run.get("started_at")
-        if not isinstance(started_at, str):
-            return None
-        try:
-            return datetime.fromisoformat(started_at).timestamp()
-        except ValueError:
-            return None
+        return _iso_ts(current_run.get("started_at"))
     try:
         return pid_file.stat().st_mtime
     except OSError:
+        return None
+
+
+def _iso_ts(stamp: object) -> float | None:
+    """Epoch seconds for an ISO-8601 stamp; None when absent or malformed."""
+    if not isinstance(stamp, str):
+        return None
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except ValueError:
         return None
 
 
@@ -379,15 +383,25 @@ def _health_probe(config: dict) -> tuple[dict, int]:
         # before its first stamp and inherited the previous run's staleness).
         # Once it stamps, its own heartbeat is newer and wins, so a run that
         # really does freeze still ages past max_age.
-        stamps = [
-            ts
-            for ts in (
-                hb.stat().st_mtime if hb.exists() else None,
-                _index_run_started_ts(current_run, index_root / "indexer.pid"),
+        # An index write counts too. Writes need the table writer lock, so while
+        # this run is alive a write is either its own or the holder's it is
+        # queued behind — a scheduled queue drain keeps the lock for up to 64
+        # requests, and a sweep blocked on it cannot stamp. A run that holds the
+        # lock and freezes stops the writes as well, so it still ages out.
+        stamps = {
+            label: ts
+            for label, ts in (
+                ("heartbeat", hb.stat().st_mtime if hb.exists() else None),
+                (
+                    "run_start",
+                    _index_run_started_ts(current_run, index_root / "indexer.pid"),
+                ),
+                ("index_write", _iso_ts(freshness.get("last_indexed_at"))),
             )
             if ts is not None
-        ]
-        age = (time.time() - max(stamps)) if stamps else None
+        }
+        newest = max(stamps, key=stamps.get) if stamps else None
+        age = (time.time() - stamps[newest]) if newest else None
         if age is None or age > max_age:
             return (
                 {
@@ -404,6 +418,7 @@ def _health_probe(config: dict) -> tuple[dict, int]:
             )
         payload["indexer_pid"] = pid
         payload["heartbeat_age_s"] = round(age)
+        payload["progress_evidence"] = newest
     status_code = 200
     if not running and index_run["unresolved_failure"]:
         terminal = index_run["latest_terminal"]
