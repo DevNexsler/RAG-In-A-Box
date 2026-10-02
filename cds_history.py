@@ -80,25 +80,32 @@ def fetch_conversation(cur, contact: dict) -> dict:
     if cursor:
         through, before, before_id = _decode(cursor, scope, through)
     participants, recipients, identity_params, recipient_params = [], [], [], []
+    mail_recipient = None
     if email:
         participants.append("lower(p.email)=lower(%s)")
         identity_params.append(email)
         # Same verified raw-mail lane as cds_live, guarded against malformed JSON.
-        recipients.append("""(m.source='zoho_mail' AND EXISTS (
+        # Any direction: staff whose own mailbox is not ingested reach CDS as
+        # 'inbound' copies in an archived mailbox, yet the contact is a recipient.
+        mail_recipient = """(m.source='zoho_mail' AND EXISTS (
             SELECT 1 FROM jsonb_array_elements(CASE
                 WHEN jsonb_typeof(r.payload->'participants')='array'
                 THEN r.payload->'participants' ELSE '[]'::jsonb END) pt
-            WHERE pt->>'kind' IN ('to','cc','bcc') AND lower(pt->>'address')=%s))""")
-        recipient_params.append(email)
+            WHERE pt->>'kind' IN ('to','cc','bcc') AND lower(pt->>'address')=%s))"""
     if phone:
         participants.append("(p.phone=%s OR p.phone_number=%s)")
         identity_params.extend([phone, phone])
+        # A Quo inbound's 'to' is our own line, so this lane stays outbound-only.
         recipients.append("(m.source='quo' AND r.payload->'data'->'object'->>'to'=%s)")
         recipient_params.append(phone)
     where = """EXISTS (SELECT 1 FROM message_participants mp
         JOIN participants p ON p.id=mp.participant_id
         WHERE mp.message_id=m.id AND (""" + " OR ".join(participants) + "))"
-    where += " OR (m.direction='outbound' AND (" + " OR ".join(recipients) + "))"
+    if mail_recipient:
+        where += " OR " + mail_recipient
+        recipient_params.insert(0, email)  # Precedes the Quo lane in the SQL.
+    if recipients:
+        where += " OR (m.direction='outbound' AND (" + " OR ".join(recipients) + "))"
     if email and not calls:
         # Cliq raw sender identity survives absent normalized participant links.
         # Channel recipients and body mentions do not establish sender ownership.

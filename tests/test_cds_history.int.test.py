@@ -124,3 +124,30 @@ def test_raw_cliq_sender_email_recovers_event_without_participant_link(database)
     assert [m['source_message_id'] for m in result['messages']] == ['raw-10', 'mail', 'withdrawal']
     assert result['coverage_complete']
     assert result['messages'][0]['sender_name'] == 'Stored sender name'
+
+
+def test_staff_email_to_contact_counts_whatever_mailbox_direction(database):
+    # Staff whose own mailbox is not ingested (cc'd into an archived one) arrive
+    # with direction 'inbound'; the contact is still a recipient of that mail.
+    conn, old = database
+    for rid, direction, kind, address in [
+        (20, 'inbound', 'to', 'person@example.test'),
+        (21, 'inbound', 'cc', 'PERSON@example.test'),
+        (22, 'inbound', 'to', 'other@example.test'),
+    ]:
+        conn.execute('INSERT INTO raw_events VALUES (%s,%s)',
+                     (rid, Jsonb({'participants': [{'kind': 'from', 'address': 'staff@example.test'},
+                                                   {'kind': kind, 'address': address}]})))
+        conn.execute('INSERT INTO messages VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                     (rid, 'zoho_mail', 'staff-' + str(rid), old + dt.timedelta(minutes=20 + rid),
+                      direction, 'Staff', 'Balance', 'Payment plan agreed.', None, None, rid, 99))
+    # A Quo inbound's 'to' is our own line, never the contact: still outbound-only.
+    conn.execute('INSERT INTO raw_events VALUES (23,%s)', (Jsonb({'data': {'object': {'id': 'q', 'to': '+12025550123'}}}),))
+    conn.execute('INSERT INTO messages VALUES (23,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                 ('quo', 'quo-inbound', old + dt.timedelta(minutes=50), 'inbound', None, None, 'x', None, None, 23, 99))
+    with conn.cursor() as cur:
+        email = fetch_conversation(cur, {'email': 'person@example.test'})
+        phone = fetch_conversation(cur, {'phone_e164': '+12025550123'})
+    assert [m['source_message_id'] for m in email['messages']][:2] == ['staff-21', 'staff-20']
+    assert 'staff-22' not in [m['source_message_id'] for m in email['messages']]
+    assert 'quo-inbound' not in [m['source_message_id'] for m in phone['messages']]
