@@ -100,3 +100,15 @@ def test_context_builder_rejects_conflicting_call_transcripts(monkeypatch):
     page = srv._context_builder_impl(event_refs=[ref])['cds']['events']
     assert page['ambiguous_refs'] == [ref]
     assert page['messages'] == []
+
+
+def test_call_sides_name_the_pfg_line_and_the_other_party():
+    from cds_exact_events import _call_sides
+    out = _call_sides({'direction': 'outbound', 'from_number': '+17579972130', 'to_number': '+19083861296'})
+    assert out['pfg_line'] == '+17579972130' and out['counterparty_number'] == '+19083861296'
+    assert 'PFG placed this call' in out['speaker_legend']
+    inbound = _call_sides({'direction': 'inbound', 'from_number': '+19083861296', 'to_number': '+17579972130'})
+    assert inbound['pfg_line'] == '+17579972130' and 'the other party called PFG' in inbound['speaker_legend']
+    assert _call_sides({'direction': None, 'from_number': '+1', 'to_number': '+2'}) == {}
+    missed = _call_sides({'direction': 'inbound', 'from_number': '+19083861296', 'to_number': None})
+    assert missed == {}

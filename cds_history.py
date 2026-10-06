@@ -141,8 +141,10 @@ def fetch_conversation(cur, contact: dict) -> dict:
     if calls:
         # Discovery only. Exact-event retrieval owns transcript/metadata semantics.
         select = """/* contact_call_history */
-            SELECT c.id,c.source,c.source_call_id,c.started_at,c.direction,
-                   NULL,NULL,'',false FROM calls c"""
+            SELECT c.id,c.source,c.source_call_id,c.started_at,
+                   CASE coalesce(c.direction, r.payload #>> '{data,object,direction}') WHEN 'incoming' THEN 'inbound'
+                        WHEN 'outgoing' THEN 'outbound' ELSE coalesce(c.direction, r.payload #>> '{data,object,direction}') END,
+                   NULL,NULL,'',false FROM calls c LEFT JOIN raw_events r ON r.id=c.raw_event_id"""
     cur.execute(select + " WHERE (" + where + ")" + bounds
                 + f" ORDER BY {event_time} DESC,{table}.id DESC LIMIT %s", tuple(params))
     rows = cur.fetchall()
