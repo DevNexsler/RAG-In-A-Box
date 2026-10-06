@@ -18,7 +18,8 @@ async def test_existing_transcriptless_call_is_metadata_not_missing(monkeypatch,
     with psycopg.connect(dsn) as conn:
         assert conn.info.dbname == 'doc_history_test'
         conn.execute('CREATE TEMP TABLE messages (id bigint, source text, source_message_id text, sent_at timestamptz, direction text, sender_name text, subject text, body text, body_text text, content text)')
-        conn.execute('CREATE TEMP TABLE calls (id bigint, source text, source_call_id text, started_at timestamptz, direction text, transcript text, duration_seconds integer, status text, from_number text, to_number text)')
+        conn.execute('CREATE TEMP TABLE calls (id bigint, source text, source_call_id text, started_at timestamptz, direction text, transcript text, duration_seconds integer, status text, from_number text, to_number text, raw_event_id bigint)')
+        conn.execute('CREATE TEMP TABLE raw_events (id bigint, payload jsonb)')
         conn.execute('CREATE TEMP TABLE transcripts (call_id bigint, transcript_text text)')
         conn.execute("INSERT INTO calls VALUES (1828,'quo',%s,'2026-07-11T00:00:00Z',NULL,NULL,9,'completed','+12025550123','+12025550456')", (ref,))
         if scenario == 'empty':
@@ -26,6 +27,9 @@ async def test_existing_transcriptless_call_is_metadata_not_missing(monkeypatch,
             conn.execute("INSERT INTO transcripts VALUES (1828,'')")
         if scenario in {'transcript', 'conflict'}:
             conn.execute("INSERT INTO transcripts VALUES (1828,'Tenant reports portal login failed.')")
+            # calls.direction is never populated; the Quo payload carries it.
+            conn.execute("""INSERT INTO raw_events VALUES (77,'{"data":{"object":{"direction":"outgoing"}}}')""")
+            conn.execute('UPDATE calls SET raw_event_id=77')
         if scenario == 'conflict':
             conn.execute("UPDATE calls SET transcript='Tenant reports portal login succeeded.'")
         if scenario == 'collision':
@@ -47,6 +51,9 @@ async def test_existing_transcriptless_call_is_metadata_not_missing(monkeypatch,
             assert event['event_kind'] == 'call_transcript'
             assert event['transcript_status'] == 'available'
             assert event['body'] == 'Tenant reports portal login failed.'
+            assert event['direction'] == 'outbound'
+            assert event['pfg_line'] == '+12025550123' and event['counterparty_number'] == '+12025550456'
+            assert event['speaker_legend'].startswith('+12025550123 is the PFG phone line (staff side)')
             return
         assert event['event_kind'] == 'call_metadata'
         assert event['transcript_status'] == 'unavailable'
