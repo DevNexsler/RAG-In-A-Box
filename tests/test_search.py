@@ -774,3 +774,81 @@ def test_diagnostics_query_embedding_failure_degrades_to_keyword_only():
         assert result.diagnostics["keyword_search_active"] is True
         assert result.diagnostics["degraded"] is True
         assert [hit.doc_id for hit in result] == ["a.md"]
+
+
+# ---------------------------------------------------------------------------
+# Exact identifier search (2026-10-07, PFG collection ticket 103)
+# ---------------------------------------------------------------------------
+
+def _identifier_store(tmpdir):
+    vec = [1.0] + [0.0] * 767
+    nodes = [
+        _make_node("rep.md", "c:0", "Contact the field rep field.rep@agency.example.gov about the voucher", vec),
+        _make_node("other.md", "c:0", "Her email is case.worker@county.example.gov, agency example gov field rep", vec),
+        # Only the neighbouring messages a chunk carries name it: not the hit's own words.
+        _make_node("ctx.md", "context:c:0", "BEFORE MESSAGES field.rep@agency.example.gov wrote", vec),
+        _make_node("receipt.md", "c:0", "Receipt\n\n[Conversation context]\nBEFORE MESSAGES\n"
+                   "Write to field.rep@agency.example.gov", vec),
+        _make_node("call.md", "c:0", "Call me at (908) 555-0144 tomorrow", vec),
+        _make_node("near.md", "c:0", "Call me at 908 555 0145 tomorrow", vec),
+        _make_node("e164.md", "c:0", "Texted from +19085550144", vec),
+        _make_node("docket.md", "c:0", "Docket LT-462-26 hearing set", vec),
+        _make_node("docket2.md", "c:0", "Docket LT-462-27 hearing set", vec),
+    ]
+    return _build_store_with_fts(tmpdir, nodes)
+
+
+def test_exact_identifier_search_keeps_only_hits_whose_own_text_holds_the_identifier():
+    """A hybrid search always fills its slots: an email-shaped query for a ticket's
+    identifier returned a stranger's text that named a different address. An exact
+    identifier search is keyword only (no vector neighbours, no recency boost) and
+    keeps only hits whose own text, not their conversation context, holds it."""
+    from search_hybrid import exact_identifier_search
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = _identifier_store(tmpdir)
+
+        email = exact_identifier_search(store, "field.rep@agency.example.gov", final_top_k=8)
+        assert [h.doc_id for h in email] == ["rep.md"]
+        assert email.diagnostics["vector_search_active"] is False
+        assert email.diagnostics["degraded"] is False
+        assert email.diagnostics["exact_identifier"]["kept"] == 1
+
+        phone = exact_identifier_search(store, "+19085550144", final_top_k=8)
+        assert sorted(h.doc_id for h in phone) == ["call.md", "e164.md"]
+
+        docket = exact_identifier_search(store, "LT-462-26", final_top_k=8)
+        assert [h.doc_id for h in docket] == ["docket.md"]
+
+        assert list(exact_identifier_search(store, "nobody@example.org", final_top_k=8)) == []
+
+
+def test_exact_identifier_search_without_a_keyword_index_is_degraded_and_empty():
+    from search_hybrid import exact_identifier_search
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [1.0] + [0.0] * 767
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([_make_node("rep.md", "c:0", "field.rep@agency.example.gov", vec)])
+        result = exact_identifier_search(store, "field.rep@agency.example.gov", final_top_k=8)
+        assert list(result) == []
+        assert result.diagnostics["keyword_search_active"] is False
+        assert result.diagnostics["degraded"] is True
+
+
+def test_file_search_exact_identifier_answers_only_exact_hits(monkeypatch):
+    import mcp_server
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = _identifier_store(tmpdir)
+        vec = [1.0] + [0.0] * 767
+        config = {"index_root": tmpdir, "search": {}}
+        monkeypatch.setattr(mcp_server, "_get_deps", lambda *a, **k: (store, MockEmbedProvider(vec), config))
+
+        exact = mcp_server._file_search_impl("field.rep@agency.example.gov", top_k=8, prefer_recent=True,
+                                             exact_identifier=True, include_diagnostics=False)
+        assert exact["exact_identifier"] is True
+        assert [r["doc_id"] for r in exact["results"]] == ["rep.md"]
+
+        hybrid = mcp_server._file_search_impl("field.rep@agency.example.gov", top_k=8, include_diagnostics=False)
+        assert "exact_identifier" not in hybrid and len(hybrid["results"]) > 1
