@@ -4,10 +4,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from core.sensitive_content import redact_sensitive_text
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -20,6 +23,7 @@ class CommunicationMessage:
     origin_source: str = ""
     channel_id: str = ""
     thread_id: str = ""
+    direction: str = ""
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,8 @@ class CommunicationItem:
     attachment_index: str = ""
     sidecar_path: str = ""
     primary_text: str = ""
+    # A phone-line sidecar's counterparty as the participants table names it.
+    counterparty_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -50,6 +56,10 @@ class ContextEnvelope:
     nearest_nonempty_before: CommunicationMessage | None = None
     nearest_nonempty_after: CommunicationMessage | None = None
     same_batch: list[CommunicationItem] = field(default_factory=list)
+    # The item is scoped to a counterparty, but its line's records name none
+    # (the comm_messages query predates thread_id): the line's context, less
+    # inbound texts from anyone other than the counterparty.
+    unscoped_line: bool = False
 
 
 class SourceWindowContextProvider:
@@ -74,6 +84,35 @@ class SourceWindowContextProvider:
         ) * 60.0
         self._max_relative_gap = max(1.0, float(max_relative_gap or 1.0))
         self._max_extra_gap_seconds = max(0, int(max_extra_gap_seconds or 0))
+        self._threaded_lines = {(source, channel) for source, channel, thread in self._messages_by_scope if thread}
+        self._warned_lines: set[tuple[str, str]] = set()
+
+    def _scoped_messages(self, item: CommunicationItem) -> tuple[list[CommunicationMessage], bool]:
+        """The item's conversation, and whether it fell back to the whole line.
+
+        A phone-line item is scoped to its counterparty (thread_id). When none of
+        its line's records name a counterparty, the comm_messages query does not
+        export thread_id yet: rather than no context at all, the line's, without
+        inbound texts whose sender is not the item's counterparty."""
+        source, channel, thread = _text(item.origin_source), _text(item.channel_id), _text(item.thread_id)
+        scope = (source, channel, thread)
+        if not thread or (source, channel) in self._threaded_lines \
+                or (source, channel, "") not in self._messages_by_scope:
+            return self._messages_by_scope.get(scope, []), False
+        if (source, channel) not in self._warned_lines:
+            self._warned_lines.add((source, channel))
+            logger.warning(
+                "communication_context: %s line %s has no thread_id on its message records; "
+                "counterparty-scoped context falls back to the line (unscoped_line). "
+                "Add thread_id to the comm_messages query and metadata_columns.",
+                source, channel)
+        counterparty = _text(item.counterparty_name).casefold()
+        messages = [
+            message for message in self._messages_by_scope[(source, channel, "")]
+            if not (counterparty and _text(message.direction).casefold() == "inbound"
+                    and _text(message.sender) and _text(message.sender).casefold() != counterparty)
+        ]
+        return messages, True
 
     @classmethod
     def from_messages(
@@ -134,8 +173,7 @@ class SourceWindowContextProvider:
         )
 
     def get_context_envelope(self, item: CommunicationItem) -> ContextEnvelope:
-        scope = (_text(item.origin_source), _text(item.channel_id), _text(item.thread_id))
-        messages = self._messages_by_scope.get(scope, [])
+        messages, unscoped_line = self._scoped_messages(item)
         item_key = _context_item_sort_key(item, messages)
         before = [
             message
@@ -175,6 +213,7 @@ class SourceWindowContextProvider:
             same_channel_after=after_window,
             nearest_nonempty_before=nearest_before,
             nearest_nonempty_after=nearest_after,
+            unscoped_line=unscoped_line,
         )
 
 
@@ -259,7 +298,13 @@ def _communication_item_from_sidecar_payload(
         batch_key=_batch_key(origin_source, channel_id, sent_at),
         attachment_index=_text(media.get("media_index"), default="0"),
         sidecar_path=str(sidecar_path),
+        counterparty_name=_counterparty_name(payload),
     )
+
+
+def _counterparty_name(payload: dict[str, Any]) -> str:
+    counterparty = payload.get("counterparty")
+    return _text(counterparty.get("display_name")) if isinstance(counterparty, dict) else ""
 
 
 def communication_item_from_record(
@@ -385,6 +430,7 @@ def build_context_provider_from_records(
             origin_source=item.origin_source,
             channel_id=item.channel_id,
             thread_id=item.thread_id,
+            direction=_text(metadata.get("direction")),
         )
         if not _record_message_has_context_scope(item, message):
             continue
@@ -458,6 +504,7 @@ def envelope_metadata(envelope: ContextEnvelope) -> dict[str, str]:
         ),
         "context_nearest_after_message_id": _message_id(nearest_after),
         "context_nearest_after_source_message_id": _source_message_id(nearest_after),
+        "context_scope": "unscoped_line" if envelope.unscoped_line else "",
     }
     return {key: value for key, value in metadata.items() if value}
 
@@ -533,6 +580,13 @@ def context_envelope_from_sidecar_payload(
     context = payload.get("context") if isinstance(payload, dict) else None
     if not isinstance(context, dict):
         return ContextEnvelope(primary_item=item)
+    scope = context.get("scope") if isinstance(context.get("scope"), dict) else {}
+    unscoped_line = _text(scope.get("unscoped_line")).lower() == "true"
+    if _text(item.thread_id) and not _text(scope.get("thread_id")) and not unscoped_line:
+        # Built with the line-only scope before a phone line's conversation was
+        # the line plus the counterparty: it may hold other texters' messages
+        # (850050's BEFORE was a stranger's 850031). Stale until the sweep.
+        return ContextEnvelope(primary_item=item)
     before = [_message_from_sidecar_entry(m) for m in (context.get("same_channel_before") or [])]
     after = [_message_from_sidecar_entry(m) for m in (context.get("same_channel_after") or [])]
     max_seconds = max(0.0, float(max_time_window_minutes or 0)) * 60.0
@@ -550,6 +604,7 @@ def context_envelope_from_sidecar_payload(
         same_channel_after=after,
         nearest_nonempty_before=explicit_before or _nearest_nonempty(reversed(before)),
         nearest_nonempty_after=explicit_after or _nearest_nonempty(after),
+        unscoped_line=unscoped_line,
     )
 
 
@@ -600,6 +655,7 @@ def _sidecar_context_payload(
                 "origin_source": primary.origin_source,
                 "channel_id": primary.channel_id,
                 "thread_id": primary.thread_id,
+                "unscoped_line": "true" if envelope.unscoped_line else "",
             }
         ),
         "same_channel_before": _sidecar_context_messages(

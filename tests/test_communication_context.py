@@ -1293,3 +1293,70 @@ def test_a_chat_attachment_is_not_split_by_its_sender(tmp_path: Path):
     payload["channel"]["channel_type"] = "conversation"
     sidecar.write_text(json.dumps(payload))
     assert communication_item_from_sidecar(media, sidecar).thread_id == ""
+
+
+def _line_records(*rows):
+    """comm_messages rows as the live query emits them before it names thread_id."""
+    from sources.base import SourceRecord
+
+    out = []
+    for sid, sender, direction, sent_at, text in rows:
+        metadata = {"source": "quo", "source_message_id": sid, "source_channel_id": "PNtjMqMO2h",
+                    "sent_at": sent_at, "sender": sender, "direction": direction, "_text": text}
+        doc_id = f"comm_messages::quo/{sid}"
+        out.append(({"doc_id": doc_id, "source_name": "comm_messages", "source_type": "pg_message"},
+                    (doc_id, SourceRecord(doc_id=f"quo/{sid}", source_type="pg_message", natural_key=f"quo/{sid}",
+                                          mtime=1.0, size=10, metadata=metadata))))
+    return out
+
+
+def test_a_line_whose_records_name_no_counterparty_falls_back_to_the_line_without_other_texters(tmp_path: Path):
+    """r6 review: the live comm_messages query has no thread_id yet. Counterparty
+    scoping then matched nothing and a tenant's receipt lost all context, her own
+    'Annette Alexander' text included. Until the line's records name counterparties
+    the context is the line's, marked unscoped_line, minus inbound texts from anyone
+    other than the sidecar's counterparty."""
+    from communication_context import build_context_provider_from_records, envelope_metadata
+
+    rows = _line_records(
+        ("quo-other-850031", "Malik Example", "inbound", "2026-10-05 14:42:53+00:00",
+         "Have you able to reach the case worker?"),
+        ("quo-staff-850040", "PFG Staff", "outbound", "2026-10-05 14:50:00+00:00", "We received it."),
+        ("quo-tenant-850051", "Tenant One", "inbound", "2026-10-05 14:54:58+00:00", "Tenant One"),
+    )
+    provider = build_context_provider_from_records([r for r, _ in rows], dict(s for _, s in rows), {})
+    media, sidecar = _quo_sidecar(tmp_path, counterparty="+19085550189")
+    item = communication_item_from_sidecar(media, sidecar)
+    assert item.thread_id == "+19085550189"
+
+    envelope = provider.get_context_envelope(item)
+
+    assert envelope.unscoped_line is True
+    assert [m.source_message_id for m in envelope.same_channel_before] == ["quo-staff-850040"]
+    assert [m.source_message_id for m in envelope.same_channel_after] == ["quo-tenant-850051"]
+    assert envelope_metadata(envelope)["context_scope"] == "unscoped_line"
+
+
+def test_a_stored_line_context_is_stale_for_a_counterparty_scoped_item(tmp_path: Path):
+    """r6 review: 850050's stored context, built with the line-only scope, still held
+    the other texter's 850031 and the targeted index path re-rendered it unfiltered.
+    A stored block without a thread_id is stale for an item that has one, unless it
+    says it is the line's own fallback (unscoped_line)."""
+    from communication_context import context_envelope_from_sidecar_payload
+
+    media, sidecar = _quo_sidecar(tmp_path, counterparty="+19085550189")
+    item = communication_item_from_sidecar(media, sidecar)
+    other = {"source_message_id": "quo-other-850031", "sender": "Malik Example",
+             "sent_at": "2026-10-05T14:52:53+00:00", "text": "Have you able to reach the case worker?"}
+
+    def stored(scope):
+        return {"context": {"scope": scope, "same_channel_before": [other], "same_channel_after": []}}
+
+    line = {"origin_source": "quo", "channel_id": "PNtjMqMO2h"}
+    stale = context_envelope_from_sidecar_payload(stored(line), item)
+    assert stale.same_channel_before == [] and stale.nearest_nonempty_before is None
+    scoped = context_envelope_from_sidecar_payload(stored({**line, "thread_id": "+19085550189"}), item)
+    assert [m.source_message_id for m in scoped.same_channel_before] == ["quo-other-850031"]
+    fallback = context_envelope_from_sidecar_payload(stored({**line, "unscoped_line": "true"}), item)
+    assert fallback.unscoped_line is True
+    assert [m.source_message_id for m in fallback.same_channel_before] == ["quo-other-850031"]

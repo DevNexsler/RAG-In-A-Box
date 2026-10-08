@@ -1,11 +1,14 @@
 """Load and validate config from config.yaml. Fail fast on missing/invalid keys."""
 
+import logging
 import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 # Load .env file if present (for GEMINI_API_KEY, etc.)
 try:
@@ -218,6 +221,8 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
         )
 
     raw["communication_context"] = comm_ctx
+    if comm_ctx["enabled"]:
+        _warn_phone_line_sources_without_thread_id(raw.get("sources") or [])
 
     # --- Validate search parameters ---
     search_cfg = raw.get("search", {})
@@ -267,6 +272,32 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
     raw["dedupe"] = dedupe
 
     return raw
+
+
+def _warn_phone_line_sources_without_thread_id(sources: Any) -> None:
+    """Communication context scopes a Quo/OpenPhone line by its counterparty, which
+    the comm_messages query names as thread_id. A message query that may read
+    those sources (names them, or exports source_channel_id as every source's
+    query does) without exporting thread_id leaves every such line on the
+    unscoped fallback."""
+    for source in sources if isinstance(sources, list) else ():
+        if not isinstance(source, Mapping) or source.get("type") != "postgres":
+            continue
+        for table in source.get("tables") or ():
+            if not isinstance(table, Mapping) or table.get("source_type") != "pg_message":
+                continue
+            query = str(table.get("query") or "").casefold()
+            columns = table.get("metadata_columns") or []
+            # The live query reads every source's messages without naming quo: a
+            # channel-scoped message source is one that may hold phone lines.
+            reads_lines = "'quo'" in query or "'openphone'" in query or "source_channel_id" in columns
+            if reads_lines and "thread_id" not in columns:
+                logger.warning(
+                    "source %s: its pg_message query may read Quo/OpenPhone messages but "
+                    "metadata_columns has no thread_id, so phone-line conversation context "
+                    "falls back to the whole line (unscoped_line). Export the counterparty "
+                    "as thread_id (config.yaml.example) and re-index comm_messages.",
+                    source.get("name"))
 
 
 def filesystem_source_roots(config: Mapping[str, Any]) -> dict[str, Path]:

@@ -204,3 +204,35 @@ def test_staging_comm_messages_index_subject_and_body(config_path):
     assert "NULLIF(BTRIM(COALESCE(subject, '')), '') IS NOT NULL" in query
     assert "NULLIF(BTRIM(COALESCE(body, '')), '') IS NOT NULL" in query
     assert "subject" in message_table["metadata_columns"]
+
+
+def test_a_quo_message_source_without_thread_id_warns_while_context_is_on(tmp_path, caplog):
+    """r6 review: counterparty-scoped context needs the comm_messages query to export
+    thread_id; the live config did not, and nothing said so. Loading such a config
+    warns (context falls back to unscoped_line), naming the source."""
+    import logging
+
+    quo_query = "SELECT m.source, m.source_message_id FROM messages m WHERE m.source IN ('quo', 'zoho_cliq')"
+    table = {"source_type": "pg_message", "query": quo_query,
+             "metadata_columns": ["source", "source_message_id", "sender", "direction"]}
+    source = {"type": "postgres", "name": "comm_messages", "dsn": "postgres://x", "tables": [table]}
+    cfg_path = _write_config(tmp_path, {"sources": [source]})
+    with caplog.at_level(logging.WARNING, logger="core.config"):
+        load_config(str(cfg_path))
+    assert any("comm_messages" in r.getMessage() and "thread_id" in r.getMessage() for r in caplog.records)
+
+    # The live query reads every source without naming quo; it exports source_channel_id.
+    caplog.clear()
+    table.update(query="SELECT m.source, c.source_channel_id FROM messages m",
+                 metadata_columns=["source", "source_message_id", "source_channel_id", "sender"])
+    cfg_path = _write_config(tmp_path, {"sources": [source]})
+    with caplog.at_level(logging.WARNING, logger="core.config"):
+        load_config(str(cfg_path))
+    assert any("thread_id" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    table["metadata_columns"].append("thread_id")
+    cfg_path = _write_config(tmp_path, {"sources": [source]})
+    with caplog.at_level(logging.WARNING, logger="core.config"):
+        load_config(str(cfg_path))
+    assert not any("thread_id" in r.getMessage() for r in caplog.records)

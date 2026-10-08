@@ -275,6 +275,13 @@ event_hooks:
 #                  ) AS direction,
 #                  -- A Quo line is shared by everyone who texts it: its conversation
 #                  -- (context scope) is the line plus the counterparty.
+#                  -- Deploy: add this column and thread_id in metadata_columns to the
+#                  -- live config, then run a full index (python run_index.py): it
+#                  -- re-indexes comm_messages and its sidecar repair rewrites every
+#                  -- Quo attachment's stored context. Without it, load_config warns
+#                  -- and a counterparty's context falls back to the whole line less
+#                  -- other texters' inbound messages (context_scope unscoped_line);
+#                  -- a stored line-only context block is dropped as stale.
 #                  CASE WHEN m.source IN ('quo', 'openphone') THEN
 #                    CASE r.payload->'data'->'object'->>'direction'
 #                      WHEN 'outgoing' THEN CASE jsonb_typeof(r.payload->'data'->'object'->'to')
