@@ -852,3 +852,24 @@ def test_file_search_exact_identifier_answers_only_exact_hits(monkeypatch):
 
         hybrid = mcp_server._file_search_impl("field.rep@agency.example.gov", top_k=8, include_diagnostics=False)
         assert "exact_identifier" not in hybrid and len(hybrid["results"]) > 1
+
+
+def test_identifier_in_text_matches_the_identifier_as_a_whole_token():
+    """r6 review: a plain substring let a longer, different identifier answer an
+    exact search: another person's address ending in the queried one, or a
+    docket with extra digits."""
+    from search_hybrid import identifier_in_text
+
+    assert not identifier_in_text("ann@gmail.com", "reach me at joann@gmail.com")
+    assert not identifier_in_text("lee@aol.com", "from ashlee@aol.com")
+    assert not identifier_in_text("smith@county.gov", "From: jsmith@county.gov")
+    assert not identifier_in_text("ann@gmail.com", "ann@gmail.com.evil.example")
+    assert not identifier_in_text("LT-462-26", "Docket MER-LT-462-261")
+    assert not identifier_in_text("LT-1234-26", "docket LT-1234-260 filed")
+    # Still the identifier itself, however it is set off.
+    assert identifier_in_text("ann@gmail.com", "Email: <Ann@Gmail.com>.")
+    assert identifier_in_text("ann@gmail.com", "mailto:ann@gmail.com")
+    assert identifier_in_text("ann@gmail.com", "(ann@gmail.com)")
+    assert identifier_in_text("LT-462-26", "Docket MER-LT-462-26, filed 9/2")
+    assert identifier_in_text("LT-462-26", "docket lt-462-26.")
+    assert identifier_in_text("+19085550144", "call (908) 555-0144")

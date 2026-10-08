@@ -1118,16 +1118,25 @@ def _own_text(hit: SearchHit) -> str:
 
 
 def identifier_in_text(identifier: str, text: str) -> bool:
-    """``text`` holds ``identifier``: a phone in any common writing
-    ("+19085550144", "(908) 555-0144", "908.555.0144"), anything else verbatim,
-    case and spacing aside."""
+    """``text`` holds ``identifier`` as a whole token: a phone in any common
+    writing ("+19085550144", "(908) 555-0144", "908.555.0144"), anything else
+    verbatim, case and spacing aside. An email is not part of a longer address
+    (ann@ is not joann@, nor ann@gmail.com.example); anything else is set off by
+    non-alphanumerics, so 'MER-LT-462-26' holds 'LT-462-26' but 'LT-462-261'
+    does not."""
     national = _phone_digits(identifier)
     if national:
         pattern = (rf"(?<!\d)(?:\+?1[\s.-]*)?\(?{national[:3]}\)?[\s.-]*"
                    rf"{national[3:6]}[\s.-]*{national[6:]}(?!\d)")
         return bool(re.search(pattern, text))
     wanted = " ".join(identifier.split()).casefold()
-    return bool(wanted) and wanted in " ".join(text.split()).casefold()
+    if not wanted:
+        return False
+    if "@" in wanted:
+        pattern = r"(?<![\w.+-])" + re.escape(wanted) + r"(?![\w-]|\.\w)"
+    else:
+        pattern = r"(?<![a-z0-9])" + re.escape(wanted) + r"(?![a-z0-9])"
+    return re.search(pattern, " ".join(text.split()).casefold()) is not None
 
 
 def _identifier_keywords(identifier: str) -> str:
