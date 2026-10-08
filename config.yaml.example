@@ -272,7 +272,17 @@ event_hooks:
 #                      WHEN 'outgoing' THEN 'outbound'
 #                      WHEN 'incoming' THEN 'inbound'
 #                    END
-#                  ) AS direction
+#                  ) AS direction,
+#                  -- A Quo line is shared by everyone who texts it: its conversation
+#                  -- (context scope) is the line plus the counterparty.
+#                  CASE WHEN m.source IN ('quo', 'openphone') THEN
+#                    CASE r.payload->'data'->'object'->>'direction'
+#                      WHEN 'outgoing' THEN CASE jsonb_typeof(r.payload->'data'->'object'->'to')
+#                        WHEN 'array' THEN r.payload->'data'->'object'->'to'->>0
+#                        ELSE r.payload->'data'->'object'->>'to' END
+#                      ELSE r.payload->'data'->'object'->>'from'
+#                    END
+#                  END AS thread_id
 #           FROM messages m
 #           LEFT JOIN channels c ON c.id = m.channel_id
 #           LEFT JOIN participants p ON p.id = m.sender_participant_id
@@ -286,7 +296,7 @@ event_hooks:
 #         text_column: _text
 #         text_normalizer: zoho_cliq_mentions
 #         mtime_column: updated_at
-#         metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, subject, sent_at, direction]
+#         metadata_columns: [source, source_message_id, source_channel_id, channel_name, sender, subject, sent_at, direction, thread_id]
 #
 # communication_context:
 #   enabled: true

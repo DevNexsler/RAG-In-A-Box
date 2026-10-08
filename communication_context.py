@@ -214,6 +214,25 @@ def communication_metadata_from_sidecar(
     return {key: value for key, value in metadata.items() if value}
 
 
+# Sources whose channel is a business phone line: everyone who texts that number shares
+# it, so a conversation is the line plus the counterparty (the comm_messages query
+# names it as thread_id; an attachment sidecar as its counterparty).
+_PHONE_LINE_SOURCES = frozenset({"quo", "openphone"})
+
+
+def _sidecar_thread_id(origin_source: str, channel: dict, payload: dict) -> str:
+    """The sidecar's thread, or on a phone line its counterparty: 2026-10-07, a tenant's
+    receipt was indexed beside another person's text to the same county line."""
+    thread_id = _text(channel.get("thread_id"))
+    if thread_id:
+        return thread_id
+    if origin_source in _PHONE_LINE_SOURCES or _text(channel.get("channel_type")) == "phone_number":
+        counterparty = payload.get("counterparty")
+        if isinstance(counterparty, dict):
+            return _text(counterparty.get("participant_key"))
+    return ""
+
+
 def _communication_item_from_sidecar_payload(
     media_path: Path,
     sidecar_path: Path,
@@ -234,7 +253,7 @@ def _communication_item_from_sidecar_payload(
         message_id=_text(message.get("message_id")),
         source_message_id=_text(message.get("source_message_id")),
         channel_id=channel_id,
-        thread_id=_text(channel.get("thread_id")),
+        thread_id=_sidecar_thread_id(origin_source, channel, payload),
         sender=_sender_name(message),
         sent_at=sent_at,
         batch_key=_batch_key(origin_source, channel_id, sent_at),

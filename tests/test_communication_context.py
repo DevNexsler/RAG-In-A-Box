@@ -1216,3 +1216,80 @@ def test_sidecar_context_provider_honors_custom_absolute_time_window(tmp_path):
         .text
         == "Within custom window"
     )
+
+
+def _quo_sidecar(tmp_path: Path, *, counterparty: str | None, source: str = "quo") -> tuple[Path, Path]:
+    media = tmp_path / "2026-10-05T14-54-40Z__msg850050__mm102996@003xs@.jpg"
+    media.write_bytes(b"fake")
+    sidecar = tmp_path / "2026-10-05T14-54-40Z__msg850050__mm102996.json"
+    payload = {
+        "source": source,
+        "message": {
+            "message_id": 850050,
+            "source_message_id": "quo-receipt-850050",
+            "sent_at": "2026-10-05T14:54:40.866000+00:00",
+            "body": "Receipt",
+        },
+        "channel": {"source_channel_id": "PNtjMqMO2h", "channel_type": "phone_number"},
+        "media": {"media_id": 102996, "media_type": "image/jpeg"},
+    }
+    if counterparty:
+        payload["counterparty"] = {"participant_type": "phone_number", "participant_key": counterparty,
+                                   "display_name": "Tenant One"}
+    sidecar.write_text(json.dumps(payload))
+    return media, sidecar
+
+
+def test_a_phone_line_conversation_is_scoped_by_its_counterparty(tmp_path: Path):
+    """2026-10-07 (a PFG collection review): Quo keys a conversation by the PFG line,
+    so a tenant's receipt was indexed with another person's "Have you able to reach
+    the case worker?" (a different number texting the same county line) as its BEFORE
+    context, and the review read his words beside hers. On a phone line the
+    conversation is the line plus the counterparty: the comm_messages query names it
+    as thread_id, an attachment sidecar as its counterparty."""
+    from communication_context import (
+        build_context_provider_from_records,
+        communication_metadata_from_sidecar,
+    )
+    from sources.base import SourceRecord
+
+    def message(sid: str, counterparty: str | None, sent_at: str, text: str):
+        metadata = {"source": "quo", "source_message_id": sid, "source_channel_id": "PNtjMqMO2h",
+                    "sent_at": sent_at, "_text": text}
+        if counterparty:
+            metadata["thread_id"] = counterparty
+        doc_id = f"comm_messages::quo/{sid}"
+        return ({"doc_id": doc_id, "source_name": "comm_messages", "source_type": "pg_message"},
+                (doc_id, SourceRecord(doc_id=f"quo/{sid}", source_type="pg_message", natural_key=f"quo/{sid}",
+                                      mtime=1.0, size=10, metadata=metadata)))
+
+    rows = [
+        message("quo-other-850031", "+16095550127", "2026-10-05 14:42:53+00:00",
+                "Have you able to reach the case worker?"),
+        message("quo-tenant-850051", "+19085550189", "2026-10-05 14:54:58+00:00",
+                "Tenant One"),
+        # Indexed before the query named the counterparty: no one's conversation.
+        message("ACold", None, "2026-10-05 14:50:00+00:00", "Thanks"),
+    ]
+    provider = build_context_provider_from_records([r for r, _ in rows], dict(s for _, s in rows), {})
+    media, sidecar = _quo_sidecar(tmp_path, counterparty="+19085550189")
+
+    item = communication_item_from_sidecar(media, sidecar)
+    assert item.thread_id == "+19085550189"
+    assert communication_metadata_from_sidecar(media, sidecar)["thread_id"] == "+19085550189"
+    envelope = provider.get_context_envelope(item)
+    assert [m.source_message_id for m in envelope.same_channel_before] == []
+    assert [m.source_message_id for m in envelope.same_channel_after] == ["quo-tenant-850051"]
+
+    # A sidecar that names no counterparty keeps the line's old, unscoped context.
+    media, sidecar = _quo_sidecar(tmp_path, counterparty=None)
+    assert communication_item_from_sidecar(media, sidecar).thread_id == ""
+
+
+def test_a_chat_attachment_is_not_split_by_its_sender(tmp_path: Path):
+    """Only a phone line is a conversation per counterparty; a Cliq chat is one conversation."""
+    media, sidecar = _quo_sidecar(tmp_path, counterparty="+19085550189", source="zoho_cliq")
+    payload = json.loads(sidecar.read_text())
+    payload["channel"]["channel_type"] = "conversation"
+    sidecar.write_text(json.dumps(payload))
+    assert communication_item_from_sidecar(media, sidecar).thread_id == ""

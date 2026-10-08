@@ -141,7 +141,24 @@ def test_project_comm_messages_config_example_exports_source_channel_id():
     assert "c.name AS channel_name" in config_example
     assert (
         "metadata_columns: [source, source_message_id, source_channel_id, "
-        "channel_name, sender, subject, sent_at, direction]"
+        "channel_name, sender, subject, sent_at, direction, thread_id]"
+    ) in config_example
+
+
+def test_project_comm_messages_config_example_scopes_a_phone_line_by_counterparty():
+    """A Quo line is shared by everyone who texts it: its conversation is the line plus
+    the counterparty (incoming: from; outgoing: to), so conversation context never
+    mixes two people's texts (2026-10-07, PFG collection ticket 103)."""
+    config_example = " ".join(Path("config.yaml.example").read_text().replace("# ", "").split())
+
+    assert (
+        "CASE WHEN m.source IN ('quo', 'openphone') THEN "
+        "CASE r.payload->'data'->'object'->>'direction' "
+        "WHEN 'outgoing' THEN CASE jsonb_typeof(r.payload->'data'->'object'->'to') "
+        "WHEN 'array' THEN r.payload->'data'->'object'->'to'->>0 "
+        "ELSE r.payload->'data'->'object'->>'to' END "
+        "ELSE r.payload->'data'->'object'->>'from' END "
+        "END AS thread_id"
     ) in config_example
 
 
