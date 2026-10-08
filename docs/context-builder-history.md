@@ -29,10 +29,15 @@ shared channels and inferred aliases never broaden the match.
 Each message carries CDS ID, provider source/message ID, timestamp, direction,
 stored sender name, subject and body. Missing sender names stay missing.
 Bodies are capped at 4,000 characters; clipping is explicit per message and page.
-A blank body on a message that has media also carries `content_status:
-"not_extracted"` and `media_count`: its content (an email letter pasted as images,
-a photo-only text) is in attachments this chronology does not include, so it is not
-an empty message. A blank body without media carries neither field.
+A message that has media carries `media_count`, and `media_text`: its attachments'
+extracted (OCR/vision) text, without the conversation context the media pipeline
+appends, capped at 4,000 characters (`media_text_truncated`). A media-only body
+(blank, or Agent-Email-Server's "[Message body is N inline images and no text...]"
+marker) also carries `content_status`: `extracted` when its content is in
+`media_text` (an email letter pasted as images, a photo-only text), `not_extracted`
+when its attachments are not read yet. Either way it is not an empty message. A
+blank body without media carries none of these. Exact-event pages carry the same
+fields for a cited message.
 
 - `has_more` and `next_cursor` expose pagination rather than silently dropping rows.
 - `through` fixes an event-time upper bound across pages; this is not a database

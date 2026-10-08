@@ -15,10 +15,15 @@ def test_context_builder_reads_long_exact_event_in_stable_pages(monkeypatch):
             pass
 
         def execute(self, sql, params):
+            self.media = "message_media" in sql
+            if self.media:
+                return
             self.offset = params[0] - 1
             assert params[-1] == "event-one"
 
         def fetchall(self):
+            if self.media:
+                return []
             body = "a" * 12000 + "FINAL correction: not paid."
             import hashlib
             return [(1, "quo", "event-one", dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
@@ -112,3 +117,35 @@ def test_call_sides_name_the_pfg_line_and_the_other_party():
     assert _call_sides({'direction': None, 'from_number': '+1', 'to_number': '+2'}) == {}
     missed = _call_sides({'direction': 'inbound', 'from_number': '+19083861296', 'to_number': None})
     assert missed == {}
+
+
+def test_a_cited_media_only_message_carries_its_media_text():
+    """r6 review: exact-event pages hydrate the collections packet's cited sources; a
+    cited letter whose body is only the inline-image marker reached it with no text."""
+    import hashlib
+
+    from cds_exact_events import event_request, fetch_event_page
+
+    marker = ("[Message body is 2 inline images and no text. Their content is in this "
+              "message's media attachments.]")
+
+    class Cursor:
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, sql, params):
+            self.queries.append((sql, params))
+
+        def fetchall(self):
+            sql, params = self.queries[-1]
+            if "message_media" in sql:
+                assert params[-1] == [839634]
+                return [(839634, 2, "Heat not fixed by October 15.", False)]
+            return [(839634, "zoho_mail", "letter-1", dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc),
+                     "inbound", "Annie", "Heat", marker, len(marker), hashlib.sha256(marker.encode()).hexdigest())]
+
+    page = fetch_event_page(Cursor(), ["letter-1"], event_request(["letter-1"]))
+    message = page["messages"][0]
+    assert message["body"] == marker
+    assert (message["content_status"], message["media_count"]) == ("extracted", 2)
+    assert message["media_text"] == "Heat not fixed by October 15."

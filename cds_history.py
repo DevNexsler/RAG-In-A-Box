@@ -10,6 +10,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import re
 
 BODY_LIMIT = 4000
 DEFAULT_LIMIT = 50
@@ -64,26 +65,49 @@ def _decode(cursor, scope, now):
         raise ValueError("invalid history_cursor for contact/window") from None
 
 
-def _flag_media_only_bodies(cur, messages) -> None:
-    """Mark a blank body whose message has media as content not extracted.
+# The body Agent-Email-Server stores when an email's content is only inline
+# images (inlineImageBodyMarker): no text of the sender's own.
+_INLINE_IMAGE_MARKER = re.compile(
+    r"\[Message body is \d+ inline images? and no text\. .{0,120}media attachments\.\]")
+# One message's media text, the vision/OCR text before the conversation context
+# the media pipeline appends; bounded like a body.
+_MEDIA_TEXT = ("nullif(btrim(split_part(coalesce(mm.enrichment->>'text',''),"
+               "'[Conversation context]',1),E' \\t\\r\\n'),'')")
+MEDIA_SQL = f"""/* chronology_media_text */
+    SELECT mm.message_id, count(*),
+           left(string_agg({_MEDIA_TEXT}, E'\n\n' ORDER BY mm.id), %s),
+           coalesce(length(string_agg({_MEDIA_TEXT}, E'\n\n' ORDER BY mm.id)), 0) > %s
+    FROM message_media mm WHERE mm.message_id = ANY(%s) GROUP BY mm.message_id"""
 
-    Its content is in attachments this chronology does not carry (an email
-    letter pasted as images, a photo-only text), so it is not an empty
-    message. Unflagged, readers reported such a letter as an empty email
-    (CDS 839634).
-    """
-    blank = [int(m["id"]) for m in messages if not (m["body"] or "").strip()]
-    if not blank:
+
+def media_only_body(body) -> bool:
+    """No text of the sender's own: blank, or the inline-image marker."""
+    text = (body or "").strip()
+    return not text or _INLINE_IMAGE_MARKER.fullmatch(text) is not None
+
+
+def attach_media(cur, messages) -> None:
+    """Every message on the page with media says so (media_count) and carries
+    the media's extracted text (media_text, BODY_LIMIT chars). A media-only body
+    also says whether its content was read: content_status extracted (it is in
+    media_text) or not_extracted. Unflagged, readers reported a letter pasted as
+    images as an empty email (CDS 839634), and a text with a photo hid the photo.
+    One query for the page."""
+    ids = [int(m["id"]) for m in messages]
+    if not ids:
         return
-    cur.execute("""/* contact_history_media */
-        SELECT message_id,count(*) FROM message_media
-        WHERE message_id = ANY(%s) GROUP BY message_id""", (blank,))
-    counts = {int(message_id): count for message_id, count in cur.fetchall()}
+    cur.execute(MEDIA_SQL, (BODY_LIMIT, BODY_LIMIT, ids))
+    media = {int(row[0]): row[1:] for row in cur.fetchall()}
     for message in messages:
-        count = counts.get(int(message["id"]))
-        if count:
-            message["content_status"] = "not_extracted"
-            message["media_count"] = count
+        count, text, truncated = media.get(int(message["id"]), (0, None, False))
+        if not count:
+            continue
+        message["media_count"] = count
+        if text:
+            message["media_text"] = text
+            message["media_text_truncated"] = bool(truncated)
+        if media_only_body(message["body"]):
+            message["content_status"] = "extracted" if text else "not_extracted"
 
 
 def fetch_conversation(cur, contact: dict) -> dict:
@@ -174,7 +198,7 @@ def fetch_conversation(cur, contact: dict) -> dict:
     rows = rows[:limit]
     messages = [dict(zip(("id", "source", "source_message_id", "sent_at", "direction", "sender_name", "subject", "body", "body_truncated"), row)) for row in rows]
     if not calls:
-        _flag_media_only_bodies(cur, messages)
+        attach_media(cur, messages)
     for message in messages:
         message["id"] = str(message["id"])
         if calls:
@@ -194,4 +218,4 @@ def fetch_conversation(cur, contact: dict) -> dict:
             "has_more": has_more, "next_cursor": next_cursor,
             "window_exhausted": not has_more,
             "coverage_complete": not cursor and not has_more and not clipped,
-            "scope": ("Call references only; retrieve transcripts/metadata through exact-event mode. " if calls else "") + "Exact supplied identifiers in CDS only; no inferred aliases. A blank body with content_status not_extracted holds its content in media_count attachments not shown here; it is not an empty message. Continuation pages must be accumulated and checked for truncation. Event-time upper bound is not a transactional snapshot."}
+            "scope": ("Call references only; retrieve transcripts/metadata through exact-event mode. " if calls else "") + "Exact supplied identifiers in CDS only; no inferred aliases. A message with media_count has attachments; media_text is their extracted (OCR/vision) text, bounded. A media-only body (blank, or the inline-image marker) is not an empty message: content_status extracted means its content is media_text, not_extracted that its attachments are not read yet. Continuation pages must be accumulated and checked for truncation. Event-time upper bound is not a transactional snapshot."}

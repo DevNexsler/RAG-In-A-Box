@@ -26,6 +26,8 @@ def database():
                 sent_at timestamptz, direction text, sender_name text, subject text, body text,
                 body_text text, content text, raw_event_id bigint, channel_id bigint);
             CREATE TEMP TABLE message_participants (message_id bigint, participant_id bigint);
+            CREATE TEMP TABLE message_media (id bigint, message_id bigint, media_type text, media_url text,
+                enrichment jsonb);
             CREATE TEMP TABLE outbound_actions (id bigint, created_at timestamptz, operation text,
                 provider_message_id text, action_uid text, status text, channel text);
         """)
@@ -156,12 +158,20 @@ def test_staff_email_to_contact_counts_whatever_mailbox_direction(database):
 def test_real_blank_body_with_media_is_flagged_not_extracted(database):
     # CDS 839634: pasted-image mail stored body "\n" read as an empty email.
     conn, old = database
-    conn.execute("CREATE TEMP TABLE message_media (id bigint, message_id bigint, media_type text, media_url text)")
     conn.execute("UPDATE messages SET body=%s WHERE id=2", ("\n",))
-    conn.execute("INSERT INTO message_media VALUES (1,2,'image/jpeg','inline://m/0'),(2,2,'image/jpeg','inline://m/1')")
+    conn.execute("INSERT INTO message_media VALUES (1,2,'image/jpeg','inline://m/0',NULL),"
+                 "(2,2,'image/jpeg','inline://m/1',NULL)")
     with conn.cursor() as cur:
         history = fetch_conversation(cur, {"phone_e164": "+12025550123"})
     withdrawal = next(m for m in history["messages"] if m["id"] == "2")
     assert withdrawal["content_status"] == "not_extracted"
     assert withdrawal["media_count"] == 2
     assert all("content_status" not in m for m in history["messages"] if m["id"] != "2")
+    # Once OCR has read the pages, the text comes through, without the context the pipeline appends.
+    conn.execute("UPDATE message_media SET enrichment=%s WHERE id=1",
+                 (Jsonb({"text": "Heat not fixed by October 15.\n[Conversation context]\nBEFORE ..."}),))
+    with conn.cursor() as cur:
+        history = fetch_conversation(cur, {"phone_e164": "+12025550123"})
+    withdrawal = next(m for m in history["messages"] if m["id"] == "2")
+    assert withdrawal["content_status"] == "extracted"
+    assert withdrawal["media_text"] == "Heat not fixed by October 15.", withdrawal

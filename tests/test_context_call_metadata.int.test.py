@@ -18,6 +18,7 @@ async def test_existing_transcriptless_call_is_metadata_not_missing(monkeypatch,
     with psycopg.connect(dsn) as conn:
         assert conn.info.dbname == 'doc_history_test'
         conn.execute('CREATE TEMP TABLE messages (id bigint, source text, source_message_id text, sent_at timestamptz, direction text, sender_name text, subject text, body text, body_text text, content text)')
+        conn.execute('CREATE TEMP TABLE message_media (id bigint, message_id bigint, media_type text, media_url text, enrichment jsonb)')
         conn.execute('CREATE TEMP TABLE calls (id bigint, source text, source_call_id text, started_at timestamptz, direction text, transcript text, duration_seconds integer, status text, from_number text, to_number text, raw_event_id bigint)')
         conn.execute('CREATE TEMP TABLE raw_events (id bigint, payload jsonb)')
         conn.execute('CREATE TEMP TABLE transcripts (call_id bigint, transcript_text text)')

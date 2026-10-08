@@ -17,6 +17,7 @@ def database(monkeypatch):
     with psycopg.connect(dsn) as conn:
         assert conn.info.dbname == 'doc_history_test'
         conn.execute('CREATE TEMP TABLE messages (id bigint,source text,source_message_id text,sent_at timestamptz,direction text,sender_name text,subject text,body text,body_text text,content text)')
+        conn.execute('CREATE TEMP TABLE message_media (id bigint, message_id bigint, media_type text, media_url text, enrichment jsonb)')
         body = 'Résumé 🏠 ' * 2000 + 'FINAL correction: no payment confirmed.'
         conn.execute("INSERT INTO messages VALUES (1,'quo','long',now(),'inbound','Sender',NULL,%s,NULL,NULL)", (body,))
         conn.execute("INSERT INTO messages VALUES (2,'quo','duplicate',now(),NULL,NULL,NULL,'one',NULL,NULL),(3,'mail','duplicate',now(),NULL,NULL,NULL,'two',NULL,NULL)")

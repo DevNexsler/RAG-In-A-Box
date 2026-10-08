@@ -10,6 +10,8 @@ import hashlib
 import json
 import re
 
+from cds_history import attach_media
+
 BODY_PAGE_CHARS = 12000
 
 
@@ -126,6 +128,10 @@ def fetch_event_page(cur, refs, state):
                 if available else 'Call metadata only; not evidence of what was said. No stored transcript available.')
             message.update(_call_sides(message))
         message["sent_at"] = message["sent_at"].isoformat() if message["sent_at"] else None
+        if not message["id"].startswith(("call:", "calendar:")):
+            # A cited letter pasted as images has only a marker for a body: its
+            # text is its media's (cds_history.attach_media). Part of the version.
+            attach_media(cur, [message])
         metadata = {k: v for k, v in message.items() if k != "body"}
         version = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
         if offset > message["body_total_chars"] or (state["version"] and state["version"] != version):
