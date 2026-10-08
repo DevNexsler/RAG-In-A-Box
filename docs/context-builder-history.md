@@ -29,6 +29,10 @@ shared channels and inferred aliases never broaden the match.
 Each message carries CDS ID, provider source/message ID, timestamp, direction,
 stored sender name, subject and body. Missing sender names stay missing.
 Bodies are capped at 4,000 characters; clipping is explicit per message and page.
+A blank body on a message that has media also carries `content_status:
+"not_extracted"` and `media_count`: its content (an email letter pasted as images,
+a photo-only text) is in attachments this chronology does not include, so it is not
+an empty message. A blank body without media carries neither field.
 
 - `has_more` and `next_cursor` expose pagination rather than silently dropping rows.
 - `through` fixes an event-time upper bound across pages; this is not a database

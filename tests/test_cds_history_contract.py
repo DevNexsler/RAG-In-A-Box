@@ -81,3 +81,46 @@ def test_truncated_body_blocks_complete_coverage():
     assert result["status"] == "degraded"
     assert result["window_exhausted"] is True
     assert result["coverage_complete"] is False
+
+
+class _Cursor:
+    """Answers each query with the next canned result, recording the SQL."""
+
+    def __init__(self, *results):
+        self.results, self.queries = list(results), []
+
+    def execute(self, sql, params):
+        self.queries.append((sql, params))
+
+    def fetchall(self):
+        return self.results.pop(0)
+
+
+def test_blank_body_with_media_is_flagged_not_extracted_not_empty():
+    # CDS 839634: a letter pasted into an email as two images stored body "\n".
+    # The chronology showed it as an empty email and the reviewer read it so.
+    now = dt.datetime.now(dt.timezone.utc)
+    cur = _Cursor(
+        [(3, "zoho_mail", "letter", now, "inbound", None, "To whom", "\n", False),
+         (2, "quo", "photo", now, "inbound", None, None, "", False),
+         (1, "quo", "text", now, "inbound", None, None, "Rent sent", False)],
+        [(3, 2)],
+    )
+    result = fetch_conversation(cur, {"phone_e164": "+12025550123"})
+    letter, photo, text = result["messages"]
+    assert letter["content_status"] == "not_extracted"
+    assert letter["media_count"] == 2
+    assert letter["body"] == "\n"
+    # Blank with no media really is empty; text never takes the flag.
+    assert "content_status" not in photo and "media_count" not in photo
+    assert "content_status" not in text
+    media_sql, media_params = cur.queries[1]
+    assert "message_media" in media_sql
+    assert media_params == ([3, 2],)
+
+
+def test_media_lookup_is_skipped_when_every_body_has_text():
+    now = dt.datetime.now(dt.timezone.utc)
+    cur = _Cursor([(1, "quo", "text", now, "inbound", None, None, "Rent sent", False)])
+    fetch_conversation(cur, {"phone_e164": "+12025550123"})
+    assert len(cur.queries) == 1

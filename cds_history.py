@@ -64,6 +64,28 @@ def _decode(cursor, scope, now):
         raise ValueError("invalid history_cursor for contact/window") from None
 
 
+def _flag_media_only_bodies(cur, messages) -> None:
+    """Mark a blank body whose message has media as content not extracted.
+
+    Its content is in attachments this chronology does not carry (an email
+    letter pasted as images, a photo-only text), so it is not an empty
+    message. Unflagged, readers reported such a letter as an empty email
+    (CDS 839634).
+    """
+    blank = [int(m["id"]) for m in messages if not (m["body"] or "").strip()]
+    if not blank:
+        return
+    cur.execute("""/* contact_history_media */
+        SELECT message_id,count(*) FROM message_media
+        WHERE message_id = ANY(%s) GROUP BY message_id""", (blank,))
+    counts = {int(message_id): count for message_id, count in cur.fetchall()}
+    for message in messages:
+        count = counts.get(int(message["id"]))
+        if count:
+            message["content_status"] = "not_extracted"
+            message["media_count"] = count
+
+
 def fetch_conversation(cur, contact: dict) -> dict:
     email = (contact.get("email") or "").strip().lower()
     phone = contact.get("phone_e164")
@@ -151,6 +173,8 @@ def fetch_conversation(cur, contact: dict) -> dict:
     has_more = len(rows) > limit
     rows = rows[:limit]
     messages = [dict(zip(("id", "source", "source_message_id", "sent_at", "direction", "sender_name", "subject", "body", "body_truncated"), row)) for row in rows]
+    if not calls:
+        _flag_media_only_bodies(cur, messages)
     for message in messages:
         message["id"] = str(message["id"])
         if calls:
@@ -170,4 +194,4 @@ def fetch_conversation(cur, contact: dict) -> dict:
             "has_more": has_more, "next_cursor": next_cursor,
             "window_exhausted": not has_more,
             "coverage_complete": not cursor and not has_more and not clipped,
-            "scope": ("Call references only; retrieve transcripts/metadata through exact-event mode. " if calls else "") + "Exact supplied identifiers in CDS only; no inferred aliases. Continuation pages must be accumulated and checked for truncation. Event-time upper bound is not a transactional snapshot."}
+            "scope": ("Call references only; retrieve transcripts/metadata through exact-event mode. " if calls else "") + "Exact supplied identifiers in CDS only; no inferred aliases. A blank body with content_status not_extracted holds its content in media_count attachments not shown here; it is not an empty message. Continuation pages must be accumulated and checked for truncation. Event-time upper bound is not a transactional snapshot."}

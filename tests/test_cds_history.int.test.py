@@ -151,3 +151,17 @@ def test_staff_email_to_contact_counts_whatever_mailbox_direction(database):
     assert [m['source_message_id'] for m in email['messages']][:2] == ['staff-21', 'staff-20']
     assert 'staff-22' not in [m['source_message_id'] for m in email['messages']]
     assert 'quo-inbound' not in [m['source_message_id'] for m in phone['messages']]
+
+
+def test_real_blank_body_with_media_is_flagged_not_extracted(database):
+    # CDS 839634: pasted-image mail stored body "\n" read as an empty email.
+    conn, old = database
+    conn.execute("CREATE TEMP TABLE message_media (id bigint, message_id bigint, media_type text, media_url text)")
+    conn.execute("UPDATE messages SET body=%s WHERE id=2", ("\n",))
+    conn.execute("INSERT INTO message_media VALUES (1,2,'image/jpeg','inline://m/0'),(2,2,'image/jpeg','inline://m/1')")
+    with conn.cursor() as cur:
+        history = fetch_conversation(cur, {"phone_e164": "+12025550123"})
+    withdrawal = next(m for m in history["messages"] if m["id"] == "2")
+    assert withdrawal["content_status"] == "not_extracted"
+    assert withdrawal["media_count"] == 2
+    assert all("content_status" not in m for m in history["messages"] if m["id"] != "2")
