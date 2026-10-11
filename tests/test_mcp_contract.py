@@ -66,6 +66,26 @@ async def test_file_search_tool_dispatch_maps_return_alias():
 
 
 @pytest.mark.anyio
+async def test_file_search_publishes_exact_identifier_as_an_optional_boolean():
+    """hermes sor_cleanup discovery sends exact_identifier=True and its provider
+    drift probe pins this exact schema entry; omitting it keeps hybrid search."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tools = await mcp_server.mcp.list_tools()
+    schema = next(tool for tool in tools if tool.name == "file_search").inputSchema
+    assert schema["properties"]["exact_identifier"] == {
+        "default": False, "title": "Exact Identifier", "type": "boolean"}
+    assert "exact_identifier" not in schema.get("required", [])
+
+    with patch("mcp_server._file_search_impl", return_value={"results": []}) as mock:
+        await mcp_server.mcp.call_tool("file_search", {"query": "LT-462-26", "exact_identifier": True})
+        assert mock.call_args.kwargs["exact_identifier"] is True
+        await mcp_server.mcp.call_tool("file_search", {"query": "lease application"})
+        assert mock.call_args.kwargs["exact_identifier"] is False
+
+
+@pytest.mark.anyio
 async def test_file_index_document_dispatches_via_to_thread():
     """Single-doc indexing must leave the event loop free for /health."""
     if not mcp_server.HAS_MCP:

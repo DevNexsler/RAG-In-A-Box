@@ -121,6 +121,25 @@ async def test_tracking_html_message_is_bounded_in_consumer_visible_lance_rows(
         assert discarded not in stored
 
 
+async def test_file_search_exact_identifier_answers_only_messages_holding_it(indexed_corpus, mcp_session):
+    # 'STAGE-246565' is the order number in the seeded tracking-heavy email only.
+    exact = await mcp_session.call_tool_json(
+        "file_search", {"query": "STAGE-246565", "top_k": 8, "exact_identifier": True})
+    assert not exact.get("error"), exact
+    assert exact["exact_identifier"] is True
+    assert {r["doc_id"] for r in exact["results"]} == {"sor::zoho_mail/tracking-heavy"}, exact
+
+    # A shorter docket-like id is not a whole-token match: no slot is filled.
+    near = await mcp_session.call_tool_json(
+        "file_search", {"query": "STAGE-24656", "top_k": 8, "exact_identifier": True})
+    assert not near.get("error"), near
+    assert near["exact_identifier"] is True and near["results"] == [], near
+
+    hybrid = await mcp_session.call_tool_json("file_search", {"query": "STAGE-24656", "top_k": 8})
+    assert not hybrid.get("error"), hybrid
+    assert "exact_identifier" not in hybrid
+
+
 def test_sor_unit_title_reaches_raw_lance_metadata_and_chunk_header(indexed_corpus):
     expected_titles = {
         "sor::unit/104": "South Main Apartments Unit 5",

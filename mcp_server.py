@@ -31,7 +31,7 @@ from lancedb_store import (
 from extractors import CONTENT_COMPLETE
 from index_run_supervisor import IndexRunSupervisor, index_log_paths
 from providers.embed import build_embed_provider
-from search_hybrid import hybrid_search, build_reranker
+from search_hybrid import build_reranker, exact_identifier_search, hybrid_search
 import cds_live
 import context_builder as ctxb
 import factbook_client
@@ -1764,6 +1764,7 @@ def _file_search_impl(
     content_max_character: int = _DEFAULT_CONTENT_MAX_CHARACTER,
     sort: str | None = None,
     include_diagnostics: bool = True,
+    exact_identifier: bool = False,
 ) -> dict:
     # Validate
     if not query or not query.strip():
@@ -1885,37 +1886,56 @@ def _file_search_impl(
         # belong to the query), recency does the ordering. Widen the pool so
         # the newest hits aren't lost below the relevance cutoff, and skip the
         # reranker — its micro-ordering is discarded by the recency sort.
-        reranker = None if recent_sort else build_reranker(config)
+        reranker = None if recent_sort or exact_identifier else build_reranker(config)
         pool_top_k = max(_RECENT_SORT_POOL, top_k) if recent_sort else top_k
 
-        result = hybrid_search(
-            store,
-            embed_provider,
-            query,
-            vector_top_k=search_cfg.get("vector_top_k", 50),
-            keyword_top_k=search_cfg.get("keyword_top_k", 50),
-            final_top_k=pool_top_k,
-            rrf_k=search_cfg.get("rrf_k", 60),
-            doc_id_prefix=doc_id_prefix,
-            source_type=source_type,
-            source_name=source_name,
-            tags=tags,
-            status=status,
-            folder=folder,
-            reranker=reranker,
-            prefer_recent=prefer_recent,
-            recency_half_life_days=recency_cfg.get("half_life_days", 90.0),
-            recency_weight=recency_cfg.get("weight", 0.3),
-            metadata_filters=parsed_filters,
-            filter_ast=parsed_filter,
-            enr_doc_type=enr_doc_type,
-            enr_topics=enr_topics,
-            importance_field=importance_cfg.get("field", "enr_importance"),
-            importance_weight=importance_cfg.get("weight", 0.3),
-            min_score_threshold=search_cfg.get("min_score_threshold", 0.0),
-            media_intent_weight=search_cfg.get("media_intent_weight", 0.35),
-            media_intent_slots=search_cfg.get("media_intent_slots", 2),
-        )
+        if exact_identifier:
+            # An identifier (docket, email, phone): only documents whose own text
+            # holds it, by keyword; never vector neighbours or a recency boost.
+            result = exact_identifier_search(
+                store,
+                query,
+                final_top_k=pool_top_k,
+                doc_id_prefix=doc_id_prefix,
+                source_type=source_type,
+                source_name=source_name,
+                tags=tags,
+                status=status,
+                folder=folder,
+                metadata_filters=parsed_filters,
+                filter_ast=parsed_filter,
+                enr_doc_type=enr_doc_type,
+                enr_topics=enr_topics,
+            )
+        else:
+            result = hybrid_search(
+                store,
+                embed_provider,
+                query,
+                vector_top_k=search_cfg.get("vector_top_k", 50),
+                keyword_top_k=search_cfg.get("keyword_top_k", 50),
+                final_top_k=pool_top_k,
+                rrf_k=search_cfg.get("rrf_k", 60),
+                doc_id_prefix=doc_id_prefix,
+                source_type=source_type,
+                source_name=source_name,
+                tags=tags,
+                status=status,
+                folder=folder,
+                reranker=reranker,
+                prefer_recent=prefer_recent,
+                recency_half_life_days=recency_cfg.get("half_life_days", 90.0),
+                recency_weight=recency_cfg.get("weight", 0.3),
+                metadata_filters=parsed_filters,
+                filter_ast=parsed_filter,
+                enr_doc_type=enr_doc_type,
+                enr_topics=enr_topics,
+                importance_field=importance_cfg.get("field", "enr_importance"),
+                importance_weight=importance_cfg.get("weight", 0.3),
+                min_score_threshold=search_cfg.get("min_score_threshold", 0.0),
+                media_intent_weight=search_cfg.get("media_intent_weight", 0.35),
+                media_intent_slots=search_cfg.get("media_intent_slots", 2),
+            )
     except ValueError as exc:
         return _error(
             "invalid_parameter",
@@ -1947,6 +1967,8 @@ def _file_search_impl(
     else:
         results = [_slim_hit_to_dict(h) for h in hits]
     payload: dict = {"results": results}
+    if exact_identifier:
+        payload["exact_identifier"] = True
     if include_diagnostics:
         payload["diagnostics"] = diagnostics
     elif diagnostics.get("degraded"):
@@ -3334,6 +3356,7 @@ if HAS_MCP and FastMCP is not None:
         sort: str | None = None,
         order_by: str | None = None,
         include_diagnostics: bool = False,
+        exact_identifier: bool = False,
         k: int | None = None,
         n: int | None = None,
         max_results: int | None = None,
@@ -3363,6 +3386,12 @@ if HAS_MCP and FastMCP is not None:
                 stage health). Off by default — it is larger than the
                 results themselves. Even when off, a degraded pipeline is
                 surfaced as a top-level "degraded": true.
+            exact_identifier: If true, the query is an identifier (a docket
+                or case number, an email address, a phone): return only
+                documents whose own text holds it (a phone in any common
+                writing), ranked by keyword score. No vector neighbours, no
+                recency boost, no re-rank; an empty result means no document
+                holds it. The response says "exact_identifier": true.
             doc_id_prefix: Filter to docs under this vault-relative path prefix
                 (e.g., "Projects/" to search only the Projects folder).
                 Filters on rel_path (the vault-relative file path), not doc_id
@@ -3466,6 +3495,7 @@ if HAS_MCP and FastMCP is not None:
             content_max_character=content_max_character,
             sort=sort if sort is not None else order_by,
             include_diagnostics=include_diagnostics,
+            exact_identifier=exact_identifier,
         )
 
     @mcp.tool()
