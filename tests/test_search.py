@@ -873,3 +873,45 @@ def test_identifier_in_text_matches_the_identifier_as_a_whole_token():
     assert identifier_in_text("LT-462-26", "Docket MER-LT-462-26, filed 9/2")
     assert identifier_in_text("LT-462-26", "docket lt-462-26.")
     assert identifier_in_text("+19085550144", "call (908) 555-0144")
+
+
+def test_exact_identifier_search_skips_context_that_runs_on_past_the_marker_chunk():
+    """The indexer appends the conversation context to the end of an attachment's
+    text before splitting it, so a long block runs on into chunks that never
+    repeat the marker. Those chunks hold only the neighbours' messages; an
+    identifier in them is not the attachment's own."""
+    from search_hybrid import exact_identifier_search
+
+    vec = [1.0] + [0.0] * 767
+    nodes = [
+        _make_node("photo.jpg", "img:c:0", "Rent receipt photo, May", vec, source_type="img"),
+        _make_node("photo.jpg", "img:c:1", "paid in full\n\n[Conversation context]\nBEFORE MESSAGES\n"
+                   "[BEFORE 2026-10-05 sender=+19085550100] hi", vec, source_type="img"),
+        _make_node("photo.jpg", "img:c:2", "[BEFORE 2026-10-05 sender=+19085550100] "
+                   "write to field.rep@agency.example.gov", vec, source_type="img"),
+        # A document without a context block: every chunk is its own text.
+        _make_node("lease.md", "c:0", "Lease agreement", vec),
+        _make_node("lease.md", "c:1", "Notices go to field.rep@agency.example.gov", vec),
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = _build_store_with_fts(tmpdir, nodes)
+        result = exact_identifier_search(store, "field.rep@agency.example.gov", final_top_k=8)
+        assert [(h.doc_id, h.loc) for h in result] == [("lease.md", "c:1")]
+
+
+def test_exact_identifier_search_ignores_the_enrichment_summary_in_the_chunk_header():
+    """The chunk header's Summary is the enrichment model's paraphrase, written
+    with the nearby conversation in its prompt: not the document's own words."""
+    from search_hybrid import exact_identifier_search
+
+    vec = [1.0] + [0.0] * 767
+    nodes = [
+        _make_node("receipt.md", "c:0", "[Document: receipt]\nSummary: Receipt; a neighbour asks "
+                   "field.rep@agency.example.gov about the voucher.\n\nRent receipt, May", vec),
+        _make_node("letter.md", "c:0", "[Document: letter]\nSummary: A letter to the field rep.\n\n"
+                   "Dear field.rep@agency.example.gov, the voucher is attached.", vec),
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = _build_store_with_fts(tmpdir, nodes)
+        result = exact_identifier_search(store, "field.rep@agency.example.gov", final_top_k=8)
+        assert [h.doc_id for h in result] == ["letter.md"]

@@ -1097,6 +1097,13 @@ def hybrid_search(
 _EXACT_IDENTIFIER_POOL = 200
 _CONVERSATION_CONTEXT_MARKER = "[Conversation context]"
 _PHONE_SHAPED = re.compile(r"^\+?[\d\s().-]{10,}$")
+# The indexer's chunk header: "[Document: ... | Topics: ...]\nSummary: ...\n\n".
+# The summary is the enrichment model's paraphrase, written with the nearby
+# conversation in its prompt, so it can quote a neighbour's identifier.
+_HEADER_SUMMARY = re.compile(r"\A(\[[^\n]*\])\nSummary: .*?\n\n", re.S)
+# A flat chunk's loc ("c:3", "img:c:3"). Page chunks ("p:2:c:0") never carry
+# the conversation context, and "context:c:0" is context-only.
+_FLAT_CHUNK_LOC = re.compile(r"^((?:img|audio|video):)?c:(\d+)$")
 
 
 def _phone_digits(identifier: str) -> str | None:
@@ -1114,7 +1121,30 @@ def _own_text(hit: SearchHit) -> str:
     messages a chunk carries after its conversation-context marker."""
     if str(hit.loc or "").startswith("context:"):
         return ""
-    return str(hit.text or "").split(_CONVERSATION_CONTEXT_MARKER, 1)[0]
+    text = str(hit.text or "").split(_CONVERSATION_CONTEXT_MARKER, 1)[0]
+    return _HEADER_SUMMARY.sub(r"\1\n\n", text, count=1)
+
+
+def _follows_context_marker(store: "LanceDBStore", hit: SearchHit, first_marker: dict) -> bool:
+    """A flat chunk without the marker that comes after its document's marker
+    chunk holds only neighbouring messages: the indexer appends the context
+    block to the end of the text before splitting it into chunks, so a long
+    block runs on into chunks that never repeat the marker."""
+    match = _FLAT_CHUNK_LOC.match(str(hit.loc or ""))
+    if not match or int(match.group(2)) == 0 or _CONVERSATION_CONTEXT_MARKER in str(hit.text or ""):
+        return False
+    key = (hit.doc_id, match.group(1) or "")
+    if key not in first_marker:
+        indexes = [
+            int(found.group(2))
+            for chunk in store.get_doc_chunks(hit.doc_id)
+            if (found := _FLAT_CHUNK_LOC.match(str(chunk.loc or "")))
+            and (found.group(1) or "") == key[1]
+            and _CONVERSATION_CONTEXT_MARKER in str(chunk.text or "")
+        ]
+        first_marker[key] = min(indexes, default=None)
+    first = first_marker[key]
+    return first is not None and first < int(match.group(2))
 
 
 def identifier_in_text(identifier: str, text: str) -> bool:
@@ -1205,6 +1235,12 @@ def exact_identifier_search(
                 diagnostics["keyword_search_active"] = False
                 diagnostics["degraded"] = True
                 return SearchResult(hits=[], diagnostics=diagnostics)
-    kept = [hit for hit in candidates if identifier_in_text(identifier, _own_text(hit))]
+    kept: list[SearchHit] = []
+    first_marker: dict = {}
+    for hit in candidates:
+        if len(kept) >= final_top_k:
+            break  # each run-on check reads the document's chunks: stop once full
+        if identifier_in_text(identifier, _own_text(hit)) and not _follows_context_marker(store, hit, first_marker):
+            kept.append(hit)
     diagnostics["exact_identifier"] = {"pool": len(candidates), "kept": len(kept)}
-    return SearchResult(hits=kept[:final_top_k], diagnostics=diagnostics)
+    return SearchResult(hits=kept, diagnostics=diagnostics)
