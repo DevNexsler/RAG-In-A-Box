@@ -1065,6 +1065,10 @@ def _refresh_repaired_sidecar_docs(
     ordered_doc_ids = sorted(repaired_doc_ids)
     started = time.monotonic()
     for position in range(0, len(ordered_doc_ids), batch_size):
+        # Heartbeat: this phase runs before the process phase's per-doc stamps
+        # and once ran ~87 min unstamped (#4056). Each batch is progress; a
+        # hung embed stops the stamps and /health flips to 503.
+        _write_heartbeat(_RUNTIME.get("index_root"))
         elapsed = time.monotonic() - started
         if elapsed >= budget_seconds:
             deferred = ordered_doc_ids[position:]
