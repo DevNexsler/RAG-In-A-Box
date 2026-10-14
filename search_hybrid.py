@@ -267,6 +267,14 @@ def _apply_min_score_threshold(
 # Reranker protocol (optional)
 # ---------------------------------------------------------------------------
 
+# How long one search waits on the cross-encoder before taking the cosine
+# fallback. The reranker runs inline on every hybrid search, so this timeout is
+# latency added to the query whenever the provider is slow: at the old 120 s a
+# degraded DeepInfra held queries for 38-120 s (#3953; prod rerank p50 ~3 s,
+# p90 6-14 s). Past this bound the cosine order is the better answer.
+RERANK_TIMEOUT_SECONDS = 10.0
+
+
 class Reranker:
     """Base class for re-rankers. Subclass and override `rerank`."""
 
@@ -292,7 +300,7 @@ class DeepInfraReranker(Reranker):
         self,
         model: str = "Qwen/Qwen3-Reranker-8B",
         api_key: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = RERANK_TIMEOUT_SECONDS,
         base_url: str | None = None,
     ):
         import os
@@ -403,7 +411,7 @@ def build_reranker(config: dict) -> Reranker | None:
             enabled: true
             provider: "deepinfra"
             model: "Qwen/Qwen3-Reranker-8B"
-            timeout: 30
+            timeout: 10
     """
     reranker_cfg = config.get("search", {}).get("reranker", {})
     if not reranker_cfg.get("enabled", False):
@@ -415,7 +423,7 @@ def build_reranker(config: dict) -> Reranker | None:
         return DeepInfraReranker(
             model=reranker_cfg.get("model", "Qwen/Qwen3-Reranker-8B"),
             api_key=reranker_cfg.get("api_key"),
-            timeout=reranker_cfg.get("timeout", 30.0),
+            timeout=reranker_cfg.get("timeout", RERANK_TIMEOUT_SECONDS),
             base_url=reranker_cfg.get("base_url"),
         )
     else:

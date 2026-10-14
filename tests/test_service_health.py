@@ -83,18 +83,27 @@ class TestDeepInfraRerankerHealth:
 
     def test_rerank_reachable(self):
         """Minimal inference endpoint returns 200."""
-        resp = httpx.post(
-            "https://api.deepinfra.com/v1/inference/Qwen/Qwen3-Reranker-8B",
-            headers={
-                "Authorization": f"Bearer {os.environ['DEEPINFRA_API_KEY']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "queries": ["test"],
-                "documents": ["test document"],
-            },
-            timeout=15.0,
-        )
+        timeout = 15.0
+        try:
+            resp = httpx.post(
+                "https://api.deepinfra.com/v1/inference/Qwen/Qwen3-Reranker-8B",
+                headers={
+                    "Authorization": f"Bearer {os.environ['DEEPINFRA_API_KEY']}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "queries": ["test"],
+                    "documents": ["test document"],
+                },
+                timeout=timeout,
+            )
+        except httpx.TimeoutException as exc:
+            # A refused key or spent account answers with a status; silence past
+            # the timeout is model-endpoint latency, which search pays per query (#3953).
+            pytest.fail(
+                f"DeepInfra reranker latency: no response to a 1-document rerank "
+                f"within {timeout:.0f}s ({type(exc).__name__}) — the endpoint is slow, not refusing"
+            )
         assert resp.status_code == 200, f"DeepInfra reranker: {resp.status_code} {resp.text[:200]}"
 
 
