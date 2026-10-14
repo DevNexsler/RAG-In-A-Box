@@ -1392,6 +1392,80 @@ def test_refresh_repaired_sidecar_docs_uses_embedding_only_path(tmp_path, monkey
     )
 
 
+def test_refresh_repaired_sidecar_docs_stops_at_budget_and_defers_rest(
+    tmp_path, monkeypatch, caplog
+):
+    """#3760: an upstream sender-name flip repaired 558 sidecars at once and the
+    serial re-embed (8-12 s/doc) held new-message processing for ~2 h. The phase
+    stops at its time budget and hands the unrefreshed docs to the next run."""
+    import flow_index_vault as fiv
+    from sources.base import SourceRecord
+
+    doc_ids = [f"documents::photo-{index}" for index in range(5)]
+    scanned = [{"doc_id": doc_id, "source_type": "img"} for doc_id in doc_ids]
+    records = {}
+    for doc_id in doc_ids:
+        sidecar = tmp_path / f"{doc_id.split('::')[1]}.json"
+        sidecar.write_text("{}")
+        records[doc_id] = SourceRecord(
+            doc_id=doc_id.split("::")[1],
+            source_type="img",
+            natural_key=f"{doc_id}.jpg",
+            mtime=1.0,
+            size=1,
+            metadata={"sidecar_path": str(sidecar), "source": "chat"},
+        )
+
+    now = [0.0]
+    refreshed = []
+
+    def slow_refresh(store, embed, doc_id, context_text):
+        refreshed.append(doc_id)
+        now[0] += 120.0  # well past prod's 8-12 s/doc; default budget is 300 s
+        return True
+
+    monkeypatch.setattr(fiv.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        fiv, "context_text_from_sidecar", MagicMock(return_value="BEFORE MESSAGES")
+    )
+    monkeypatch.setattr(fiv, "refresh_document_context", slow_refresh)
+    monkeypatch.setitem(fiv._RUNTIME, "context_refresh_deferred", set())
+
+    with caplog.at_level(logging.INFO):
+        changed, failed = fiv._refresh_repaired_sidecar_docs(
+            scanned,
+            records,
+            set(doc_ids),
+            MagicMock(),
+            MagicMock(),
+        )
+
+    assert (changed, failed) == (3, 0)
+    assert refreshed == doc_ids[:3]
+    assert fiv._RUNTIME["context_refresh_deferred"] == set(doc_ids[3:])
+    assert "deferring 2 to the next run" in caplog.text
+
+
+def test_context_refresh_candidates_carry_deferred_docs_to_next_run(tmp_path):
+    import flow_index_vault as fiv
+
+    fiv._save_context_refresh_pending(tmp_path, {"documents::a", "documents::gone"})
+    pending = fiv._load_context_refresh_pending(tmp_path)
+
+    assert pending == {"documents::a", "documents::gone"}
+    # Carried-over docs join this run's repairs; docs that left the store or
+    # are fully reprocessed this run (fresh context) drop out.
+    assert fiv._context_refresh_candidates(
+        repaired={"documents::b", "documents::c"},
+        pending=pending,
+        stored_doc_ids={"documents::a", "documents::b", "documents::c"},
+        full_processing_doc_ids={"documents::c"},
+    ) == {"documents::a", "documents::b"}
+
+    (tmp_path / "context_refresh_pending.json").write_text("not json")
+    assert fiv._load_context_refresh_pending(tmp_path) == set()
+
+
 @pytest.mark.parametrize(
     ("insert_doc_ids", "expected_write_mode"),
     [
