@@ -12,6 +12,7 @@ from communication_context import (
     context_envelope_from_sidecar_payload,
     format_context_envelope_for_prompt,
 )
+from lancedb_store import ChunkTextReplacement
 
 
 CONVERSATION_CONTEXT_MARKER = "[Conversation context]"
@@ -82,6 +83,38 @@ def refresh_document_context(
             vectors[0],
         )
     )
+
+
+def refresh_documents_context(
+    store: Any,
+    embed_provider: Any,
+    contexts: dict[str, str],
+) -> set[str]:
+    """Refresh many anchor chunks with one embed call and one store write.
+
+    Returns the doc ids whose stored row changed."""
+    plans = [
+        plan
+        for doc_id, context_text in contexts.items()
+        if (plan := plan_document_context(store, doc_id, context_text)) is not None
+        and plan.needs_refresh
+    ]
+    if not plans:
+        return set()
+    vectors = embed_provider.embed_texts([plan.desired_text for plan in plans])
+    if len(vectors) != len(plans) or not all(vectors):
+        raise RuntimeError(
+            f"Embedding provider returned {len(vectors)} vectors for {len(plans)} docs"
+        )
+    applied = store.replace_chunk_texts_and_vectors(
+        [
+            ChunkTextReplacement(
+                plan.doc_id, plan.loc, plan.current_text, plan.desired_text, vector
+            )
+            for plan, vector in zip(plans, vectors)
+        ]
+    )
+    return {plan.doc_id for plan, changed in zip(plans, applied) if changed}
 
 
 def plan_document_context(
