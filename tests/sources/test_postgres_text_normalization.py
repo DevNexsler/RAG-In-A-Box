@@ -1,5 +1,6 @@
 """Unit coverage for PostgreSQL source text normalization."""
 
+from contextlib import nullcontext
 from datetime import UTC, datetime
 import hashlib
 
@@ -36,6 +37,9 @@ class _Connection:
             return _Cursor(self.message_rows)
         self.participant_queries += 1
         return _Cursor(self.participant_rows)
+
+    def transaction(self):
+        return nullcontext()
 
 
 def _source(message_rows, participant_rows):

@@ -1,5 +1,6 @@
 """Tracking-heavy HTML mail stays useful and bounded through Lance readback."""
 
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -37,6 +38,9 @@ class _Connection:
 
     def cursor(self, name=None):
         return _Cursor(self._messages if name else [])
+
+    def transaction(self):
+        return nullcontext()
 
 
 class _Embed:

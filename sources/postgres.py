@@ -97,52 +97,59 @@ class PostgresSource:
     def scan(self) -> Iterator[SourceRecord]:
         conn = self._get_conn()
         for spec in self._tables:
-            text_normalizer = build_text_normalizer(spec.text_normalizer, conn)
-            # Server-side cursor for streaming; named cursors stream in
-            # batches of itersize rather than fetching everything.
-            with conn.cursor(name=f"scan_{self.name}_{spec.source_type}") as cur:
-                cur.itersize = 500
-                cur.execute(spec.query)
-                for row in cur:
-                    doc_id = spec.id_template.format(**row)
-                    text = row.get(spec.text_column) or ""
-                    change_hash_salts: list[str] = []
-                    normalized = normalize_source_text(spec.source_type, text)
-                    if not normalized.should_index:
-                        continue
-                    text = normalized.text
-                    if normalized.change_hash_salt:
-                        change_hash_salts.append(normalized.change_hash_salt)
-                    if text_normalizer is not None:
-                        normalized = text_normalizer.normalize(text, row)
+            # One transaction per table, ended as soon as its cursor is
+            # drained (or the caller abandons the scan). The connection is
+            # not autocommit and outlives the scan, so an implicit
+            # transaction would otherwise sit idle holding ACCESS SHARE on
+            # the scanned tables for the rest of the run, blocking DDL on
+            # the source database (#3653).
+            with conn.transaction():
+                text_normalizer = build_text_normalizer(spec.text_normalizer, conn)
+                # Server-side cursor for streaming; named cursors stream in
+                # batches of itersize rather than fetching everything.
+                with conn.cursor(name=f"scan_{self.name}_{spec.source_type}") as cur:
+                    cur.itersize = 500
+                    cur.execute(spec.query)
+                    for row in cur:
+                        doc_id = spec.id_template.format(**row)
+                        text = row.get(spec.text_column) or ""
+                        change_hash_salts: list[str] = []
+                        normalized = normalize_source_text(spec.source_type, text)
                         if not normalized.should_index:
                             continue
                         text = normalized.text
                         if normalized.change_hash_salt:
                             change_hash_salts.append(normalized.change_hash_salt)
-                    mtime_val = row[spec.mtime_column]
-                    mtime = mtime_val.timestamp() if mtime_val else 0.0
-                    metadata = {c: row[c] for c in spec.metadata_columns if c in row}
-                    metadata["_text"] = text  # cache for zero-IO extract
-                    # Content hash for churn-proof change detection: the text is
-                    # already in hand, so hashing is free. The indexer compares
-                    # this instead of mtime, so an upstream job bumping
-                    # updated_at without changing the body never re-indexes.
-                    hash_input = text
-                    if change_hash_salts:
-                        hash_input = f"{'|'.join(change_hash_salts)}\0{text}"
-                    change_hash = hashlib.blake2b(
-                        hash_input.encode("utf-8"), digest_size=16
-                    ).hexdigest()
-                    yield SourceRecord(
-                        doc_id=doc_id,
-                        source_type=spec.source_type,
-                        natural_key=doc_id,
-                        mtime=mtime,
-                        size=len(text.encode("utf-8")),
-                        metadata=metadata,
-                        change_hash=change_hash,
-                    )
+                        if text_normalizer is not None:
+                            normalized = text_normalizer.normalize(text, row)
+                            if not normalized.should_index:
+                                continue
+                            text = normalized.text
+                            if normalized.change_hash_salt:
+                                change_hash_salts.append(normalized.change_hash_salt)
+                        mtime_val = row[spec.mtime_column]
+                        mtime = mtime_val.timestamp() if mtime_val else 0.0
+                        metadata = {c: row[c] for c in spec.metadata_columns if c in row}
+                        metadata["_text"] = text  # cache for zero-IO extract
+                        # Content hash for churn-proof change detection: the text is
+                        # already in hand, so hashing is free. The indexer compares
+                        # this instead of mtime, so an upstream job bumping
+                        # updated_at without changing the body never re-indexes.
+                        hash_input = text
+                        if change_hash_salts:
+                            hash_input = f"{'|'.join(change_hash_salts)}\0{text}"
+                        change_hash = hashlib.blake2b(
+                            hash_input.encode("utf-8"), digest_size=16
+                        ).hexdigest()
+                        yield SourceRecord(
+                            doc_id=doc_id,
+                            source_type=spec.source_type,
+                            natural_key=doc_id,
+                            mtime=mtime,
+                            size=len(text.encode("utf-8")),
+                            metadata=metadata,
+                            change_hash=change_hash,
+                        )
 
     def extract(self, record: SourceRecord) -> ExtractionResult:
         # Text was cached by scan() — no second round-trip needed.
