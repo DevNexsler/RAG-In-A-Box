@@ -160,6 +160,23 @@ def test_compose_enforces_configurable_resource_envelope():
     assert service["pids_limit"] == "${DOC_ORGANIZER_PIDS_LIMIT:-512}"
 
 
+def test_compose_caps_every_core_sized_native_thread_pool():
+    """Native pools default to one thread per host core in every process; the
+    server, index run and Prefect share pids_limit, and an uncapped rayon pool
+    spawned inside optimize_indices hit EAGAIN and panicked the run (#4083)."""
+    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+    env = compose["services"]["doc-organizer"]["environment"]
+
+    for knob in (
+        "LANCE_IO_THREADS",
+        "LANCE_CPU_THREADS",
+        "RAYON_NUM_THREADS",
+        "TOKIO_WORKER_THREADS",
+        "OMP_NUM_THREADS",
+    ):
+        assert f"{knob}=${{{knob}:-8}}" in env
+
+
 def test_example_config_keeps_memory_observability_opt_in():
     """Per-doc sampling must be explicit; default indexing pays no probe cost."""
     config = yaml.safe_load(Path("config.yaml.example").read_text())
