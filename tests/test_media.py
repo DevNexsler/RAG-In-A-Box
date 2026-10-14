@@ -95,6 +95,31 @@ def test_example_configs_include_media_scan_and_provider(config_path: str):
     assert media["video_model"] == "qwen/qwen3.5-397b-a17b"
 
 
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "config.yaml.example",
+        "config.vps.yaml.example",
+        "config.local.yaml.example",
+        "config.staging.yaml",
+        "config.staging.realmedia.yaml",
+    ],
+)
+def test_documents_scan_includes_every_routed_image_format(config_path: str):
+    """#4089: the extractor describes every IMAGE_EXTENSIONS format, but a format
+    missing from the documents scan globs is never registered, so its
+    attachments (a .webp in production) are silently never indexed."""
+    from core.media_formats import IMAGE_EXTENSIONS
+
+    raw = yaml.safe_load(Path(config_path).read_text())
+    scan = raw.get("scan") or next(
+        source["scan"] for source in raw["sources"] if source["name"] == "documents"
+    )
+
+    missing = sorted(ext for ext in IMAGE_EXTENSIONS if f"**/*.{ext}" not in scan["include"])
+    assert not missing, f"{config_path}: documents scan omits image formats {missing}"
+
+
 def test_openrouter_media_provider_sends_audio_input_payload(tmp_path: Path):
     from providers.media.openrouter_media import OpenRouterMediaProvider
 
