@@ -37,6 +37,10 @@ def _claims_adoption(text):
     ('the sender proposes establishing 11 pm as a permanent cutoff time for fires. '
      'this proposal is presented as a suggestion for a standing rule rather than '
      'an already adopted policy.', False),
+    # Observed live (#3998): the negation sits five words before the token.
+    ('the sender proposes making 11 pm the permanent cutoff time for fires. this proposal '
+     'is presented as a suggestion for future policy rather than a statement of an '
+     'already adopted rule.', False),
     ('the proposed cutoff has not been adopted yet.', False),
     ("the rule isn't established; the tenant only suggests it.", False),
     ('this is a proposal, not an enacted rule.', False),
