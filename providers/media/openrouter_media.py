@@ -17,10 +17,9 @@ from providers.media.base import MediaPolicyError
 
 logger = logging.getLogger(__name__)
 
-# No speech maps to an empty reply, never a placeholder: core.fallback treats
-# reachable-empty as "confirm with the fallback or retry", whereas placeholder text
-# is stored as a final transcript. A placeholder offer is also an escape hatch the
-# non-thinking Omni `audio` alias took on audible voice notes (#3835).
+# No speech maps to an empty reply, never a placeholder: MediaFallbackProvider
+# stores a reachable-empty transcript as a clean blank. A placeholder offer is an
+# escape hatch the non-thinking Omni `audio` alias took on audible voice notes (#3835).
 _AUDIO_TRANSCRIBE_PROMPT = (
     "Transcribe all speech in this audio faithfully for document search. If "
     "multiple speakers are clear, label them only as Speaker 1, Speaker 2, and do "

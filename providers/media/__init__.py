@@ -11,7 +11,6 @@ __all__ = ["MediaProvider", "build_media_provider", "DEFAULT_VIDEO_MODEL"]
 DEFAULT_VIDEO_MODEL = "qwen/qwen3.5-397b-a17b"
 
 _VIDEO_PROMPT = "Describe this video's visual content in detail for document search."
-_AUDIO_PROMPT = "Transcribe this audio faithfully for document search."
 
 
 def _model_list(value) -> list:
@@ -140,9 +139,8 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
     """LiteLLM-primary media (video/audio), with OpenRouter demoted to fallback.
 
     Mirrors the OCR block's litellm-primary shape: the LiteLLM proxy is the
-    single router for describe/transcribe, and OpenRouter stays reachable as a
-    per-modality fallback (via the same transient-vs-blank decision rule) for
-    when the proxy is down."""
+    single router for describe/transcribe, and OpenRouter stays reachable as the
+    video fallback (via the same transient-vs-blank decision rule)."""
     from providers.fallback.litellm_fallback import (
         LiteLLMFallback,
         audio_encoder,
@@ -169,8 +167,9 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
     )
     primary = _LiteLLMMediaProvider(video.run, audio.run, max_file_size_mb=max_mb)
 
-    # OpenRouter as fallback (reverse of the legacy openrouter-primary layout).
-    video_fb = audio_fb = None
+    # OpenRouter as the video fallback (reverse of the legacy openrouter-primary
+    # layout). Audio has none: its reachable-empty is a clean blank (#3835).
+    video_fb = None
     if os.environ.get("OPENROUTER_API_KEY"):
         or_cfg = media_cfg.get("openrouter_fallback", {}) or {}
         audio_models = _openrouter_audio_routes(or_cfg, default_fallbacks=())
@@ -183,13 +182,10 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
             max_file_size_mb=max_mb,
         )
         video_fb = or_provider.analyze_video
-        audio_fb = or_provider.transcribe_audio
 
     from providers.media.fallback import MediaFallbackProvider
 
-    return MediaFallbackProvider(
-        primary, video_fallback=video_fb, audio_fallback=audio_fb
-    )
+    return MediaFallbackProvider(primary, video_fallback=video_fb)
 
 
 def build_media_provider(config: dict) -> MediaProvider | None:
@@ -234,10 +230,8 @@ def build_media_provider(config: dict) -> MediaProvider | None:
 
     from providers.media.fallback import MediaFallbackProvider
     from providers.fallback import build_litellm_fallback
-    from providers.fallback.litellm_fallback import audio_encoder, video_encoder
+    from providers.fallback.litellm_fallback import video_encoder
 
     video_fb = build_litellm_fallback(media_cfg.get("video", {}).get("fallback"),
                                       _VIDEO_PROMPT, video_encoder)
-    audio_fb = build_litellm_fallback(media_cfg.get("audio", {}).get("fallback"),
-                                      _AUDIO_PROMPT, audio_encoder)
-    return MediaFallbackProvider(primary, video_fallback=video_fb, audio_fallback=audio_fb)
+    return MediaFallbackProvider(primary, video_fallback=video_fb)

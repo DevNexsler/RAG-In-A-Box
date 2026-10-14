@@ -1,4 +1,4 @@
-"""MediaProvider that adds a per-method LiteLLM fallback via the shared decision rule."""
+"""MediaProvider that adds a video LiteLLM fallback via the shared decision rule."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,11 +12,9 @@ FallbackRun = Callable[[str], str]
 
 class MediaFallbackProvider(MediaProvider):
     def __init__(self, primary: MediaProvider,
-                 video_fallback: Optional[FallbackRun] = None,
-                 audio_fallback: Optional[FallbackRun] = None):
+                 video_fallback: Optional[FallbackRun] = None):
         self._primary = primary
         self._video_fb = video_fallback
-        self._audio_fb = audio_fallback
 
     def analyze_video(self, file_path: str | Path) -> str:
         p = str(file_path)
@@ -28,4 +26,10 @@ class MediaFallbackProvider(MediaProvider):
         p = str(file_path)
         return resolve_with_fallback(
             lambda: self._primary.transcribe_audio(p),
-            (lambda: self._audio_fb(p)) if self._audio_fb else None)
+            None,
+            # The transcribe prompt maps "no speech" to an empty reply, so a
+            # reachable-empty transcript is the model's answer, not a starved
+            # provider. Re-asking a cloud model about silence or noise invents a
+            # transcript (#3835). An unreachable primary still raises transient.
+            empty_is_clean=True,
+        )

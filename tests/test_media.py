@@ -44,7 +44,7 @@ def test_build_media_provider_uses_whisper_then_fallbacks(monkeypatch):
 
 def test_build_media_provider_litellm_primary(monkeypatch):
     """provider: litellm builds a LiteLLM-primary media provider (video+audio)
-    with OpenRouter demoted to a per-modality fallback."""
+    with OpenRouter demoted to the video fallback."""
     from providers.media import _LiteLLMMediaProvider, build_media_provider
 
     monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-litellm-test")
@@ -62,9 +62,8 @@ def test_build_media_provider_litellm_primary(monkeypatch):
         }
     )
     assert isinstance(provider._primary, _LiteLLMMediaProvider)
-    # OpenRouter stays reachable as the fallback for both modalities.
+    # OpenRouter stays reachable as the video fallback (audio has none, #3835).
     assert provider._video_fb is not None
-    assert provider._audio_fb is not None
 
 
 def test_build_media_provider_rejects_unknown_provider():
@@ -173,9 +172,7 @@ def test_litellm_audio_prompt_asks_for_all_speech_and_empty_on_none(
     Measured on the live engine, "If no speech is intelligible, return
     [No intelligible speech]" was taken for audible speech (a 26 s voice note
     as 16 kHz WAV, 8 kHz WAV and MP3: 12/12 calls), and the indexer stored the
-    placeholder as a final transcript. "No speech" must come back empty, so
-    core.fallback's reachable-empty rule decides between retry, fallback and
-    a confirmed blank.
+    placeholder as a final transcript. "No speech" must come back empty.
     """
     from providers.media import build_media_provider
 
@@ -208,6 +205,55 @@ def test_litellm_audio_prompt_asks_for_all_speech_and_empty_on_none(
     assert "transcribe all speech" in prompt.lower(), prompt
     assert "no speech at all, return nothing" in prompt.lower(), prompt
     assert "Never invent" in prompt
+
+
+def test_litellm_audio_empty_transcript_is_clean_without_cloud_fallback(
+    tmp_path: Path, monkeypatch
+):
+    """#3835: the `audio` alias returning "" (no speech) is stored as a clean blank.
+
+    The prompt maps no speech to an empty reply. Handing that empty to the
+    OpenRouter chain re-asks cloud models about silence, and they invent text:
+    voxtral described a film from 10 s of silence and gemini-flash-lite stored an
+    apology as the transcript. The production shape (OPENROUTER_API_KEY set) must
+    not call OpenRouter for audio at all.
+    """
+    from providers.media import build_media_provider
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("LITELLM_API_KEY", "litellm-key")
+    audio = tmp_path / "silence.wav"
+    audio.write_bytes(b"fake-audio")
+    provider = build_media_provider(
+        {
+            "media": {
+                "enabled": True,
+                "provider": "litellm",
+                "endpoint": "http://litellm.example/v1",
+                "audio_model": "audio",
+                "openrouter_fallback": {
+                    "audio_model": "openai/whisper-1",
+                    "fallback_audio_models": [
+                        "mistralai/voxtral-small-24b-2507",
+                        "google/gemini-2.5-flash-lite",
+                    ],
+                },
+            }
+        }
+    )
+
+    urls: list[str] = []
+
+    def fake_post(url, **kwargs):
+        urls.append(url)
+        if url.startswith("http://litellm.example/"):
+            return _ok_response("")
+        return _ok_response("An invented transcript of silence.")
+
+    with patch("httpx.post", side_effect=fake_post):
+        assert provider.transcribe_audio(audio) == ""
+
+    assert urls == ["http://litellm.example/v1/chat/completions"]
 
 
 def test_build_media_provider_resolves_litellm_audio_credentials(monkeypatch):
