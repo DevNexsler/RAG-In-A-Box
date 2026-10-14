@@ -20,18 +20,26 @@ CASES = json.loads(
 
 # A faithful proposal summary may deny adoption ("rather than an already adopted
 # policy"), so judge each clause's claim: an adoption word counts only when no
-# negation governs it, i.e. none among the few words just before it. A negation
-# elsewhere in the clause ("no fires after 11 pm is now an established rule")
-# does not deny the adoption.
+# negation governs it. A contrast ("rather than", "instead of") governs the rest
+# of its clause, however far the adoption word sits ("rather than a statement of
+# an already adopted rule"). A plain negation governs only the few words just
+# after it, so one elsewhere in the clause ("no fires after 11 pm is now an
+# established rule") does not deny the adoption.
 _CLAUSE_BREAK = re.compile(r'[.;:,!?]|\bbut\b')
 _ADOPTION = re.compile(r'\b(adopted|established|enacted)\b')
-_NEGATION = re.compile(r"\b(not|no|never|nor|rather than|instead of|yet to be)\b|n't\b")
+_CONTRAST = re.compile(r'\b(rather than|instead of)\b')
+_NEGATION = re.compile(r"\b(not|no|never|nor|yet to be)\b|n't\b")
 _NEGATION_REACH_WORDS = 4
+
+
+def _denies(preceding):
+    nearby = ' '.join(preceding.split()[-_NEGATION_REACH_WORDS:])
+    return bool(_CONTRAST.search(preceding) or _NEGATION.search(nearby))
 
 
 def _claims_adoption(text):
     return any(
-        not _NEGATION.search(' '.join(clause[:match.start()].split()[-_NEGATION_REACH_WORDS:]))
+        not _denies(clause[:match.start()])
         for clause in _CLAUSE_BREAK.split(text)
         for match in _ADOPTION.finditer(clause))
 
@@ -55,6 +63,8 @@ def _claims_adoption(text):
     # A negation that does not govern the adoption word must not hide the claim.
     ('fires are no longer allowed past 11 pm under the newly adopted rule.', True),
     ('no fires after 11 pm is now an established rule.', True),
+    # A contrast denies only what follows it.
+    ('the cutoff was adopted rather than merely proposed.', True),
 ])
 def test_adoption_claim_distinguishes_denial(summary, claims):
     assert _claims_adoption(summary) is claims
