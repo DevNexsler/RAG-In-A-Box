@@ -445,6 +445,27 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _hit_vectors(hits: list[SearchHit], store: "LanceDBStore") -> dict[str, list[float]]:
+    """Vectors for hits keyed by chunk UID (doc_id::loc).
+
+    Uses the vector a hit already carries; the rest are loaded in one batched
+    store read, never one query per hit.
+    """
+    vectors: dict[str, list[float]] = {}
+    missing_uids: list[str] = []
+    for hit in hits:
+        chunk_uid = f"{hit.doc_id}::{hit.loc}"
+        vec = getattr(hit, "vector", None)
+        if vec is not None:
+            vectors[chunk_uid] = vec
+        else:
+            missing_uids.append(chunk_uid)
+
+    if missing_uids and hasattr(store, "get_vectors"):
+        vectors.update(store.get_vectors(missing_uids))
+    return vectors
+
+
 def _cosine_fallback_rerank(
     query_vector: list[float],
     hits: list[SearchHit],
@@ -460,9 +481,9 @@ def _cosine_fallback_rerank(
     Falls back silently to original order if embeddings can't be retrieved.
     """
     try:
+        vectors = _hit_vectors(hits, store)
         for hit in hits:
-            chunk_uid = f"{hit.doc_id}::{hit.loc}"
-            stored_vec = store.get_vector(chunk_uid)
+            stored_vec = vectors.get(f"{hit.doc_id}::{hit.loc}")
             if stored_vec is not None:
                 cos_sim = _cosine_similarity(query_vector, stored_vec)
                 hit.score = blend_original * hit.score + blend_cosine * cos_sim
@@ -672,19 +693,7 @@ def _apply_mmr_diversity(
         active_hits = hits[:pool_limit] if pool_limit else list(hits)
         tail_hits = hits[len(active_hits):]
 
-        vectors: dict[str, list[float]] = {}
-        missing_uids: list[str] = []
-        for hit in active_hits:
-            chunk_uid = _chunk_uid(hit)
-            vec = getattr(hit, "vector", None)
-            if vec is not None:
-                vectors[chunk_uid] = vec
-            else:
-                missing_uids.append(chunk_uid)
-
-        if missing_uids and hasattr(store, "get_vectors"):
-            vectors.update(store.get_vectors(missing_uids))
-
+        vectors = _hit_vectors(active_hits, store)
         if not vectors:
             return (hits, []) if return_deferred else hits
 
@@ -1030,9 +1039,8 @@ def hybrid_search(
             except Exception as e:
                 logger.warning("Reranker failed, falling back to cosine rerank: %s", e)
                 if query_vector is not None:
-                    stage_started = time.perf_counter()
                     fused = _cosine_fallback_rerank(query_vector, rerank_pool, store)
-                    timing_ms["rerank"] = round((time.perf_counter() - stage_started) * 1000, 3)
+                timing_ms["rerank"] = round((time.perf_counter() - stage_started) * 1000, 3)
 
         # 7b. Media-intent boost — applied AFTER the re-ranker so it survives
         #     into the final cut. The re-ranker scores textual relevance and

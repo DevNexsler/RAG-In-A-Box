@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import time
 
 import pytest
 
@@ -462,6 +463,30 @@ def test_diagnostics_reranker_failure():
         assert result.diagnostics["degraded"] is True
         # Should still return RRF-fused results
         assert len(result) >= 1
+
+
+class SlowFailingReranker(Reranker):
+    """Reranker that waits out its budget, then raises (simulates a read timeout)."""
+    def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
+        time.sleep(0.05)
+        raise RuntimeError("DeepInfra reranker failed: The read operation timed out")
+
+
+def test_diagnostics_reranker_failure_timing_includes_failed_wait():
+    """On the cosine fallback path, timing_ms["rerank"] is the whole stage:
+    the failed reranker wait plus the fallback, not the fallback alone (#4137)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vec = [1.0] + [0.0] * 767
+        nodes = [_make_node("a.md", "c:0", "roof insurance claim damage", vec)]
+        store = _build_store_with_fts(tmpdir, nodes)
+        embed = MockEmbedProvider(vec)
+
+        result = hybrid_search(
+            store, embed, "roof claim",
+            vector_top_k=10, final_top_k=5, reranker=SlowFailingReranker(),
+        )
+        assert result.diagnostics["reranker_applied"] is False
+        assert result.diagnostics["timing_ms"]["rerank"] >= 50
 
 
 def test_diagnostics_reranker_success():
