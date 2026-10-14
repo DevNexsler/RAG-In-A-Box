@@ -1,6 +1,18 @@
 [
   {
     "prs": [
+      212
+    ],
+    "name": "single-word-field-name-vocabulary",
+    "path": "doc_enrichment.py",
+    "before": "*(key for key in (_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW) if \"_\" in key),",
+    "after": "*(key for key in (_ENRICHMENT_KEYS_RAW + _CONTEXT_KEYS_RAW)),",
+    "tests": [
+      "tests/test_enrichment_structured_retry.py::test_single_word_field_names_are_ordinary_vocabulary"
+    ]
+  },
+  {
+    "prs": [
       198
     ],
     "name": "platform-id-authority",

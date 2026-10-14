@@ -21,7 +21,11 @@ import pytest
 
 import flow_index_vault as fiv
 from core import enrichment_telemetry
-from doc_enrichment import structured_response_is_usable
+from doc_enrichment import (
+    enrichment_contract_errors,
+    parse_enrichment_response,
+    structured_response_is_usable,
+)
 from extractors import begin_degradation_capture, collect_degradations
 from lancedb_store import LanceDBStore
 from providers.llm.litellm_llm import LiteLLMGenerator
@@ -164,8 +168,13 @@ def _stored_metadata(store: LanceDBStore, doc_id: str) -> dict:
         ("importance", True),
         ("importance", float("inf")),
         ("importance", 1.01),
-        ("key_facts", ["summary"]),
+        # The #1918 production payloads: remaining field names copied as values.
+        ("key_facts", ["importance", "suggested_tags", "suggested_folder"]),
+        ("suggested_tags", ["suggested_folder", "importance"]),
         ("entities_orgs", ["suggested_folder"]),
+        ("keywords", ["enr_summary"]),
+        ("keywords", ["10-20 specific terms and phrases"]),
+        ("doc_type", ["type1", "type2"]),
     ],
 )
 def test_structured_response_contract_rejects_wrong_types_ranges_and_schema_tokens(
@@ -176,6 +185,51 @@ def test_structured_response_contract_rejects_wrong_types_ranges_and_schema_toke
     payload[field] = invalid_value
 
     assert not structured_response_is_usable(json.dumps(payload))
+
+
+# A daily ticket digest titled "Ticket Resolution Summary for the Day" (#3903):
+# every response carried the grounded keyword "Summary", and the contract
+# rejected all six attempts because "summary" is also a schema field name.
+GROUNDED_SCHEMA_WORDS = [
+    (
+        "keywords",
+        ["Ticket Resolution", "Summary", "Daily Report", "Ashfield"],
+        "Ticket Resolution, Summary, Daily Report, Ashfield",
+    ),
+    ("doc_type", ["status report", "summary"], "status_report, summary"),
+    ("suggested_tags", ["tickets", "summary"], "tickets, summary"),
+    ("topics", ["ticket resolution", "importance"], "ticket resolution, importance"),
+]
+
+
+@pytest.mark.parametrize(("field", "value", "stored"), GROUNDED_SCHEMA_WORDS)
+def test_single_word_field_names_are_ordinary_vocabulary(field, value, stored):
+    """Contract and normalization agree: a word that happens to name a schema
+    field is kept, not rejected by one and silently stripped by the other."""
+    raw = _enrichment_payload(**{field: value})
+
+    assert enrichment_contract_errors(raw) == []
+    assert parse_enrichment_response(raw)[f"enr_{field}"] == stored
+
+
+def test_grounded_summary_keyword_is_indexed_on_first_response(runtime):
+    docs_root, store = runtime
+    doc = _write_doc(docs_root)
+    (docs_root / doc["rel_path"]).write_text(
+        "Ticket Resolution Summary for the Day - Ashfield"
+    )
+
+    calls = _index_with_responses(doc, [
+        _response(
+            _enrichment_payload(keywords=["Ticket Resolution", "Summary"]),
+            completion_tokens=430,
+        ),
+    ])
+
+    assert len(calls) == 1, "a grounded answer was rejected and re-requested"
+    stored = _stored_metadata(store, doc["doc_id"])
+    assert stored["enr_keywords"] == "Ticket Resolution, Summary"
+    assert not collect_degradations()
 
 
 def test_malformed_first_response_then_valid_retry_stores_required_metadata(runtime):
