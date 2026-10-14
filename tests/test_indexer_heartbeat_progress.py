@@ -201,3 +201,58 @@ def test_completion_summary_surfaces_actionable_skip_ids():
         "Index run has permanent actionable skips: %s",
         {"corrupt_mangled_binary": ["documents::001sp", "documents::001su"]},
     )
+
+
+def test_context_refresh_stamps_heartbeat_per_document(tmp_path, monkeypatch):
+    """The attachment context-only refresh re-embeds every repaired sidecar doc
+    before the process phase's per-doc stamps begin. In production (#4056) it
+    refreshed ~930 docs over ~87 minutes with no stamp, so /health reported a
+    progressing indexer as stalled for most of that phase. Each refreshed doc
+    is progress and must re-stamp the heartbeat before the next embed call.
+    """
+    from sources.base import SourceRecord
+
+    monkeypatch.setitem(flow_index_vault._RUNTIME, "index_root", tmp_path)
+    refreshed: list[str] = []
+    stamps: list[int] = []
+    real_write = flow_index_vault._write_heartbeat
+
+    def _spy(index_root):
+        stamps.append(len(refreshed))
+        real_write(index_root)
+
+    def _refresh(store, embed_provider, doc_id, context_text):
+        refreshed.append(doc_id)
+        return True
+
+    monkeypatch.setattr(flow_index_vault, "_write_heartbeat", _spy)
+    monkeypatch.setattr(
+        flow_index_vault, "context_text_from_sidecar", lambda *a, **k: "CONTEXT"
+    )
+    monkeypatch.setattr(flow_index_vault, "refresh_document_context", _refresh)
+
+    sidecar = tmp_path / "photo.json"
+    sidecar.write_text("{}")
+    doc_ids = [f"documents::photo{i}" for i in range(3)]
+    scanned = [{"doc_id": doc_id, "source_type": "img"} for doc_id in doc_ids]
+    records = {
+        doc_id: SourceRecord(
+            doc_id=doc_id.split("::", 1)[1],
+            source_type="img",
+            natural_key=f"{doc_id}.jpg",
+            mtime=1.0,
+            size=1,
+            metadata={"sidecar_path": str(sidecar), "source": "chat"},
+        )
+        for doc_id in doc_ids
+    }
+
+    changed, failed = flow_index_vault._refresh_repaired_sidecar_docs(
+        scanned, records, set(doc_ids), Mock(), Mock()
+    )
+
+    assert (changed, failed) == (3, 0)
+    # One stamp ahead of each embed call: a refresh that hangs stops stamping,
+    # so a real freeze in this phase still ages past INDEXER_HEARTBEAT_MAX_AGE.
+    assert stamps == [0, 1, 2]
+    assert flow_index_vault._heartbeat_path(tmp_path).exists()

@@ -1002,6 +1002,10 @@ def _refresh_repaired_sidecar_docs(
     changed = 0
     failed = 0
     for doc_id in sorted(repaired_doc_ids):
+        # Heartbeat: this phase re-embeds every repaired doc before the first
+        # per-doc stamp, and can run for over an hour (#4056). Each doc is
+        # progress; a hung embed stops the stamps and /health flips to 503.
+        _write_heartbeat(_RUNTIME.get("index_root"))
         doc = records_by_doc_id.get(doc_id)
         source_record = source_records_by_ns_doc_id.get(doc_id)
         if doc is None or source_record is None:
