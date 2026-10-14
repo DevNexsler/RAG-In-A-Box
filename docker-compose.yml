@@ -89,6 +89,16 @@ services:
       # table; the index run's throughput is bound by provider calls, not this.
       - LANCE_IO_THREADS=${LANCE_IO_THREADS:-8}
       - LANCE_CPU_THREADS=${LANCE_CPU_THREADS:-8}
+      # Every other native pool sizes itself to those 32 cores too, once per
+      # process: rayon (Lance index build/merge), the tokio runtimes behind
+      # lance and lancedb, and OpenBLAS/Arrow (numpy, pyarrow). The index-run
+      # subprocess peaked at 178 threads and the server at 167; they share
+      # pids_limit with Prefect, so rayon's lazy 32-thread spawn inside
+      # optimize_indices hit EAGAIN and panicked the run (#4083). Capped, the
+      # same Lance work peaks near 64 threads per process.
+      - RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-8}
+      - TOKIO_WORKER_THREADS=${TOKIO_WORKER_THREADS:-8}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
       # glibc malloc (Python's allocator; Lance uses its own jemalloc) gives every
       # worker thread a private arena and keeps that thread's freed search
       # objects — ~100 candidate rows with text, metadata and a 4096-float list
