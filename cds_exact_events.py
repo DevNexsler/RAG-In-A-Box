@@ -38,6 +38,19 @@ def event_request(refs, cursor=None):
     return state
 
 
+def _call_sides(call):
+    """Name the PFG line and the other party: transcripts label speakers by phone number only,
+    so an outgoing staff call otherwise reads as an unlabelled exchange (2026-10-06, ticket 180)."""
+    line, other = {'outbound': (call.get('from_number'), call.get('to_number')),
+                   'inbound': (call.get('to_number'), call.get('from_number'))}.get(call.get('direction'), (None, None))
+    if not line:
+        return {}
+    legend = f"{line} is the PFG phone line (staff side)" + (f"; {other} is the other party" if other else "")
+    return {'pfg_line': line, 'counterparty_number': other,
+            'speaker_legend': f"{legend}. Direction {call['direction']}: "
+                              + ("PFG placed this call." if call['direction'] == 'outbound' else "the other party called PFG.")}
+
+
 def fetch_event_page(cur, refs, state):
     index, offset = state["index"], state["offset"]
     ref = refs[index]
@@ -75,12 +88,14 @@ def fetch_event_page(cur, refs, state):
         transcript = "coalesce(t.body,'')"
         cur.execute(
             "/* exact_call_event_page */ SELECT 'call:' || c.id::text,c.source,c.source_call_id,c.started_at,"
-            "CASE c.direction WHEN 'incoming' THEN 'inbound' WHEN 'outgoing' THEN 'outbound' ELSE c.direction END,"
+            # calls.direction is never populated (v3 or v4); the Quo payload carries it.
+            "CASE coalesce(c.direction, re.payload #>> '{data,object,direction}') WHEN 'incoming' THEN 'inbound' "
+            "WHEN 'outgoing' THEN 'outbound' ELSE coalesce(c.direction, re.payload #>> '{data,object,direction}') END,"
             "NULL::text,CASE WHEN t.body IS NULL THEN 'Call metadata (no transcript)' ELSE 'Call transcript' END,"
             f"substring({transcript} from %s for %s),length({transcript}),"
             f"encode(sha256(convert_to({transcript},'UTF8')),'hex'),"
             "c.duration_seconds,c.status,c.from_number,c.to_number "
-            "FROM calls c LEFT JOIN LATERAL (SELECT body FROM (SELECT nullif(c.transcript,'') AS body UNION "
+            "FROM calls c LEFT JOIN raw_events re ON re.id=c.raw_event_id LEFT JOIN LATERAL (SELECT body FROM (SELECT nullif(c.transcript,'') AS body UNION "
             "SELECT nullif(transcript_text,'') FROM transcripts WHERE call_id=c.id) candidates "
             "WHERE body IS NOT NULL) t ON TRUE "
             "WHERE c.source_call_id=%s ORDER BY c.id,t.body LIMIT 2",
@@ -109,6 +124,7 @@ def fetch_event_page(cur, refs, state):
             message['transcript_status'] = 'available' if available else 'unavailable'
             message['body_authority'] = ('Stored call transcript, not a verbatim audio verification or summary.'
                 if available else 'Call metadata only; not evidence of what was said. No stored transcript available.')
+            message.update(_call_sides(message))
         message["sent_at"] = message["sent_at"].isoformat() if message["sent_at"] else None
         metadata = {k: v for k, v in message.items() if k != "body"}
         version = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()

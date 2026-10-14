@@ -18,7 +18,8 @@ def test_real_call_history_scopes_endpoints_and_hosts_and_pages_timestamp_ties()
             (id bigint, email text, phone text, phone_number text);
             CREATE TEMP TABLE calls (id bigint, source text, source_call_id text,
             started_at timestamptz, direction text, host_participant_id bigint,
-            from_number text, to_number text);""")
+            from_number text, to_number text, raw_event_id bigint);
+            CREATE TEMP TABLE raw_events (id bigint, payload jsonb);""")
         conn.execute("INSERT INTO participants VALUES (1,'person@example.test',NULL,NULL),(2,NULL,'+12025550199',NULL)")
         at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)
         for row_id, host, caller, callee, when in [

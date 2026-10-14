@@ -1336,3 +1336,61 @@ def test_duplicate_callback_is_announced_when_canonical_payload_vanishes(
               if row.event["doc_id"] == duplicate["doc_id"]]
     assert len(events) == 1
     assert events[0]["text"] and events[0]["chunks"]
+
+
+@pytest.mark.parametrize("media_type,mime_type", [
+    ("video", "video/3gpp"), ("audio", "audio/amr"), ("img", "image/heic"),
+])
+@pytest.mark.parametrize("content_status", ["complete", "partial"])
+def test_binary_duplicate_preserves_canonical_media_and_primary_provenance(
+    runtime, media_type, mime_type, content_status,
+):
+    from communication_context import SidecarContextProvider, communication_metadata_from_sidecar
+    from extractors import Degradation, ExtractionResult
+
+    docs_root, store, registry = runtime
+    canonical = _make_doc(docs_root, "f/canonical.bin", "identical media bytes", "00001")
+    duplicate = _make_doc(docs_root, "quo-attachments/duplicate@00002@.bin", "identical media bytes", "00002")
+    canonical["ext"] = duplicate["ext"] = "bin"
+    _register(registry, canonical)
+    _register(registry, duplicate)
+    failures = [Degradation("segment_decode_failed")] if content_status == "partial" else []
+    with patch("flow_index_vault.extract_text", return_value=ExtractionResult(
+        full_text="Primary media describes property repairs. " * 10,
+        frontmatter={"media_type": media_type},
+    )), patch("flow_index_vault.collect_degradations", return_value=failures):
+        fiv.process_doc_task.fn(canonical)
+
+    sidecar = Path(duplicate["abs_path"]).with_suffix(".json")
+    sidecar.write_text(json.dumps({
+        "schema_version": 2,
+        "source": "quo",
+        "message": {"source_message_id": "attachment", "sent_at": "2026-06-18T19:08:42Z"},
+        "channel": {"source_channel_id": "maintenance"},
+        "media": {"media_index": 0, "media_type": mime_type},
+        "context": {"same_channel_before": [{
+            "source_message_id": "before", "sent_at": "2026-06-18T19:07:07Z",
+            "text": "Please check property repairs.", "origin_source": "quo",
+            "channel_id": "maintenance",
+        }]},
+    }))
+    fiv._RUNTIME["source_records_by_ns_doc_id"] = {
+        duplicate["doc_id"]: SimpleNamespace(metadata=communication_metadata_from_sidecar(
+            Path(duplicate["abs_path"]), sidecar,
+        )),
+    }
+    fiv._RUNTIME["communication_context_provider"] = SidecarContextProvider()
+    with patch("flow_index_vault.extract_text", side_effect=AssertionError("duplicate must reuse canonical media")):
+        fiv.process_doc_task.fn(duplicate)
+
+    alias_chunks = store.get_doc_chunks(duplicate["doc_id"])
+    assert len(alias_chunks) == 1
+    assert alias_chunks[0].source_type == media_type
+    assert "Please check property repairs." in alias_chunks[0].text
+    event = fiv._build_duplicate_document_indexed_event(duplicate, canonical["doc_id"])
+    assert event["source_type"] == event["metadata"]["source_type"] == media_type
+    assert event["metadata"]["content_status"] == content_status
+    if failures:
+        assert event["metadata"]["content_failure_reasons"] == "segment_decode_failed"
+    assert "Primary media describes property repairs." in event["text"]
+    assert event["metadata"]["canonical_doc_id"] == canonical["doc_id"]

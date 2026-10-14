@@ -22,6 +22,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple, Optional
 
+from core.media_formats import (
+    AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MediaConversionError,
+    detect_media_format, provider_image_paths, provider_media_path,
+)
 from core.resilience import is_transient
 from core.skip_policy import CORRUPT_MANGLED_BINARY
 from providers.media.base import MediaPolicyError, MediaProvider
@@ -78,8 +82,6 @@ def note_skip(reason: str) -> None:
     if skips is not None:
         skips.append(reason)
 
-AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "flac", "ogg", "aac", "aiff"}
-VIDEO_EXTENSIONS = {"mp4", "mov", "mkv", "webm", "avi", "m4v"}
 
 
 @dataclass
@@ -575,6 +577,14 @@ def extract_image(
     Extracts EXIF metadata (camera, date, GPS, dimensions) and stores in frontmatter.
     """
     file_path = Path(file_path)
+    # Register decoder before metadata read as well as vision conversion.
+    image_format = detect_media_format(file_path, file_path.suffix)
+    if image_format in {"heic", "heif"}:
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        except ImportError:
+            pass  # Conversion below records missing decoder as degradation.
     meta = _extract_image_metadata(file_path)
     fm: dict = {}
     if meta.get("date_taken"):
@@ -593,7 +603,16 @@ def extract_image(
         return ExtractionResult.from_text(header, frontmatter=fm, primary_content=False)
 
     try:
-        vision_text = ocr_provider.describe(str(file_path))
+        with provider_image_paths(file_path, image_format) as pages:
+            descriptions = []
+            for page_number, prepared in enumerate(pages, start=1):
+                description = ocr_provider.describe(str(prepared))
+                if not description.strip():
+                    continue
+                if len(pages) > 1:
+                    description = f"Page {page_number}:\n{description}"
+                descriptions.append(description)
+            vision_text = "\n\n".join(descriptions)
     except Exception as e:
         logger.warning("OCR describe failed for %s: %s", file_path, e)
         note_degradation("ocr_describe_failed", transient=is_transient(e))
@@ -706,27 +725,20 @@ def extract_audio(
     file_path: str | Path,
     media_provider: Optional[MediaProvider] = None,
 ) -> ExtractionResult:
-    """Extract searchable text from an audio file.
-
-    ffmpeg is deliberately NOT in the image (#0546): transcription is a cloud call
-    that uploads the file as-is, so nothing here decodes audio locally. The
-    ``Couldn't find ffmpeg or avconv`` RuntimeWarning comes from pydub, imported by
-    markitdown — whose own audio converter we never reach, because audio extensions
-    route here and markitdown only handles docx/pptx/html/epub/rtf/csv. The warning
-    is now a normal timestamped log record via logging.captureWarnings.
-    """
+    """Extract audio, normalizing legacy WAV/AMR codecs before upload."""
     fm = _media_frontmatter(file_path, "audio")
     if media_provider is None:
-        return ExtractionResult.from_text("", frontmatter=fm)
+        return ExtractionResult.from_text("", frontmatter=fm, primary_content=False)
     if _is_nonmedia_stub(file_path):
         logger.warning(
             "Audio file is a non-media stub (attachment retrieval failed?), "
             "skipping without provider call: %s", file_path,
         )
         note_skip("media_retrieval_stub")
-        return ExtractionResult.from_text("", frontmatter=fm)
+        return ExtractionResult.from_text("", frontmatter=fm, primary_content=False)
     try:
-        transcript = media_provider.transcribe_audio(file_path)
+        with provider_media_path(file_path, detect_media_format(file_path, Path(file_path).suffix), "audio") as prepared:
+            transcript = media_provider.transcribe_audio(prepared)
     except MediaPolicyError as e:
         # Deterministic policy rejection (e.g. oversize) — an intentional skip,
         # not a backend failure: the skip ledger stops the re-extract-every-run
@@ -751,16 +763,17 @@ def extract_video(
     """Extract searchable text from a video file."""
     fm = _media_frontmatter(file_path, "video")
     if media_provider is None:
-        return ExtractionResult.from_text("", frontmatter=fm)
+        return ExtractionResult.from_text("", frontmatter=fm, primary_content=False)
     if _is_nonmedia_stub(file_path):
         logger.warning(
             "Video file is a non-media stub (attachment retrieval failed?), "
             "skipping without provider call: %s", file_path,
         )
         note_skip("media_retrieval_stub")
-        return ExtractionResult.from_text("", frontmatter=fm)
+        return ExtractionResult.from_text("", frontmatter=fm, primary_content=False)
     try:
-        notes = media_provider.analyze_video(file_path)
+        with provider_media_path(file_path, detect_media_format(file_path, Path(file_path).suffix), "video") as prepared:
+            notes = media_provider.analyze_video(prepared)
     except MediaPolicyError as e:
         # Deterministic policy rejection (e.g. oversize) — an intentional skip,
         # not a backend failure: the skip ledger stops the re-extract-every-run
@@ -898,8 +911,16 @@ def extract_text(
     min_text_chars: int = 200,
     ocr_page_limit: int = 200,
 ) -> ExtractionResult:
-    """Route to the right extractor based on file extension."""
+    """Route using media bytes, retaining original paths and identifiers."""
     ext = ext.lower().lstrip(".")
+    try:
+        ext = detect_media_format(file_path, ext)
+    except MediaConversionError:
+        note_degradation("media_probe_failed")
+        return ExtractionResult.from_text("", primary_content=False)
+    if ext == "bin":
+        note_degradation("unrecognized_media_format")
+        return ExtractionResult.from_text("", primary_content=False)
     if ext == "md":
         return extract_markdown(file_path)
     elif ext == "pdf":
@@ -910,12 +931,19 @@ def extract_text(
             min_text_chars=min_text_chars,
             ocr_page_limit=ocr_page_limit,
         )
-    elif ext in ("png", "jpg", "jpeg", "gif", "webp"):
-        return extract_image(file_path, ocr_provider=ocr_provider)
+    elif ext in IMAGE_EXTENSIONS:
+        result = extract_image(file_path, ocr_provider=ocr_provider)
+        result.frontmatter["media_type"] = "img"
+        result.frontmatter["detected_format"] = ext
+        return result
     elif ext in AUDIO_EXTENSIONS:
-        return extract_audio(file_path, media_provider=media_provider)
+        result = extract_audio(file_path, media_provider=media_provider)
+        result.frontmatter["detected_format"] = ext
+        return result
     elif ext in VIDEO_EXTENSIONS:
-        return extract_video(file_path, media_provider=media_provider)
+        result = extract_video(file_path, media_provider=media_provider)
+        result.frontmatter["detected_format"] = ext
+        return result
     elif ext == "txt":
         return extract_plaintext(file_path)
     elif ext in ("xlsx", "xls"):

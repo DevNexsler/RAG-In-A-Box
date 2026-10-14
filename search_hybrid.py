@@ -1086,3 +1086,161 @@ def hybrid_search(
         candidate_counts["returned"] = len(hits)
         timing_ms["total"] = round((time.perf_counter() - search_started) * 1000, 3)
         return SearchResult(hits=hits, diagnostics=diagnostics)
+
+
+# ---------------------------------------------------------------------------
+# Exact identifier search
+# ---------------------------------------------------------------------------
+
+# Keyword candidates read before the own-text filter: an identifier's tokens
+# ("dca", "gov", "26") are common, so the exact hit may rank low on BM25.
+_EXACT_IDENTIFIER_POOL = 200
+_CONVERSATION_CONTEXT_MARKER = "[Conversation context]"
+_PHONE_SHAPED = re.compile(r"^\+?[\d\s().-]{10,}$")
+# The indexer's chunk header: "[Document: ... | Topics: ...]\nSummary: ...\n\n".
+# The summary is the enrichment model's paraphrase, written with the nearby
+# conversation in its prompt, so it can quote a neighbour's identifier.
+_HEADER_SUMMARY = re.compile(r"\A(\[[^\n]*\])\nSummary: .*?\n\n", re.S)
+# A flat chunk's loc ("c:3", "img:c:3"). Page chunks ("p:2:c:0") never carry
+# the conversation context, and "context:c:0" is context-only.
+_FLAT_CHUNK_LOC = re.compile(r"^((?:img|audio|video):)?c:(\d+)$")
+
+
+def _phone_digits(identifier: str) -> str | None:
+    """The ten national digits of a phone-shaped identifier (NANP), else None."""
+    digits = re.sub(r"\D", "", identifier)
+    if not _PHONE_SHAPED.match(identifier.strip()):
+        return None
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else None
+
+
+def _own_text(hit: SearchHit) -> str:
+    """A hit's own words: never a context-only chunk, never the neighbouring
+    messages a chunk carries after its conversation-context marker."""
+    if str(hit.loc or "").startswith("context:"):
+        return ""
+    text = str(hit.text or "").split(_CONVERSATION_CONTEXT_MARKER, 1)[0]
+    return _HEADER_SUMMARY.sub(r"\1\n\n", text, count=1)
+
+
+def _follows_context_marker(store: "LanceDBStore", hit: SearchHit, first_marker: dict) -> bool:
+    """A flat chunk without the marker that comes after its document's marker
+    chunk holds only neighbouring messages: the indexer appends the context
+    block to the end of the text before splitting it into chunks, so a long
+    block runs on into chunks that never repeat the marker."""
+    match = _FLAT_CHUNK_LOC.match(str(hit.loc or ""))
+    if not match or int(match.group(2)) == 0 or _CONVERSATION_CONTEXT_MARKER in str(hit.text or ""):
+        return False
+    key = (hit.doc_id, match.group(1) or "")
+    if key not in first_marker:
+        indexes = [
+            int(found.group(2))
+            for chunk in store.get_doc_chunks(hit.doc_id)
+            if (found := _FLAT_CHUNK_LOC.match(str(chunk.loc or "")))
+            and (found.group(1) or "") == key[1]
+            and _CONVERSATION_CONTEXT_MARKER in str(chunk.text or "")
+        ]
+        first_marker[key] = min(indexes, default=None)
+    first = first_marker[key]
+    return first is not None and first < int(match.group(2))
+
+
+def identifier_in_text(identifier: str, text: str) -> bool:
+    """``text`` holds ``identifier`` as a whole token: a phone in any common
+    writing ("+19085550144", "(908) 555-0144", "908.555.0144"), anything else
+    verbatim, case and spacing aside. An email is not part of a longer address
+    (ann@ is not joann@, nor ann@gmail.com.example); anything else is set off by
+    non-alphanumerics, so 'MER-LT-462-26' holds 'LT-462-26' but 'LT-462-261'
+    does not."""
+    national = _phone_digits(identifier)
+    if national:
+        pattern = (rf"(?<!\d)(?:\+?1[\s.-]*)?\(?{national[:3]}\)?[\s.-]*"
+                   rf"{national[3:6]}[\s.-]*{national[6:]}(?!\d)")
+        return bool(re.search(pattern, text))
+    wanted = " ".join(identifier.split()).casefold()
+    if not wanted:
+        return False
+    if "@" in wanted:
+        pattern = r"(?<![\w.+-])" + re.escape(wanted) + r"(?![\w-]|\.\w)"
+    else:
+        pattern = r"(?<![a-z0-9])" + re.escape(wanted) + r"(?![a-z0-9])"
+    return re.search(pattern, " ".join(text.split()).casefold()) is not None
+
+
+def _identifier_keywords(identifier: str) -> str:
+    """The keyword query for an identifier: its letter and digit runs (no
+    query-syntax operators), plus a phone's other common writings."""
+    national = _phone_digits(identifier)
+    if national:
+        return " ".join(["1" + national, national, national[:3], national[3:6], national[6:]])
+    return " ".join(re.findall(r"[A-Za-z0-9]+", identifier))
+
+
+def exact_identifier_search(
+    store: "LanceDBStore",
+    identifier: str,
+    final_top_k: int = 10,
+    *,
+    pool: int = _EXACT_IDENTIFIER_POOL,
+    doc_id_prefix: str | None = None,
+    source_type: str | None = None,
+    source_name: str | None = None,
+    tags: str | None = None,
+    status: str | None = None,
+    folder: str | None = None,
+    metadata_filters: dict[str, str] | None = None,
+    filter_ast: dict | None = None,
+    enr_doc_type: str | None = None,
+    enr_topics: str | None = None,
+) -> SearchResult:
+    """Documents whose own text holds ``identifier`` (a docket number, an email
+    address, a phone), ranked by keyword score.
+
+    Keyword (BM25/FTS) candidates only: no vector neighbours, no recency boost,
+    no re-rank. A hybrid search always fills its slots, so an identifier query
+    there returns whatever is nearest; 2026-10-07 a stranger's text naming a
+    different address answered an email-shaped query for a collection ticket.
+    """
+    diagnostics = {
+        "vector_search_active": False,
+        "keyword_search_active": True,
+        "reranker_applied": False,
+        "degraded": False,
+        "exact_identifier": {"pool": 0, "kept": 0},
+    }
+    keywords = _identifier_keywords(identifier)
+    if not keywords:
+        return SearchResult(hits=[], diagnostics=diagnostics)
+    where = store._build_where_clause(
+        doc_id_prefix=doc_id_prefix,
+        source_type=source_type,
+        source_name=source_name,
+        status=status,
+        folder=folder,
+        tags=tags,
+        enr_doc_type=enr_doc_type,
+        enr_topics=enr_topics,
+        metadata_filters=metadata_filters,
+        filter_ast=filter_ast,
+    )
+    with _tracer.start_as_current_span("search.exact_identifier", attributes={"top_k": final_top_k}):
+        try:
+            candidates = store.keyword_search(keywords, max(pool, final_top_k), where, include_vector=False)
+        except Exception as error:
+            candidates, retry_error = _retry_keyword_search(store, keywords, max(pool, final_top_k), where, error)
+            if retry_error is not None:
+                logger.warning("Exact identifier search failed: %s", retry_error)
+                diagnostics["keyword_search_active"] = False
+                diagnostics["degraded"] = True
+                return SearchResult(hits=[], diagnostics=diagnostics)
+    kept: list[SearchHit] = []
+    first_marker: dict = {}
+    for hit in candidates:
+        if len(kept) >= final_top_k:
+            break  # each run-on check reads the document's chunks: stop once full
+        if identifier_in_text(identifier, _own_text(hit)) and not _follows_context_marker(store, hit, first_marker):
+            kept.append(hit)
+    diagnostics["exact_identifier"] = {"pool": len(candidates), "kept": len(kept)}
+    return SearchResult(hits=kept, diagnostics=diagnostics)

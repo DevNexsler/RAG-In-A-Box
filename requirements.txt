@@ -69,6 +69,9 @@ python-docx>=1.1.0
 # PDF extraction
 pymupdf>=1.24.0
 
+# HEIC/HEIF image decoding before vision upload
+pillow-heif>=0.18,<2
+
 # Document format conversion (docx, doc, pptx, html, epub, rtf, csv → Markdown)
 markitdown[all]>=0.1.0
 

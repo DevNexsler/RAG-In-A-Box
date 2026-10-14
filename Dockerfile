@@ -1,6 +1,8 @@
 FROM python:3.13-slim
 
 WORKDIR /app
+# Attachment codec probing and legacy WAV/AMR/3GP normalization.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 # Lean Lance index statistics (no centroid copy, no stderr WARN in indexer.log);
 # core/lance_session.py sets the same default for processes outside the image.
 ENV LANCE_INCLUDE_VECTOR_CENTROIDS=false

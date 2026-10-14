@@ -59,6 +59,8 @@ MUTATIONS = (
 
 
 def run_test_process(repo: Path, selectors: tuple[str, ...], timeout: float, report_path: Path) -> dict:
+    # Child pytest runs in a disposable checkout, so report paths must be absolute.
+    report_path = report_path.resolve()
     report_path.unlink(missing_ok=True)
     env = {key: value for key, value in os.environ.items() if key not in {'PYTHONPATH', 'PYTEST_ADDOPTS'}}
     env['PYTHONPATH'] = str(repo)
