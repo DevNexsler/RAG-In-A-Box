@@ -708,6 +708,24 @@ def _is_nonmedia_stub(file_path: str | Path) -> bool:
         return False
 
 
+def _looks_like_mangled_audio_binary(file_path: str | Path) -> bool:
+    """Detect audio bytes irreversibly decoded as text and re-written.
+
+    The decode replaced nearly every byte >= 0x80 with 0xFD, so a WAV header's
+    16000 Hz reads 16125 and the samples are destroyed. Real audio, PCM or
+    compressed, spreads its high bytes over many values: across production
+    media 0xFD is at most ~7% of them, against ≥98% in every mangled file.
+    The first 64 KiB holds enough samples to tell even past leading silence.
+    """
+    try:
+        with Path(file_path).open("rb") as handle:
+            window = handle.read(65536)
+    except OSError:
+        return False
+    high_bytes = len(window.translate(None, bytes(range(0x80))))
+    return high_bytes > 0 and window.count(0xFD) > 0.9 * high_bytes
+
+
 def _media_frontmatter(file_path: str | Path, media_type: str) -> dict:
     path = Path(file_path)
     fm = {
@@ -735,6 +753,13 @@ def extract_audio(
             "skipping without provider call: %s", file_path,
         )
         note_skip("media_retrieval_stub")
+        return ExtractionResult.from_text("", frontmatter=fm, primary_content=False)
+    if _looks_like_mangled_audio_binary(file_path):
+        logger.warning(
+            "Audio contains text-mangled binary bytes and requires source recovery: %s",
+            file_path,
+        )
+        note_skip(CORRUPT_MANGLED_BINARY)
         return ExtractionResult.from_text("", frontmatter=fm, primary_content=False)
     try:
         with provider_media_path(file_path, detect_media_format(file_path, Path(file_path).suffix), "audio") as prepared:

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from extractors import begin_degradation_capture, collect_degradations, extract_text
+from extractors import begin_degradation_capture, collect_degradations, collect_skips, extract_text
 
 
 class InspectingProvider:
@@ -55,6 +55,20 @@ def test_wav_bytes_normalized_even_with_wrong_suffix(tmp_path, suffix):
     assert result.full_text == 'Spoken maintenance request'
     assert result.frontmatter['media_type'] == 'audio'
     assert path.read_bytes() == original
+
+
+def test_16khz_pcm_wav_still_transcribes(tmp_path):
+    # Real 16-bit PCM spreads its high bytes; it must not read as the
+    # text-mangled binary that the extractor parks without a provider call.
+    path = tmp_path / 'voice.wav'
+    subprocess.run([
+        'ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=1',
+        '-ar', '16000', '-c:a', 'pcm_s16le', str(path),
+    ], check=True)
+    begin_degradation_capture()
+    result = extract_text(path, 'wav', media_provider=InspectingProvider())
+    assert result.full_text == 'Spoken maintenance request'
+    assert collect_skips() == []
 
 
 @pytest.mark.parametrize('suffix', ['heic', 'bin', 'jpg'])

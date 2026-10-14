@@ -617,6 +617,45 @@ def test_extract_audio_retrieval_stub_skips_without_provider_call(tmp_path):
     assert "media_retrieval_stub" in collect_skips()
 
 
+def test_extract_audio_text_mangled_wav_skips_as_corrupt_without_provider_call(tmp_path):
+    # #4105: email-attachment WAVs whose bytes went through a text decode came
+    # back with nearly every byte >= 0x80 replaced by 0xFD (16000 Hz reads
+    # 16125, the samples are gone). They must park as corrupt binary like a
+    # mangled PDF, not reach a transcription model that may invent speech.
+    import io
+    import math
+    import wave
+
+    from extractors import (
+        begin_degradation_capture,
+        collect_degradations,
+        collect_skips,
+        extract_audio,
+    )
+
+    pcm = io.BytesIO()
+    with wave.open(pcm, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"".join(
+            int(8000 * math.sin(2 * math.pi * 440 * i / 16000)).to_bytes(2, "little", signed=True)
+            for i in range(16000)
+        ))
+    mangled = tmp_path / "voicemail.wav"
+    mangled.write_bytes(bytes(b if b < 0x80 else 0xFD for b in pcm.getvalue()))
+
+    class _Boom:
+        def transcribe_audio(self, file_path):
+            raise AssertionError("provider must not be called for mangled audio")
+
+    begin_degradation_capture()
+    result = extract_audio(mangled, media_provider=_Boom())
+    assert result.full_text == ""
+    assert collect_skips() == ["corrupt_mangled_binary"]
+    assert collect_degradations() == []
+
+
 def test_extract_video_real_bytes_not_treated_as_stub(tmp_path):
     # Binary media that is not JSON must still reach the provider as normal.
     from extractors import begin_degradation_capture, collect_skips, extract_video
