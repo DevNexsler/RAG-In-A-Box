@@ -43,13 +43,15 @@ def test_video_dark_mode_empty_raises_transient():
         w.analyze_video("/x.mp4")
 
 
-def test_audio_recovers_from_reachable_empty():
-    w = MediaFallbackProvider(_Stub(audio_fn=lambda p: ""), audio_fallback=_fb("a"))
-    assert w.transcribe_audio("/x.mp3") == "a"
+def test_audio_reachable_empty_is_clean_blank():
+    # The transcribe prompt maps "no speech" to "" (#3835).
+    w = MediaFallbackProvider(_Stub(audio_fn=lambda p: ""))
+    assert w.transcribe_audio("/x.mp3") == ""
 
 
-def test_audio_dark_mode_empty_raises_transient():
-    w = MediaFallbackProvider(_Stub(audio_fn=lambda p: ""), audio_fallback=None)
+def test_audio_primary_unreachable_raises_transient():
+    def boom(p): raise TransientError("down")
+    w = MediaFallbackProvider(_Stub(audio_fn=boom))
     with pytest.raises(TransientError):
         w.transcribe_audio("/x.mp3")
 
@@ -92,7 +94,7 @@ def test_media_factory_builds_video_fallback():
 def test_media_factory_missing_model_raises():
     with pytest.raises(Exception):
         build_media_provider({"media": {"enabled": True, "provider": "openrouter", "api_key": "k",
-            "audio": {"fallback": {"provider": "litellm", "endpoint": "http://lite/v1"}}}})
+            "video": {"fallback": {"provider": "litellm", "endpoint": "http://lite/v1"}}}})
 
 
 def test_media_factory_disabled_returns_none():
