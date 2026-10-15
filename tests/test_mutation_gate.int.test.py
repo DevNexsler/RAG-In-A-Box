@@ -1,5 +1,6 @@
 """Mutation runner distinguishes assertion kills from broken test infrastructure."""
 import subprocess
+from pathlib import Path
 
 from scripts.mutation_gate import Mutation, run_mutations
 
@@ -49,6 +50,48 @@ def test_process_crash_cannot_reuse_stale_junit(tmp_path):
     assert run_test_process(tmp_path, ('test_sample.py',), 10, report)['status'] == 'error'
 
 
+def _pytest_child(parent_pid):
+    """Return the parent's pytest child, not the short-lived git ls-files subprocess."""
+    for value in Path(f'/proc/{parent_pid}/task/{parent_pid}/children').read_text().split():
+        try:
+            if b'pytest' in Path(f'/proc/{value}/cmdline').read_bytes():
+                return int(value)
+        except (FileNotFoundError, ProcessLookupError):
+            pass  # The child was reaped before (ENOENT) or after (ESRCH) its cmdline opened.
+    return None
+
+
+def test_child_scan_skips_a_child_that_exits_between_listing_and_read(monkeypatch):
+    import errno
+    import os
+    import signal
+    import sys
+    # A parent with two pytest-like children, the first of which is reaped after
+    # its pid was listed: reading its cmdline then raises ESRCH, not ENOENT (#4119).
+    script = ('import subprocess, sys, time\n'
+              'kids = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "pytest"])'
+              ' for _ in range(2)]\n'
+              'print(*[kid.pid for kid in kids], flush=True)\n'
+              'time.sleep(30)\n')
+    parent = subprocess.Popen([sys.executable, '-c', script], stdout=subprocess.PIPE, text=True,
+                              start_new_session=True)
+    try:
+        exiting, survivor = map(int, parent.stdout.readline().split())
+        read_bytes = Path.read_bytes
+
+        def read_bytes_racing_exit(path):
+            if path == Path(f'/proc/{exiting}/cmdline'):
+                raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
+            return read_bytes(path)
+
+        monkeypatch.setattr(Path, 'read_bytes', read_bytes_racing_exit)
+        assert _pytest_child(parent.pid) == survivor
+        assert _pytest_child(survivor) is None
+    finally:
+        os.killpg(parent.pid, signal.SIGKILL)
+        parent.wait(timeout=10)
+
+
 def test_mutation_cli_termination_reaps_child_and_removes_copy(tmp_path):
     import os
     from pathlib import Path
@@ -66,15 +109,7 @@ def test_mutation_cli_termination_reaps_child_and_removes_copy(tmp_path):
         try:
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
-                children = Path(f'/proc/{parent.pid}/task/{parent.pid}/children').read_text().split()
-                # Wait for pytest, not the short-lived git ls-files subprocess.
-                for value in children:
-                    try:
-                        if b'pytest' in Path(f'/proc/{value}/cmdline').read_bytes():
-                            child = int(value)
-                            break
-                    except FileNotFoundError:
-                        pass
+                child = _pytest_child(parent.pid)
                 if child is not None:
                     break
                 time.sleep(.02)
