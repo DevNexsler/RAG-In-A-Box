@@ -252,6 +252,35 @@ class TestCosineFallbackRerank:
             # close.md should rank higher after cosine blending
             assert result[0].doc_id == "close.md"
 
+    def test_loads_pool_vectors_in_one_batched_read(self):
+        """The fallback runs after a timed-out reranker, so it must not add one
+        store query per hit (#4137: ~7 s for 99 hits). Vectors already on the
+        hits are used as-is; only the missing ones are fetched, in one call."""
+        query_vec = [1.0, 0.0]
+        close_vec = [0.9, 0.1]
+        far_vec = [0.0, 1.0]
+
+        class FakeStore:
+            def __init__(self):
+                self.batches = []
+
+            def get_vector(self, chunk_uid):
+                raise AssertionError("cosine fallback should not do per-hit vector lookups")
+
+            def get_vectors(self, chunk_uids):
+                self.batches.append(list(chunk_uids))
+                return {"close.md::c:0": close_vec}
+
+        store = FakeStore()
+        hits = [
+            SearchHit(doc_id="far.md", loc="c:0", snippet="x", text="far", score=0.5, vector=far_vec),
+            SearchHit(doc_id="close.md", loc="c:0", snippet="x", text="close", score=0.5),
+        ]
+        result = _cosine_fallback_rerank(query_vec, hits, store)
+
+        assert store.batches == [["close.md::c:0"]]
+        assert [h.doc_id for h in result] == ["close.md", "far.md"]
+
 
 # ---------------------------------------------------------------------------
 # Time decay with floor
