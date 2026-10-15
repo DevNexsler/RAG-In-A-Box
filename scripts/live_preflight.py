@@ -138,7 +138,7 @@ class ProductionStorage:
         Containment counts both ways: a scratch root above production storage
         still scans (and dedupe archives out of) production documents.
         """
-        resolved = path.resolve()
+        resolved = path.expanduser().resolve()  # dedupe expands ~ in archive_root
         for prod in sorted(self.paths):
             if resolved == prod or prod in resolved.parents or resolved in prod.parents:
                 return prod
@@ -205,7 +205,8 @@ def production_storage() -> ProductionStorage:
         raise RuntimeError(f"cannot inspect production container {PROD_CONTAINER} "
                            f"({proc.stderr.strip()[:120]})")
     mounts_json, workdir_json, env_json = proc.stdout.splitlines()[:3]
-    mounts = json.loads(mounts_json) or []
+    # A tmpfs mount has no host Source; Path("") would resolve to our CWD.
+    mounts = [m for m in json.loads(mounts_json) or [] if m.get("Source")]
     workdir = json.loads(workdir_json) or "/"
     env = dict(item.split("=", 1) for item in json.loads(env_json) or [] if "=" in item)
     config_file = _container_to_host("config.yaml", workdir, mounts)

@@ -672,6 +672,25 @@ def test_production_storage_is_derived_from_the_production_container(production)
     assert storage.databases == {"comm_data_store"}
 
 
+def test_production_storage_ignores_a_mount_without_a_host_source(production):
+    # A tmpfs mount has no Source; it must not turn the preflight's own CWD
+    # (a scratch worktree) into production storage.
+    production.mounts.append({"Type": "tmpfs", "Source": "", "Destination": "/tmp"})
+
+    storage = lp.production_storage()
+
+    assert storage.path_conflict(production.worktree / "scratch-index") is None
+
+
+def test_path_conflict_expands_a_home_relative_root(production, monkeypatch):
+    # core.dedupe expands ~ in archive_root, so the check must too.
+    monkeypatch.setenv("HOME", str(production.docs.parent))
+
+    storage = lp.production_storage()
+
+    assert storage.path_conflict(Path("~/documents/dups")) == production.docs.resolve()
+
+
 def test_scratch_storage_refuses_a_copied_production_config(production, monkeypatch):
     # #4183 / RAG #226: a worker copied production config.yaml into its
     # worktree and the live tier ran against the production roots.
