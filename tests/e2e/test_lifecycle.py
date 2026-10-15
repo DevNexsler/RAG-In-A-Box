@@ -16,12 +16,14 @@ import hashlib
 import hmac
 import json
 import os
+import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
 
 from tests.e2e.client import search_hits as _hits
-from tests.e2e.conftest import NOTE_PHRASE
+from tests.e2e.conftest import NOTE_PHRASE, _compose_cp_into_documents
 
 pytestmark = pytest.mark.anyio
 E2E_REAL = os.environ.get("E2E_REAL") == "1"
@@ -217,3 +219,32 @@ async def test_rest_search_parity(indexed_corpus, api):
     payload = resp.json()
     assert not payload.get("error"), payload
     assert any("note" in r.get("rel_path", "") for r in payload["results"]), payload
+
+
+async def test_rest_index_document_separates_outside_scan_from_missing(
+    indexed_corpus, api
+):
+    """#4198: a deposited file the documents scan does not select is a terminal
+    200 not_indexable — distinct from a missing file's 404 not_found, so the
+    depositor (CDS /index/attachment) can stop waiting without copying the
+    scan rules."""
+    name = f"bundle-{uuid.uuid4().hex[:8]}.zip"  # .zip is outside the scan
+    with tempfile.TemporaryDirectory() as tmp:
+        deposit = Path(tmp) / name
+        deposit.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+        _compose_cp_into_documents(deposit)
+
+    outside = await api.post("/api/index/document", json={"rel_path": name})
+    assert outside.status_code == 200, outside.text
+    assert outside.json() == {
+        "status": "not_indexable",
+        "reason": "outside_scan",
+        "rel_path": name,
+        "source_name": "documents",
+    }
+
+    missing = await api.post(
+        "/api/index/document", json={"rel_path": f"absent-{name}"}
+    )
+    assert missing.status_code == 404, missing.text
+    assert missing.json()["reason"] == "not_found"

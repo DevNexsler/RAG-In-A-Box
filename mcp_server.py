@@ -4122,6 +4122,8 @@ if HAS_MCP and FastMCP is not None:
         Returns one of:
             - {"status": "indexed", "doc_id": ..., "rel_path": ...}
             - {"status": "skipped", "reason": "unchanged", "doc_id": ...}
+            - {"status": "not_indexable", "reason": "outside_scan", ...} for
+              an existing file the source's scan does not select (terminal).
             - {"status": "error", "reason": "not_found", ...}
             - {"error": true, "code": ..., "message": ...} on failure.
         """

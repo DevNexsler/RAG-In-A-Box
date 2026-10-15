@@ -5076,7 +5076,11 @@ def resolve_single_record(
 
     Reuses scan_filesystem_records for doc_id assignment so the deposit-owned
     (no_rename) ID-alias convention name@<5char>@.ext is honored identically to
-    the full flow. Returns None if the file is missing or excluded/unsupported.
+    the full flow. Returns None if the file is missing. An existing file the
+    source's scan does not select (include/exclude, matched exactly as the full
+    scan matches them) resolves to ``{"rel_path", "not_indexable"}`` with no
+    doc_id: a terminal answer, so a caller never waits on or retries a file
+    that will never be indexed.
     """
     from glob import escape as glob_escape
 
@@ -5101,15 +5105,18 @@ def resolve_single_record(
 
     scan_cfg = src_cfg.get("scan", {})
     include = scan_cfg.get("include", [])
+    exclude = scan_cfg.get("exclude", [])
     # Respect the source's supported file types — don't index a deposit the
     # full scan would never pick up.
-    if include and not _matches_any(rel_path, include):
-        return None
+    if _matches_any(rel_path, exclude) or (
+        include and not _matches_any(rel_path, include)
+    ):
+        return {"rel_path": rel_path, "not_indexable": "outside_scan"}
 
     records = scan_filesystem_records(
         root,
         [glob_escape(rel_path)],
-        scan_cfg.get("exclude", []),
+        exclude,
         doc_id_store=doc_id_store,
         logger=_get_logger(),
         no_rename_prefixes=scan_cfg.get("no_rename", []),
@@ -5435,6 +5442,14 @@ def _index_document_unlocked(
             "status": "error",
             "reason": "not_found",
             "target": request.target,
+            "source_name": request.source_name,
+        }
+
+    if record.get("not_indexable"):
+        return {
+            "status": "not_indexable",
+            "reason": record["not_indexable"],
+            "rel_path": record["rel_path"],
             "source_name": request.source_name,
         }
 

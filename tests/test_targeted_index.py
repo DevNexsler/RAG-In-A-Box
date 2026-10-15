@@ -663,6 +663,46 @@ def test_index_document_flow_missing_file_returns_error(tmp_path):
     proc.fn.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "email-attachments/laura/bundle.zip",  # extension the scan never includes
+        "email-attachments/laura/scan.PNG",  # include globs match case-sensitively
+        "99-Archive/old.pdf",  # included type, but excluded by the source
+    ],
+)
+def test_index_document_flow_answers_not_indexable_for_file_outside_scan(
+    tmp_path, rel
+):
+    """An existing file the source's scan does not select is a terminal
+    not_indexable answer, never not_found: the caller must be able to tell
+    "never indexable" from "not there (yet)" without copying the scan rules
+    (#4198)."""
+    root, _ = _make_attachment(tmp_path, rel)
+    cfg = _fs_config(root, tmp_path / "index")
+    cfg["sources"][0]["scan"]["exclude"] = ["**/99-Archive/**"]
+
+    with patch("flow_index_vault.load_config", return_value=cfg), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=MagicMock()), \
+         patch("flow_index_vault.process_doc_task") as proc:
+        result = fiv.index_document_flow(target=rel, source_name="documents")
+
+    assert result == {
+        "status": "not_indexable",
+        "reason": "outside_scan",
+        "rel_path": rel,
+        "source_name": "documents",
+    }
+    proc.fn.assert_not_called()
+    from core.index_request_queue import IndexRequestQueue
+
+    # Terminal: the drained request is completed, not retained for retry.
+    assert IndexRequestQueue(tmp_path / "index").pending("chunks", limit=10) == []
+    # And the file is never given an identity the full scan would not give it.
+    registry = DocIDStore(tmp_path / "index" / "doc_registry.db")
+    assert registry.lookup_id(rel) is None
+
+
 def test_index_document_flow_durably_queues_during_full_writer_session(
     tmp_path, monkeypatch
 ):
