@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 
 
 # --- Frontmatter parsing ---
@@ -902,6 +904,74 @@ def test_dispatch_unknown_ext(tmp_path):
 
     result = extract_text("/fake/file.xyz", ext="xyz")
     assert result.full_text == ""
+
+
+# --- Calendar extraction ---
+
+# Shaped like the invites mail clients attach (#4249): CRLF lines, a timezone
+# block with its own DTSTART, a folded DESCRIPTION, escaped commas, quoted
+# CN parameters and a reminder alarm.
+CALENDAR_INVITE = (
+    "BEGIN:VCALENDAR\r\n"
+    "PRODID:-//Example Corp//Calendar//EN\r\n"
+    "VERSION:2.0\r\n"
+    "METHOD:REQUEST\r\n"
+    "BEGIN:VTIMEZONE\r\n"
+    "TZID:America/New_York\r\n"
+    "BEGIN:DAYLIGHT\r\n"
+    "DTSTART:19700308T020000\r\n"
+    "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\n"
+    "END:DAYLIGHT\r\n"
+    "END:VTIMEZONE\r\n"
+    "BEGIN:VEVENT\r\n"
+    "UID:0f4e2c-example@calendar.example.com\r\n"
+    "DTSTAMP:20260101T120000Z\r\n"
+    "SUMMARY:Viewing - Unit 3\r\n"
+    "DTSTART;TZID=America/New_York:20260416T090000\r\n"
+    "DTEND;TZID=America/New_York:20260416T093000\r\n"
+    "LOCATION:100 Example Street\\, Springfield\r\n"
+    "ORGANIZER;CN=\"Pat Organizer: Leasing\":mailto:pat@example.com\r\n"
+    "ATTENDEE;ROLE=REQ-PARTICIPANT;CN=Sam Tenant:MAILTO:sam@example.com\r\n"
+    "DESCRIPTION:Meet at the side door.\\nBring the appli\r\n"
+    " cation form.\r\n"
+    "BEGIN:VALARM\r\n"
+    "ACTION:DISPLAY\r\n"
+    "DESCRIPTION:Reminder\r\n"
+    "TRIGGER:-PT15M\r\n"
+    "END:VALARM\r\n"
+    "END:VEVENT\r\n"
+    "END:VCALENDAR\r\n"
+)
+
+
+@pytest.mark.parametrize("suffix", ["bin", "ics"])
+def test_calendar_attachment_indexes_event_fields_without_media_model(tmp_path, suffix):
+    """A calendar invite is read as text by its content, whatever its suffix:
+    the event fields are indexed and no OCR or media provider is called."""
+    from extractors import begin_degradation_capture, collect_degradations, extract_text
+
+    class NoMediaModel:
+        def __getattr__(self, name):
+            raise AssertionError(f"calendar sent to a media model ({name})")
+
+    path = tmp_path / f"invite.{suffix}"
+    path.write_bytes(CALENDAR_INVITE.encode("utf-8"))
+
+    begin_degradation_capture()
+    result = extract_text(path, suffix, ocr_provider=NoMediaModel(), media_provider=NoMediaModel())
+
+    assert result.full_text.splitlines() == [
+        "SUMMARY: Viewing - Unit 3",
+        "DTSTART: 20260416T090000 (America/New_York)",
+        "DTEND: 20260416T093000 (America/New_York)",
+        "LOCATION: 100 Example Street, Springfield",
+        "ORGANIZER: Pat Organizer: Leasing <pat@example.com>",
+        "ATTENDEE: Sam Tenant <sam@example.com>",
+        "DESCRIPTION: Meet at the side door.",
+        "Bring the application form.",
+    ]
+    assert result.primary_content
+    assert collect_degradations() == []
 
 
 # --- Plaintext extraction ---

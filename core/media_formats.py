@@ -36,8 +36,8 @@ def _probe(path: Path) -> dict:
 def detect_media_format(file_path: str | Path, extension: str) -> str:
     """Prefer recognized signatures over labels, probing ambiguous containers.
 
-    Unknown .bin content stays unknown. In particular JSON error bodies and
-    calendar attachments must never be sent to a media model.
+    Unknown .bin content stays unknown. In particular JSON error bodies must
+    never be sent to a media model; calendar attachments are text ('ics').
     """
     ext = extension.lower().lstrip('.')
     if ext not in MEDIA_EXTENSIONS:
@@ -50,6 +50,8 @@ def detect_media_format(file_path: str | Path, extension: str) -> str:
         return ext
     if header.startswith(b'%PDF-'):
         return 'pdf'
+    if header.startswith(b'BEGIN:VCALENDAR'):
+        return 'ics'
     if header.startswith(b'\x89PNG\r\n\x1a\n'):
         return 'png'
     if header.startswith(b'\xff\xd8\xff'):

@@ -502,6 +502,39 @@ async def test_oversized_conversation_context_still_indexes(indexed_corpus, mcp_
     assert search_hits(payload, stem), payload["results"]
 
 
+async def test_calendar_attachment_deposited_as_bin_indexes_its_event(indexed_corpus, mcp_session):
+    """#4249: mail clients attach invites as text/calendar, which the deposit
+    path stores as `.bin`. Production indexed all of them content-free
+    (`unrecognized_media_format`), so no event field was ever searchable."""
+    stem = f"invite-{uuid.uuid4().hex[:8]}"
+    invite = (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n"
+        "BEGIN:VEVENT\r\n"
+        f"SUMMARY:Walkthrough {stem}\r\n"
+        "DTSTART:20261008T190000Z\r\nDTEND:20261008T193000Z\r\n"
+        "LOCATION:100 Example Street\r\n"
+        "ORGANIZER;CN=Pat Organizer:mailto:pat@example.com\r\n"
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        deposit = Path(tmp) / f"{stem}.bin"
+        deposit.write_text(invite)
+        _compose_cp_into_documents(deposit)
+
+    result = await mcp_session.call_tool_json(
+        "file_index_document", {"target": deposit.name, "source_name": "documents"})
+    assert result.get("status") == "indexed", result
+
+    chunks = await mcp_session.call_tool_json(
+        "file_get_doc_chunks", {"doc_id": result["doc_id"]})
+    assert isinstance(chunks, list) and chunks, chunks
+    text = "\n".join(c.get("text") or "" for c in chunks)
+    assert f"SUMMARY: Walkthrough {stem}" in text, chunks
+    assert "DTSTART: 20261008T190000Z" in text, chunks
+    assert "ORGANIZER: Pat Organizer <pat@example.com>" in text, chunks
+    assert all(c["content_status"] == "complete" for c in chunks), chunks
+
+
 async def test_reindexed_document_has_no_stale_chunks(indexed_corpus, api, mcp_session):
     """A re-indexed document's rows must be exactly the new ones.
 
