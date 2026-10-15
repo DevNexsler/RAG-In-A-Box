@@ -5083,6 +5083,7 @@ def resolve_single_record(
     that will never be indexed.
     """
     from glob import escape as glob_escape
+    from sources.filesystem import scan_patterns
 
     src_cfg = _find_source_config(config, source_name)
     if src_cfg.get("type", "filesystem") != "filesystem":
@@ -5104,13 +5105,10 @@ def resolve_single_record(
         rel_path = abs_path.relative_to(root).as_posix()
 
     scan_cfg = src_cfg.get("scan", {})
-    include = scan_cfg.get("include", [])
-    exclude = scan_cfg.get("exclude", [])
+    include, exclude = scan_patterns(scan_cfg)
     # Respect the source's supported file types — don't index a deposit the
     # full scan would never pick up.
-    if _matches_any(rel_path, exclude) or (
-        include and not _matches_any(rel_path, include)
-    ):
+    if _matches_any(rel_path, exclude) or not _matches_any(rel_path, include):
         return {"rel_path": rel_path, "not_indexable": "outside_scan"}
 
     records = scan_filesystem_records(

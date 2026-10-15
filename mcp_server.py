@@ -2880,6 +2880,7 @@ def _file_folders_impl() -> dict:
     import os
     from collections import Counter
     from flow_index_vault import _matches_any
+    from sources.filesystem import scan_patterns
 
     config = load_config()
     docs_root = Path(config["documents_root"])
@@ -2890,9 +2891,7 @@ def _file_folders_impl() -> dict:
             "Check documents_root (or vault_root) in config.yaml.",
         )
 
-    scan_cfg = config.get("scan", {})
-    include = scan_cfg.get("include", ["**/*.md"])
-    exclude = scan_cfg.get("exclude", [])
+    include, exclude = scan_patterns(config.get("scan", {}))
 
     folder_counts: Counter = Counter()
     total_files = 0

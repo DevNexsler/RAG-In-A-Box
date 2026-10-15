@@ -116,6 +116,7 @@ def _filesystem_live_doc_ids(
     index_root: Path,
 ) -> set[str]:
     from flow_index_vault import _is_communication_sidecar, _matches_any
+    from sources.filesystem import scan_patterns
 
     registry_path = index_root / "doc_registry.db"
     if not registry_path.is_file():
@@ -130,9 +131,7 @@ def _filesystem_live_doc_ids(
         )
         root = Path(source_config["root"])
         source_name = str(source_config["name"])
-        scan_config = source_config.get("scan", {})
-        include = scan_config.get("include", ["**/*.md"])
-        exclude = scan_config.get("exclude", [])
+        include, exclude = scan_patterns(source_config.get("scan", {}))
         live: set[str] = set()
         for stored_doc_id, rel_path, stored_source_name in rows:
             namespaced = (
