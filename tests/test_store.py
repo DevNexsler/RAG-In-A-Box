@@ -634,6 +634,36 @@ def test_vector_search_recovers_from_stale_store_handle():
         assert hits[0].doc_id == "a.md"
 
 
+def test_get_vectors_recovers_from_stale_store_handle():
+    """The cosine-fallback and MMR batch read keeps get_vector's stale-handle
+    recovery, so a peer writer mid-sweep doesn't silently skip reranking."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LanceDBStore(tmpdir, "test_chunks")
+        store.upsert_nodes([
+            _make_node("a.md", "c:0", "apple banana", [1.0] + [0.0] * 767),
+        ])
+        # A peer writer moves the table past this handle — what actually makes
+        # the handle below stale, and what read recovery keys on.
+        LanceDBStore(tmpdir, "test_chunks").upsert_nodes([
+            _make_node("b.md", "c:0", "cherry date", [0.0, 1.0] + [0.0] * 766),
+        ])
+
+        class _StaleTable:
+            def search(self, *args, **kwargs):
+                raise RuntimeError("Not found: data/index/test_chunks.lance/data/abc123.lance")
+
+        class _StaleVS:
+            @property
+            def table(self):
+                return _StaleTable()
+
+        store._vs = _StaleVS()
+
+        vectors = store.get_vectors(["a.md::c:0", "b.md::c:0", "missing.md::c:0"])
+        assert set(vectors) == {"a.md::c:0", "b.md::c:0"}
+        assert vectors["a.md::c:0"] == pytest.approx([1.0] + [0.0] * 767)
+
+
 def _make_node_with_meta(doc_id, loc, text, vector, **extra_meta):
     """Helper that lets tests set arbitrary metadata fields."""
     meta = {

@@ -3554,33 +3554,29 @@ class LanceDBStore:
 
     def get_vectors(self, chunk_uids: list[str]) -> dict[str, list[float]]:
         """Batch-load stored vectors for chunk UIDs missing from search hits."""
-        if not chunk_uids:
-            return {}
-        try:
-            table = self._vs.table
-        except TableNotFoundError:
-            return {}
-
         unique_uids = list(dict.fromkeys(uid for uid in chunk_uids if uid))
         if not unique_uids:
             return {}
         in_values = ", ".join(f"'{self._sql_escape(uid)}'" for uid in unique_uids)
-        rows = (
-            table.search(None)
-            .where(f"id IN ({in_values})", prefilter=True)
-            .select(["id", "vector"])
-            .limit(len(unique_uids))
-            .to_list()
-        )
 
-        vectors: dict[str, list[float]] = {}
-        for row in rows:
-            uid = row.get("id")
-            vec = row.get("vector")
-            if not uid or vec is None:
-                continue
-            vectors[str(uid)] = vec.tolist() if hasattr(vec, "tolist") else list(vec)
-        return vectors
+        def _op():
+            rows = (
+                self._vs.table.search(None)
+                .where(f"id IN ({in_values})", prefilter=True)
+                .select(["id", "vector"])
+                .limit(len(unique_uids))
+                .to_list()
+            )
+            vectors: dict[str, list[float]] = {}
+            for row in rows:
+                uid = row.get("id")
+                vec = row.get("vector")
+                if not uid or vec is None:
+                    continue
+                vectors[str(uid)] = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+            return vectors
+
+        return self._run_read_with_recovery(_op, {})
 
     def get_chunk(self, doc_id: str, loc: str) -> SearchHit | None:
         """Get a single chunk by doc_id and loc.

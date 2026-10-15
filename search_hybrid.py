@@ -445,6 +445,10 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _chunk_uid(hit: SearchHit) -> str:
+    return f"{hit.doc_id}::{hit.loc}"
+
+
 def _hit_vectors(hits: list[SearchHit], store: "LanceDBStore") -> dict[str, list[float]]:
     """Vectors for hits keyed by chunk UID (doc_id::loc).
 
@@ -454,7 +458,7 @@ def _hit_vectors(hits: list[SearchHit], store: "LanceDBStore") -> dict[str, list
     vectors: dict[str, list[float]] = {}
     missing_uids: list[str] = []
     for hit in hits:
-        chunk_uid = f"{hit.doc_id}::{hit.loc}"
+        chunk_uid = _chunk_uid(hit)
         vec = getattr(hit, "vector", None)
         if vec is not None:
             vectors[chunk_uid] = vec
@@ -483,7 +487,7 @@ def _cosine_fallback_rerank(
     try:
         vectors = _hit_vectors(hits, store)
         for hit in hits:
-            stored_vec = vectors.get(f"{hit.doc_id}::{hit.loc}")
+            stored_vec = vectors.get(_chunk_uid(hit))
             if stored_vec is not None:
                 cos_sim = _cosine_similarity(query_vector, stored_vec)
                 hit.score = blend_original * hit.score + blend_cosine * cos_sim
@@ -671,9 +675,6 @@ def _apply_mmr_diversity(
     """
     if len(hits) <= 1:
         return (hits, []) if return_deferred else hits
-
-    def _chunk_uid(hit: SearchHit) -> str:
-        return f"{hit.doc_id}::{hit.loc}"
 
     def _deferred_record(hit: SearchHit, similar_to: SearchHit, similarity: float) -> dict:
         record_uuid = _chunk_uid(hit)
