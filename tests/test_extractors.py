@@ -961,6 +961,7 @@ def test_calendar_attachment_indexes_event_fields_without_media_model(tmp_path, 
     result = extract_text(path, suffix, ocr_provider=NoMediaModel(), media_provider=NoMediaModel())
 
     assert result.full_text.splitlines() == [
+        "METHOD: REQUEST",
         "SUMMARY: Viewing - Unit 3",
         "DTSTART: 20260416T090000 (America/New_York)",
         "DTEND: 20260416T093000 (America/New_York)",
@@ -972,6 +973,54 @@ def test_calendar_attachment_indexes_event_fields_without_media_model(tmp_path, 
     ]
     assert result.primary_content
     assert collect_degradations() == []
+
+
+def test_calendar_cancellation_and_reply_keep_what_the_message_says(tmp_path):
+    """A cancellation or a reply repeats the event with STATUS:CONFIRMED; its
+    METHOD and the attendee's PARTSTAT are the only record that the event was
+    cancelled or declined, so both must reach the index."""
+    from extractors import extract_calendar
+
+    for method, partstat in (("CANCEL", "NEEDS-ACTION"), ("REPLY", "DECLINED")):
+        path = tmp_path / f"{method.lower()}.bin"
+        path.write_bytes(
+            CALENDAR_INVITE.replace("METHOD:REQUEST", f"METHOD:{method}")
+            .replace("ATTENDEE;ROLE=REQ-PARTICIPANT;", f"ATTENDEE;PARTSTAT={partstat};")
+            .replace("DTEND;", "STATUS:CONFIRMED\r\nDTEND;")
+            .encode("utf-8")
+        )
+        lines = extract_calendar(path).full_text.splitlines()
+        assert lines[0] == f"METHOD: {method}"
+        assert f"ATTENDEE: Sam Tenant <sam@example.com> ({partstat})" in lines
+
+
+def test_calendar_without_event_fields_is_not_primary_content(tmp_path):
+    """A VCALENDAR holding only a timezone (or bytes that merely start with the
+    header) has nothing to index; it must not be reported as complete."""
+    from extractors import extract_calendar
+
+    path = tmp_path / "empty.bin"
+    path.write_bytes(
+        b"BEGIN:VCALENDAR\r\nMETHOD:PUBLISH\r\nBEGIN:VTIMEZONE\r\nTZID:UTC\r\n"
+        b"END:VTIMEZONE\r\nEND:VCALENDAR\r\n"
+    )
+    result = extract_calendar(path)
+    assert result.full_text == ""
+    assert not result.primary_content
+
+
+def test_calendar_unfolds_a_utf8_character_split_across_a_fold(tmp_path):
+    """RFC 5545 §3.1 folds octets, so a multi-byte character may be split."""
+    from extractors import extract_calendar
+
+    encoded = "Caf\u00e9 meeting".encode("utf-8")
+    split = encoded.index(b"\xa9")
+    path = tmp_path / "folded.bin"
+    path.write_bytes(
+        b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:" + encoded[:split]
+        + b"\r\n " + encoded[split:] + b"\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    assert extract_calendar(path).full_text == "SUMMARY: Caf\u00e9 meeting"
 
 
 # --- Plaintext extraction ---

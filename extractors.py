@@ -943,10 +943,18 @@ _CALENDAR_ESCAPE = re.compile(r"\\([\\;,nN])")
 
 
 def extract_calendar(file_path: str | Path) -> ExtractionResult:
-    """Render an iCalendar file's event fields as text, one per line."""
-    with open(file_path, encoding="utf-8", errors="replace") as f:
-        unfolded = re.sub(r"\r?\n[ \t]", "", f.read())
+    """Render an iCalendar file's event fields as text, one per line.
+
+    The calendar's METHOD leads the text when it has events: a CANCEL or REPLY
+    usually repeats the original event with STATUS:CONFIRMED, so METHOD and an
+    attendee's PARTSTAT are the only record of what the message says.
+    """
+    # RFC 5545 §3.1: unfold octets before decoding, so a UTF-8 character
+    # split across a fold is rejoined.
+    with open(file_path, "rb") as f:
+        unfolded = re.sub(rb"\r?\n[ \t]", b"", f.read()).decode("utf-8", errors="replace")
     components: list[str] = []
+    method = ""
     lines: list[str] = []
     for content_line in unfolded.splitlines():
         match = _CALENDAR_LINE.fullmatch(content_line)
@@ -958,6 +966,8 @@ def extract_calendar(file_path: str | Path) -> ExtractionResult:
         elif name == "END":
             if components and components.pop() in CALENDAR_COMPONENTS and lines and lines[-1]:
                 lines.append("")
+        elif name == "METHOD" and components == ["VCALENDAR"]:
+            method = value.strip()
         elif name in CALENDAR_PROPERTIES and components and components[-1] in CALENDAR_COMPONENTS:
             params = {k.upper(): v.strip('"') for k, v in _CALENDAR_PARAM.findall(raw_params)}
             value = _CALENDAR_ESCAPE.sub(lambda m: "\n" if m.group(1) in "nN" else m.group(1), value)
@@ -965,10 +975,16 @@ def extract_calendar(file_path: str | Path) -> ExtractionResult:
                 value = re.sub(r"(?i)^mailto:", "", value)
                 if params.get("CN"):
                     value = f"{params['CN']} <{value}>"
+                if params.get("PARTSTAT"):
+                    value = f"{value} ({params['PARTSTAT']})"
             elif params.get("TZID"):
                 value = f"{value} ({params['TZID']})"
             lines.append(f"{name}: {value}")
-    return ExtractionResult.from_text("\n".join(lines).strip())
+    text = "\n".join(lines).strip()
+    if text and method:
+        text = f"METHOD: {method}\n{text}"
+    # A calendar with no event fields carries nothing to index.
+    return ExtractionResult.from_text(text, primary_content=bool(text))
 
 
 # ---------------------------------------------------------------------------
