@@ -12,6 +12,7 @@ Supported formats:
   MarkItDown converts to Markdown for heading-aware chunking.
 - Spreadsheets (.xlsx, .xls): openpyxl extracts headers + text-only cells.
 - Plain text (.txt): UTF-8 reader with error replacement.
+- Calendars (.ics, or iCalendar bytes under any suffix): event fields as text.
 """
 
 import json
@@ -924,6 +925,53 @@ def extract_plaintext(file_path: str | Path) -> ExtractionResult:
 
 
 # ---------------------------------------------------------------------------
+# Calendar (ics)
+# ---------------------------------------------------------------------------
+
+#: Components a reader schedules around; timezone rules and alarms are not.
+CALENDAR_COMPONENTS = {"VEVENT", "VTODO", "VJOURNAL"}
+#: Properties that say what, when, where and who. UIDs, DTSTAMP, SEQUENCE
+#: and X- vendor fields are client bookkeeping.
+CALENDAR_PROPERTIES = {
+    "SUMMARY", "DTSTART", "DTEND", "DUE", "RRULE", "LOCATION",
+    "ORGANIZER", "ATTENDEE", "DESCRIPTION", "STATUS",
+}
+# RFC 5545 §3.1: NAME *(";" param) ":" value; quoted param values may hold ":".
+_CALENDAR_LINE = re.compile(r'([A-Za-z0-9-]+)((?:;[^:;"]*(?:"[^"]*"[^:;"]*)*)*):(.*)')
+_CALENDAR_PARAM = re.compile(r';([A-Za-z0-9-]+)=("[^"]*"|[^;]*)')
+_CALENDAR_ESCAPE = re.compile(r"\\([\\;,nN])")
+
+
+def extract_calendar(file_path: str | Path) -> ExtractionResult:
+    """Render an iCalendar file's event fields as text, one per line."""
+    with open(file_path, encoding="utf-8", errors="replace") as f:
+        unfolded = re.sub(r"\r?\n[ \t]", "", f.read())
+    components: list[str] = []
+    lines: list[str] = []
+    for content_line in unfolded.splitlines():
+        match = _CALENDAR_LINE.fullmatch(content_line)
+        if not match:
+            continue
+        name, raw_params, value = match.group(1).upper(), match.group(2), match.group(3)
+        if name == "BEGIN":
+            components.append(value.upper())
+        elif name == "END":
+            if components and components.pop() in CALENDAR_COMPONENTS and lines and lines[-1]:
+                lines.append("")
+        elif name in CALENDAR_PROPERTIES and components and components[-1] in CALENDAR_COMPONENTS:
+            params = {k.upper(): v.strip('"') for k, v in _CALENDAR_PARAM.findall(raw_params)}
+            value = _CALENDAR_ESCAPE.sub(lambda m: "\n" if m.group(1) in "nN" else m.group(1), value)
+            if name in ("ORGANIZER", "ATTENDEE"):
+                value = re.sub(r"(?i)^mailto:", "", value)
+                if params.get("CN"):
+                    value = f"{params['CN']} <{value}>"
+            elif params.get("TZID"):
+                value = f"{value} ({params['TZID']})"
+            lines.append(f"{name}: {value}")
+    return ExtractionResult.from_text("\n".join(lines).strip())
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -971,6 +1019,8 @@ def extract_text(
         return result
     elif ext == "txt":
         return extract_plaintext(file_path)
+    elif ext == "ics":
+        return extract_calendar(file_path)
     elif ext in ("xlsx", "xls"):
         return extract_excel(file_path)
     elif ext in ("docx", "doc", "pptx", "html", "htm", "epub", "rtf", "csv"):
