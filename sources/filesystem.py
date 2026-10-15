@@ -23,6 +23,20 @@ logger = logging.getLogger(__name__)
 _INJECTED_ID_SUFFIX_RE = re.compile(r"^(?P<prefix>.+)@[^@]+@$")
 
 
+def scan_patterns(scan_config: dict) -> tuple[list[str], list[str]]:
+    """A filesystem source's effective (include, exclude) globs.
+
+    The one place a source's ``scan`` config gets its defaults: a source that
+    omits ``include`` selects Markdown only. Every path that decides whether a
+    file belongs to a source — the full scan, targeted indexing, folder
+    listings — derives its globs from here so they cannot disagree.
+    """
+    return (
+        scan_config.get("include", ["**/*.md"]),
+        scan_config.get("exclude", []),
+    )
+
+
 # Satisfies the Source protocol from sources.base structurally — no explicit
 # inheritance needed. Runtime isinstance checks against Source() work because
 # the protocol is @runtime_checkable.
@@ -39,8 +53,7 @@ class FilesystemSource:
     ):
         self.name = name
         self._root = Path(root)
-        self._include = scan_config.get("include", ["**/*.md"])
-        self._exclude = scan_config.get("exclude", [])
+        self._include, self._exclude = scan_patterns(scan_config)
         self._no_rename = scan_config.get("no_rename", [])
         self._registry = registry
         self._pdf_config = pdf_config or {}

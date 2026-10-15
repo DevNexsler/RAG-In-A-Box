@@ -703,6 +703,33 @@ def test_index_document_flow_answers_not_indexable_for_file_outside_scan(
     assert registry.lookup_id(rel) is None
 
 
+@pytest.mark.parametrize("rel", ["inbox/report.pdf", "inbox/note.md"])
+def test_targeted_index_selects_what_the_full_scan_selects_without_include(
+    tmp_path, rel
+):
+    """A source that omits scan.include gets the same default selection on
+    the targeted path as in the full scan: a targeted file answers
+    not_indexable exactly when the full scan would not pick it up (#4205)."""
+    from sources import build_source
+
+    root, _ = _make_attachment(tmp_path, rel)
+    cfg = _fs_config(root, tmp_path / "index")
+    src_cfg = cfg["sources"][0]
+    src_cfg["scan"] = {"no_rename": ["inbox/"]}
+
+    full_scan = build_source(src_cfg, registry=DocIDStore(tmp_path / "scan.db"))
+    selected = {r.natural_key for r in full_scan.scan()}
+
+    rec = fiv.resolve_single_record(
+        cfg, "documents", rel, DocIDStore(tmp_path / "reg.db")
+    )
+
+    assert rec is not None
+    assert ("not_indexable" in rec) == (rel not in selected)
+    if rel.endswith(".pdf"):
+        assert rec == {"rel_path": rel, "not_indexable": "outside_scan"}
+
+
 def test_index_document_flow_durably_queues_during_full_writer_session(
     tmp_path, monkeypatch
 ):
