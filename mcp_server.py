@@ -2891,7 +2891,12 @@ def _file_folders_impl() -> dict:
             "Check documents_root (or vault_root) in config.yaml.",
         )
 
-    include, exclude = scan_patterns(config.get("scan", {}))
+    # documents_root is the first filesystem source's root (load_config), and
+    # that source carries the scan in both legacy and sources: configs.
+    first_fs = next(
+        (s for s in config.get("sources") or [] if s.get("type") == "filesystem"), {}
+    )
+    include, exclude = scan_patterns(first_fs.get("scan") or config.get("scan", {}))
 
     folder_counts: Counter = Counter()
     total_files = 0
