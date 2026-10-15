@@ -268,6 +268,33 @@ async def test_image_with_failed_describe_is_indexed_as_incomplete(
         assert chunk["enr_summary"] == "", chunk
 
 
+@pytest.mark.parametrize("image_format", ["webp", "gif"])
+async def test_webp_and_gif_attachments_reach_document_indexed(
+    indexed_corpus, api, mcp_session, image_format
+):
+    """#4089: .webp/.gif route to the image describer, but the documents scan
+    globs omitted them, so a deposited .webp attachment was never indexed."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    salt = uuid.uuid4().hex
+    buf = BytesIO()
+    Image.new("RGB", (48, 32), color=(int(salt[:2], 16), 60, 120)).save(buf, image_format.upper())
+    name = f"attachment-{salt[:8]}.{image_format}"
+    resp = await api.post("/api/upload", files={"file": (name, buf.getvalue())})
+    assert resp.status_code == 201, resp.text
+    result = await mcp_session.call_tool_json(
+        "file_index_document", {"target": name, "source_name": "documents"}
+    )
+    assert result.get("status") == "indexed", result
+
+    events = await get_hook_events()
+    delivered = [e for e in events
+                 if e.get("event") == "document.indexed" and e.get("doc_id") == result["doc_id"]]
+    assert delivered and delivered[0]["chunks"], events
+
+
 @pytest.mark.skipif(
     E2E_REAL,
     reason="enrichment is live in real mode; simulator truncation cannot be armed",
