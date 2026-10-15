@@ -292,6 +292,18 @@ rendered with the tier's own env, refuses a stack whose mounts or service DSNs
 reach production storage (inside a container a configured root persists only
 through a mount, so the mounts cover every root its config can name).
 
+Some live tests connect to a DSN taken straight from the environment, outside
+any config `scratch_storage` sees. A test that writes to such a database
+refuses a production one itself, before it connects, with the same rule
+(`production_storage().database_conflict`): `tests/test_sor_query_integration_live.py`
+drops and recreates tables in `SOR_TEST_DSN`, so it fails when that DSN names
+a database the production container uses (`sor`, `comm_data_store`). Point
+`SOR_TEST_DSN` at a scratch database. Read-only live tests still read the
+production comm store through `COMM_DATA_STORE_DSN` (`comm_postgres`
+answers `SELECT 1`; `tests/sources/test_postgres_source.py` runs
+`PostgresSource.scan` SELECTs). Whether they may keep doing so is an open
+operator decision (Maint-Manager #4193); until it is made they are unchanged.
+
 **Worktree setup**: linked worktrees need their own copies of three
 gitignored files from the main checkout — `config_test.yaml`, `.env`,
 and `config.yaml` (several live tests call `load_config()` on it for

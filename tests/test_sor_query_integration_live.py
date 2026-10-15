@@ -2,6 +2,7 @@ import os
 import pytest
 
 import sor_query
+from scripts import live_preflight
 
 DSN = os.environ.get("SOR_TEST_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="SOR_TEST_DSN not set")
@@ -9,6 +10,12 @@ pytestmark = pytest.mark.skipif(not DSN, reason="SOR_TEST_DSN not set")
 
 @pytest.fixture()
 def seeded(monkeypatch):
+    # The seed drops and recreates tables, so refuse a production database
+    # (as the production container names them; unknown production raises).
+    database = live_preflight.production_storage().database_conflict(DSN)
+    if database:
+        pytest.fail(f"SOR_TEST_DSN names production database {database!r} "
+                    "— point it at a scratch database")
     import psycopg
     with psycopg.connect(DSN) as conn:
         conn.execute('DROP TABLE IF EXISTS "Buildings"')
