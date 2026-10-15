@@ -5069,6 +5069,23 @@ def _normalize_index_request_target(
     return rel_path.as_posix()
 
 
+def _scan_selects(src_cfg: dict, rel_path: str) -> bool:
+    """Whether the source's full scan selects ``rel_path`` (exclude wins)."""
+    from sources.filesystem import scan_patterns
+
+    include, exclude = scan_patterns(src_cfg.get("scan", {}))
+    return not _matches_any(rel_path, exclude) and _matches_any(rel_path, include)
+
+
+def _not_indexable_answer(rel_path: str, reason: str, source_name: str) -> dict:
+    return {
+        "status": "not_indexable",
+        "reason": reason,
+        "rel_path": rel_path,
+        "source_name": source_name,
+    }
+
+
 def resolve_single_record(
     config: dict, source_name: str, target: str, doc_id_store: DocIDStore
 ) -> dict | None:
@@ -5105,10 +5122,10 @@ def resolve_single_record(
         rel_path = abs_path.relative_to(root).as_posix()
 
     scan_cfg = src_cfg.get("scan", {})
-    include, exclude = scan_patterns(scan_cfg)
+    _, exclude = scan_patterns(scan_cfg)
     # Respect the source's supported file types — don't index a deposit the
     # full scan would never pick up.
-    if _matches_any(rel_path, exclude) or not _matches_any(rel_path, include):
+    if not _scan_selects(src_cfg, rel_path):
         return {"rel_path": rel_path, "not_indexable": "outside_scan"}
 
     records = scan_filesystem_records(
@@ -5444,12 +5461,9 @@ def _index_document_unlocked(
         }
 
     if record.get("not_indexable"):
-        return {
-            "status": "not_indexable",
-            "reason": record["not_indexable"],
-            "rel_path": record["rel_path"],
-            "source_name": request.source_name,
-        }
+        return _not_indexable_answer(
+            record["rel_path"], record["not_indexable"], request.source_name
+        )
 
     if record.get("skip_reason"):
         admitted, _ = _apply_skip_ledger(index_root, [record])
@@ -5790,6 +5804,13 @@ def index_document_flow(
     index_root = Path(config["index_root"])
     table_name = config.get("lancedb", {}).get("table", "chunks")
     target = _normalize_index_request_target(config, source_name, target)
+    if "::" not in target:
+        # Scan selection is a pure read of config and disk, so an existing
+        # file outside the scan gets its terminal answer now, not a "queued"
+        # that only resolves after a running sweep releases the writer lock.
+        src_cfg = _find_source_config(config, source_name)
+        if (Path(src_cfg["root"]) / target).is_file() and not _scan_selects(src_cfg, target):
+            return _not_indexable_answer(target, "outside_scan", source_name)
     queue = IndexRequestQueue(index_root)
     request = queue.enqueue(
         table_name,

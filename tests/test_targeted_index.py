@@ -730,6 +730,27 @@ def test_targeted_index_selects_what_the_full_scan_selects_without_include(
         assert rec == {"rel_path": rel, "not_indexable": "outside_scan"}
 
 
+def test_file_folders_counts_what_the_documents_source_scan_selects(
+    tmp_path, monkeypatch
+):
+    """In a sources: config there is no top-level scan; the folder listing must
+    count with the documents source's own scan, not the **/*.md default (#4205)."""
+    import mcp_server
+    from sources import build_source
+
+    root, _ = _make_attachment(tmp_path, "inbox/report.pdf")
+    (root / "inbox" / "ignored.zip").write_bytes(b"PK\x03\x04")
+    cfg = _fs_config(root, tmp_path / "index")
+    cfg["documents_root"] = str(root)
+    monkeypatch.setattr(mcp_server, "load_config", lambda *a, **k: cfg)
+
+    full_scan = build_source(cfg["sources"][0], registry=DocIDStore(tmp_path / "scan.db"))
+    selected = [r.natural_key for r in full_scan.scan()]
+
+    listing = mcp_server._file_folders_impl()
+    assert listing["total_files"] == len(selected) == 1, listing
+
+
 def test_index_document_flow_durably_queues_during_full_writer_session(
     tmp_path, monkeypatch
 ):
@@ -766,6 +787,44 @@ def test_index_document_flow_durably_queues_during_full_writer_session(
         "chunks", limit=10
     )
     assert queued.target == "queued.pdf"
+
+
+def test_index_document_flow_answers_outside_scan_while_a_sweep_holds_the_lock(
+    tmp_path, monkeypatch
+):
+    """The outside-scan answer is terminal, so a running sweep must not turn it
+    into a "queued" the caller waits on and retries (#4198)."""
+    from core.index_request_queue import IndexRequestQueue
+    from core.index_write_lock import index_write_lock
+
+    config = _fs_config(tmp_path / "docs", tmp_path / "index")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "photo.zip").write_bytes(b"PK\x03\x04")
+    monkeypatch.setattr(fiv, "load_config", lambda _path: config)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_full_writer():
+        with index_write_lock(config["index_root"], "chunks"):
+            acquired.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_full_writer)
+    holder.start()
+    try:
+        assert acquired.wait(5)
+        result = fiv.index_document_flow(target="photo.zip")
+    finally:
+        release.set()
+        holder.join(5)
+
+    assert result == {
+        "status": "not_indexable",
+        "reason": "outside_scan",
+        "rel_path": "photo.zip",
+        "source_name": "documents",
+    }
+    assert IndexRequestQueue(config["index_root"]).pending("chunks", limit=10) == []
 
 
 def test_index_document_flow_enqueue_failure_never_attempts_table_lock(
