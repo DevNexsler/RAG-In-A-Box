@@ -58,9 +58,9 @@ print(json.dumps({"peak_threads": peak}))
 
 
 def _compose_thread_env() -> dict[str, str]:
-    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
+    compose = yaml.safe_load(Path("docker-compose.runtime-envelope.yml").read_text())
     env = {}
-    for item in compose["services"]["doc-organizer"]["environment"]:
+    for item in compose["services"]["doc-organizer-runtime-envelope"]["environment"]:
         match = re.fullmatch(r"(\w*THREADS\w*)=\$\{\1:-(\d+)\}", item)
         if match:
             env[match.group(1)] = match.group(2)

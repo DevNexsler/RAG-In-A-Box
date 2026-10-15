@@ -157,6 +157,8 @@ def test_compose_enforces_configurable_resource_envelope():
     # 10g since 2026-09-07: bounded ~3.5-5 GB server plateau + ~3.7 GB sweep (see compose comment).
     assert service["mem_limit"] == "${DOC_ORGANIZER_MEMORY_LIMIT:-10g}"
     assert service["mem_reservation"] == "${DOC_ORGANIZER_MEMORY_RESERVATION:-4g}"
+    envelope = yaml.safe_load(Path("docker-compose.runtime-envelope.yml").read_text())
+    service = envelope["services"]["doc-organizer-runtime-envelope"]
     assert service["pids_limit"] == "${DOC_ORGANIZER_PIDS_LIMIT:-512}"
 
 
@@ -164,8 +166,8 @@ def test_compose_caps_every_core_sized_native_thread_pool():
     """Native pools default to one thread per host core in every process; the
     server, index run and Prefect share pids_limit, and an uncapped rayon pool
     spawned inside optimize_indices hit EAGAIN and panicked the run (#4083)."""
-    compose = yaml.safe_load(Path("docker-compose.yml").read_text())
-    env = compose["services"]["doc-organizer"]["environment"]
+    compose = yaml.safe_load(Path("docker-compose.runtime-envelope.yml").read_text())
+    env = compose["services"]["doc-organizer-runtime-envelope"]["environment"]
 
     for knob in (
         "LANCE_IO_THREADS",
@@ -254,3 +256,33 @@ def test_reranker_timeout_defaults_to_search_budget():
     reranker = build_reranker({"search": {"reranker": {"enabled": True, "api_key": "test-key"}}})
 
     assert reranker.timeout == RERANK_TIMEOUT_SECONDS
+
+
+def _rendered_service(compose_file: str, service: str) -> dict:
+    rendered = subprocess.run(
+        ["docker", "compose", "-f", compose_file, "config", "--no-interpolate"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    service = yaml.safe_load(rendered.stdout)["services"][service]
+    env = service.get("environment", {})
+    if isinstance(env, list):
+        service["environment"] = dict(item.split("=", 1) for item in env)
+    return service
+
+
+def test_staging_runs_production_runtime_envelope():
+    """The staging-e2e candidate must run the image under production's pid and
+    thread/allocator shape, or the gate can never reproduce a pids-cgroup EAGAIN
+    (#4083) or glibc arena growth (#4085). Both services render the same
+    pids_limit and envelope env, and neither may override a value from it."""
+    production = _rendered_service("docker-compose.yml", "doc-organizer")
+    staging = _rendered_service("docker-compose.staging.yml", "doc-organizer-staging")
+    knobs = ("LANCE_IO_THREADS", "LANCE_CPU_THREADS", "RAYON_NUM_THREADS",
+             "TOKIO_WORKER_THREADS", "OMP_NUM_THREADS", "MALLOC_ARENA_MAX",
+             "MALLOC_TRIM_THRESHOLD_")
+
+    assert staging.get("pids_limit") == production["pids_limit"]
+    for knob in knobs:
+        assert staging["environment"].get(knob) == production["environment"][knob], knob

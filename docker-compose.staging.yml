@@ -16,6 +16,11 @@ x-staging-logging: &staging-logging
 
 services:
   doc-organizer-staging:
+    extends:
+      # pids_limit and the native thread-pool/allocator env — production's, so
+      # the gate runs the image under the same pid/thread/allocator shape (#4085).
+      file: docker-compose.runtime-envelope.yml
+      service: doc-organizer-runtime-envelope
     build: .
     mem_limit: 4g
     ports: ["${STAGING_APP_PORT:-17788}:7788"]

@@ -1,5 +1,9 @@
 services:
   doc-organizer:
+    extends:
+      # pids_limit and the native thread-pool/allocator env (#4085).
+      file: docker-compose.runtime-envelope.yml
+      service: doc-organizer-runtime-envelope
     build: .
     image: doc-organizer:latest
     container_name: doc-organizer
@@ -16,7 +20,6 @@ services:
     # earlyoom; deliberate host-specific sizing remains an explicit override.
     mem_limit: ${DOC_ORGANIZER_MEMORY_LIMIT:-10g}
     mem_reservation: ${DOC_ORGANIZER_MEMORY_RESERVATION:-4g}
-    pids_limit: ${DOC_ORGANIZER_PIDS_LIMIT:-512}
     logging:
       driver: json-file
       options:
@@ -83,31 +86,6 @@ services:
       # server that orphans when earlyoom kills the indexer (49+ orphans /
       # ~19 GiB baseline). One intentional server, never a leak.
       - PREFECT_SERVER_ALLOW_EPHEMERAL_MODE=false
-      # Lance sizes its IO and CPU pools to the host's 32 cores (the container has
-      # no cpu limit): 64 threads, each with allocator arenas that retain a share
-      # of every query's partition reads. 8/8 caps the fan-out for one 88k-row
-      # table; the index run's throughput is bound by provider calls, not this.
-      - LANCE_IO_THREADS=${LANCE_IO_THREADS:-8}
-      - LANCE_CPU_THREADS=${LANCE_CPU_THREADS:-8}
-      # Every other native pool sizes itself to those 32 cores too, once per
-      # process: rayon (Lance index build/merge), the tokio runtimes behind
-      # lance and lancedb, and OpenBLAS/Arrow (numpy, pyarrow). The index-run
-      # subprocess peaked at 178 threads and the server at 167; they share
-      # pids_limit with Prefect, so rayon's lazy 32-thread spawn inside
-      # optimize_indices hit EAGAIN and panicked the run (#4083). Capped, the
-      # same Lance work peaks near 64 threads per process.
-      - RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-8}
-      - TOKIO_WORKER_THREADS=${TOKIO_WORKER_THREADS:-8}
-      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
-      # glibc malloc (Python's allocator; Lance uses its own jemalloc) gives every
-      # worker thread a private arena and keeps that thread's freed search
-      # objects — ~100 candidate rows with text, metadata and a 4096-float list
-      # per query — instead of returning them. Each new MCP session lands its
-      # call on a fresh thread, so the server grew ~0.4 GB/h under organic load
-      # and needed a restart every ~14 h (2026-09-07). Measured, 80 searches on
-      # fresh threads: 457 -> 1084 MB by default, 449 -> 484 MB with these two.
-      - MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-2}
-      - MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-131072}
 
 networks:
   rag-net:
