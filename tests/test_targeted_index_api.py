@@ -5,7 +5,7 @@ attachment. index_document_flow itself is covered by test_targeted_index.py;
 here we only pin the route's request/response contract.
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -70,6 +70,48 @@ async def test_index_document_route_maps_not_found_to_404(client):
         resp = await client.post("/index/document", json={"rel_path": "nope.pdf"})
     assert resp.status_code == 404
     assert resp.json()["reason"] == "not_found"
+
+
+@pytest.mark.anyio
+async def test_index_document_route_separates_outside_scan_from_missing(
+    client, tmp_path
+):
+    """Through the real flow: an existing file outside the source's scan is a
+    terminal 200 not_indexable; a missing file stays a 404 not_found (#4198)."""
+    root = tmp_path / "docs"
+    (root / "email-attachments").mkdir(parents=True)
+    (root / "email-attachments" / "bundle.zip").write_bytes(b"PK\x03\x04")
+    cfg = {
+        "index_root": str(tmp_path / "index"),
+        "lancedb": {"table": "chunks"},
+        "sources": [
+            {
+                "type": "filesystem",
+                "name": "documents",
+                "root": str(root),
+                "scan": {"include": ["**/*.pdf"], "exclude": []},
+            }
+        ],
+    }
+
+    with patch("flow_index_vault.load_config", return_value=cfg), \
+         patch("flow_index_vault.open_store_with_recovery", return_value=MagicMock()):
+        outside = await client.post(
+            "/index/document", json={"rel_path": "email-attachments/bundle.zip"}
+        )
+        missing = await client.post(
+            "/index/document", json={"rel_path": "email-attachments/gone.zip"}
+        )
+
+    assert outside.status_code == 200
+    assert outside.json() == {
+        "status": "not_indexable",
+        "reason": "outside_scan",
+        "rel_path": "email-attachments/bundle.zip",
+        "source_name": "documents",
+    }
+    assert missing.status_code == 404
+    assert missing.json()["reason"] == "not_found"
 
 
 @pytest.mark.anyio
