@@ -27,6 +27,7 @@ Enhancements inspired by memory-lancedb-pro (win4r/memory-lancedb-pro):
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import hmac
 import logging
@@ -274,6 +275,62 @@ def _apply_min_score_threshold(
 # p90 6-14 s). Past this bound the cosine order is the better answer.
 RERANK_TIMEOUT_SECONDS = 10.0
 
+# The cross-encoder's latency follows the tokens it reads, and the timeout above
+# turns a long payload into a degraded search. Each candidate is cut to
+# RERANK_DOC_CHARS; when the whole request (every candidate plus the query and
+# prompt the provider pairs with each one) still exceeds the token budget, all
+# candidates are cut further to one shared length. 2026-10-15: 70 accounting
+# emails ("6 tenant invoices are due today") made a 154k-token request that took
+# 11-27 s, so the search degraded on every attempt and comms-review retried it for
+# hours; cut to fit (1754 chars each) it was 68k tokens and answered in 4-5 s.
+# Of six ordinary searches measured that day, five were sent whole and one was
+# cut to 3546 chars.
+RERANK_DOC_CHARS = 4000
+RERANK_TOKEN_BUDGET = 64_000  # estimated request tokens (see _rerank_token_starts)
+RERANK_PAIR_OVERHEAD_TOKENS = 90  # the provider's prompt around each query/candidate pair
+# Qwen's tokenizer reads every digit as its own token, so digit-heavy text
+# (invoices, ledgers) costs far more per character than prose.
+_RERANK_TOKEN_PIECE = re.compile(r"\d|[^\W\d_]+|[^\w\s]")
+
+
+def _rerank_token_starts(text: str) -> list[int]:
+    """Start offset of each estimated token: digits, words and symbols each count one.
+
+    A prefix text[:n] holds exactly the tokens that start before n (a word cut
+    short still counts once).
+    """
+    return [match.start() for match in _RERANK_TOKEN_PIECE.finditer(text)]
+
+
+def fit_rerank_documents(
+    query: str,
+    texts: list[str],
+    budget: int = RERANK_TOKEN_BUDGET,
+    max_chars: int = RERANK_DOC_CHARS,
+) -> list[str]:
+    """Cut candidates to one shared length so the estimated request fits the budget.
+
+    Keeps every candidate (the reranker must score each hit) and the head of each,
+    which is where a chunk's subject sits.
+    """
+    docs = [text[:max_chars] for text in texts]
+    starts = [_rerank_token_starts(doc) for doc in docs]
+    pairs = len(docs) * (len(_rerank_token_starts(query)) + RERANK_PAIR_OVERHEAD_TOKENS)
+
+    def tokens_within(limit: int) -> int:
+        return pairs + sum(bisect.bisect_left(doc_starts, limit) for doc_starts in starts)
+
+    if tokens_within(max_chars) <= budget:
+        return docs
+    low, high = 0, max_chars
+    while low < high:
+        mid = (low + high + 1) // 2
+        if tokens_within(mid) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    return [doc[:low] for doc in docs]
+
 
 class Reranker:
     """Base class for re-rankers. Subclass and override `rerank`."""
@@ -328,7 +385,13 @@ class DeepInfraReranker(Reranker):
         # Preserve original scores for blending
         original_scores = {(h.doc_id, h.loc): h.score for h in hits}
 
-        documents = [h.text[:4000] for h in hits]
+        texts = [h.text for h in hits]
+        documents = fit_rerank_documents(query, texts)
+        if any(len(doc) < min(len(text), RERANK_DOC_CHARS) for doc, text in zip(documents, texts)):
+            logger.info(
+                "DeepInfraReranker: %d candidates over the %d-token budget; cut to %d chars each",
+                len(documents), RERANK_TOKEN_BUDGET, max(map(len, documents)),
+            )
 
         try:
             # Every search builds a fresh reranker, so the endpoint's circuit is
