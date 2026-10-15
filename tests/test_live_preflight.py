@@ -570,6 +570,248 @@ def test_main_check_exception_is_a_failure(monkeypatch, capsys):
 
 def test_real_checks_are_registered():
     names = [name for name, _ in lp.CHECKS]
-    assert names == ["api_keys", "config_test", "litellm_ocr",
+    assert names == ["api_keys", "config_test", "scratch_storage", "litellm_ocr",
                      "prod_indexer_idle", "comm_postgres"]
     assert "mac_ocr" not in names
+
+
+# ---------------------------------------------------------------------------
+# check_scratch_storage / check_compose_storage (#4183): live and E2E tiers
+# refuse any configured root or database that is production storage. The
+# production locations come from the production container's own description
+# (mounts, environment, mounted config.yaml) — never from a hand list.
+# ---------------------------------------------------------------------------
+
+PROD_DSN = "postgresql://comm:secret@comm-data-store-postgres-1:5432/comm_data_store"
+HOST_DSN = "postgresql://comm:secret@localhost:5433/comm_data_store"
+
+
+@pytest.fixture
+def production(tmp_path, monkeypatch):
+    """A fake production deployment: compose bind mounts, a named index
+    volume, and the production config.yaml mounted at /app/config.yaml."""
+    prod = tmp_path / "prod"
+    docs = prod / "documents"
+    host_index = prod / "doc-organizer-index"
+    volume = prod / "volumes" / "rag-in-a-box_doc-organizer-data" / "_data"
+    for path in (docs, host_index, volume):
+        path.mkdir(parents=True)
+    config = prod / "config.yaml"
+    config.write_text(lp.yaml.safe_dump({
+        "index_root": str(host_index),
+        "sources": [
+            {"type": "filesystem", "name": "documents", "root": str(docs)},
+            {"type": "postgres", "name": "comm_messages",
+             "dsn": "${COMM_DATA_STORE_DSN}"},
+        ],
+        "dedupe": {"archive_root": "/data/index/duplicates"},
+    }))
+    mounts = [
+        {"Type": "bind", "Source": str(config), "Destination": "/app/config.yaml"},
+        {"Type": "bind", "Source": str(docs), "Destination": "/data/documents"},
+        {"Type": "volume", "Name": "rag-in-a-box_doc-organizer-data",
+         "Source": str(volume), "Destination": "/data/index"},
+    ]
+    env = [f"COMM_DATA_STORE_DSN={PROD_DSN}", "INDEX_ROOT=/data/index",
+           "DOCUMENTS_ROOT=/data/documents"]
+    compose = {"services": {}, "volumes": {}}
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["docker", "inspect"]:
+            assert cmd[-1] == lp.PROD_CONTAINER
+            stdout = "\n".join(lp.json.dumps(part) for part in (mounts, "/app", env))
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout + "\n", stderr="")
+        if cmd[:2] == ["docker", "compose"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=lp.json.dumps(compose), stderr="")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    for name in ("INDEX_ROOT", "DOCUMENTS_ROOT", "COMM_DATA_STORE_DSN"):
+        monkeypatch.delenv(name, raising=False)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
+    monkeypatch.setattr(lp, "main_checkout_root", lambda: worktree)
+    return SimpleNamespace(config=config, docs=docs, host_index=host_index,
+                           volume=volume, mounts=mounts, env=env,
+                           compose=compose, calls=calls, worktree=worktree)
+
+
+def _write_scratch_configs(worktree, **overrides):
+    docs = worktree / "scratch-docs"
+    docs.mkdir(exist_ok=True)
+    config = {
+        "index_root": str(worktree / "scratch-index"),
+        "sources": [{"type": "filesystem", "name": "documents", "root": str(docs)}],
+        **overrides,
+    }
+    (worktree / "config.yaml").write_text(lp.yaml.safe_dump(config))
+    (worktree / "config_test.yaml").write_text(lp.yaml.safe_dump({
+        "vault_root": str(docs), "index_root": str(worktree / "test-index"),
+    }))
+
+
+def _write_scratch_configs_test_only(worktree):
+    docs = worktree / "scratch-docs"
+    docs.mkdir(exist_ok=True)
+    (worktree / "config_test.yaml").write_text(lp.yaml.safe_dump({
+        "vault_root": str(docs), "index_root": str(worktree / "test-index"),
+    }))
+
+
+def test_production_storage_is_derived_from_the_production_container(production):
+    storage = lp.production_storage()
+
+    assert production.docs.resolve() in storage.paths
+    assert production.volume.resolve() in storage.paths
+    # index_root from the production config.yaml, which the container mounts
+    assert production.host_index.resolve() in storage.paths
+    assert storage.volumes == {"rag-in-a-box_doc-organizer-data"}
+    assert storage.databases == {"comm_data_store"}
+
+
+def test_scratch_storage_refuses_a_copied_production_config(production, monkeypatch):
+    # #4183 / RAG #226: a worker copied production config.yaml into its
+    # worktree and the live tier ran against the production roots.
+    (production.worktree / "config.yaml").write_text(production.config.read_text())
+    _write_scratch_configs_test_only(production.worktree)
+    monkeypatch.setenv("COMM_DATA_STORE_DSN", HOST_DSN)
+
+    ok, reason = lp.check_scratch_storage()
+
+    assert not ok
+    assert "config.yaml index_root" in reason
+    assert "config.yaml sources[documents].root" in reason
+    assert "config.yaml sources[comm_messages].dsn" in reason
+    assert "comm_data_store" in reason
+    assert "secret" not in reason  # never print DSN credentials
+
+
+def test_scratch_storage_falls_back_to_the_production_checkout_config(production, monkeypatch):
+    # No config.yaml in the worktree: preflight's main-checkout fallback is
+    # the production config itself, which must be refused too.
+    _write_scratch_configs_test_only(production.worktree)
+    monkeypatch.setattr(lp, "main_checkout_root", lambda: production.config.parent)
+
+    ok, reason = lp.check_scratch_storage()
+
+    assert not ok
+    assert f"{production.config} index_root" in reason
+
+
+def test_scratch_storage_accepts_scratch_configs(production):
+    _write_scratch_configs(production.worktree)
+
+    ok, reason = lp.check_scratch_storage()
+
+    assert ok, reason
+    assert "config.yaml" in reason and "config_test.yaml" in reason
+
+
+@pytest.mark.parametrize("env_name", ["INDEX_ROOT", "DOCUMENTS_ROOT"])
+def test_scratch_storage_resolves_env_overrides(production, monkeypatch, env_name):
+    _write_scratch_configs(production.worktree)
+    target = production.volume if env_name == "INDEX_ROOT" else production.docs
+    monkeypatch.setenv(env_name, str(target))
+
+    ok, reason = lp.check_scratch_storage()
+
+    assert not ok
+    assert str(target) in reason
+
+
+@pytest.mark.parametrize("relation", ["under", "contains", "symlink"])
+def test_scratch_storage_refuses_overlap_with_production(production, relation):
+    if relation == "under":
+        index_root = production.volume / "scratch"
+    elif relation == "contains":
+        index_root = production.volume.parent
+    else:
+        index_root = production.worktree / "index-link"
+        index_root.symlink_to(production.host_index)
+    _write_scratch_configs(production.worktree, index_root=str(index_root))
+
+    ok, reason = lp.check_scratch_storage()
+
+    assert not ok
+    assert "config.yaml index_root" in reason
+
+
+def test_scratch_storage_refuses_a_production_database(production, monkeypatch):
+    _write_scratch_configs(production.worktree, sources=[
+        {"type": "filesystem", "name": "documents",
+         "root": str(production.worktree / "scratch-docs")},
+        {"type": "postgres", "name": "comm_messages", "dsn": "${COMM_DATA_STORE_DSN}"},
+    ])
+    monkeypatch.setenv("COMM_DATA_STORE_DSN", HOST_DSN)
+    assert not lp.check_scratch_storage()[0]
+
+    monkeypatch.setenv("COMM_DATA_STORE_DSN", "postgresql://comm:comm@localhost:15432/comm")
+    ok, reason = lp.check_scratch_storage()
+    assert ok, reason
+
+
+def test_scratch_storage_fails_closed_when_production_is_unknown(production, monkeypatch):
+    _write_scratch_configs(production.worktree)
+
+    def no_container(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="",
+                                           stderr="Error: No such object: doc-organizer")
+
+    monkeypatch.setattr(lp.subprocess, "run", no_container)
+    ok, reason = lp.check_scratch_storage()
+
+    assert not ok
+    assert "No such object" in reason
+
+
+def _staging_compose(source_for_index, *, index_type="volume", dsn=None):
+    index_mount = {"type": index_type, "source": source_for_index, "target": "/data/index"}
+    return {
+        "services": {
+            "doc-organizer-staging": {
+                "volumes": [
+                    {"type": "volume", "source": "staging-docs", "target": "/data/documents"},
+                    index_mount,
+                ],
+                "environment": {
+                    "COMM_DATA_STORE_DSN": dsn or "postgresql://comm:comm@comm-postgres:5432/comm",
+                    "OPENROUTER_API_KEY": "sim",
+                },
+            },
+            "provider-sim": {},
+        },
+        "volumes": {
+            "staging-docs": {"name": "proj_staging-docs"},
+            "staging-index": {"name": "proj_staging-index"},
+            "prod-index": {"name": "rag-in-a-box_doc-organizer-data", "external": True},
+        },
+    }
+
+
+def test_compose_storage_accepts_the_staging_stack(production):
+    production.compose.update(_staging_compose("staging-index"))
+
+    ok, reason = lp.check_compose_storage("docker-compose.staging.yml")
+
+    assert ok, reason
+    assert ["docker", "compose", "-f", "docker-compose.staging.yml",
+            "config", "--format", "json"] in production.calls
+
+
+@pytest.mark.parametrize("compose", [
+    _staging_compose("prod-index"),
+    _staging_compose("PROD_DOCS", index_type="bind"),
+    _staging_compose("staging-index", dsn=PROD_DSN),
+], ids=["production-volume", "production-bind", "production-database"])
+def test_compose_storage_refuses_production_storage(production, compose):
+    compose = lp.json.loads(lp.json.dumps(compose).replace("PROD_DOCS", str(production.docs)))
+    production.compose.update(compose)
+
+    ok, reason = lp.check_compose_storage("docker-compose.staging.yml")
+
+    assert not ok
+    assert "doc-organizer-staging" in reason
+    assert "secret" not in reason

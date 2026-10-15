@@ -265,13 +265,14 @@ routing. The first-class OCR factory does not read a LiteLLM credential from
 YAML; it reads `LITELLM_API_KEY` first, then `LITELLM_MASTER_KEY`, from the
 environment.
 
-`scripts/live_preflight.py` runs all five checks (no early exit — one run
+`scripts/live_preflight.py` runs all six checks (no early exit — one run
 reports every problem) and **only exit code 0 releases the spend**:
 
 | Check | What it verifies | When it fails |
 |---|---|---|
 | `api_keys` | `OPENROUTER_API_KEY` and `DEEPINFRA_API_KEY` non-empty | set them in `.env` (dotenv is loaded) |
 | `config_test` | `config_test.yaml` present in CWD | it's gitignored so fresh worktrees don't have it — copy from the main checkout (the failure message prints the path) |
+| `scratch_storage` | every root and database the live tier's configs resolve to — `index_root`, each source `root`, `dedupe.archive_root` and each postgres source `dsn` of CWD `config.yaml` and `config_test.yaml`, after `INDEX_ROOT`/`DOCUMENTS_ROOT` and `${VAR}` resolution — is clear of production storage. Production storage is read from the running `doc-organizer` container (`docker inspect`): every mount source, the paths its mounted `config.yaml` names, and the databases its postgres sources resolve to | a root is, contains, or lives under a production location, or a DSN names a production database (the message names the config file and key; DSN credentials are never printed). Point every root at scratch. Production unknown (container not inspectable) also fails closed |
 | `litellm_ocr` | reads the first existing config candidate (CWD/worktree `config.yaml` before the main checkout), authenticates a non-generating `GET {ocr.endpoint}/models`, and confirms both configured aliases | config/endpoint/model alias/credential missing, endpoint unreachable, authentication rejected, malformed response, or either alias absent; credentials belong only in `LITELLM_API_KEY` or `LITELLM_MASTER_KEY` |
 | `prod_indexer_idle` | `/data/index/indexer.pid` is absent or points to no live process; a live PID must be non-zombie and its `/proc/<pid>/cmdline` must identify the indexer | **"prod indexer active — rerun when quiet"**: the prod indexer is mid-run and would contend with the live tier for shared LiteLLM/local inference hardware. Wait for it to finish and re-run. Docker failures, malformed PID state, unreadable process metadata, foreign PID reuse, and unexpected probe output all fail closed. |
 | `comm_postgres` | `COMM_DATA_STORE_DSN` answers `SELECT 1` | DSN unset or Postgres down |
@@ -285,12 +286,20 @@ The production-indexer probe is also fail-closed. Only an explicit, successful
 container probe proving there is no live indexer PID reports idle; inability to
 verify container or process state blocks the live tier.
 
+The E2E tiers (`staging-e2e`, `e2e-real`) run the same storage check before
+`compose up`: `scripts/live_preflight.py --compose docker-compose.staging.yml`,
+rendered with the tier's own env, refuses a stack whose mounts or service DSNs
+reach production storage (inside a container a configured root persists only
+through a mount, so the mounts cover every root its config can name).
+
 **Worktree setup**: linked worktrees need their own copies of three
 gitignored files from the main checkout — `config_test.yaml`, `.env`,
-and `config.yaml` (several live tests call `load_config()` on the real
-config for provider settings and the read-only index health checks; its
-paths are absolute, so a straight copy is correct — without it the live
-tier fails ~35 tests on `FileNotFoundError: config.yaml`). The `.env`
+and `config.yaml` (several live tests call `load_config()` on it for
+provider settings — without it the live tier fails ~35 tests on
+`FileNotFoundError: config.yaml`). A straight copy of the production
+`config.yaml` is refused by `scratch_storage`: rewrite `index_root`, every
+filesystem source `root` and `dedupe.archive_root` to scratch directories and
+drop (or repoint) the postgres sources before running anything. The `.env`
 copy must keep the host-side DSN rewrite
 (`COMM_DATA_STORE_DSN=postgresql://...@localhost:5433/...`), since live
 tests run on the host, not in a container. CWD precedence means a worktree's

@@ -8,18 +8,35 @@ every problem at once, printing one line per check:
     ok <name>: <reason>   /   FAIL <name>: <reason>
 
 Checks: OpenRouter/DeepInfra API keys, config_test.yaml present in CWD,
+every configured root and database is scratch (not production storage),
 LiteLLM OCR/vision aliases available, prod indexer idle, comm-store Postgres
 reachable.
+
+`--compose FILE` runs only the scratch-storage check, against the compose
+stack an E2E tier is about to start (scripts/gate.py calls it before `up`).
 """
+import argparse
+import dataclasses
+import json
 import os
 import shlex
 import subprocess
 import sys
-from pathlib import Path
+from collections.abc import Mapping
+from pathlib import Path, PurePosixPath
 
 import httpx
 import psycopg
 import yaml
+from psycopg.conninfo import conninfo_to_dict
+
+# scripts/ is not a package: make the repo root importable when run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from core.config import (  # noqa: E402
+    filesystem_source_roots,
+    load_config,
+    resolve_env_reference,
+)
 
 PROBE_TIMEOUT_S = 5
 PROD_CONTAINER = "doc-organizer"
@@ -106,6 +123,174 @@ def check_config_test() -> tuple[bool, str]:
             f"— copy it from {main_checkout_root() / 'config_test.yaml'}"
         )
     return True, "config_test.yaml present"
+
+
+@dataclasses.dataclass(frozen=True)
+class ProductionStorage:
+    """Where the production deployment keeps its data on this host."""
+    paths: frozenset[Path]      # host paths (resolved)
+    volumes: frozenset[str]     # docker volume names
+    databases: frozenset[str]   # postgres database names
+
+    def path_conflict(self, path: Path) -> Path | None:
+        """The production path that ``path`` is, contains, or lives under.
+
+        Containment counts both ways: a scratch root above production storage
+        still scans (and dedupe archives out of) production documents.
+        """
+        resolved = path.resolve()
+        for prod in sorted(self.paths):
+            if resolved == prod or prod in resolved.parents or resolved in prod.parents:
+                return prod
+        return None
+
+    def database_conflict(self, dsn: str) -> str | None:
+        database = dsn_database(dsn)
+        return database if database in self.databases else None
+
+
+def dsn_database(dsn: str) -> str | None:
+    """Database a libpq connection string names (libpq defaults it to the
+    user); None for a value that is not a connection string."""
+    try:
+        info = conninfo_to_dict(dsn)
+    except psycopg.ProgrammingError:
+        return None
+    return info.get("dbname") or info.get("user")
+
+
+def config_paths(config: Mapping) -> list[tuple[str, str]]:
+    """(key, path) for every filesystem location a config reads or writes."""
+    paths = [("index_root", config.get("index_root"))]
+    paths += [(f"sources[{name}].root", str(root))
+              for name, root in filesystem_source_roots(config).items()]
+    paths.append(("dedupe.archive_root", (config.get("dedupe") or {}).get("archive_root")))
+    return [(key, str(path)) for key, path in paths if path]
+
+
+def config_dsns(config: Mapping, env: Mapping[str, str]) -> list[tuple[str, str]]:
+    """(key, resolved dsn) for every postgres source of a config."""
+    return [(f"sources[{src.get('name')}].dsn", resolve_env_reference(str(src["dsn"]), env))
+            for src in config.get("sources") or []
+            if isinstance(src, dict) and src.get("type") == "postgres" and src.get("dsn")]
+
+
+def _container_to_host(path: str, workdir: str, mounts: list[dict]) -> Path:
+    """Host path behind a container path: the deepest covering mount wins."""
+    container_path = PurePosixPath(workdir) / path
+    best = None
+    for mount in mounts:
+        dest = PurePosixPath(mount["Destination"])
+        if container_path == dest or dest in container_path.parents:
+            if best is None or len(dest.parts) > len(PurePosixPath(best["Destination"]).parts):
+                best = mount
+    if best is None:
+        return Path(container_path)
+    return Path(best["Source"]) / container_path.relative_to(best["Destination"])
+
+
+def production_storage() -> ProductionStorage:
+    """Production storage as the production container itself describes it.
+
+    The docker-compose.yml deployment (with any override) is what the running
+    container's mounts and environment are; its config.yaml is the file it
+    loads from its working directory. Every mount source, every path that
+    config names, and every database its postgres sources resolve to (in the
+    container's environment) is production.
+    """
+    template = "{{json .Mounts}}\n{{json .Config.WorkingDir}}\n{{json .Config.Env}}"
+    proc = subprocess.run(["docker", "inspect", "--format", template, PROD_CONTAINER],
+                          capture_output=True, text=True, timeout=PROBE_TIMEOUT_S * 2)
+    if proc.returncode != 0:
+        raise RuntimeError(f"cannot inspect production container {PROD_CONTAINER} "
+                           f"({proc.stderr.strip()[:120]})")
+    mounts_json, workdir_json, env_json = proc.stdout.splitlines()[:3]
+    mounts = json.loads(mounts_json) or []
+    workdir = json.loads(workdir_json) or "/"
+    env = dict(item.split("=", 1) for item in json.loads(env_json) or [] if "=" in item)
+    config_file = _container_to_host("config.yaml", workdir, mounts)
+    config = yaml.safe_load(config_file.read_text()) or {}
+    paths = {Path(mount["Source"]).resolve() for mount in mounts}
+    paths |= {_container_to_host(path, workdir, mounts).resolve()
+              for _, path in config_paths(config)}
+    return ProductionStorage(
+        paths=frozenset(paths),
+        volumes=frozenset(m["Name"] for m in mounts if m.get("Type") == "volume"),
+        databases=frozenset(filter(None, (dsn_database(dsn)
+                                          for _, dsn in config_dsns(config, env)))),
+    )
+
+
+def _storage_verdict(problems: list[str], checked: str) -> tuple[bool, str]:
+    if problems:
+        return False, ("production storage — point every root and DSN at scratch: "
+                       + "; ".join(problems))
+    return True, f"no production storage in {checked}"
+
+
+def check_scratch_storage() -> tuple[bool, str]:
+    """Every config the live tier loads resolves to scratch storage.
+
+    Live tests load CWD config.yaml and config_test.yaml in-process, so each is
+    resolved with load_config itself (INDEX_ROOT/DOCUMENTS_ROOT overrides
+    included) and the DSNs with this process's environment.
+    """
+    try:
+        production = production_storage()
+    except RuntimeError as exc:
+        return False, str(exc)
+    config_yaml = next((c for c in config_candidates() if c.exists()), Path("config.yaml"))
+    problems = []
+    for path in (config_yaml, Path("config_test.yaml")):
+        try:
+            config = load_config(path)
+        except (FileNotFoundError, ValueError) as exc:
+            problems.append(f"{path}: cannot resolve ({exc})")
+            continue
+        for key, root in config_paths(config):
+            hit = production.path_conflict(Path(root))
+            if hit:
+                problems.append(f"{path} {key}={root} overlaps {hit}")
+        for key, dsn in config_dsns(config, os.environ):
+            database = production.database_conflict(dsn)
+            if database:
+                problems.append(f"{path} {key} names production database {database!r}")
+    return _storage_verdict(problems, f"{config_yaml}, config_test.yaml")
+
+
+def check_compose_storage(compose_file: str) -> tuple[bool, str]:
+    """The compose stack an E2E tier starts uses no production storage.
+
+    Inside a container a configured root persists only through a mount, and a
+    `${VAR}` DSN resolves only from the service environment, so checking every
+    service's mounts and environment covers every root its config can name.
+    """
+    try:
+        production = production_storage()
+    except RuntimeError as exc:
+        return False, str(exc)
+    proc = subprocess.run(["docker", "compose", "-f", compose_file, "config", "--format", "json"],
+                          capture_output=True, text=True, timeout=PROBE_TIMEOUT_S * 6)
+    if proc.returncode != 0:
+        return False, f"cannot render {compose_file} ({proc.stderr.strip()[:120]})"
+    rendered = json.loads(proc.stdout)
+    volumes = rendered.get("volumes") or {}
+    problems = []
+    for service, spec in (rendered.get("services") or {}).items():
+        for mount in spec.get("volumes") or []:
+            source, hit = mount.get("source"), None
+            if mount.get("type") == "bind" and source:
+                hit = production.path_conflict(Path(source))
+            elif mount.get("type") == "volume" and source:
+                name = (volumes.get(source) or {}).get("name", source)
+                hit = name if name in production.volumes else None
+            if hit:
+                problems.append(f"{service} mount {mount.get('target')} uses {hit}")
+        for key, value in (spec.get("environment") or {}).items():
+            database = production.database_conflict(str(value or ""))
+            if database:
+                problems.append(f"{service} env {key} names production database {database!r}")
+    return _storage_verdict(problems, compose_file)
 
 
 def check_litellm_ocr() -> tuple[bool, str]:
@@ -218,6 +403,7 @@ def check_comm_postgres() -> tuple[bool, str]:
 CHECKS = [
     ("api_keys", check_api_keys),
     ("config_test", check_config_test),
+    ("scratch_storage", check_scratch_storage),
     ("litellm_ocr", check_litellm_ocr),
     ("prod_indexer_idle", check_prod_indexer_idle),
     ("comm_postgres", check_comm_postgres),
@@ -243,4 +429,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--compose", metavar="FILE",
+                        help="check only the storage of this compose stack (E2E tiers)")
+    args = parser.parse_args()
+    if args.compose:
+        CHECKS = [("scratch_storage", lambda: check_compose_storage(args.compose))]
     sys.exit(main())

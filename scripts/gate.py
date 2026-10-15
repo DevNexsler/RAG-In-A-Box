@@ -247,6 +247,9 @@ def run_compose_tier(tier, run_dir):
     # Applied to up/down/cp alike so the whole lifecycle targets one rendering.
     lifecycle_env = staging_lifecycle_env()
     env = {**os.environ, **dict(tier.compose_env), **lifecycle_env}
+    if not compose_storage_preflight_ok(env):
+        print(f"FAIL {tier.name}: stack would use production storage", flush=True)
+        return False
     env["E2E_ATTACHMENT_EVIDENCE_FILE"] = str(Path(run_dir).resolve() / "attachment-path-evidence.json")
     env["E2E_QUERY_FINGERPRINT_KEY"] = secrets.token_hex(32)
     up = ["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d", "--build", "--wait"]
@@ -306,6 +309,16 @@ def live_preflight_ok():
         print("FAIL live: live preflight not implemented (Task 10 pending)", flush=True)
         return False
     rc = subprocess.run([sys.executable, "scripts/live_preflight.py"]).returncode
+    return preflight_passed(rc)
+
+
+def compose_storage_preflight_ok(env):
+    # The E2E tiers' share of the live preflight: refuse a stack whose mounts or
+    # DSNs (rendered with the tier's own env) reach production storage (#4183).
+    rc = subprocess.run(
+        [sys.executable, "scripts/live_preflight.py", "--compose", str(COMPOSE_FILE)],
+        env=env,
+    ).returncode
     return preflight_passed(rc)
 
 
