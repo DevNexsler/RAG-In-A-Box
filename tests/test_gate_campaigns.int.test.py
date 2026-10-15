@@ -66,7 +66,10 @@ def test_release_runs_mutations_and_soak_before_staging_and_live(gate_cli):
     assert "mutation_gate" in names, "release omitted mutation campaign"
     assert "pipeline_soak" in names, "release omitted bounded soak"
     assert names.index("mutation_gate") < names.index("pipeline_soak") < names.index("docker")
-    assert names.index("docker") < names.index("live_preflight")
+    # The staging stack's storage check (#4183) runs before its containers;
+    # the paid live preflight still runs after them.
+    assert calls.index(["live_preflight", "--compose", "docker-compose.staging.yml"]) \
+        < names.index("docker") < calls.index(["live_preflight"])
     assert result["tiers"]["mutation"] == result["tiers"]["soak"] == "pass"
     for command, artifact in (("mutation_gate", "mutation.json"), ("pipeline_soak", "soak.json")):
         call = next(call for call in calls if call[0] == command)

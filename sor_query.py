@@ -19,7 +19,7 @@ import time
 import psycopg
 from psycopg.rows import dict_row
 
-from core.config import load_config
+from core.config import load_config, resolve_env_reference
 
 
 def validate_select(sql: str) -> str | None:
@@ -99,8 +99,7 @@ def resolve_sor_dsn(config_path: str = "config.yaml") -> str:
         dsn = ""
     if not dsn:
         dsn = os.environ.get("SOR_DSN", "")
-    if dsn.startswith("${") and dsn.endswith("}"):
-        dsn = os.environ.get(dsn[2:-1], "")
+    dsn = resolve_env_reference(dsn)
     if not dsn:
         raise ValueError("SOR DSN not configured (sources['sor'].dsn / $SOR_DSN)")
     return dsn

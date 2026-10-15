@@ -8,13 +8,13 @@ don't OOM, and yields a SourceRecord per row.
 """
 
 import hashlib
-import os
 from dataclasses import dataclass, field
 from typing import Iterator
 
 import psycopg
 from psycopg.rows import dict_row
 
+from core.config import resolve_env_reference
 from sources.base import SourceRecord
 from sources.text_normalization import build_text_normalizer, normalize_source_text
 from extractors import ExtractionResult
@@ -62,14 +62,12 @@ class TableSpec:
 class PostgresSource:
     def __init__(self, name: str, dsn: str, tables: list[TableSpec]):
         self.name = name
-        if dsn.startswith("${") and dsn.endswith("}"):
-            env_name = dsn[2:-1]
-            dsn = os.environ.get(env_name, "")
-            if not dsn:
-                raise ValueError(
-                    f"DSN env var {env_name!r} not set for postgres source '{name}'"
-                )
-        self._dsn = dsn
+        resolved = resolve_env_reference(dsn)
+        if dsn and not resolved:
+            raise ValueError(
+                f"DSN env var {dsn[2:-1]!r} not set for postgres source '{name}'"
+            )
+        self._dsn = resolved
         self._tables = tables
         self._conn: psycopg.Connection | None = None
 

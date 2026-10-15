@@ -269,6 +269,17 @@ def load_config(config_path: str | Path = "config.yaml") -> dict[str, Any]:
     return raw
 
 
+def resolve_env_reference(value: str, env: Mapping[str, str] | None = None) -> str:
+    """Resolve a whole-value ``${NAME}`` reference, as postgres ``dsn`` uses.
+
+    Any other value is returned unchanged; an unset ``NAME`` resolves to "".
+    ``env`` defaults to the process environment.
+    """
+    if value.startswith("${") and value.endswith("}"):
+        return (os.environ if env is None else env).get(value[2:-1], "")
+    return value
+
+
 def filesystem_source_roots(config: Mapping[str, Any]) -> dict[str, Path]:
     """Return {source_name: root} for every filesystem-backed source.
 

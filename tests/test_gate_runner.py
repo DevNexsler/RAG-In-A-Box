@@ -455,3 +455,32 @@ def test_run_tier_passes_attachment_evidence_path_to_host_pytest(tmp_path, monke
     ) is True
     assert captured["E2E_ATTACHMENT_EVIDENCE_FILE"] == "/tmp/evidence.json"
     assert captured["E2E_REAL"] == "0"
+
+
+@pytest.mark.parametrize("tier_name", ["staging-e2e", "e2e-real"])
+def test_compose_tier_refuses_production_storage_before_compose_up(
+        tmp_path, monkeypatch, tier_name):
+    # #4183: the E2E tiers run the storage preflight against the exact compose
+    # rendering they are about to start, and a refusal starts nothing.
+    compose_file = tmp_path / "compose.yml"
+    compose_file.write_text("services: {}\n")
+    monkeypatch.setattr(gate, "COMPOSE_FILE", compose_file)
+    monkeypatch.delenv("COMPOSE_PROJECT_NAME", raising=False)
+    calls = []
+
+    def capture_run(cmd, **kwargs):
+        calls.append((list(cmd), dict(kwargs.get("env") or {})))
+        if cmd[1:3] == ["scripts/live_preflight.py", "--compose"]:
+            return subprocess.CompletedProcess(cmd, 1)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(gate.subprocess, "run", capture_run)
+    tier = next(t for t in [*gate.TIERS, gate.E2E_REAL_TIER] if t.name == tier_name)
+
+    assert gate.run_compose_tier(tier, tmp_path / "run") is False
+
+    assert [cmd for cmd, _ in calls] == [
+        [sys.executable, "scripts/live_preflight.py", "--compose", str(compose_file)],
+    ]
+    env = calls[0][1]
+    assert env["STAGING_CONFIG"] == dict(tier.compose_env)["STAGING_CONFIG"]
