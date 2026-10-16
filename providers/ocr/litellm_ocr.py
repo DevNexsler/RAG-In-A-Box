@@ -20,6 +20,10 @@ _DESCRIBE_PROMPT = "Describe this image in detail for document search."
 # 4000px image is ~4-5x slower to describe than ~1024px, with no describe-quality
 # loss (measured against qwen3-vl:8b). We downscale ONLY for the describe call;
 # the extract (OCR text) path keeps full resolution so small text stays legible.
+# Re-measured 2026-10-16 on `vision` = omni, 20 real receipt/document photos,
+# dollar amounts read: 1024px 18/20, 2048px 17/20, full 16/20, at 809 vs 1941
+# median image tokens. The 2026-10-16 sideways-receipt misread was LiteLLM's
+# orientation hook turning the photo the wrong way, not this cap.
 _DESCRIBE_MAX_EDGE = 1024
 
 
@@ -37,10 +41,12 @@ def _downscaled_describe_encoder(path: Path, prompt: str) -> list:
     encoder if the file is not a decodable image."""
     path = Path(path)
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
 
         with Image.open(path) as img:
-            img = img.convert("RGB")
+            # Re-encoding below drops the EXIF orientation tag, so apply it to
+            # the pixels first; otherwise a phone photo reaches the model sideways.
+            img = ImageOps.exif_transpose(img).convert("RGB")
             width, height = img.size
             scale = max(width, height) / _DESCRIBE_MAX_EDGE
             if scale > 1.0:
