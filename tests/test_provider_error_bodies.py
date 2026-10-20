@@ -141,8 +141,9 @@ def _deepseek_ocr(monkeypatch) -> BaseException:
 
 
 def _litellm_fallback(monkeypatch) -> BaseException:
-    """providers/fallback/litellm_fallback.py — re-wrapped as TransientError so a
-    misconfigured fallback self-heals (#0251); the reason rides along in the text."""
+    """providers/fallback/litellm_fallback.py — an input rejection propagates
+    as-is (#4387); other permanent errors are re-wrapped as TransientError so a
+    misconfigured client self-heals (#0251), with the reason in the text."""
     monkeypatch.setattr(
         "providers.fallback.litellm_fallback.httpx.post",
         lambda url, **kw: _rejection(url),

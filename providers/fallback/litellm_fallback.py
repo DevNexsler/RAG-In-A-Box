@@ -2,6 +2,7 @@
 
 Contract (matches core.fallback.resolve_with_fallback's fallback_call):
   - unreachable -> raises a transient error (httpx.ConnectError / 5xx via is_transient)
+  - input rejected (400/413/422, is_input_rejection) -> raises it as-is: permanent
   - reachable but empty -> returns ""
 Per-modality difference is ONLY (endpoint, model, prompt, encoder).
 """
@@ -19,6 +20,7 @@ from core.resilience import (
     DEFAULT_BACKOFF,
     TransientError,
     call_with_retry,
+    is_input_rejection,
     is_transient,
     raise_for_status,
 )
@@ -96,9 +98,13 @@ class LiteLLMFallback:
                                    label=f"litellm-fallback {self.model}",
                                    circuit_key=self.base_url)
         except Exception as exc:
-            if is_transient(exc):
+            # An input rejection is the provider's verdict on THIS file (a video it
+            # cannot decode, a body over its limit): the same bytes get the same
+            # answer every run, so it stays permanent and the degraded ledger caps
+            # it for this file version instead of re-sending it forever (#4387).
+            if is_transient(exc) or is_input_rejection(exc):
                 raise
-            # A misconfigured/erroring fallback (401 bad key, 404 wrong model, 4xx,
+            # A misconfigured/erroring fallback (401 bad key, 404 wrong model,
             # malformed body) must be treated as UNREACHABLE -> transient, so the doc
             # retries and self-heals once the config is fixed. It must never cap the
             # doc (#0251) nor be mistaken for a confirmed blank (#0264).

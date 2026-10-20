@@ -194,6 +194,22 @@ def is_account_refusal(exc: BaseException) -> bool:
     )
 
 
+# Statuses that reject one request's own payload: the provider answered and
+# refused these bytes, so the same document gets the same answer on every retry
+# and it says nothing about the provider's availability (#0705). Auth and
+# routing refusals (401/403/404) are deliberately absent — they reject every
+# request alike, which is a configuration fault, not a bad document.
+INPUT_REJECTION_STATUSES = frozenset({400, 413, 422})
+
+
+def is_input_rejection(exc: BaseException) -> bool:
+    """True if `exc` means the provider refused this request's input."""
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code in INPUT_REJECTION_STATUSES
+    )
+
+
 class EndpointCircuits:
     """Circuit state for every endpoint, keyed by base_url. Thread-safe: indexing
     processes documents concurrently against the same providers."""

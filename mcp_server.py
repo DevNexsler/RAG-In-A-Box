@@ -17,7 +17,7 @@ from core.config import filesystem_source_roots, load_config
 from core import index_freshness
 from core.artifacts import is_communication_sidecar
 from core.logging_setup import configure_logging_from_config
-from core.resilience import CIRCUITS, EndpointCircuits
+from core.resilience import CIRCUITS, INPUT_REJECTION_STATUSES, EndpointCircuits
 from core.source_types import BUILTIN_SOURCE_TYPES, canonical_source_type, is_safe_source_type
 from core.degraded_policy import partition_degraded_docs, terminal_degraded_docs
 from core.skip_policy import actionable_skip_docs
@@ -66,9 +66,6 @@ _DEFAULT_SEARCH_TOP_K = 8
 _RECENT_SORT_POOL = 50
 _PROVIDER_FAILURE_LOOKBACK_SECONDS = 24 * 60 * 60
 _PROVIDER_FAILURE_MAX_BYTES = 128 * 1024 * 1024
-# Input-invalid rejections: the provider answered and refused one request's
-# payload, so they never indicate provider unavailability (#0705).
-_CLIENT_INVALID_HTTP_STATUSES = frozenset({400, 413, 422})
 _COMPACT_EXCLUDED_METADATA_KEYS = {
     "_node_content",
     "_node_type",
@@ -1261,7 +1258,7 @@ def _provider_failure_kind(line: str) -> tuple[str, str, str] | None:
     # not the provider-availability ledger (#0705: two bad documents falsely
     # marked openrouter_embeddings and deep health critical). Auth (401/403),
     # rate limits (429), and 5xx still count against the provider.
-    if status_code in _CLIENT_INVALID_HTTP_STATUSES:
+    if status_code in INPUT_REJECTION_STATUSES:
         return None
     failure_marker = (
         status_code is not None and status_code >= 400
