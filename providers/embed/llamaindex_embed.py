@@ -63,13 +63,15 @@ class LlamaIndexEmbedProvider(EmbedProvider):
         if not texts:
             return []
         bounded = bound_inputs(
-            texts, self.max_input_tokens, label=f"{self.provider}-embed[{self.model}]",
+            texts, self.max_input_tokens, model=self.model,
+            label=f"{self.provider}-embed[{self.model}]",
         )
         return [self._embed_model.get_text_embedding(t) for t in bounded]
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a single query (for search). Uses LlamaIndex query embedding."""
         (bounded,) = bound_inputs(
-            [query], self.max_input_tokens, label=f"{self.provider}-embed[{self.model}]",
+            [query], self.max_input_tokens, model=self.model,
+            label=f"{self.provider}-embed[{self.model}]",
         )
         return self._embed_model.get_query_embedding(bounded)

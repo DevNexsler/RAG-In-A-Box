@@ -24,16 +24,16 @@ The token window is not the only such limit: a hosted route may also cap the
 takes both bounds and honours whichever binds first, and each provider
 supplies the caps its own route enforces.
 
-Lengths are measured with the same tokenizer LlamaIndex's SentenceSplitter
-uses for `chunk_size`, so "tokens" means one thing across the pipeline. It is
-an approximation of any given hosted model's own tokenizer, hence the headroom
-below.
+Lengths are measured the way the model counts them where the module knows its
+tokenizer (#1344), and otherwise with the tokenizer LlamaIndex's
+SentenceSplitter uses for `chunk_size` — an approximation of any given hosted
+model's own tokenizer, hence the headroom below.
 """
 
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,27 @@ DEFAULT_MAX_INPUT_TOKENS = 8192
 
 # Our tokenizer is a proxy for the model's own, so spend only this share of the
 # advertised window; a model that tokenizes ~10% denser than cl100k still fits.
+# It is also the margin for the end-of-sequence token a model appends, which is
+# why it applies to the models counted exactly below, too.
 TOKENIZER_HEADROOM = 0.9
+
+# Pre-tokenizer pattern, matched by substring on the model id like
+# MODEL_INPUT_TOKENS, of models whose BPE vocabulary extends cl100k_base's.
+# Applying cl100k_base's merges under the model's own split rule reproduces the
+# model's count for text in the shared vocabulary and over-counts the text its
+# added tokens cover (CJK), so a bounded input never exceeds what the model
+# counts. A cap the headroom cannot cover otherwise: Qwen splits every digit
+# while cl100k groups three, so a digit-dense snapshot cut to 36864 cl100k tokens
+# was 43340 to qwen3-embedding and 400'd on every run (#1344). Measured
+# 2026-10-21 against Qwen/Qwen3-Embedding-8B's tokenizer.json: identical counts
+# on 400 production messages over 20k characters.
+MODEL_PRETOKENIZERS: dict[str, str] = {
+    # Qwen2/Qwen3 tokenizer.json `pre_tokenizer` Split regex, verbatim.
+    "qwen3-embedding": (
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
+        r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+    ),
+}
 
 # Stand-in for an input carrying no text. Measured against
 # openrouter.ai/api/v1/embeddings (qwen/qwen3-embedding-8b) on 2026-08-27: "" is
@@ -79,9 +99,38 @@ def _tokenizer() -> Callable[[str], list]:
     return get_tokenizer()
 
 
-def token_count(text: str) -> int:
-    """Token length of `text` under the pipeline's tokenizer."""
-    return len(_tokenizer()(text))
+@lru_cache(maxsize=None)
+def _model_tokenizer(pattern: str) -> Callable[[str], list]:
+    """cl100k_base's merges under the pre-tokenizer `pattern`."""
+    import tiktoken
+
+    # The pipeline tokenizer loads cl100k_base from llama-index's bundled BPE
+    # cache, so the hermetic image never fetches ranks; tiktoken then holds the
+    # encoding by name.
+    _tokenizer()
+    base = tiktoken.get_encoding("cl100k_base")
+    # tiktoken's README documents extending an encoding through these fields.
+    encoding = tiktoken.Encoding(
+        name=f"cl100k_base[{pattern}]",
+        pat_str=pattern,
+        mergeable_ranks=base._mergeable_ranks,
+        special_tokens={},
+    )
+    return partial(encoding.encode, disallowed_special=())
+
+
+def _tokenizer_for(model: str | None) -> Callable[[str], list]:
+    """The tokenizer that counts like `model`, or the pipeline's for unknown ones."""
+    name = (model or "").lower()
+    for key, pattern in MODEL_PRETOKENIZERS.items():
+        if key in name:
+            return _model_tokenizer(pattern)
+    return _tokenizer()
+
+
+def token_count(text: str, model: str | None = None) -> int:
+    """Token length of `text` as `model` counts it (default: the pipeline's tokenizer)."""
+    return len(_tokenizer_for(model)(text))
 
 
 def resolve_max_input_tokens(model: str | None) -> int:
@@ -98,6 +147,7 @@ def bound_inputs(
     max_input_tokens: int,
     *,
     max_input_chars: int = 0,
+    model: str | None = None,
     label: str = "embed",
 ) -> list[str]:
     """Return `texts` with every input reshaped to something the route accepts.
@@ -116,6 +166,9 @@ def bound_inputs(
     every later vector in the batch. Nothing indexed is lost by the truncation
     in practice: the long un-chunked bodies are whole-document or whole-context
     summaries whose text is also indexed through the normal chunked path.
+
+    Tokens are counted the way `model` counts them where MODEL_PRETOKENIZERS
+    knows its tokenizer, and with the pipeline's tokenizer otherwise.
 
     `max_input_tokens <= 0` disables the context-window bound only. The route's
     refusal of a text-free input is not a tunable, so it always applies.
@@ -138,7 +191,9 @@ def bound_inputs(
                 label, len(text), char_limit, len(fitted),
             )
         if token_limit:
-            fitted = _bound_to_tokens(fitted, token_limit, max_input_tokens, label)
+            fitted = _bound_to_tokens(
+                fitted, token_limit, max_input_tokens, _tokenizer_for(model), label,
+            )
         # Checked after both truncations, not before: a text whose only content
         # sits past a limit is bounded down to whitespace, which the route
         # refuses for the same reason it refuses "" (#1687).
@@ -153,16 +208,18 @@ def bound_inputs(
     return bounded
 
 
-def _bound_to_tokens(text: str, limit: int, window: int, label: str) -> str:
+def _bound_to_tokens(
+    text: str, limit: int, window: int, tokenize: Callable[[str], list], label: str,
+) -> str:
     """`text` truncated to `limit` tokens; `window` is the model's advertised one."""
     # Every token is at least one character, so a text no longer than the limit
     # in characters cannot exceed it in tokens — skip the tokenizer.
     if len(text) <= limit:
         return text
-    measured = token_count(text)
+    measured = len(tokenize(text))
     if measured <= limit:
         return text
-    fitted = _truncate_to_tokens(text, limit)
+    fitted = _truncate_to_tokens(text, limit, tokenize)
     logger.warning(
         "%s: input of %d tokens exceeds the model's %d-token context — "
         "truncated to %d tokens (%d of %d chars)",
@@ -171,7 +228,7 @@ def _bound_to_tokens(text: str, limit: int, window: int, label: str) -> str:
     return fitted
 
 
-def _truncate_to_tokens(text: str, limit: int) -> str:
+def _truncate_to_tokens(text: str, limit: int, tokenize: Callable[[str], list]) -> str:
     """Longest prefix of `text` that fits in `limit` tokens.
 
     Binary search over characters keeps this tokenizer-agnostic: it needs only
@@ -181,7 +238,7 @@ def _truncate_to_tokens(text: str, limit: int) -> str:
     lo, hi = 0, len(text)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if len(_tokenizer()(text[:mid])) <= limit:
+        if len(tokenize(text[:mid])) <= limit:
             lo = mid
         else:
             hi = mid - 1

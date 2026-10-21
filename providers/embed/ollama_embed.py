@@ -124,7 +124,8 @@ class OllamaEmbedProvider(EmbedProvider):
         import httpx
 
         texts = bound_inputs(
-            texts, self.max_input_tokens, label=f"ollama-embed[{self.model_name}]",
+            texts, self.max_input_tokens, model=self.model_name,
+            label=f"ollama-embed[{self.model_name}]",
         )
         use_timeout = WARMUP_TIMEOUT if not self._model_loaded else self.timeout
         last_exc: Exception | None = None

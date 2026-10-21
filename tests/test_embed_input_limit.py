@@ -16,6 +16,7 @@ label), so the guard lives at the provider boundary — the only place that
 knows which route, and therefore which limits, apply.
 """
 
+import re
 from unittest.mock import patch
 
 from providers.embed.limits import (
@@ -269,3 +270,71 @@ def test_provider_char_cap_is_configurable():
         provider.embed_texts(["a much longer body " * 2000])
 
     assert len(sent["input"][0]) == 4096
+
+
+# --- counting tokens the way the model counts them (#1344) ---
+
+def _qwen_token_floor(text: str) -> int:
+    """A floor on Qwen's token count that does not use the bound's tokenizer.
+
+    Qwen's published pre-tokenizer (tokenizer.json) makes every digit its own
+    piece and never merges whitespace into a digit, and every piece is at least
+    one token. cl100k_base groups up to three digits per token, so digit-dense
+    text costs Qwen far more than the pipeline tokenizer measures.
+    """
+    return len(re.findall(r"\d|\s+", text))
+
+
+def _structured_snapshot(records: int) -> str:
+    """A machine-generated status snapshot: ids, timestamps and counters.
+
+    The shape of the #1344 doc — a hypercare snapshot whose context block the
+    bound cut to 36864 cl100k tokens, which qwen3-embedding counted past its
+    40960-token window, so OpenRouter answered 400 on every run.
+    """
+    return "".join(
+        f"{i:08d} 2026-10-04 17:05:{i % 60:02d} {i * 7919 % 100000:05d} {i % 997:03d}\n"
+        for i in range(records)
+    )
+
+
+def test_bound_counts_digits_the_way_a_qwen_embedding_model_does():
+    snapshot = _structured_snapshot(2000)
+    assert len(snapshot) < 131072, "the token window, not the char cap, must bind"
+    assert _qwen_token_floor(snapshot) > 40960
+
+    (bounded,) = bound_inputs(
+        [snapshot], 40960, max_input_chars=131072, model="qwen/qwen3-embedding-8b",
+    )
+
+    assert _qwen_token_floor(bounded) <= 40960
+    assert bounded and snapshot.startswith(bounded)
+
+
+def test_provider_never_sends_an_input_its_model_counts_past_the_window():
+    """The #1344 repro at the provider boundary."""
+    provider = OpenRouterEmbedProvider(
+        model="qwen/qwen3-embedding-8b", api_key="test-key",
+    )
+    snapshot = _structured_snapshot(2000)
+    sent = {}
+
+    def _capture(url, json=None, headers=None, timeout=None):
+        sent["input"] = json["input"]
+        return _FakeResponse({"data": [{"index": 0, "embedding": [0.1] * 8}]})
+
+    with patch("providers.embed.openrouter_embed.httpx.post", side_effect=_capture):
+        vectors = provider.embed_texts([snapshot])
+
+    assert len(vectors) == 1
+    assert _qwen_token_floor(sent["input"][0]) <= 40960
+
+
+def test_unmapped_model_keeps_the_pipeline_tokenizer():
+    """A model whose tokenizer the module does not know is still bounded by the
+    pipeline tokenizer and its headroom."""
+    oversized = "context line about the invoice\n" * 4000
+
+    assert bound_inputs([oversized], 4096, model="some/brand-new-embedder") == (
+        bound_inputs([oversized], 4096)
+    )

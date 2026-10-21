@@ -77,7 +77,8 @@ class BasetenEmbedProvider(EmbedProvider):
     def _call_embeddings(self, texts: list[str]) -> list[list[float]]:
         """Call /v1/embeddings with retry and backoff."""
         texts = bound_inputs(
-            texts, self.max_input_tokens, label=f"baseten-embed[{self.model_name}]",
+            texts, self.max_input_tokens, model=self.model_name,
+            label=f"baseten-embed[{self.model_name}]",
         )
         headers = {
             "Authorization": f"Api-Key {self.api_key}",

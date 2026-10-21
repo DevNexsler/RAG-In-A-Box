@@ -100,6 +100,7 @@ class OpenRouterEmbedProvider(EmbedProvider):
             texts,
             self.max_input_tokens,
             max_input_chars=self.max_input_chars,
+            model=self.model,
             label=f"openrouter-embed[{self.model}]",
         )
         headers = {
