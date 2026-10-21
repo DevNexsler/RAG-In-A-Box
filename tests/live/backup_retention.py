@@ -17,7 +17,11 @@ def docker(*args):
 
 
 try:
+    # A stopped scratch container of the deployed image: the wrapper takes its
+    # tar image from the container, and must never exec into production.
+    image = docker("inspect", "--format", "{{.Image}}", "doc-organizer")
     docker("volume", "create", name)
+    docker("create", "--name", name, image)
     docker(
         "run",
         "--rm",
@@ -31,7 +35,7 @@ try:
         "echo business-fixture > /data/record; mkdir /data/chunks__shadow.lance; echo transient > /data/chunks__shadow.lance/skip",
     )
     with tempfile.TemporaryDirectory(prefix="backup-e2e-") as tmp:
-        env = dict(os.environ, DOC_BACKUP_VOLUME=name, DOC_BACKUP_DIR=tmp, DOC_BACKUP_CONTAINER="missing-" + name)
+        env = dict(os.environ, DOC_BACKUP_VOLUME=name, DOC_BACKUP_DIR=tmp, DOC_BACKUP_CONTAINER=name)
         subprocess.run(["bash", str(ROOT / "scripts/backup_index.sh")], env=env, check=True)
         archives = list(Path(tmp).glob("index-*.tar.gz"))
         assert len(archives) == 1
@@ -43,8 +47,10 @@ try:
             assert not any("chunks__shadow" in item for item in archive.getnames())
         assert not list(Path(tmp).glob("*.partial"))
         print("PASS real Docker backup restored, transient data excluded, monthly snapshot hardlinked")
-        print("image", docker("image", "inspect", "alpine:latest", "--format", "{{.Id}}"))
+        print("image", image)
 finally:
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     docker("volume", "rm", name)
+    assert name not in docker("ps", "-a", "--format", "{{.Names}}").split()
     assert name not in docker("volume", "ls", "-q").split()
     print("cleanup: fixture containers, volume and private backup files removed")
