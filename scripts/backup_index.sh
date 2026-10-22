@@ -41,9 +41,11 @@ trap 'rm -f -- "${BACKUP_DIR}/${PARTIAL}"' EXIT
 
 log() { echo "$(date -Is) $*" >> "${LOG}"; }
 
+CONTAINER="${DOC_BACKUP_CONTAINER:-doc-organizer}"
+
 # Flag (but don't skip) backups taken while the indexer is writing.
 RUNNING=""
-if docker exec "${DOC_BACKUP_CONTAINER:-doc-organizer}" test -f /data/index/indexer.pid 2>/dev/null; then
+if docker exec "${CONTAINER}" test -f /data/index/indexer.pid 2>/dev/null; then
   RUNNING=" (indexer was running — point-in-time snapshot)"
 fi
 
@@ -53,7 +55,11 @@ fi
 # 2026-09-15/16). GNU tar with --ignore-failed-read skips vanished files, and
 # the "file changed as we read it" case is exit status 1, which is a valid
 # point-in-time snapshot here; anything else (2+) is a real failure.
-TAR_IMAGE="${DOC_BACKUP_TAR_IMAGE:-doc-organizer:latest}"
+# The tar comes from the image the production container runs, by image ID:
+# releases tag images doc-organizer:main-<sha> and retire old tags, so any
+# fixed tag eventually stops resolving (:latest did on 2026-09-27, #4391),
+# while a container's image cannot be removed out from under it.
+TAR_IMAGE="${DOC_BACKUP_TAR_IMAGE:-$(docker inspect --format '{{.Image}}' "${CONTAINER}")}"
 docker run --rm --network none --entrypoint sh \
   -v "${VOLUME}:/vol:ro" \
   -v "${BACKUP_DIR}:/backup" \
