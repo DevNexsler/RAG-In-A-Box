@@ -19,6 +19,8 @@ knows which route, and therefore which limits, apply.
 import re
 from unittest.mock import patch
 
+import httpx
+
 from providers.embed.limits import (
     DEFAULT_MAX_INPUT_TOKENS,
     EMPTY_INPUT_PLACEHOLDER,
@@ -29,6 +31,7 @@ from providers.embed.limits import (
 from providers.embed.openrouter_embed import (
     DEFAULT_MAX_INPUT_CHARS,
     OpenRouterEmbedProvider,
+    _fetch_route_input_tokens,
 )
 
 
@@ -338,3 +341,71 @@ def test_unmapped_model_keeps_the_pipeline_tokenizer():
     assert bound_inputs([oversized], 4096, model="some/brand-new-embedder") == (
         bound_inputs([oversized], 4096)
     )
+
+
+# --- the route's per-upstream token window (#4415) ---
+
+class _EndpointsResponse(_FakeResponse):
+    """OpenRouter's GET /models/{model}/endpoints listing."""
+
+    def __init__(self, windows):
+        super().__init__({"data": {"endpoints": [
+            {"provider_name": f"upstream-{i}", "context_length": window}
+            for i, window in enumerate(windows)
+        ]}})
+
+
+def _no_route_listing(url, timeout=None):
+    raise httpx.ConnectError("no route listing")
+
+
+def _provider_listing(windows):
+    _fetch_route_input_tokens.cache_clear()
+    with patch(
+        "providers.embed.openrouter_embed.httpx.get",
+        return_value=_EndpointsResponse(windows),
+    ):
+        return OpenRouterEmbedProvider(
+            model="qwen/qwen3-embedding-8b", api_key="test-key",
+        )
+
+
+def test_provider_never_sends_an_input_past_the_smallest_upstream_window():
+    """The #4415 repro: a digit-dense snapshot bounded to qwen3-embedding's own
+    40960-token window (36864 with headroom) still 400'd on every run, because
+    OpenRouter routed it to SiliconFlow, which serves the model with 32768."""
+    provider = _provider_listing([40960, 32768, 32768])
+    # Shaped like the production doc: past the route's char cap, and still past
+    # the model's own window once cut to it.
+    snapshot = _structured_snapshot(4500)
+    assert len(snapshot) > DEFAULT_MAX_INPUT_CHARS
+    assert token_count(snapshot[:DEFAULT_MAX_INPUT_CHARS], "qwen/qwen3-embedding-8b") > 40960
+    sent = {}
+
+    def _capture(url, json=None, headers=None, timeout=None):
+        sent["input"] = json["input"]
+        return _FakeResponse({"data": [{"index": 0, "embedding": [0.1] * 8}]})
+
+    with patch("providers.embed.openrouter_embed.httpx.post", side_effect=_capture):
+        vectors = provider.embed_texts([snapshot])
+
+    assert len(vectors) == 1
+    # The upstream appends an end-of-sequence token to what the model counts.
+    assert token_count(sent["input"][0], "qwen/qwen3-embedding-8b") + 1 <= 32768
+    assert snapshot.startswith(sent["input"][0])
+
+
+def test_provider_falls_back_to_the_model_window_without_a_route_listing():
+    """A base_url that lists no upstreams (a proxy, the staging simulator) or a
+    listing that cannot be read keeps the model's own window, as before #4415 —
+    and a failed lookup is retried by the next provider rather than cached."""
+    _fetch_route_input_tokens.cache_clear()
+    with patch(
+        "providers.embed.openrouter_embed.httpx.get", side_effect=_no_route_listing,
+    ):
+        provider = OpenRouterEmbedProvider(
+            model="qwen/qwen3-embedding-8b", api_key="test-key",
+        )
+    assert provider.max_input_tokens == 40960
+
+    assert _provider_listing([40960, 32768]).max_input_tokens == 32768
