@@ -79,6 +79,35 @@ def _no_real_detached_index_runs(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_real_openrouter_route_lookup(request, monkeypatch):
+    """Keep the unit tier off OpenRouter's live upstream listing (#4415).
+
+    ``OpenRouterEmbedProvider`` reads the route's per-upstream token windows
+    when it is built, so any unit test that builds one would otherwise bound
+    its inputs by whatever openrouter.ai lists that day. Refusing the lookup
+    makes it take the documented fallback (the model's own window); tests of
+    the lookup patch ``httpx.get`` themselves.
+    """
+    if request.node.get_closest_marker("unit") is None:
+        yield
+        return
+
+    import httpx
+    from providers.embed import openrouter_embed
+
+    real_get = httpx.get
+
+    def guarded_get(url, *args, **kwargs):
+        if str(url).startswith(openrouter_embed.OPENROUTER_BASE_URL):
+            raise httpx.ConnectError("unit tier does not reach openrouter.ai")
+        return real_get(url, *args, **kwargs)
+
+    monkeypatch.setattr(httpx, "get", guarded_get)
+    openrouter_embed._fetch_route_input_tokens.cache_clear()
+    yield
+
+
 def pytest_collection_modifyitems(config, items):
     for item in items:
         fname = item.fspath.basename

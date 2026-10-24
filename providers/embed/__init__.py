@@ -28,7 +28,8 @@ def build_embed_provider(config: dict) -> EmbedProvider:
           model: "qwen/qwen3-embedding-8b"
           batch_size: 64
           # optional: override the model's input context window (tokens).
-          # Defaults to providers.embed.limits.resolve_max_input_tokens(model);
+          # Defaults to providers.embed.limits.resolve_max_input_tokens(model)
+          # (openrouter: the smallest window its route's upstreams list);
           # inputs longer than it are truncated instead of 400-ing the batch.
           max_input_tokens: 40960
           # optional: override the route's per-input character cap, which some

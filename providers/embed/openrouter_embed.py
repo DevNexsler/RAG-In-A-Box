@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import lru_cache
 
 import httpx
 
@@ -48,6 +49,42 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # endpoint, 131072 characters is accepted and 131073 is not.
 DEFAULT_MAX_INPUT_CHARS = 131_072
 
+# The token window, by contrast, OpenRouter publishes per upstream, and the
+# route may land a request on any of them — so the window that holds is the
+# smallest one listed, not the model's own. qwen3-embedding is 40960 tokens
+# natively, but SiliconFlow serves it with 32768 and rejects anything longer
+# with a permanent 400 (`{"code":20015,"message":"The parameter is invalid."}`)
+# that no retry clears (#4415). Measured 2026-10-24 with the route pinned to
+# SiliconFlow: 32767 tokens (32766 + end-of-sequence) accepted, 32769 rejected.
+ROUTE_LOOKUP_TIMEOUT = 10.0
+
+
+@lru_cache(maxsize=None)
+def _fetch_route_input_tokens(base_url: str, model: str) -> int:
+    resp = httpx.get(f"{base_url}/models/{model}/endpoints", timeout=ROUTE_LOOKUP_TIMEOUT)
+    resp.raise_for_status()
+    windows = [
+        endpoint.get("context_length")
+        for endpoint in resp.json()["data"]["endpoints"]
+    ]
+    return min(w for w in windows if isinstance(w, int) and w > 0)
+
+
+def _route_input_tokens(base_url: str, model: str) -> int | None:
+    """Smallest input window among the upstreams the route may pick for `model`,
+    or None when the route does not publish one (a non-OpenRouter base_url, or
+    the listing is unreachable). Only a successful lookup is cached, so a blip
+    at startup is retried by the next provider instead of pinning the fallback."""
+    try:
+        return _fetch_route_input_tokens(base_url, model)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        logger.warning(
+            "OpenRouterEmbedProvider: no per-upstream window listed for %s at %s "
+            "(%s) — bounding to the model's own window",
+            model, base_url, exc,
+        )
+        return None
+
 
 class OpenRouterEmbedProvider(EmbedProvider):
     """Embed via OpenRouter's /v1/embeddings endpoint.
@@ -76,7 +113,11 @@ class OpenRouterEmbedProvider(EmbedProvider):
         self.batch_size = batch_size
         self.timeout = timeout
         self._base_url = (base_url or OPENROUTER_BASE_URL).rstrip("/")
-        self.max_input_tokens = max_input_tokens or resolve_max_input_tokens(model)
+        self.max_input_tokens = (
+            max_input_tokens
+            or _route_input_tokens(self._base_url, model)
+            or resolve_max_input_tokens(model)
+        )
         # Explicit None check, not `or`: 0 is the module's "no bound" value and
         # has to stay reachable as an escape hatch if the route's cap changes.
         self.max_input_chars = (
@@ -89,7 +130,8 @@ class OpenRouterEmbedProvider(EmbedProvider):
             )
 
         logger.info(
-            "OpenRouterEmbedProvider: model=%s", model,
+            "OpenRouterEmbedProvider: model=%s max_input_tokens=%d",
+            model, self.max_input_tokens,
         )
 
     def _call_embeddings(self, texts: list[str]) -> list[list[float]]:
