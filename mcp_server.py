@@ -4172,7 +4172,19 @@ if HAS_MCP and FastMCP is not None:
                     logger.warning("Auth DISABLED: API_KEY env var not set")
 
                 mcp_app = mcp.streamable_http_app()
-                api_app = build_api_app(documents_root=Path(config["documents_root"]))
+                document_source = next(
+                    source for source in config["sources"]
+                    if source["type"] == "filesystem"
+                    and Path(source["root"]).resolve() == Path(config["documents_root"]).resolve()
+                )
+                api_app = build_api_app(
+                    documents_root=Path(config["documents_root"]),
+                    index_root=Path(config["index_root"]),
+                    source_name=document_source["name"],
+                    table_name=config.get("lancedb", {}).get("table", "chunks"),
+                    identity_roots=[Path(source["root"]) for source in config["sources"]
+                                    if source["type"] == "filesystem"],
+                )
 
                 # The MCP session manager must be initialized via its lifespan.
                 # When mounting mcp_app inside an outer Starlette, the inner
