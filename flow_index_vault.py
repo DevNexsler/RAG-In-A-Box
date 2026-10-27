@@ -32,6 +32,8 @@ than as task arguments.  This avoids Prefect 3's input-serialisation warnings
 while keeping the flow easy to read.
 """
 
+from document_acceptance import STAGING_PREFIX, identity_scan
+
 import hashlib
 import json
 import logging
@@ -556,6 +558,7 @@ class _SweepLedger:
         )
 
 
+@identity_scan
 def scan_filesystem_records(
     vault_root: str | Path,
     include: list[str],
@@ -618,6 +621,13 @@ def scan_filesystem_records(
         dirnames.sort()
         for fname in sorted(filenames):
             full_path = Path(dirpath) / fname
+            if fname.startswith(STAGING_PREFIX):
+                # The identity lock excludes active uploads, and pending
+                # journals were recovered before the walk. Remaining staging
+                # files died before their journal committed (or after ACK).
+                if doc_id_store:
+                    full_path.unlink(missing_ok=True)
+                continue
             rel_str = str(full_path.relative_to(root)).replace("\\", "/")
             if _matches_any(rel_str, exclude):
                 continue

@@ -5,6 +5,7 @@ Requires the same API_KEY auth when set.
 """
 
 import logging
+import sqlite3
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -56,7 +57,7 @@ def _safe_subpath(base: Path, user_input: str) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-async def upload(request: Request) -> JSONResponse:
+async def _read_upload(request: Request) -> tuple[Path, str, bytes] | JSONResponse:
     """Upload a file to documents_root.
 
     Multipart form data:
@@ -109,6 +110,16 @@ async def upload(request: Request) -> JSONResponse:
     if len(content) == 0:
         return _api_error("empty_file", "Uploaded file is empty")
 
+    return target_dir, safe_name, content
+
+
+async def upload(request: Request) -> JSONResponse:
+    """Legacy path-based upload; use /documents/accept for identity-first acceptance."""
+    parts = await _read_upload(request)
+    if isinstance(parts, JSONResponse):
+        return parts
+    target_dir, safe_name, content = parts
+    docs_root = request.app.state.documents_root
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / safe_name
 
@@ -125,6 +136,40 @@ async def upload(request: Request) -> JSONResponse:
         {"uploaded": True, "rel_path": rel_path, "doc_id": rel_path, "size": len(content)},
         status_code=201,
     )
+
+
+async def accept_document(request: Request) -> JSONResponse:
+    """Accept/register bytes and queue indexing without running the pipeline."""
+    index_root = request.app.state.index_root
+    if index_root is None:
+        return _api_error("acceptance_unavailable", "Persistent identity registry is not configured", 503)
+    parts = await _read_upload(request)
+    if isinstance(parts, JSONResponse):
+        return parts
+    from starlette.concurrency import run_in_threadpool
+    from document_acceptance import AcceptanceConflict, DocumentAcceptance
+    from doc_id_store import DocIDStore
+
+    def accept():
+        index_root.mkdir(parents=True, exist_ok=True)
+        registry = DocIDStore(index_root / "doc_registry.db")
+        try:
+            return DocumentAcceptance(
+                request.app.state.documents_root, registry,
+                source_name=request.app.state.source_name,
+                table_name=request.app.state.table_name,
+                identity_roots=request.app.state.identity_roots,
+            ).accept(*parts, idempotency_key=request.headers.get("idempotency-key"))
+        finally:
+            registry.close()
+    try:
+        receipt = await run_in_threadpool(accept)
+    except AcceptanceConflict as exc:
+        return _api_error("acceptance_conflict", str(exc), 409)
+    except (OSError, RuntimeError, sqlite3.Error):
+        logger.exception("Document acceptance interrupted; retry with the same Idempotency-Key")
+        return _api_error("acceptance_interrupted", "Retry with the same Idempotency-Key", 503)
+    return JSONResponse(receipt, status_code=201)
 
 
 async def download(request: Request) -> FileResponse | JSONResponse:
@@ -312,11 +357,17 @@ async def index_document(request: Request) -> JSONResponse:
     return JSONResponse(result, status_code=status_code)
 
 
-def build_api_app(documents_root: Path) -> Starlette:
+def build_api_app(documents_root: Path, *, index_root: Path | None = None,
+                  source_name: str = "documents", table_name: str = "chunks",
+                  identity_roots: list[Path] | None = None) -> Starlette:
     """Build the REST API Starlette app.
 
     Args:
         documents_root: Path to the documents directory (injected, not re-loaded per request).
+        index_root: Shared registry/queue directory; None preserves legacy upload-only setup.
+        source_name: Filesystem source namespace for accepted document IDs.
+        table_name: Existing targeted-index queue's table.
+        identity_roots: Filesystem roots whose filename IDs need recovery if registry is empty.
     """
     # Starlette dispatches on the first matching route, and a ``:path``
     # convertor compiles to ``(?P<rel_path>.*)`` — which also matches the empty
@@ -324,6 +375,7 @@ def build_api_app(documents_root: Path) -> Starlette:
     # before the catch-all download route, or it is shadowed by it.
     routes = [
         Route("/upload", upload, methods=["POST"]),
+        Route("/documents/accept", accept_document, methods=["POST"]),
         Route("/search", search, methods=["POST"]),
         Route("/index/document", index_document, methods=["POST"]),
         Route("/documents", list_documents, methods=["GET"]),
@@ -332,4 +384,15 @@ def build_api_app(documents_root: Path) -> Starlette:
     ]
     app = Starlette(routes=routes)
     app.state.documents_root = Path(documents_root)
+    app.state.index_root = Path(index_root) if index_root is not None else None
+    app.state.source_name = source_name
+    app.state.table_name = table_name
+    app.state.identity_roots = identity_roots or [Path(documents_root)]
+    if index_root is not None:
+        # Initialize once before serving concurrent uploads. Each operation
+        # opens/closes its own connection; no inner-app lifespan is required.
+        from doc_id_store import DocIDStore
+        app.state.index_root.mkdir(parents=True, exist_ok=True)
+        registry = DocIDStore(app.state.index_root / "doc_registry.db")
+        registry.close()
     return app

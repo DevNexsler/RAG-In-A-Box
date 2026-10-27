@@ -204,6 +204,38 @@ curl -X POST http://localhost:7788/api/upload \
 # it (it was never an index doc id) and will be dropped — read "rel_path".
 ```
 
+**Accept a document and receive its persistent ID immediately:**
+```bash
+curl -X POST http://localhost:7788/api/documents/accept \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Idempotency-Key: notice-84-approved-revision-1" \
+  -F "file=@report.pdf" \
+  -F "directory=2-Area/Legal"
+# -> {"accepted": true, "doc_id": "documents::00001",
+#     "rel_path": "2-Area/Legal/report@00001@.pdf", "filename": "report.pdf",
+#     "sha256": "...", "size": 84521, "index_status": "pending"}
+```
+
+Acceptance publishes complete bytes, registers identity, and durably queues targeted
+indexing. It runs no extraction, enrichment, or embedding. The configured scheduler
+drains the existing queue asynchronously; with the scheduler disabled, run the usual
+index drain/sweep. The file must be eligible under its filesystem source's scan rules
+to become searchable. Registration alone is not proof of indexing.
+
+Use the same `Idempotency-Key`, filename, directory and bytes when retrying an
+interrupted request: the original receipt and ID are replayed. Reusing a key with
+different inputs returns 409. Without a key, each request accepts a new document.
+The receipt records the accepted revision; later file edits or moves do not change
+that historical hash/path. Resolve the ID again and verify bytes before later reuse.
+
+Existing files are never overwritten. Client-supplied `@XXXXX@` tokens are stripped
+before assigning a fresh identity. If an empty/rebuilt registry has surviving IDs
+in filesystem-source filenames, acceptance returns 409 until an identity scan has
+recovered them; it never consumes a surviving legacy ID. Private `.organizer-accept-*` staging names are
+reserved: scans recover journaled acceptance before assigning IDs and remove orphan
+staging left by interrupted requests. Indexing and acceptance share an identity lock
+only during scans/publication, not during provider calls.
+
 **Download a file:**
 ```bash
 curl http://localhost:7788/api/documents/2-Area/Legal/report.pdf \
@@ -220,6 +252,7 @@ curl "http://localhost:7788/api/documents/?directory=2-Area&limit=50" \
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/upload` | POST | Upload a file (multipart form: `file` + optional `directory`) |
+| `/api/documents/accept` | POST | Accept/register bytes, return real ID/hash, queue indexing; optional `Idempotency-Key` |
 | `/api/documents/{rel_path}` | GET | Download a file by its path under `documents_root` |
 | `/api/documents/` | GET | List files (query params: `directory`, `limit`, `offset`) |
 
