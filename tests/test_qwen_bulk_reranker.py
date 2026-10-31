@@ -402,3 +402,36 @@ def test_refusal_remembered_without_retries_and_valid_recovery_required(monkeypa
     mode[0] = "valid"
     assert len(scorer().rerank("query", hits())) == 3
     assert not circuit.tripped() and not CIRCUITS.tripped()
+
+
+def test_queued_searches_take_freed_slots_in_arrival_order(monkeypatch):
+    # #4473: overlapping 100-candidate searches queued behind busy slots took
+    # them by unordered polling; their batches interleaved and every search
+    # missed its deadline. Capacity here fits one search: it must be the first.
+    async def answer(url, payload):
+        await asyncio.sleep(.2)
+        return response(payload)
+    install(monkeypatch, answer)
+    outcomes = {}
+
+    def search(order):
+        try:
+            scorer(timeout=.75).rerank("query", hits(100))
+            outcomes[order] = "reranked"
+        except RuntimeError:
+            outcomes[order] = "degraded"
+
+    threads = [threading.Thread(target=search, args=(order,)) for order in range(4)]
+    qwen._SLOTS.acquire()
+    qwen._SLOTS.acquire()
+    try:
+        for thread in threads:
+            thread.start()
+            time.sleep(.05)
+        time.sleep(.05)
+    finally:
+        qwen._SLOTS.release()
+        qwen._SLOTS.release()
+    for thread in threads:
+        thread.join()
+    assert outcomes == {0: "reranked", 1: "degraded", 2: "degraded", 3: "degraded"}
