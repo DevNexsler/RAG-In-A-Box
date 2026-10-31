@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
+import heapq
+import itertools
 import json
 import logging
 import math
@@ -21,8 +23,13 @@ from search_hybrid import RERANK_TOKEN_BUDGET, Reranker, fit_rerank_documents
 
 
 # Searches construct fresh adapters and run in different threads/event loops.
-# A process-wide semaphore bounds their combined gateway load.
+# A process-wide semaphore bounds their combined gateway load. Waiting batches
+# take slots earliest deadline first: unordered polling spread the slots over
+# every overlapping search, so all of them missed their deadline (#4473).
 _SLOTS = threading.BoundedSemaphore(2)
+_WAITING_LOCK = threading.Lock()
+_WAITING = []  # heap of (deadline, operation, first passage index)
+_OPERATIONS = itertools.count()
 logger = logging.getLogger(__name__)
 BATCH_SIZE = 32
 PROMPT_TOKEN_BUDGET = 16_000
@@ -98,6 +105,7 @@ class QwenBulkReranker(Reranker):
             return hits
         own_deadline = time.monotonic() + self.timeout
         deadline = own_deadline if deadline is None else min(deadline, own_deadline)
+        operation = next(_OPERATIONS)
         cancel_event = rerank_cancel_event.get()
         if cancel_event is not None and cancel_event.is_set():
             raise asyncio.CancelledError
@@ -118,7 +126,8 @@ class QwenBulkReranker(Reranker):
                         try:
                             async with asyncio.TaskGroup() as group:
                                 tasks = [group.create_task(self._score_batch(
-                                    client, query, documents[start:start + BATCH_SIZE], start, deadline,
+                                    client, query, documents[start:start + BATCH_SIZE], start,
+                                    deadline, operation,
                                     min(PROMPT_TOKEN_BUDGET, RERANK_TOKEN_BUDGET
                                         // math.ceil(len(documents) / BATCH_SIZE)),
                                 )) for start in range(0, len(hits), BATCH_SIZE)]
@@ -192,15 +201,22 @@ class QwenBulkReranker(Reranker):
             raise ValueError("Rerank budget leaves no passage evidence")
         return body(low)
 
-    async def _score_batch(self, client, query, documents, start, deadline, budget):
+    async def _score_batch(self, client, query, documents, start, deadline, operation, budget):
         ids = [f"D{i + 1}" for i in range(start, start + len(documents))]
         payload = self._payload(query, documents, ids, budget)
+        waiter = (deadline, operation, start)
+        with _WAITING_LOCK:
+            heapq.heappush(_WAITING, waiter)
         acquired = False
         try:
             while not acquired:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Qwen bulk reranker queue deadline exhausted")
-                acquired = _SLOTS.acquire(blocking=False)
+                with _WAITING_LOCK:
+                    if _WAITING[0] == waiter:
+                        acquired = _SLOTS.acquire(blocking=False)
+                        if acquired:
+                            heapq.heappop(_WAITING)
                 if not acquired:
                     await asyncio.sleep(0.01)
             remaining = deadline - time.monotonic()
@@ -230,3 +246,7 @@ class QwenBulkReranker(Reranker):
         finally:
             if acquired:
                 _SLOTS.release()
+            else:
+                with _WAITING_LOCK:
+                    _WAITING.remove(waiter)
+                    heapq.heapify(_WAITING)
