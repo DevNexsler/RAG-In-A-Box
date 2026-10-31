@@ -5,7 +5,8 @@ budget. Qwen now defaults to, and is capped at, **30 seconds for the entire
 rerank operation**, including semaphore wait and all batches. Compose explicitly
 overrides old mounted ten-second configs. A shorter configured budget remains
 supported. Health probing stays capped at five seconds; explicit DeepInfra
-retains its previous timeout behavior. No merge or deployment has occurred.
+retains its previous timeout behavior. These measurements precede merge and
+deployment; final release status is recorded in the PR.
 
 The real MCP streamable-HTTP test seeds a temporary LanceDB/FTS corpus, runs the
 production `file_search` consumer and sends real gateway inference requests.
@@ -75,9 +76,19 @@ honest degradation and cancellation behavior under the larger cap.
 - Fast gate passed: 248 integration tests passed, 16 skipped because isolated
   PostgreSQL history test credentials were not configured.
 
-The complete release gate (mutation, soak and unrelated paid-provider live
-tiers) was not run. It and post-deployment smoke remain required before release.
-This PR remains draft, unmerged and undeployed.
+The first full release run passed all six deterministic tiers, including all
+264 integration cases with disposable PostgreSQL, 42/42 killed mutations,
+160-write soak and 74 staging cases. Live preflight first refused an active
+production indexer. Its guarded retry completed 137/140 live cases; it exposed
+the synchronous scorer's nested-event-loop incompatibility and a remaining
+hardcoded DeepInfra health test against the spent account.
+
+The synchronous scorer now uses a separate event loop thread when called from
+an active async consumer, with the same absolute deadline and inherited
+cancellation context. Real-loopback/Lance regressions cover both caller modes;
+the health test requires a valid score from the configured scorer. Final
+release gates and post-deployment smoke are recorded in the PR; earlier failed
+run artifacts remain available and are not relabeled as passes.
 
 The worktree is registered and incomplete pending merge and verification.
 Disposable tests use temporary indexes and isolated compose resources. The

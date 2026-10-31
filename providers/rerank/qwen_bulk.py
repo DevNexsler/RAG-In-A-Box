@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import json
 import logging
 import math
@@ -72,18 +74,36 @@ class QwenBulkReranker(Reranker):
             raise ValueError("Set LITELLM_API_KEY or LITELLM_MASTER_KEY for qwen-bulk")
 
     def rerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
-        return asyncio.run(self.arerank(query, hits))
+        deadline = time.monotonic() + self.timeout
 
-    async def arerank(self, query: str, hits: list[SearchHit]) -> list[SearchHit]:
+        def run():
+            return asyncio.run(self.arerank(query, hits, deadline=deadline))
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            running = False
+        else:
+            running = True
+        if not running:
+            return run()
+        # Legacy synchronous consumers also run inside async callers. Give the
+        # coroutine its own loop without nesting or patching the caller's loop.
+        # Carry MCP cancellation context and the original absolute deadline.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(copy_context().run, run).result()
+
+    async def arerank(self, query: str, hits: list[SearchHit], *, deadline=None) -> list[SearchHit]:
         if not hits:
             return hits
-        deadline = time.monotonic() + self.timeout
+        own_deadline = time.monotonic() + self.timeout
+        deadline = own_deadline if deadline is None else min(deadline, own_deadline)
         cancel_event = rerank_cancel_event.get()
         if cancel_event is not None and cancel_event.is_set():
             raise asyncio.CancelledError
         watcher = None
         try:
-            async with asyncio.timeout(self.timeout):
+            async with asyncio.timeout(max(0, deadline - time.monotonic())):
                 parent = asyncio.current_task()
                 if cancel_event is not None:
                     watcher = asyncio.create_task(self._watch_cancel(cancel_event, parent))

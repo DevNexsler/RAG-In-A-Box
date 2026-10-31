@@ -76,6 +76,52 @@ def test_invalid_timeout(timeout):
         scorer(timeout=timeout)
 
 
+@pytest.mark.parametrize("mode", ["success", "timeout", "cancel"])
+def test_sync_interface_inside_async_consumer_keeps_deadline_and_cancel_context(monkeypatch, mode):
+    event, ended = threading.Event(), threading.Event()
+    timers = []
+
+    async def answer(url, payload):
+        assert 0 < payload["metadata"]["inference_deadline_seconds"] <= .2
+        if mode == "cancel":
+            timer = threading.Timer(.01, event.set)
+            timers.append(timer)
+            timer.start()
+        try:
+            if mode != "success":
+                await asyncio.sleep(1)
+            return response(payload)
+        finally:
+            ended.set()
+
+    install(monkeypatch, answer)
+    candidates = hits()
+
+    async def run():
+        token = rerank_cancel_event.set(event)
+        try:
+            if mode == "success":
+                ranked = scorer(timeout=.2).rerank("query", candidates)
+                assert [h.doc_id for h in ranked] == ["doc-2", "doc-1", "doc-0"]
+            else:
+                error = asyncio.CancelledError if mode == "cancel" else RuntimeError
+                with pytest.raises(error):
+                    scorer(timeout=.2).rerank("query", candidates)
+                assert all(h.score == 1 for h in candidates)
+        finally:
+            rerank_cancel_event.reset(token)
+
+    began = time.monotonic()
+    try:
+        asyncio.run(run())
+    finally:
+        for timer in timers:
+            timer.cancel()
+            timer.join()
+    assert time.monotonic() - began < .6
+    assert ended.is_set()
+
+
 def test_thirty_second_deadline_reaches_gateway_and_config_can_shorten_it(monkeypatch):
     remaining = []
 

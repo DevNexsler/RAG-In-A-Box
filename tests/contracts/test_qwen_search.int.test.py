@@ -13,7 +13,8 @@ from tests.qwen_search_support import ANSWER_ID, QUERY, corpus
 
 
 @pytest.mark.parametrize("failure", [None, "partial", "truncated", "http", "timeout"])
-def test_search_preserves_identity_and_honest_degradation(tmp_path, monkeypatch, http_peer, failure):
+@pytest.mark.parametrize("async_caller", [False, True])
+def test_search_preserves_identity_and_honest_degradation(tmp_path, monkeypatch, http_peer, failure, async_caller):
     store, embed, config = corpus(tmp_path / "index")
     config["search"]["reranker"].update(base_url=http_peer.url + "/v1", api_key="loopback-only", timeout=.5)
     monkeypatch.setattr(mcp_server, "_get_deps", lambda: (store, embed, config))
@@ -35,7 +36,13 @@ def test_search_preserves_identity_and_honest_degradation(tmp_path, monkeypatch,
 
     http_peer.respond = respond
     began = time.monotonic()
-    result = mcp_server._file_search_impl(QUERY, top_k=25, return_mode="full", include_diagnostics=True)
+    def search():
+        return mcp_server._file_search_impl(QUERY, top_k=25, return_mode="full", include_diagnostics=True)
+
+    async def run():
+        return search()
+
+    result = asyncio.run(run()) if async_caller else search()
     assert "error" not in result, result
     assert time.monotonic() - began < 2
     assert result["diagnostics"]["reranker_applied"] is (failure is None)

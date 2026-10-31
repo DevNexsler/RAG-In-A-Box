@@ -70,41 +70,32 @@ class TestOpenRouterHealth:
 
 
 # -----------------------------------------------------------------------
-# DeepInfra (reranker)
+# Configured reranker (local qwen-bulk by default)
 # -----------------------------------------------------------------------
 
-_has_deepinfra_key = bool(os.environ.get("DEEPINFRA_API_KEY"))
-
-
 @pytest.mark.live
-@pytest.mark.skipif(not _has_deepinfra_key, reason="DEEPINFRA_API_KEY not set")
 class TestDeepInfraRerankerHealth:
-    """Verify DeepInfra reranker endpoint is reachable."""
+    """Verify configured reranker; retain historical test class identity."""
 
     def test_rerank_reachable(self):
-        """Minimal inference endpoint returns 200."""
-        timeout = 15.0
-        try:
-            resp = httpx.post(
-                "https://api.deepinfra.com/v1/inference/Qwen/Qwen3-Reranker-8B",
-                headers={
-                    "Authorization": f"Bearer {os.environ['DEEPINFRA_API_KEY']}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "queries": ["test"],
-                    "documents": ["test document"],
-                },
-                timeout=timeout,
-            )
-        except httpx.TimeoutException as exc:
-            # A refused key or spent account answers with a status; silence past
-            # the timeout is model-endpoint latency, which search pays per query (#3953).
-            pytest.fail(
-                f"DeepInfra reranker latency: no response to a 1-document rerank "
-                f"within {timeout:.0f}s ({type(exc).__name__}) — the endpoint is slow, not refusing"
-            )
-        assert resp.status_code == 200, f"DeepInfra reranker: {resp.status_code} {resp.text[:200]}"
+        """Selected scorer must return a valid aligned result within health budget."""
+        import math
+        import time
+
+        from core.config import load_config
+        from core.storage import SearchHit
+        from search_hybrid import build_reranker
+
+        scorer = build_reranker(load_config())
+        assert scorer is not None, "configured reranker must be enabled"
+        scorer.timeout = min(scorer.timeout, 5.0)
+        began = time.monotonic()
+        result = scorer.rerank("health check", [SearchHit(
+            doc_id="health-probe", loc="0", text="health check document", snippet="health check", score=1.0,
+        )])
+        assert time.monotonic() - began < 8
+        assert len(result) == 1 and result[0].doc_id == "health-probe"
+        assert math.isfinite(result[0].score) and 0 <= result[0].score <= 1
 
 
 # -----------------------------------------------------------------------

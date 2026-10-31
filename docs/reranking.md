@@ -47,6 +47,11 @@ failed batch, timeout or cancellation. MCP dispatch signals cancellation into
 the synchronous search worker. Cancellation propagates without a degraded
 success response.
 
+`rerank` retains its synchronous contract even inside an active async caller.
+A helper thread supplies its own event loop, inherits cancellation context and
+uses the original absolute deadline, including handoff time. Async callers can
+also await `arerank` directly.
+
 The MCP server adds no whole-search deadline: retrieval and fallback can add
 time outside reranking. Configure caller timeouts above 30 seconds. Staging and
 live test clients use 45-second HTTP timeouts; the live client also sets an
