@@ -40,6 +40,25 @@ post-deployment smoke. Default provider selection changes on service recreation
 because compose overrides legacy mounted DeepInfra configuration. Explicit paid
 rollback remains an operator choice, described in [reranking.md](reranking.md).
 
+Deterministic qualification completed:
+
+- Static lint and collection: pass (2,916 collected).
+- Final unit suite: 2,438 passed.
+- Integration gate: 248 passed, 16 skipped (isolated PostgreSQL history cases).
+- Final targeted provider/search/health contracts: 74 passed.
+- Final-image staging gate: 74 passed, including all five Qwen failure/recovery
+  cases; MCP tool coverage and attachment-path audits passed.
+
+An earlier staging image built during the smaller-prompt experiment failed one
+media-presence assertion. The committed 16k envelope passed the same 31-test
+prefix; Qwen and simulated DeepInfra returned identical top-ten paths on its
+same corpus. The full final-image staging gate then passed. No assertion was
+weakened to obtain that result.
+
+The complete release gate (mutation, soak and unrelated paid-provider live
+tiers) was not run. These passing deterministic gates do not override the
+failing large-pool live qualification above.
+
 The implementation worktree is registered and remains incomplete pending merge
 and verification. Disposable tests use temporary filesystem indexes and an
 isolated compose project; no Factbook database or source is touched.

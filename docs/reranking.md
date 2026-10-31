@@ -69,5 +69,6 @@ RUN_QWEN_RERANK_LIVE=1 python -m pytest tests/test_qwen_bulk_live.py -q -s
 
 Provide gateway credentials only through environment. The test creates no
 database service or Docker volume; its loopback MCP server, store and temporary
-files are closed/removed at teardown. Full release gate and post-deploy smoke
+indexes use test-owned paths. Pytest can retain diagnostic files; remove owned
+scratch paths after inspecting failures. Full release gate and post-deploy smoke
 remain required before deployment; a focused live run does not qualify release.
