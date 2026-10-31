@@ -433,6 +433,7 @@ async def embeddings(request: Request):
 
 
 @app.post("/api/v1/chat/completions")
+@app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> dict:
     body = await request.json()
     messages = body.get("messages", [])
@@ -470,7 +471,14 @@ async def chat_completions(request: Request) -> dict:
         content = f"[transcript] simulated {kinds} transcript {marker} model {model}"
     else:
         response_format = body.get("response_format") or {}
-        if response_format.get("type") in ("json_schema", "json_object"):
+        if (response_format.get("json_schema") or {}).get("name") == "relevance_scores_by_id":
+            scoring = json.loads(messages[-1]["content"])
+            # Reverse property order to exercise ID lookup, not positional zip.
+            content = json.dumps({"scores": {
+                passage["id"]: _lexical_overlap(scoring["query"], passage["text"])
+                for passage in reversed(scoring["passages"])
+            }})
+        elif response_format.get("type") in ("json_schema", "json_object"):
             content = _fake_enrichment(text)
         else:
             content = (

@@ -52,6 +52,11 @@ services:
       - DEEPINFRA_API_KEY=${DEEPINFRA_API_KEY}
       - LITELLM_API_KEY=${LITELLM_API_KEY}
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - LITELLM_BASE_URL=${LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+      # Overrides legacy mounted DeepInfra config; workers inherit this env.
+      # Set deepinfra explicitly only when paid reranking is intended.
+      - DOC_ORGANIZER_RERANKER_PROVIDER=${DOC_ORGANIZER_RERANKER_PROVIDER:-qwen-bulk}
+      - DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS=${DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS:-30}
       - API_KEY=${API_KEY}
       - COMM_DATA_STORE_DSN=${COMM_DATA_STORE_DSN}
       - COMM_DATA_STORE_HOOK_SECRET=${COMM_DATA_STORE_HOOK_SECRET}

@@ -55,8 +55,9 @@ mcp~=1.27.0
 # Server auto-starts: llama-server -m models/Qwen3-Embedding-4B-Q8_0.gguf --port 8788 --embedding -c 8192
 # Asymmetric retrieval: queries get an instruction prefix, documents don't (handled by LlamaCppEmbedProvider)
 
-# Reranker: Qwen3-Reranker-8B via DeepInfra (cloud, always-on)
-# API key: DEEPINFRA_API_KEY in .env
+# Reranker: local LiteLLM qwen-bulk, priority 0 (default)
+# LITELLM_API_KEY or LITELLM_MASTER_KEY; optional LITELLM_BASE_URL
+# Explicit legacy DeepInfra opt-in requires DEEPINFRA_API_KEY
 
 # Testing
 pytest>=8.0.0

@@ -90,7 +90,8 @@ def search_hits(payload, needle: str | None = None) -> list[dict]:
 @asynccontextmanager
 async def open_mcp_session(test_name: str):
     """Open a real streamable-HTTP MCP session against the staging container."""
-    async with streamablehttp_client(MCP_URL, headers=dict(AUTH_HEADERS)) as (read, write, _):
+    # Allow the shared 30s reranker deadline plus retrieval/fallback overhead.
+    async with streamablehttp_client(MCP_URL, headers=dict(AUTH_HEADERS), timeout=45) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             yield RecordingSession(session, test_name)

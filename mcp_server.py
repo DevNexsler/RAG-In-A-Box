@@ -1288,6 +1288,8 @@ def _provider_failure_kind(line: str) -> tuple[str, str, str] | None:
             or "enrichment failed" in lower
         ):
             return "openrouter_chat", "openrouter", "chat"
+    if "qwen bulk reranker" in lower:
+        return "qwen_bulk_reranker", "litellm", "reranker"
     if "deepinfra" in lower or "reranker" in lower:
         return "deepinfra_reranker", "deepinfra", "reranker"
     return None
@@ -1303,6 +1305,8 @@ def _provider_success_kind(line: str) -> tuple[str, str, str] | None:
             return "openrouter_embeddings", "openrouter", "embeddings"
         if "chat/completions" in lower or "openrouter_llm" in lower:
             return "openrouter_chat", "openrouter", "chat"
+    if "qwen bulk reranker" in lower:
+        return "qwen_bulk_reranker", "litellm", "reranker"
     if "deepinfra" in lower or "reranker" in lower:
         return "deepinfra_reranker", "deepinfra", "reranker"
     # OCR/vision provider endpoints: ollama chat (describe) and deepseek-ocr2
@@ -2750,29 +2754,12 @@ def _file_status_impl() -> dict:
     reranker_responsive = None
     if reranker_enabled:
         try:
-            import httpx
-            api_key = os.environ.get("DEEPINFRA_API_KEY", "")
-            model = reranker_cfg.get("model", "Qwen/Qwen3-Reranker-8B")
-            # Honor base_url overrides (staging provider-sim) — never ping
-            # production DeepInfra when the config points elsewhere.
-            # `or` (not a .get default): a present-but-null base_url: key must
-            # fall back too, not AttributeError into a false "unresponsive".
-            base_url = (
-                reranker_cfg.get("base_url") or "https://api.deepinfra.com"
-            ).rstrip("/")
-            resp = httpx.post(
-                f"{base_url}/v1/inference/{model}",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "queries": ["test"],
-                    "documents": ["test"],
-                },
-                timeout=10.0,
-            )
-            reranker_responsive = resp.status_code == 200
+            from core.storage import SearchHit
+
+            probe = build_reranker(config)
+            probe.timeout = min(probe.timeout, 5.0)
+            probe.rerank("test", [SearchHit(doc_id="health", loc="0", snippet="test", text="test", score=1.0)])
+            reranker_responsive = True
         except Exception:
             reranker_responsive = False
 
@@ -3318,7 +3305,16 @@ if HAS_MCP and FastMCP is not None:
                 f"mcp.tool.{tool_name}",
                 attributes=_span_attributes(args, kwargs),
             ):
-                return await asyncio.to_thread(fn, *args, **kwargs)
+                from threading import Event
+                from core.rerank_cancellation import rerank_cancel_event
+
+                cancelled = Event()
+                token = rerank_cancel_event.set(cancelled)
+                try:
+                    return await asyncio.to_thread(fn, *args, **kwargs)
+                finally:
+                    cancelled.set()
+                    rerank_cancel_event.reset(token)
 
         return offloaded_wrapper
 

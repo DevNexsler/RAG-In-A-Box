@@ -180,10 +180,10 @@ search:
   rrf_k: 60
   reranker:
     enabled: true
-    provider: "deepinfra"
-    model: "Qwen/Qwen3-Reranker-8B"
+    provider: "qwen-bulk"
     timeout: 30
-    base_url: "http://provider-sim:9999"   # sim (reranker not under test in the media path)
+    base_url: "http://provider-sim:9999/v1"
+    api_key: "sim"
 
 dedupe:
   enabled: true

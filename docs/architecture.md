@@ -10,7 +10,7 @@ Developer-facing details about the search pipeline, storage schema, taxonomy sys
 | `LITELLM_MASTER_KEY` | LiteLLM credential fallback when `LITELLM_API_KEY` is unset |
 | `GEMINI_API_KEY`     | Legacy direct Gemini OCR adapter only |
 | `OPENROUTER_API_KEY` | Default cloud config — embeddings (Qwen3-Embedding-8B) + enrichment (GPT-4.1 Mini) |
-| `DEEPINFRA_API_KEY`  | Default cloud config — reranker (Qwen3-Reranker-8B via DeepInfra) |
+| `LITELLM_API_KEY` / `LITELLM_MASTER_KEY` | Default local qwen-bulk reranker and OCR |
 | `LANCE_VERSION_RETENTION_MINUTES` | Optional (default 30) — prune index versions older than this each run. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
 | `LANCE_DAILY_RESTORE_POINTS` | Optional (default 7) — exactly this many daily version-tag restore points kept. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
 | `DISK_USAGE_MAX_PERCENT` | Optional (default 90) — `/health` returns 503 when the index filesystem is at/above this used-percent. See [index-storage-lifecycle.md](index-storage-lifecycle.md). |
@@ -32,7 +32,7 @@ Store these in a `.env` file in the project root. The MCP server and indexer loa
 | Image description | LiteLLM alias `vision`; proxy owns local/cloud selection and fallback. Legacy direct Gemini/Ollama adapters remain available. |
 | Image metadata    | Pillow EXIF extraction (camera, date, GPS, dimensions)        |
 | PDF metadata      | PyMuPDF (title, author, dates, page count)                    |
-| Reranking         | Qwen3-Reranker-8B via DeepInfra (cloud, always-on, batch scoring, 30s timeout) |
+| Reranking         | Local LiteLLM qwen-bulk (priority 0, bounded batches, 30s total deadline) |
 | Orchestration     | Prefect 3.x — flow/task logging, retry, dashboard at `http://127.0.0.1:4200` |
 | Event hooks       | Optional HTTP `document.indexed` webhooks after successful LanceDB upsert |
 
@@ -44,7 +44,7 @@ Store these in a `.env` file in the project root. The MCP server and indexer loa
 4. **Length normalization:** Log-based penalty for long chunks — `score *= 1 / (1 + 0.5 * log2(len/anchor))` with anchor=800 chars. Chunks at or below anchor are unaffected.
 5. **Importance weighting:** Boosts docs with higher importance/priority metadata — `score *= (0.7 + 0.3 * importance)`. Reads configurable metadata field (default: `enr_importance`). Missing values treated as neutral (0.5). Frontmatter `importance` overrides LLM value; source tracked in `enr_importance_source`.
 6. **Recency boost (optional):** When `prefer_recent=true`, multiplicative time decay with floor (`0.5 + 0.5 * exp(-age/half_life)`) + additive bonus. Old docs keep ≥50% score.
-7. **Cross-encoder reranking:** Qwen3-Reranker-8B (DeepInfra) with 60/40 blend — 60% reranker score + 40% original fusion score (both normalized to [0,1]). On failure, falls back to cosine similarity rerank (70% original + 30% cosine) instead of giving up.
+7. **Relevance reranking:** Local LiteLLM qwen-bulk with 60/40 blend — 60% reranker score + 40% original fusion score (both normalized to [0,1]). On failure, falls back to cosine similarity rerank (70% original + 30% cosine) instead of giving up.
 8. **MMR diversity:** Greedy selection defers near-duplicate chunks (cosine similarity > 0.85) to end of results list, preventing redundancy in top-K.
 9. **Minimum score threshold:** Discards results below configurable threshold (default: 0.0 = disabled). Filters noise from low-relevance matches.
 10. **Diagnostics:** Every response includes `{vector_search_active, keyword_search_active, reranker_applied, degraded}` so callers detect silent degradation
