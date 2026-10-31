@@ -1307,6 +1307,7 @@ def test_file_status_includes_health():
                         "enabled": True,
                         "provider": "deepinfra",
                         "model": "Qwen/Qwen3-Reranker-8B",
+                        "api_key": "health-test-only",
                     },
                 },
             }
@@ -1314,7 +1315,9 @@ def test_file_status_includes_health():
 
             # Mock reranker health check to return 200 (DeepInfra uses httpx.post)
             import httpx
-            with patch.object(httpx, "post", return_value=MagicMock(status_code=200)):
+            with patch.object(httpx, "post", return_value=httpx.Response(
+                200, json={"scores": [0.5]}, request=httpx.Request("POST", "https://api.deepinfra.com"),
+            )):
                 result = mcp_server._file_status_impl()
 
             assert "health" in result

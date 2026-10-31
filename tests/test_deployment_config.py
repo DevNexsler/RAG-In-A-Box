@@ -240,7 +240,7 @@ def test_shipped_reranker_timeout_stays_within_search_budget(config_path, monkey
     """The reranker runs inline on every hybrid search; its timeout is how long a
     slow DeepInfra endpoint holds each query before the cosine fallback runs.
     #3953: the shipped 120 s let a degraded endpoint add 38-120 s per search."""
-    monkeypatch.setenv("DEEPINFRA_API_KEY", "test-key")
+    monkeypatch.setenv("LITELLM_API_KEY", "test-key")
     config = yaml.safe_load(Path(config_path).read_text())
 
     reranker = build_reranker(config)

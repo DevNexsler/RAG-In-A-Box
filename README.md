@@ -38,7 +38,7 @@ models**, or fallback chains.
 | Embeddings | Qwen3-Embedding-8B via OpenRouter |
 | LLM enrichment | GPT-4.1 Mini via OpenRouter |
 | OCR + image description | LiteLLM aliases `ocr` + `vision`; proxy owns local/cloud fallback. Gemini, DeepSeek OCR2, and Ollama remain legacy direct adapters. |
-| Reranker | Qwen3-Reranker-8B via DeepInfra |
+| Reranker | Local LiteLLM qwen-bulk, priority 0, no paid fallback |
 | Vector + FTS | LanceDB + tantivy (BM25) |
 | Orchestration | Prefect 3.x |
 
@@ -81,7 +81,8 @@ Create a `.env` file in the project root:
 LITELLM_API_KEY=...              # OCR/vision proxy (preferred)
 # LITELLM_MASTER_KEY=...         # alternative when LITELLM_API_KEY is unset
 OPENROUTER_API_KEY=sk-or-...     # embeddings + enrichment — https://openrouter.ai/keys
-DEEPINFRA_API_KEY=...            # reranker — https://deepinfra.com/dash/api_keys
+LITELLM_API_KEY=...              # local reranker/OCR (or LITELLM_MASTER_KEY)
+# DEEPINFRA_API_KEY=...          # explicit legacy paid reranker only
 ```
 
 ### 4. Build the index
@@ -392,3 +393,5 @@ docs/vps-architecture.md     VPS/cloud deployment architecture
 ## License
 
 [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) — free for personal, research, educational, and nonprofit use. Commercial use requires a separate license.
+
+Search reranker configuration, deadlines and migration: [docs/reranking.md](docs/reranking.md).

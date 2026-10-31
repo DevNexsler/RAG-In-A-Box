@@ -37,13 +37,19 @@ def _run_status_capture_url(monkeypatch, tmp_path, reranker_cfg):
     }
     captured = {}
 
-    class _Resp:
-        status_code = 200
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "health-test")
+    monkeypatch.setenv("LITELLM_API_KEY", "health-test")
 
     def fake_post(url, **kwargs):
         captured["url"] = url
-        return _Resp()
+        return httpx.Response(200, json={"scores": [0.5]}, request=httpx.Request("POST", url))
 
+    async def fake_chat(self, url, **kwargs):
+        captured["url"] = url
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+            "message": {"content": '{"scores":{"D1":0.5}}'}}]}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_chat)
     monkeypatch.setattr(httpx, "post", fake_post)
     monkeypatch.setattr(mcp_server, "_get_deps", lambda: (_FakeStore(), None, config))
     monkeypatch.setattr(mcp_server, "_get_deep_health", lambda **kwargs: {})
@@ -68,7 +74,7 @@ def test_health_check_honors_base_url_override(monkeypatch, tmp_path):
 def test_health_check_strips_trailing_slash_on_base_url(monkeypatch, tmp_path):
     captured, _ = _run_status_capture_url(
         monkeypatch, tmp_path,
-        {"enabled": True, "model": "m", "base_url": "http://provider-sim:9999/"},
+        {"enabled": True, "provider": "deepinfra", "model": "m", "base_url": "http://provider-sim:9999/"},
     )
     assert captured["url"] == "http://provider-sim:9999/v1/inference/m"
 
@@ -76,7 +82,7 @@ def test_health_check_strips_trailing_slash_on_base_url(monkeypatch, tmp_path):
 def test_health_check_defaults_to_deepinfra_when_unset(monkeypatch, tmp_path):
     captured, _ = _run_status_capture_url(
         monkeypatch, tmp_path,
-        {"enabled": True, "model": "Qwen/Qwen3-Reranker-8B"},
+        {"enabled": True, "provider": "deepinfra", "model": "Qwen/Qwen3-Reranker-8B"},
     )
     assert captured["url"] == (
         "https://api.deepinfra.com/v1/inference/Qwen/Qwen3-Reranker-8B"
@@ -88,7 +94,13 @@ def test_health_check_null_base_url_key_falls_back(monkeypatch, tmp_path):
     # back to the default, not AttributeError into a false "unresponsive".
     captured, result = _run_status_capture_url(
         monkeypatch, tmp_path,
-        {"enabled": True, "model": "m", "base_url": None},
+        {"enabled": True, "provider": "deepinfra", "model": "m", "base_url": None},
     )
     assert captured["url"] == "https://api.deepinfra.com/v1/inference/m"
+    assert result["health"]["reranker_responsive"] is True
+
+
+def test_health_default_probes_local_gateway(monkeypatch, tmp_path):
+    captured, result = _run_status_capture_url(monkeypatch, tmp_path, {"enabled": True})
+    assert captured["url"] == "http://host.docker.internal:4000/v1/chat/completions"
     assert result["health"]["reranker_responsive"] is True

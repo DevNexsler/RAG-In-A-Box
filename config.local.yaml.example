@@ -148,11 +148,9 @@ search:
     weight: 0.3
   reranker:
     enabled: true
-    provider: "llama_cpp"                 # local llama-server reranker
-    base_url: "http://localhost:8787"
-    model_path: "models/qwen3-reranker-4b-q8_0.gguf"
-    idle_timeout: 300
-    # Cloud alternative: provider: "baseten", model_id: "wnppr2y3", timeout: 120
+    provider: "qwen-bulk"                 # local LiteLLM alias; no qwen-fast fallback
+    timeout: 10
+    base_url: "http://localhost:4000/v1"
 
 server:
   heartbeat_dir: "/tmp/llama-server"      # lifecycle management for local llama-server

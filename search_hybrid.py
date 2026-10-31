@@ -472,17 +472,29 @@ def build_reranker(config: dict) -> Reranker | None:
         search:
           reranker:
             enabled: true
-            provider: "deepinfra"
-            model: "Qwen/Qwen3-Reranker-8B"
+            provider: "qwen-bulk"
             timeout: 10
     """
     reranker_cfg = config.get("search", {}).get("reranker", {})
     if not reranker_cfg.get("enabled", False):
         return None
 
-    provider = reranker_cfg.get("provider", "deepinfra")
+    # Compose explicitly selects qwen-bulk when migrating an existing mounted
+    # config that still names DeepInfra. Paid inference requires explicit opt-in.
+    provider = os.getenv("DOC_ORGANIZER_RERANKER_PROVIDER") or reranker_cfg.get("provider", "qwen-bulk")
 
-    if provider == "deepinfra":
+    if provider == "qwen-bulk":
+        from providers.rerank.qwen_bulk import QwenBulkReranker
+
+        return QwenBulkReranker(
+            # An env override migrating a paid-provider config must not reuse
+            # that provider's credential for the gateway.
+            api_key=(reranker_cfg.get("api_key")
+                     if reranker_cfg.get("provider", "qwen-bulk") == "qwen-bulk" else None),
+            timeout=reranker_cfg.get("timeout", RERANK_TIMEOUT_SECONDS),
+            base_url=reranker_cfg.get("base_url"),
+        )
+    elif provider == "deepinfra":
         return DeepInfraReranker(
             model=reranker_cfg.get("model", "Qwen/Qwen3-Reranker-8B"),
             api_key=reranker_cfg.get("api_key"),
@@ -490,8 +502,7 @@ def build_reranker(config: dict) -> Reranker | None:
             base_url=reranker_cfg.get("base_url"),
         )
     else:
-        logger.warning("Unknown reranker provider: %s", provider)
-        return None
+        raise ValueError(f"Unknown reranker provider: {provider}")
 
 
 # ---------------------------------------------------------------------------
