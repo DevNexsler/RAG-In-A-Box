@@ -1,6 +1,7 @@
 """Opt-in real gateway + MCP HTTP + isolated Lance semantic-search E2E."""
 
 import asyncio
+from datetime import timedelta
 import json
 import os
 import socket
@@ -41,6 +42,7 @@ def test_real_gateway_mcp_semantic_search(tmp_path, monkeypatch, count):
             passages = json.loads(payload["messages"][1]["content"])["passages"]
             wire.append({"passages": len(passages), "remaining_s": round(
                 payload["metadata"]["inference_deadline_seconds"], 3)})
+            assert 0 < payload["metadata"]["inference_deadline_seconds"] <= 30
         return await original_post(client, url, **kwargs)
     monkeypatch.setattr(httpx.AsyncClient, "post", measured_post)
     monkeypatch.setattr(mcp_server.mcp, "_session_manager", None)
@@ -58,8 +60,8 @@ def test_real_gateway_mcp_semantic_search(tmp_path, monkeypatch, count):
         assert server.started, "isolated MCP server failed to start"
 
         async def run():
-            async with streamablehttp_client(f"http://127.0.0.1:{port}/mcp") as (read, write, _):
-                async with ClientSession(read, write) as session:
+            async with streamablehttp_client(f"http://127.0.0.1:{port}/mcp", timeout=45) as (read, write, _):
+                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=45)) as session:
                     await session.initialize()
                     began = time.monotonic()
                     result = tool_payload(await session.call_tool("file_search", {
@@ -77,7 +79,7 @@ def test_real_gateway_mcp_semantic_search(tmp_path, monkeypatch, count):
                     assert result["results"][0]["doc_id"] == ANSWER_ID, result["results"][:3]
                     assert "Tenant Mira" in result["results"][0]["snippet"]
                     assert sum(batch["passages"] for batch in wire) == count
-                    assert elapsed < 12, f"MCP search exceeded bounded local rerank budget: {elapsed:.3f}s"
+                    assert elapsed < 35, f"MCP search exceeded bounded local rerank budget: {elapsed:.3f}s"
         asyncio.run(run())
     finally:
         server.should_exit = True

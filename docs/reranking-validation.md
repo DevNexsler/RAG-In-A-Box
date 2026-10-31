@@ -1,7 +1,11 @@
-# qwen-bulk candidate qualification — 2026-10-30
+# qwen-bulk candidate qualification — 2026-10-31
 
-**Deployment blocked: large-pool live latency qualification fails.** This change
-is a draft PR. No merge or deployment is authorized by this evidence.
+The user accepted observed local latency and requested a thirty-second test
+budget. Qwen now defaults to, and is capped at, **30 seconds for the entire
+rerank operation**, including semaphore wait and all batches. Compose explicitly
+overrides old mounted ten-second configs. A shorter configured budget remains
+supported. Health probing stays capped at five seconds; explicit DeepInfra
+retains its previous timeout behavior. No merge or deployment has occurred.
 
 The real MCP streamable-HTTP test seeds a temporary LanceDB/FTS corpus, runs the
 production `file_search` consumer and sends real gateway inference requests.
@@ -11,54 +15,72 @@ written to test configuration. Every observed request asserts `qwen-bulk`,
 top-level priority 0, thinking disabled, zero retries, disabled fallbacks and a
 positive remaining coordinator deadline. No paid provider is selected.
 
-Final real-gateway results:
+## Thirty-second factory-path live E2E
+
+All four cases passed without an adapter monkeypatch. Six-check live preflight
+passed before inference; the test client uses 45-second HTTP and MCP deadlines.
+Every case preserved the paid-tenant answer document ID/snippet at rank one and
+sent exactly one occurrence score per retrieved candidate.
 
 | Corpus | MCP elapsed | Rerank elapsed | Result |
 |---|---:|---:|---|
-| 3 ordinary passages | 0.983s | 0.921s | Correct paid-tenant document ID/snippet; healthy |
-| 70 digit-dense passages | 10.075s | 10.002s | Deadline; cosine fallback, degraded |
-| 80 digit-dense passages | 10.070s | 10.002s | Deadline; cosine fallback, degraded |
-| 90 digit-dense passages | 10.069s | 10.002s | Deadline; cosine fallback, degraded |
+| 3 ordinary passages | 0.922s | 0.863s | Correct answer; healthy |
+| 70 digit-dense passages | 10.026s | 9.958s | Correct answer; healthy |
+| 80 digit-dense passages | 14.088s | 14.007s | Correct answer; healthy |
+| 90 digit-dense passages | 9.680s | 9.613s | Correct answer; healthy |
 
-The large-pool tests intentionally require successful scoring and therefore
-remain failing qualification tests (`1 passed, 3 failed`). They must pass before
-release; a healthy cosine fallback is not successful reranker qualification.
+## Repeated diagnostic measurements
 
-Read-only coordinator logs showed local attempts timing out around 3.3s: the
-coordinator reserves remaining time across its three local candidates. Smaller
-prompt/batch trials (32/16/8 passages, lower byte budgets and bounded increased
-concurrency) also missed the shared ten-second deadline. Those experiments do
-not justify reducing evidence further or increasing load in the shipped default.
-The candidate retains 32 passages, two process-wide concurrent requests, the
-aggregate 64k limit and a stricter 16k request envelope. No gateway changes,
-backend pinning, paid fallback or timeout increase are included.
+Before changing the default, an isolated harness repeatedly called the same real
+MCP consumer using the committed adapter. Its diagnostic profile overrode only
+the adapter object's timeout to 30 seconds. Warmups are excluded. Requests were
+sequential at the MCP level, with the normal two concurrent batch slots. The
+benchmark stopped when the user accepted latency; it did not reach its planned
+100 samples per dense profile.
 
-Remaining work before release: achieve successful 70/80/90 digit-dense MCP runs
-inside the existing ten-second rerank budget, assess relevance beyond passage
-heads on a labeled real corpus, then run the full seven-tier release gate and
-post-deployment smoke. Default provider selection changes on service recreation
-because compose overrides legacy mounted DeepInfra configuration. Explicit paid
-rollback remains an operator choice, described in [reranking.md](reranking.md).
+| Profile | Samples | Successful reranks | MCP p50 | MCP p95 | MCP p99 |
+|---|---:|---:|---:|---:|---:|
+| 90 dense, 30s diagnostic | 59 | 59 | 9.654s | 17.022s | 20.573s |
+| 90 dense, original 10s | 60 | 0 | 10.021s | 10.033s | 10.042s |
+| 3 ordinary, 10s control | 12 | 12 | 1.042s | 2.648s | 2.648s |
 
-Deterministic qualification completed:
+These are nearest-rank empirical response percentiles on a fixed synthetic
+corpus, not production SLAs. At 59 samples, p99 is simply the largest observed
+value. Every ten-second dense sample was censored by timeout and returned honest
+cosine degradation; those response percentiles are not inference completion
+percentiles. Thirty-second dense rerank-only p95/p99 were 16.985s/20.556s.
 
-- Static lint and collection: pass (2,916 collected).
-- Final unit suite: 2,438 passed.
-- Integration gate: 248 passed, 16 skipped (isolated PostgreSQL history cases).
-- Final targeted provider/search/health contracts: 74 passed.
-- Final-image staging gate: 74 passed, including all five Qwen failure/recovery
-  cases; MCP tool coverage and attachment-path audits passed.
+Read-only coordinator inspection showed that a ten-second remaining deadline
+reserves time across three local backends, leaving roughly 3.3 seconds for the
+first attempt. A thirty-second deadline gives that attempt roughly ten seconds.
+Thus changing the deadline can change local retry behavior as well as allowing
+more total time. This does not prove which portion of latency is queue, prefill
+or generation. Priority 0 survives caller-knob merging, including numeric zero;
+no repeated packet capture or gateway modification was needed.
 
-An earlier staging image built during the smaller-prompt experiment failed one
-media-presence assertion. The committed 16k envelope passed the same 31-test
-prefix; Qwen and simulated DeepInfra returned identical top-ten paths on its
-same corpus. The full final-image staging gate then passed. No assertion was
-weakened to obtain that result.
+The implementation retains 32 passages per batch, two process-wide requests,
+the digit-aware aggregate 64k limit and conservative 16k request envelopes.
+Truncation may discard relevant evidence beyond passage heads. Further labeled
+real-corpus quality and production-load latency evaluation remain future work.
+Timeout, malformed output and cancellation regressions preserve atomic scoring,
+honest degradation and cancellation behavior under the larger cap.
+
+## Deterministic qualification
+
+- Focused provider/search/deployment/health contracts: 77 passed.
+- Static lint and collection passed (2,921 collected); unit suite: 2,443 passed.
+- Final-image staging: 74 E2E passed, with 22/22 MCP tools covered/traced and
+  attachment-path audit passed. Injected 32-second hangs degrade at the shared
+  30-second cap, then recover through the same MCP consumer.
+- Fast gate passed: 248 integration tests passed, 16 skipped because isolated
+  PostgreSQL history test credentials were not configured.
 
 The complete release gate (mutation, soak and unrelated paid-provider live
-tiers) was not run. These passing deterministic gates do not override the
-failing large-pool live qualification above.
+tiers) was not run. It and post-deployment smoke remain required before release.
+This PR remains draft, unmerged and undeployed.
 
-The implementation worktree is registered and remains incomplete pending merge
-and verification. Disposable tests use temporary filesystem indexes and an
-isolated compose project; no Factbook database or source is touched.
+The worktree is registered and incomplete pending merge and verification.
+Disposable tests use temporary indexes and isolated compose resources. The
+interrupted benchmark's exact owned scratch was removed after verifying no
+benchmark process remained; evidence and its diagnostic script were archived
+outside the worktree. No Factbook database or source is touched.

@@ -76,6 +76,43 @@ def test_invalid_timeout(timeout):
         scorer(timeout=timeout)
 
 
+def test_thirty_second_deadline_reaches_gateway_and_config_can_shorten_it(monkeypatch):
+    remaining = []
+
+    async def answer(url, payload):
+        remaining.append(payload["metadata"]["inference_deadline_seconds"])
+        return response(payload)
+
+    install(monkeypatch, answer)
+    scorer().rerank("query", hits())
+    scorer(timeout=120).rerank("query", hits())
+    scorer(timeout=.5).rerank("query", hits())
+    assert all(29 < deadline <= 30 for deadline in remaining[:2])
+    assert 0 < remaining[2] <= .5
+
+
+def test_compose_timeout_migrates_legacy_config_without_changing_paid_opt_in(monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.setenv("LITELLM_API_KEY", "local-test-key")
+    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_PROVIDER", "qwen-bulk")
+    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS", "30")
+    config = {"search": {"reranker": {"enabled": True, "provider": "deepinfra", "timeout": 10,
+                                       "api_key": "paid-test-key"}}}
+    migrated = build_reranker(config)
+    assert migrated.timeout == 30 and migrated.api_key == "local-test-key"
+    env = yaml.safe_load(Path("docker-compose.yml").read_text())["services"]["doc-organizer"]["environment"]
+    assert "DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS=${DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS:-30}" in env
+    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS", "0.5")
+    assert build_reranker(config).timeout == .5
+    for invalid in ["0", "nan", "inf", "invalid"]:
+        monkeypatch.setenv("DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS", invalid)
+        with pytest.raises(ValueError):
+            build_reranker(config)
+    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_PROVIDER", "deepinfra")
+    assert build_reranker(config).timeout == 10
+
+
 @pytest.mark.parametrize("count", [1, 32, 64, 70, 90])
 def test_maps_reversed_keys_to_original_documents_and_bounds_payload(monkeypatch, count):
     sent = []
@@ -86,7 +123,7 @@ def test_maps_reversed_keys_to_original_documents_and_bounds_payload(monkeypatch
         assert payload["temperature"] == 0 and payload["num_retries"] == 0
         assert payload["disable_fallbacks"] is True
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-        assert 0 < payload["metadata"]["inference_deadline_seconds"] <= 10
+        assert 0 < payload["metadata"]["inference_deadline_seconds"] <= 30
         passages = json.loads(payload["messages"][1]["content"])["passages"]
         assert len(passages) <= 32
         assert all(0 < len(p["text"]) <= 4000 for p in passages)

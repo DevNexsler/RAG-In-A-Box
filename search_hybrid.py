@@ -473,7 +473,7 @@ def build_reranker(config: dict) -> Reranker | None:
           reranker:
             enabled: true
             provider: "qwen-bulk"
-            timeout: 10
+            timeout: 30
     """
     reranker_cfg = config.get("search", {}).get("reranker", {})
     if not reranker_cfg.get("enabled", False):
@@ -484,14 +484,16 @@ def build_reranker(config: dict) -> Reranker | None:
     provider = os.getenv("DOC_ORGANIZER_RERANKER_PROVIDER") or reranker_cfg.get("provider", "qwen-bulk")
 
     if provider == "qwen-bulk":
-        from providers.rerank.qwen_bulk import QwenBulkReranker
+        from providers.rerank.qwen_bulk import TIMEOUT_SECONDS, QwenBulkReranker
 
         return QwenBulkReranker(
             # An env override migrating a paid-provider config must not reuse
             # that provider's credential for the gateway.
             api_key=(reranker_cfg.get("api_key")
                      if reranker_cfg.get("provider", "qwen-bulk") == "qwen-bulk" else None),
-            timeout=reranker_cfg.get("timeout", RERANK_TIMEOUT_SECONDS),
+            timeout=(float(os.environ["DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS"])
+                     if "DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS" in os.environ
+                     else reranker_cfg.get("timeout", TIMEOUT_SECONDS)),
             base_url=reranker_cfg.get("base_url"),
         )
     elif provider == "deepinfra":

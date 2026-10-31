@@ -16,14 +16,14 @@ async def test_qwen_search_failure_and_recovery(indexed_corpus, mcp_session, fau
     if fault:
         async with httpx.AsyncClient() as sim:
             response = await sim.post(f"{E2E_SIM_URL}/admin/fault", json={
-                "route_prefix": "/v1/chat/completions", "fault": fault, "times": 1, "seconds": 12,
+                "route_prefix": "/v1/chat/completions", "fault": fault, "times": 1, "seconds": 32,
             })
             assert response.status_code == 200
     began = time.monotonic()
     result = await mcp_session.call_tool_json("file_search", {
         "query": NOTE_PHRASE, "top_k": 5, "include_diagnostics": True,
     })
-    assert time.monotonic() - began < 13
+    assert time.monotonic() - began < 35
     assert not result.get("error"), result
     assert result["results"]
     assert result["diagnostics"]["reranker_applied"] is (fault is None)

@@ -32,7 +32,7 @@ Store these in a `.env` file in the project root. The MCP server and indexer loa
 | Image description | LiteLLM alias `vision`; proxy owns local/cloud selection and fallback. Legacy direct Gemini/Ollama adapters remain available. |
 | Image metadata    | Pillow EXIF extraction (camera, date, GPS, dimensions)        |
 | PDF metadata      | PyMuPDF (title, author, dates, page count)                    |
-| Reranking         | Local LiteLLM qwen-bulk (priority 0, bounded batches, 10s total deadline) |
+| Reranking         | Local LiteLLM qwen-bulk (priority 0, bounded batches, 30s total deadline) |
 | Orchestration     | Prefect 3.x — flow/task logging, retry, dashboard at `http://127.0.0.1:4200` |
 | Event hooks       | Optional HTTP `document.indexed` webhooks after successful LanceDB upsert |
 

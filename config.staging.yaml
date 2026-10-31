@@ -187,7 +187,7 @@ search:
   reranker:
     enabled: true
     provider: "qwen-bulk"
-    timeout: 10
+    timeout: 30
     base_url: "http://provider-sim:9999/v1"
     api_key: "sim"
 

@@ -209,7 +209,7 @@ search:
   reranker:
     enabled: true
     provider: "qwen-bulk"                 # local LiteLLM alias, priority 0, no paid fallback
-    timeout: 10                           # total budget: queue + all batches
+    timeout: 30                           # total budget: queue + all batches
     # base_url: "http://host.docker.internal:4000/v1"  # LITELLM_BASE_URL overrides this
     # Explicit paid opt-in: provider: "deepinfra", model: "Qwen/Qwen3-Reranker-8B"
 

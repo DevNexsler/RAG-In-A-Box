@@ -15,7 +15,7 @@ import httpx
 from core.rerank_cancellation import rerank_cancel_event
 from core.resilience import CIRCUITS
 from core.storage import SearchHit
-from search_hybrid import RERANK_TIMEOUT_SECONDS, RERANK_TOKEN_BUDGET, Reranker, fit_rerank_documents
+from search_hybrid import RERANK_TOKEN_BUDGET, Reranker, fit_rerank_documents
 
 
 # Searches construct fresh adapters and run in different threads/event loops.
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 32
 PROMPT_TOKEN_BUDGET = 16_000
 QUERY_CHARS = 2000
+TIMEOUT_SECONDS = 30.0
 _SYSTEM = """Score each passage's relevance to the document search query from 0 to 1.
 0 means irrelevant, 0.5 partial evidence, 1 direct evidence answering the query.
 Use one decimal place at most; choose from 0, 0.1, 0.2, ..., 1.
@@ -60,10 +61,10 @@ class QwenBulkReranker(Reranker):
 
     model = "qwen-bulk"
 
-    def __init__(self, api_key=None, base_url=None, timeout=RERANK_TIMEOUT_SECONDS):
+    def __init__(self, api_key=None, base_url=None, timeout=TIMEOUT_SECONDS):
         if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Reranker timeout must be positive and finite")
-        self.timeout = min(timeout, RERANK_TIMEOUT_SECONDS)
+        self.timeout = min(timeout, TIMEOUT_SECONDS)
         self.api_key = api_key or os.getenv("LITELLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY", "")
         self.base_url = (os.getenv("LITELLM_BASE_URL") or base_url
                          or "http://host.docker.internal:4000/v1").rstrip("/")

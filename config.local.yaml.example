@@ -149,7 +149,7 @@ search:
   reranker:
     enabled: true
     provider: "qwen-bulk"                 # local LiteLLM alias; no qwen-fast fallback
-    timeout: 10
+    timeout: 30
     base_url: "http://localhost:4000/v1"
 
 server:
