@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 import heapq
@@ -30,6 +31,12 @@ _SLOTS = threading.BoundedSemaphore(2)
 _WAITING_LOCK = threading.Lock()
 _WAITING = []  # heap of (deadline, operation, first passage index)
 _OPERATIONS = itertools.count()
+# Recent successful requests as (passages, seconds), guarded by _WAITING_LOCK.
+# Under overload, earliest deadline first hands each freed slot to the most-
+# starved batch; one sent with less time left than a request takes held the
+# slot until its deadline and failed anyway, so almost every search degraded
+# (#4484). Such a batch leaves the queue instead of taking the slot.
+_SERVICE_SECONDS = deque(maxlen=100)
 logger = logging.getLogger(__name__)
 BATCH_SIZE = 32
 PROMPT_TOKEN_BUDGET = 16_000
@@ -58,6 +65,15 @@ def _unique_object(pairs):
 def _normalize(values):
     low, high = min(values), max(values)
     return [(value - low) / (high - low) for value in values] if high > low else [1.0] * len(values)
+
+
+def _request_seconds(passages):
+    """90th percentile of recent successes no larger than this batch, else 0.
+
+    Call with _WAITING_LOCK held.
+    """
+    samples = sorted(seconds for size, seconds in _SERVICE_SECONDS if size <= passages)
+    return samples[int(0.9 * (len(samples) - 1))] if samples else 0.0
 
 
 class QwenBulkReranker(Reranker):
@@ -214,6 +230,8 @@ class QwenBulkReranker(Reranker):
                     raise TimeoutError("Qwen bulk reranker queue deadline exhausted")
                 with _WAITING_LOCK:
                     if _WAITING[0] == waiter:
+                        if deadline - time.monotonic() <= _request_seconds(len(ids)):
+                            raise TimeoutError("Qwen bulk reranker deadline cannot cover a request")
                         acquired = _SLOTS.acquire(blocking=False)
                         if acquired:
                             heapq.heappop(_WAITING)
@@ -223,6 +241,7 @@ class QwenBulkReranker(Reranker):
             if remaining <= 0:
                 raise TimeoutError("Qwen bulk reranker deadline exhausted")
             payload["metadata"] = {"inference_deadline_seconds": remaining}
+            sent = time.monotonic()
             response = await client.post(
                 f"{self.base_url}/chat/completions", json=payload,
                 timeout=httpx.Timeout(remaining, connect=min(5.0, remaining)),
@@ -230,6 +249,8 @@ class QwenBulkReranker(Reranker):
             # HTTPX's status error omits response bodies; a gateway error may
             # echo credentials or passage data into the shared circuit log.
             response.raise_for_status()
+            with _WAITING_LOCK:
+                _SERVICE_SECONDS.append((len(ids), time.monotonic() - sent))
             choices = response.json()["choices"]
             if len(choices) != 1 or choices[0]["finish_reason"] != "stop":
                 raise ValueError("Incomplete reranker generation")

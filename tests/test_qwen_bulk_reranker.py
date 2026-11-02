@@ -435,3 +435,51 @@ def test_queued_searches_take_freed_slots_in_arrival_order(monkeypatch):
     for thread in threads:
         thread.join()
     assert outcomes == {0: "reranked", 1: "degraded", 2: "degraded", 3: "degraded"}
+
+
+def test_overloaded_queue_sheds_batches_that_cannot_finish_before_their_deadline(monkeypatch):
+    # #4484: under sustained overload, earliest-deadline-first handed every
+    # freed slot to the most-starved batch. Requests sent with less time left
+    # than a request takes almost never succeeded (7 of 6,017 sent with under
+    # 5 s in production), yet each held a slot until its deadline, so almost
+    # no search reranked. A batch that cannot finish must leave the queue.
+    service = .1
+    sent, finished = [], []
+
+    async def answer(url, payload):
+        sent.append(payload["metadata"]["inference_deadline_seconds"])
+        await asyncio.sleep(service)
+        finished.append(True)
+        return response(payload)
+    install(monkeypatch, answer)
+    outcomes = []
+
+    def search():
+        try:
+            scorer(timeout=.3).rerank("query", hits())
+            outcomes.append("reranked")
+        except RuntimeError:
+            outcomes.append("degraded")
+
+    # Single-batch searches arrive at twice the rate two slots can serve.
+    threads = [threading.Thread(target=search) for _ in range(60)]
+    for thread in threads:
+        thread.start()
+        time.sleep(.025)
+    for thread in threads:
+        thread.join()
+    doomed = len(sent) - len(finished)
+    assert doomed <= 2, f"{doomed} of {len(sent)} requests were sent without time to finish"
+    assert outcomes.count("reranked") >= 20  # capacity is ~30; base reranked 6
+
+
+def test_learned_request_time_never_sheds_a_smaller_request(monkeypatch):
+    # file_status probes with one passage and a 5 s budget; slow 32-passage
+    # batches must not make that probe report the reranker unresponsive.
+    async def answer(url, payload):
+        passages = json.loads(payload["messages"][1]["content"])["passages"]
+        await asyncio.sleep(.3 if len(passages) > 1 else .02)
+        return response(payload)
+    install(monkeypatch, answer)
+    assert len(scorer().rerank("query", hits(32))) == 32
+    assert len(scorer(timeout=.2).rerank("test", hits(1))) == 1

@@ -28,6 +28,17 @@ def _isolate_process_global_resilience_state():
     CIRCUITS.reset()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_learned_rerank_request_time():
+    """The qwen-bulk reranker learns recent request durations process-wide and
+    sheds batches that cannot finish in time (#4484). Reset it per test so one
+    test's fake gateway latency cannot decide which batches another admits."""
+    yield
+    qwen_bulk = sys.modules.get("providers.rerank.qwen_bulk")
+    if qwen_bulk is not None:
+        qwen_bulk._SERVICE_SECONDS.clear()
+
+
 class RealIndexerLaunchAttempted(BaseException):
     """A unit test tried to launch the real detached indexer.
 

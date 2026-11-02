@@ -38,7 +38,12 @@ all batches; each batch receives at most 64k divided by the number of batches.
 Two requests per process may run concurrently, shared across fresh search
 adapters. Waiting batches take freed slots earliest deadline first, so
 overlapping searches finish in arrival order instead of interleaving their
-batches until every one misses its deadline. One thirty-second maximum covers preprocessing, semaphore wait and all
+batches until every one misses its deadline. Under overload that order hands
+each freed slot to the most-starved batch, so a batch whose search has less
+time left than the 90th percentile of recent successful requests no larger
+than it gives up its turn and degrades the search to cosine instead of
+holding a slot it cannot use (#4484). With no successes yet, every batch is
+sent. One thirty-second maximum covers preprocessing, semaphore wait and all
 batches; a shorter YAML `timeout` or environment override reduces that budget.
 The environment timeout applies only to Qwen; explicit DeepInfra keeps its
 configured timeout and legacy ten-second default.
