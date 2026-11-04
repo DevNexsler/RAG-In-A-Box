@@ -270,6 +270,11 @@ class QwenBulkReranker(Reranker):
             return 0
         if not isinstance(answer, dict) or answer.get("admit_now") is not True:
             return 0
+        # LiteLLM counts the live requests its ready engines can still take
+        # before each hits its live_max_inflight; older answers lack it.
+        available = answer.get("available_requests")
+        if type(available) is int:
+            return max(0, available)
         ready = answer.get("engines_ready")
         return ready * BATCHES_PER_READY_ENGINE if type(ready) is int and ready > 0 else 0
 
