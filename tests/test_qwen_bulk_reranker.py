@@ -649,3 +649,24 @@ def test_a_ready_answer_admits_a_bounded_number_of_batches(pools, monkeypatch):
     capacity_gateway(monkeypatch, {"qwen-bulk": 1, "ds-flash-local": 1}, sent=sent)
     scorer().rerank("query", hits(32 * 3))
     assert sorted(sent) == ["ds-flash-local", "qwen-bulk", "qwen-bulk"]
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_fallback_batches_never_carry_a_router_priority(pools, monkeypatch, background):
+    # 2026-11-04: LiteLLM's Router scheduler 500s on concurrent prioritized
+    # requests to a group its coordinator does not own.
+    sent = []
+    async def answer(url, payload):
+        if url.endswith("/inference/capacity"):
+            engines = 1 if payload["model"] == "ds-flash-local" else 0
+            return httpx.Response(200, json={"admit_now": engines > 0, "engines_ready": engines},
+                                  request=httpx.Request("POST", url))
+        sent.append((payload["model"], payload.get("priority")))
+        return response(payload)
+    install(monkeypatch, answer)
+    scorer(background=background).rerank("query", hits(3))
+    assert sent == [("ds-flash-local", None)]
+    monkeypatch.setenv(qwen.RERANK_MODELS_ENV, "qwen-bulk")
+    sent.clear()
+    scorer(background=background).rerank("query", hits(3))
+    assert sent == [("qwen-bulk", qwen.BACKGROUND_PRIORITY if background else qwen.LIVE_PRIORITY)]

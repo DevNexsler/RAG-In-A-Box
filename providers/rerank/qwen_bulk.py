@@ -315,6 +315,13 @@ class QwenBulkReranker(Reranker):
             payload["model"] = await self._choose_model(client, budget)
             if payload["model"] != rerank_models()[0]:
                 logger.info("Qwen bulk reranker batch routed to %s", payload["model"])
+                # LiteLLM queues a request with a nonzero top-level priority in its
+                # Redis-backed Router scheduler unless the coordinator owns the
+                # group, and concurrent pushes crash it ("'<' not supported between
+                # 'tuple' and 'list'", HTTP 500): 2+ background batches on
+                # ds-flash-local degraded the search. Without it, the fallback
+                # deployment's own vLLM priority applies (ds-flash-local: 10).
+                payload.pop("priority", None)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Qwen bulk reranker deadline exhausted")
