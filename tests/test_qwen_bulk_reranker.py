@@ -39,6 +39,12 @@ def scorer(**kwargs):
     return qwen.QwenBulkReranker(api_key="test-only", base_url="http://gateway/v1", **kwargs)
 
 
+@pytest.fixture
+def two_slots(monkeypatch):
+    """Queueing contracts are easiest to drive against a small bound."""
+    monkeypatch.setattr(qwen, "_SLOTS", threading.BoundedSemaphore(2))
+
+
 def test_default_and_compose_migrate_legacy_provider(monkeypatch):
     monkeypatch.delenv("LITELLM_API_KEY", raising=False)
     monkeypatch.setenv("LITELLM_MASTER_KEY", "test-only")
@@ -258,7 +264,7 @@ def test_failed_batch_cancels_and_awaits_siblings(monkeypatch):
     assert all(h.score == 1 for h in candidates)
 
 
-def test_total_deadline_includes_multibatch_and_cancels_transport(monkeypatch):
+def test_total_deadline_includes_multibatch_and_cancels_transport(two_slots, monkeypatch):
     calls, ended = [], []
     async def answer(url, payload):
         calls.append(payload["metadata"]["inference_deadline_seconds"])
@@ -277,7 +283,7 @@ def test_total_deadline_includes_multibatch_and_cancels_transport(monkeypatch):
         assert calls[2] < calls[0] - .08
 
 
-def test_queue_wait_is_bounded_without_gateway_request(monkeypatch):
+def test_queue_wait_is_bounded_without_gateway_request(two_slots, monkeypatch):
     async def forbidden(url, payload):
         pytest.fail("queued request must not reach gateway")
     install(monkeypatch, forbidden)
@@ -292,7 +298,7 @@ def test_queue_wait_is_bounded_without_gateway_request(monkeypatch):
 
 
 @pytest.mark.parametrize("via_event", [False, True])
-def test_cancellation_propagates_and_releases_slots(monkeypatch, via_event):
+def test_cancellation_propagates_and_releases_slots(two_slots, monkeypatch, via_event):
     started, ended = threading.Event(), threading.Event()
     async def answer(url, payload):
         started.set()
@@ -355,7 +361,7 @@ def test_impossible_overhead_rejected_and_empty_pool_never_calls_gateway(monkeyp
         rerank_cancel_event.reset(token)
 
 
-def test_process_wide_slots_bound_overlapping_fresh_adapters(monkeypatch):
+def test_process_wide_slots_bound_overlapping_fresh_adapters(two_slots, monkeypatch):
     active = peak = 0
     async def answer(url, payload):
         nonlocal active, peak
@@ -372,6 +378,28 @@ def test_process_wide_slots_bound_overlapping_fresh_adapters(monkeypatch):
         assert all(len(result) == 33 for result in results)
     asyncio.run(run())
     assert peak == 2 and active == 0
+
+
+def test_default_bound_leaves_admission_to_the_gateway(monkeypatch):
+    # 2026-11-04: two process-wide slots queued searches here while every
+    # qwen-bulk engine had room. Overlapping searches must all reach LiteLLM.
+    assert qwen.IN_FLIGHT_BATCHES == 50
+    active = peak = 0
+    async def answer(url, payload):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(.05)
+            return response(payload)
+        finally:
+            active -= 1
+    install(monkeypatch, answer)
+    async def run():
+        results = await asyncio.gather(*(scorer().arerank("query", hits(64)) for _ in range(5)))
+        assert all(len(result) == 64 for result in results)
+    asyncio.run(run())
+    assert peak == 10 and active == 0
 
 
 def test_refusal_remembered_without_retries_and_valid_recovery_required(monkeypatch):
@@ -404,7 +432,7 @@ def test_refusal_remembered_without_retries_and_valid_recovery_required(monkeypa
     assert not circuit.tripped() and not CIRCUITS.tripped()
 
 
-def test_queued_searches_take_freed_slots_in_arrival_order(monkeypatch):
+def test_queued_searches_take_freed_slots_in_arrival_order(two_slots, monkeypatch):
     # #4473: overlapping 100-candidate searches queued behind busy slots took
     # them by unordered polling; their batches interleaved and every search
     # missed its deadline. Capacity here fits one search: it must be the first.
@@ -437,7 +465,7 @@ def test_queued_searches_take_freed_slots_in_arrival_order(monkeypatch):
     assert outcomes == {0: "reranked", 1: "degraded", 2: "degraded", 3: "degraded"}
 
 
-def test_overloaded_queue_sheds_batches_that_cannot_finish_before_their_deadline(monkeypatch):
+def test_overloaded_queue_sheds_batches_that_cannot_finish_before_their_deadline(two_slots, monkeypatch):
     # #4484: under sustained overload, earliest-deadline-first handed every
     # freed slot to the most-starved batch. Requests sent with less time left
     # than a request takes almost never succeeded (7 of 6,017 sent with under
@@ -522,7 +550,7 @@ def test_factory_background_ignores_live_timeout_override(monkeypatch):
     assert build_reranker(config, background=True).timeout == 10
 
 
-def test_queued_live_search_takes_a_freed_slot_before_an_earlier_background_one(monkeypatch):
+def test_queued_live_search_takes_a_freed_slot_before_an_earlier_background_one(two_slots, monkeypatch):
     order = []
 
     async def answer(url, payload):
