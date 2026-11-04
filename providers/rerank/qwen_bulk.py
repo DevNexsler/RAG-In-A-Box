@@ -78,6 +78,24 @@ once, no other IDs or fields. Keep each score attached to its exact passage ID.
 """
 
 
+class _GuardrailBlocked(Exception):
+    """LiteLLM's prompt-injection guardrail refused this batch's passages."""
+
+
+GUARDRAIL_BLOCK_PREFIX = "Prompt injection detected"
+
+
+def _guardrail_blocked(response):
+    """True for LiteLLM's injection-guardrail 400; never logs the body."""
+    if response.status_code != 400:
+        return False
+    try:
+        message = response.json()["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        return False
+    return isinstance(message, str) and message.startswith(GUARDRAIL_BLOCK_PREFIX)
+
+
 def _unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -321,6 +339,29 @@ class QwenBulkReranker(Reranker):
         return body(low)
 
     async def _score_batch(self, client, query, documents, start, deadline, operation, budget):
+        """Score one batch; isolate passages LiteLLM's injection guardrail refuses.
+
+        Reranking quotes untrusted third-party text, and the guardrail blocks a
+        whole request when any passage reads like an injection: 317 rerank
+        batches in one day (2026-11-04), each degrading its search, and the
+        same query is refused the same way on retry. Halve a refused batch
+        until the refused passages stand alone, and score those 0: suspected
+        injections are demoted, never exempted, and the rest still rank.
+        """
+        try:
+            return await self._score_batch_once(client, query, documents, start, deadline, operation, budget)
+        except _GuardrailBlocked:
+            if len(documents) == 1:
+                logger.info("Qwen bulk reranker withheld 1 passage the injection guardrail refused")
+                return [0.0]
+            mid = len(documents) // 2
+            left, right = await asyncio.gather(
+                self._score_batch(client, query, documents[:mid], start, deadline, operation, budget),
+                self._score_batch(client, query, documents[mid:], start + mid, deadline, operation, budget),
+            )
+            return left + right
+
+    async def _score_batch_once(self, client, query, documents, start, deadline, operation, budget):
         ids = [f"D{i + 1}" for i in range(start, start + len(documents))]
         payload = self._payload(query, documents, ids, budget)
         waiter = (deadline, operation, start)
@@ -359,6 +400,8 @@ class QwenBulkReranker(Reranker):
                 f"{self.base_url}/chat/completions", json=payload,
                 timeout=httpx.Timeout(remaining, connect=min(5.0, remaining)),
             )
+            if _guardrail_blocked(response):
+                raise _GuardrailBlocked()
             # HTTPX's status error omits response bodies; a gateway error may
             # echo credentials or passage data into the shared circuit log.
             response.raise_for_status()
