@@ -27,7 +27,12 @@ from search_hybrid import RERANK_TOKEN_BUDGET, Reranker, fit_rerank_documents
 # A process-wide semaphore bounds their combined gateway load. Waiting batches
 # take slots earliest deadline first: unordered polling spread the slots over
 # every overlapping search, so all of them missed their deadline (#4473).
-_SLOTS = threading.BoundedSemaphore(2)
+# The bound is a runaway guard, not capacity planning: LiteLLM's coordinator
+# admits by engine KV space across every qwen-bulk engine. At 2, searches
+# queued here while the engines sat idle (2026-11-04: 0-2 running, none
+# waiting, 10 degraded searches in 10 minutes) and the comms review failed.
+IN_FLIGHT_BATCHES = 50
+_SLOTS = threading.BoundedSemaphore(IN_FLIGHT_BATCHES)
 _WAITING_LOCK = threading.Lock()
 _WAITING = []  # heap of (deadline, operation, first passage index)
 _OPERATIONS = itertools.count()
