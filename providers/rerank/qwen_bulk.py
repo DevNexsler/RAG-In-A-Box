@@ -54,6 +54,18 @@ TIMEOUT_SECONDS = 30.0
 BACKGROUND_TIMEOUT_SECONDS = 180.0
 LIVE_PRIORITY = 0
 BACKGROUND_PRIORITY = 5
+# LiteLLM model groups in preference order, e.g. "qwen-bulk,ds-flash-local".
+# Each batch goes to the first group LiteLLM reports as able to start it now
+# (POST /v1/inference/capacity, workload_class=live); when none is, or the
+# signal is unavailable, it queues on the first. Unset keeps qwen-bulk alone.
+RERANK_MODELS_ENV = "DOC_ORGANIZER_RERANK_MODELS"
+CAPACITY_TTL_SECONDS = 1.0  # LiteLLM scrapes engine metrics once a second
+CAPACITY_TIMEOUT_SECONDS = 0.5
+# A "ready" answer is a snapshot, not a lease: without a bound, every batch in
+# flight would land on the same fallback within one refresh.
+BATCHES_PER_READY_ENGINE = 4
+_CAPACITY_LOCK = threading.Lock()
+_CAPACITY = {}  # model -> [fetched_at, batches it may still take]
 _SYSTEM = """Score each passage's relevance to the document search query from 0 to 1.
 0 means irrelevant, 0.5 partial evidence, 1 direct evidence answering the query.
 Use one decimal place at most; choose from 0, 0.1, 0.2, ..., 1.
@@ -77,6 +89,23 @@ def _unique_object(pairs):
 def _normalize(values):
     low, high = min(values), max(values)
     return [(value - low) / (high - low) for value in values] if high > low else [1.0] * len(values)
+
+
+def rerank_models():
+    models = tuple(m.strip() for m in os.getenv(RERANK_MODELS_ENV, "").split(",") if m.strip())
+    return models or ("qwen-bulk",)
+
+
+def _take_capacity(model, now):
+    """Spend one batch of a fresh ready answer; None when it must be refetched."""
+    with _CAPACITY_LOCK:
+        entry = _CAPACITY.get(model)
+        if entry is None or now - entry[0] >= CAPACITY_TTL_SECONDS:
+            return None
+        if entry[1] <= 0:
+            return False
+        entry[1] -= 1
+        return True
 
 
 def _request_seconds(passages):
@@ -188,6 +217,39 @@ class QwenBulkReranker(Reranker):
             await asyncio.sleep(0.01)
         parent.cancel()
 
+    async def _choose_model(self, client, tokens):
+        """First group LiteLLM says can start this batch now, else the first."""
+        models = rerank_models()
+        if len(models) == 1:
+            return models[0]
+        for model in models:
+            if await self._has_capacity(client, model, tokens):
+                return model
+        return models[0]
+
+    async def _has_capacity(self, client, model, tokens):
+        now = time.monotonic()
+        taken = _take_capacity(model, now)
+        if taken is None:
+            batches = await self._ready_batches(client, model, tokens)
+            with _CAPACITY_LOCK:
+                _CAPACITY[model] = [now, batches]
+            taken = _take_capacity(model, now)
+        return taken
+
+    async def _ready_batches(self, client, model, tokens):
+        try:
+            response = await client.post(
+                f"{self.base_url}/inference/capacity",
+                json={"model": model, "workload_class": "live", "request_tokens": tokens},
+                timeout=CAPACITY_TIMEOUT_SECONDS,
+            )
+            answer = response.json() if response.status_code == 200 else {}
+        except (httpx.HTTPError, ValueError):
+            return 0
+        ready = answer.get("engines_ready") if answer.get("admit_now") is True else 0
+        return ready * BATCHES_PER_READY_ENGINE if isinstance(ready, int) and ready > 0 else 0
+
     def _payload(self, query, documents, ids, budget):
         schema = {
             "type": "object", "properties": {"scores": {
@@ -250,6 +312,9 @@ class QwenBulkReranker(Reranker):
                             heapq.heappop(_WAITING)
                 if not acquired:
                     await asyncio.sleep(0.01)
+            payload["model"] = await self._choose_model(client, budget)
+            if payload["model"] != rerank_models()[0]:
+                logger.info("Qwen bulk reranker batch routed to %s", payload["model"])
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Qwen bulk reranker deadline exhausted")
