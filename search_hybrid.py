@@ -465,8 +465,13 @@ class DeepInfraReranker(Reranker):
         return ranked
 
 
-def build_reranker(config: dict) -> Reranker | None:
+def build_reranker(config: dict, *, background: bool = False) -> Reranker | None:
     """Factory: build a Reranker from the search.reranker config section.
+
+    background=True is for scheduled callers that would rather wait than get
+    cosine-fallback scores: qwen-bulk then waits up to 180 s at a priority
+    below live searches. The configured timeout only bounds live searches.
+    DeepInfra ignores it.
 
     Config example:
         search:
@@ -484,17 +489,22 @@ def build_reranker(config: dict) -> Reranker | None:
     provider = os.getenv("DOC_ORGANIZER_RERANKER_PROVIDER") or reranker_cfg.get("provider", "qwen-bulk")
 
     if provider == "qwen-bulk":
-        from providers.rerank.qwen_bulk import TIMEOUT_SECONDS, QwenBulkReranker
+        from providers.rerank.qwen_bulk import BACKGROUND_TIMEOUT_SECONDS, TIMEOUT_SECONDS, QwenBulkReranker
 
+        if background:
+            timeout = BACKGROUND_TIMEOUT_SECONDS
+        elif "DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS" in os.environ:
+            timeout = float(os.environ["DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS"])
+        else:
+            timeout = reranker_cfg.get("timeout", TIMEOUT_SECONDS)
         return QwenBulkReranker(
             # An env override migrating a paid-provider config must not reuse
             # that provider's credential for the gateway.
             api_key=(reranker_cfg.get("api_key")
                      if reranker_cfg.get("provider", "qwen-bulk") == "qwen-bulk" else None),
-            timeout=(float(os.environ["DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS"])
-                     if "DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS" in os.environ
-                     else reranker_cfg.get("timeout", TIMEOUT_SECONDS)),
+            timeout=timeout,
             base_url=reranker_cfg.get("base_url"),
+            background=background,
         )
     elif provider == "deepinfra":
         return DeepInfraReranker(

@@ -35,3 +35,23 @@ async def test_qwen_search_failure_and_recovery(indexed_corpus, mcp_session, fau
     })
     assert recovered["diagnostics"]["reranker_applied"] is True
     assert recovered["diagnostics"]["degraded"] is False
+
+
+async def test_background_search_waits_out_a_slow_reranker(indexed_corpus, mcp_session):
+    # A scheduled caller refuses degraded scores (the comms review failed for
+    # days on 30 s cosine fallbacks). The same 32 s stall that degrades a live
+    # search above must still rerank a background one.
+    async with httpx.AsyncClient() as sim:
+        response = await sim.post(f"{E2E_SIM_URL}/admin/fault", json={
+            "route_prefix": "/v1/chat/completions", "fault": "timeout", "times": 1, "seconds": 32,
+        })
+        assert response.status_code == 200
+    began = time.monotonic()
+    result = await mcp_session.call_tool_json("file_search", {
+        "query": NOTE_PHRASE, "top_k": 5, "include_diagnostics": True, "background": True,
+    })
+    assert 32 <= time.monotonic() - began < 60
+    assert not result.get("error"), result
+    assert result["results"]
+    assert result["diagnostics"]["reranker_applied"] is True
+    assert result["diagnostics"]["degraded"] is False

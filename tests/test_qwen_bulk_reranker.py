@@ -483,3 +483,75 @@ def test_learned_request_time_never_sheds_a_smaller_request(monkeypatch):
     install(monkeypatch, answer)
     assert len(scorer().rerank("query", hits(32))) == 32
     assert len(scorer(timeout=.2).rerank("test", hits(1))) == 1
+
+
+def test_background_budget_and_priority_reach_gateway_without_changing_live(monkeypatch):
+    # The scheduled comms review refused 30 s cosine-fallback scores and failed
+    # for days while qwen-bulk was busy. Only a background caller waits longer.
+    sent = []
+
+    async def answer(url, payload):
+        sent.append((payload["priority"], payload["metadata"]["inference_deadline_seconds"]))
+        return response(payload)
+
+    install(monkeypatch, answer)
+    scorer().rerank("query", hits())
+    scorer(timeout=999).rerank("query", hits())
+    scorer(background=True, timeout=999).rerank("query", hits())
+    scorer(background=True, timeout=.5).rerank("query", hits())
+    (live, live_ceiling, background, short) = sent
+    assert live[0] == live_ceiling[0] == qwen.LIVE_PRIORITY == 0
+    assert 29 < live[1] <= 30 and 29 < live_ceiling[1] <= 30
+    assert background[0] == short[0] == qwen.BACKGROUND_PRIORITY
+    assert qwen.LIVE_PRIORITY < qwen.BACKGROUND_PRIORITY < 10  # gateway bulk lanes send 10
+    assert 179 < background[1] <= 180
+    assert 0 < short[1] <= .5
+
+
+def test_factory_background_ignores_live_timeout_override(monkeypatch):
+    monkeypatch.setenv("LITELLM_API_KEY", "local-test-key")
+    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_PROVIDER", "qwen-bulk")
+    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS", "30")
+    config = {"search": {"reranker": {"enabled": True, "provider": "deepinfra", "timeout": 10,
+                                       "api_key": "paid-test-key"}}}
+    live = build_reranker(config)
+    background = build_reranker(config, background=True)
+    assert (live.timeout, live.priority) == (30, qwen.LIVE_PRIORITY)
+    assert (background.timeout, background.priority) == (180, qwen.BACKGROUND_PRIORITY)
+    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_PROVIDER", "deepinfra")
+    assert build_reranker(config, background=True).timeout == 10
+
+
+def test_queued_live_search_takes_a_freed_slot_before_an_earlier_background_one(monkeypatch):
+    order = []
+
+    async def answer(url, payload):
+        order.append(payload["priority"])
+        return response(payload)
+    install(monkeypatch, answer)
+    outcomes = {}
+
+    def search(name, **kwargs):
+        try:
+            scorer(**kwargs).rerank("query", hits())
+            outcomes[name] = "reranked"
+        except RuntimeError:
+            outcomes[name] = "degraded"
+
+    background = threading.Thread(target=search, args=("background",), kwargs={"background": True})
+    live = threading.Thread(target=search, args=("live",), kwargs={"timeout": 2})
+    qwen._SLOTS.acquire()
+    qwen._SLOTS.acquire()
+    try:
+        background.start()
+        time.sleep(.05)
+        live.start()
+        time.sleep(.05)
+    finally:
+        qwen._SLOTS.release()
+        time.sleep(.2)
+        qwen._SLOTS.release()
+    background.join()
+    live.join()
+    assert outcomes == {"background": "reranked", "live": "reranked"}
+    assert order == [qwen.LIVE_PRIORITY, qwen.BACKGROUND_PRIORITY]

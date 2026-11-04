@@ -42,6 +42,13 @@ BATCH_SIZE = 32
 PROMPT_TOKEN_BUDGET = 16_000
 QUERY_CHARS = 2000
 TIMEOUT_SECONDS = 30.0
+# A scheduled job (the comms review) can wait out a busy lane: at 30 s its
+# searches degraded and the review refused cosine scores, failing for days.
+# Its later deadline already queues it behind live searches here; the lower
+# vLLM priority keeps it behind them at the engine, ahead of priority-10 bulk.
+BACKGROUND_TIMEOUT_SECONDS = 180.0
+LIVE_PRIORITY = 0
+BACKGROUND_PRIORITY = 5
 _SYSTEM = """Score each passage's relevance to the document search query from 0 to 1.
 0 means irrelevant, 0.5 partial evidence, 1 direct evidence answering the query.
 Use one decimal place at most; choose from 0, 0.1, 0.2, ..., 1.
@@ -86,10 +93,11 @@ class QwenBulkReranker(Reranker):
 
     model = "qwen-bulk"
 
-    def __init__(self, api_key=None, base_url=None, timeout=TIMEOUT_SECONDS):
+    def __init__(self, api_key=None, base_url=None, timeout=TIMEOUT_SECONDS, *, background=False):
         if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Reranker timeout must be positive and finite")
-        self.timeout = min(timeout, TIMEOUT_SECONDS)
+        self.timeout = min(timeout, BACKGROUND_TIMEOUT_SECONDS if background else TIMEOUT_SECONDS)
+        self.priority = BACKGROUND_PRIORITY if background else LIVE_PRIORITY
         self.api_key = api_key or os.getenv("LITELLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY", "")
         self.base_url = (os.getenv("LITELLM_BASE_URL") or base_url
                          or "http://host.docker.internal:4000/v1").rstrip("/")
@@ -186,7 +194,7 @@ class QwenBulkReranker(Reranker):
 
         def body(limit):
             return {
-                "model": self.model, "priority": 0,
+                "model": self.model, "priority": self.priority,
                 "messages": [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": json.dumps({
                     "query": query, "passages": [{"id": docid, "text": text[:limit]}
                                                 for docid, text in zip(ids, documents, strict=True)],

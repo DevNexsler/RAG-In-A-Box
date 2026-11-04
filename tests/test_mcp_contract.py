@@ -272,6 +272,28 @@ async def test_file_search_dispatch_maps_topk_aliases():
     assert mock.call_args.kwargs["top_k"] == 5
 
 
+@pytest.mark.anyio
+async def test_file_search_background_reaches_reranker_and_defaults_to_live():
+    """background=True selects the scheduled-caller rerank budget; omitted or
+    false keeps the live budget for interactive searches."""
+    if not mcp_server.HAS_MCP:
+        pytest.skip("mcp package not installed")
+
+    tools = await mcp_server.mcp.list_tools()
+    props = next(tool for tool in tools if tool.name == "file_search").inputSchema["properties"]
+    assert props["background"]["default"] is False
+
+    fake_result = MagicMock()
+    fake_result.hits = []
+    fake_result.diagnostics = {}
+    for args, expected in (({}, False), ({"background": False}, False), ({"background": True}, True)):
+        with patch("mcp_server._get_deps", return_value=(MagicMock(), MagicMock(), {})), \
+             patch("mcp_server.build_reranker", return_value=None) as factory, \
+             patch("mcp_server.hybrid_search", return_value=fake_result):
+            await mcp_server.mcp.call_tool("file_search", {"query": "x", **args})
+        assert factory.call_args.kwargs == {"background": expected}, args
+
+
 def _comm_hit(**extra):
     meta = {
         "sender": "Lee Donnelly",
