@@ -715,3 +715,24 @@ def test_a_slow_capacity_answer_is_bounded_as_a_whole(pools, monkeypatch):
     assert len(scorer().rerank("query", hits(3))) == 3
     assert sent == ["qwen-bulk"]
     assert time.monotonic() - began < .5, "two groups, each bounded at 0.05 s"
+
+
+@pytest.mark.parametrize(("available", "expected"), [
+    (1, ["ds-flash-local", "qwen-bulk", "qwen-bulk"]),
+    (0, ["qwen-bulk"] * 3),
+])
+def test_available_requests_bounds_the_batches_a_group_takes(pools, monkeypatch, available, expected):
+    # LiteLLM's per-engine live limit, when present, replaces the flat
+    # BATCHES_PER_READY_ENGINE allowance.
+    sent = []
+    async def answer(url, payload):
+        if url.endswith("/inference/capacity"):
+            await asyncio.sleep(.01)
+            body = ({"admit_now": False} if payload["model"] == "qwen-bulk" else
+                    {"admit_now": available > 0, "engines_ready": 1, "available_requests": available})
+            return httpx.Response(200, json=body, request=httpx.Request("POST", url))
+        sent.append(payload["model"])
+        return response(payload)
+    install(monkeypatch, answer)
+    scorer().rerank("query", hits(32 * 3))
+    assert sorted(sent) == sorted(expected)
