@@ -57,6 +57,9 @@ services:
       # Set deepinfra explicitly only when paid reranking is intended.
       - DOC_ORGANIZER_RERANKER_PROVIDER=${DOC_ORGANIZER_RERANKER_PROVIDER:-qwen-bulk}
       - DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS=${DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS:-30}
+      # Rerank batches take the first group LiteLLM reports ready, else the
+      # first. Set to qwen-bulk alone to turn the local DeepSeek fallback off.
+      - DOC_ORGANIZER_RERANK_MODELS=${DOC_ORGANIZER_RERANK_MODELS:-qwen-bulk,ds-flash-local}
       - API_KEY=${API_KEY}
       - COMM_DATA_STORE_DSN=${COMM_DATA_STORE_DSN}
       - COMM_DATA_STORE_HOOK_SECRET=${COMM_DATA_STORE_HOOK_SECRET}

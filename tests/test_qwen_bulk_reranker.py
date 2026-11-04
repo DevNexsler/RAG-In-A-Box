@@ -59,6 +59,7 @@ def test_default_and_compose_migrate_legacy_provider(monkeypatch):
     env = yaml.safe_load(Path("docker-compose.yml").read_text())["services"]["doc-organizer"]["environment"]
     assert "DOC_ORGANIZER_RERANKER_PROVIDER=${DOC_ORGANIZER_RERANKER_PROVIDER:-qwen-bulk}" in env
     assert "LITELLM_BASE_URL=${LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}" in env
+    assert "DOC_ORGANIZER_RERANK_MODELS=${DOC_ORGANIZER_RERANK_MODELS:-qwen-bulk,ds-flash-local}" in env
 
 
 def test_gateway_credentials_precedence_and_no_paid_fallback(monkeypatch):
@@ -583,3 +584,68 @@ def test_queued_live_search_takes_a_freed_slot_before_an_earlier_background_one(
     live.join()
     assert outcomes == {"background": "reranked", "live": "reranked"}
     assert order == [qwen.LIVE_PRIORITY, qwen.BACKGROUND_PRIORITY]
+
+
+@pytest.fixture
+def pools(monkeypatch):
+    monkeypatch.setenv(qwen.RERANK_MODELS_ENV, "qwen-bulk,ds-flash-local")
+    monkeypatch.setattr(qwen, "_CAPACITY", {})
+
+
+def capacity_gateway(monkeypatch, ready, *, status=200, sent=None, asked=None):
+    """Fake LiteLLM: `ready` maps model -> engines ready now (0 means busy)."""
+    async def answer(url, payload):
+        if url.endswith("/inference/capacity"):
+            if asked is not None:
+                asked.append(payload)
+            engines = ready.get(payload["model"], 0)
+            return httpx.Response(status, json={
+                "schema_version": 1, "workload_class": "live", "model": payload["model"],
+                "admit_now": engines > 0, "engines_ready": engines,
+            }, request=httpx.Request("POST", url))
+        if sent is not None:
+            sent.append(payload["model"])
+        return response(payload)
+    install(monkeypatch, answer)
+
+
+def test_single_model_never_asks_for_capacity(monkeypatch):
+    monkeypatch.delenv(qwen.RERANK_MODELS_ENV, raising=False)
+    asked, sent = [], []
+    capacity_gateway(monkeypatch, {}, sent=sent, asked=asked)
+    scorer().rerank("query", hits(3))
+    assert (asked, sent) == ([], ["qwen-bulk"])
+
+
+@pytest.mark.parametrize(("ready", "expected"), [
+    ({"qwen-bulk": 3, "ds-flash-local": 1}, "qwen-bulk"),
+    ({"qwen-bulk": 0, "ds-flash-local": 1}, "ds-flash-local"),
+    # Nothing can start it now: queue on the first group, as before.
+    ({}, "qwen-bulk"),
+])
+def test_batch_goes_to_the_first_group_that_can_start_it(pools, monkeypatch, ready, expected):
+    asked, sent = [], []
+    capacity_gateway(monkeypatch, ready, sent=sent, asked=asked)
+    scorer().rerank("query", hits(3))
+    assert sent == [expected]
+    assert {(a["workload_class"], a["request_tokens"] > 0) for a in asked} == {("live", True)}
+
+
+@pytest.mark.parametrize("status", [503, 500])
+def test_unavailable_signal_keeps_todays_routing_and_is_cached(pools, monkeypatch, status):
+    asked, sent = [], []
+    capacity_gateway(monkeypatch, {"ds-flash-local": 1}, status=status, sent=sent, asked=asked)
+    for _ in range(3):
+        scorer().rerank("query", hits(3))
+    assert sent == ["qwen-bulk"] * 3
+    assert len(asked) == 2, "one refresh per group per second, not one per batch"
+
+
+def test_a_ready_answer_admits_a_bounded_number_of_batches(pools, monkeypatch):
+    # One ready engine takes BATCHES_PER_READY_ENGINE batches per refresh; the
+    # rest of a burst falls back instead of all landing on that one engine.
+    monkeypatch.setattr(qwen, "BATCHES_PER_READY_ENGINE", 1)
+    sent = []
+    capacity_gateway(monkeypatch, {"qwen-bulk": 1, "ds-flash-local": 1}, sent=sent)
+    scorer().rerank("query", hits(32 * 3))
+    assert sorted(sent) == ["ds-flash-local", "qwen-bulk", "qwen-bulk"]
