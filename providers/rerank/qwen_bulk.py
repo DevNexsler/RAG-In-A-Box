@@ -66,6 +66,7 @@ CAPACITY_TIMEOUT_SECONDS = 0.5
 BATCHES_PER_READY_ENGINE = 4
 _CAPACITY_LOCK = threading.Lock()
 _CAPACITY = {}  # model -> [fetched_at, batches it may still take]
+_REFRESHING = set()  # models whose answer one batch is refetching now
 _SYSTEM = """Score each passage's relevance to the document search query from 0 to 1.
 0 means irrelevant, 0.5 partial evidence, 1 direct evidence answering the query.
 Use one decimal place at most; choose from 0, 0.1, 0.2, ..., 1.
@@ -97,15 +98,21 @@ def rerank_models():
 
 
 def _take_capacity(model, now):
-    """Spend one batch of a fresh ready answer; None when it must be refetched."""
-    with _CAPACITY_LOCK:
-        entry = _CAPACITY.get(model)
-        if entry is None or now - entry[0] >= CAPACITY_TTL_SECONDS:
-            return None
-        if entry[1] <= 0:
-            return False
-        entry[1] -= 1
-        return True
+    """Spend one batch of a fresh ready answer.
+
+    None means the caller must refetch it; "wait" means another batch already
+    is. Call with _CAPACITY_LOCK held.
+    """
+    entry = _CAPACITY.get(model)
+    if entry is None or now - entry[0] >= CAPACITY_TTL_SECONDS:
+        if model in _REFRESHING:
+            return "wait"
+        _REFRESHING.add(model)
+        return None
+    if entry[1] <= 0:
+        return False
+    entry[1] -= 1
+    return True
 
 
 def _request_seconds(passages):
@@ -228,27 +235,43 @@ class QwenBulkReranker(Reranker):
         return models[0]
 
     async def _has_capacity(self, client, model, tokens):
-        now = time.monotonic()
-        taken = _take_capacity(model, now)
-        if taken is None:
-            batches = await self._ready_batches(client, model, tokens)
+        # Batches of every search share one refresh per model: if each
+        # refetched, each would reset the credits and the bound would not hold.
+        waited_until = time.monotonic() + 2 * CAPACITY_TIMEOUT_SECONDS
+        while True:
             with _CAPACITY_LOCK:
-                _CAPACITY[model] = [now, batches]
-            taken = _take_capacity(model, now)
-        return taken
+                taken = _take_capacity(model, time.monotonic())
+            if taken is None:
+                batches = 0
+                try:
+                    batches = await self._ready_batches(client, model, tokens)
+                finally:
+                    with _CAPACITY_LOCK:
+                        _CAPACITY[model] = [time.monotonic(), batches]
+                        _REFRESHING.discard(model)
+            elif taken == "wait":
+                if time.monotonic() >= waited_until:
+                    return False
+                await asyncio.sleep(0.01)
+            else:
+                return taken
 
     async def _ready_batches(self, client, model, tokens):
         try:
-            response = await client.post(
-                f"{self.base_url}/inference/capacity",
-                json={"model": model, "workload_class": "live", "request_tokens": tokens},
-                timeout=CAPACITY_TIMEOUT_SECONDS,
-            )
+            # One bound for the whole call; httpx applies its timeout per phase.
+            async with asyncio.timeout(CAPACITY_TIMEOUT_SECONDS):
+                response = await client.post(
+                    f"{self.base_url}/inference/capacity",
+                    json={"model": model, "workload_class": "live", "request_tokens": tokens},
+                    timeout=CAPACITY_TIMEOUT_SECONDS,
+                )
             answer = response.json() if response.status_code == 200 else {}
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError, TimeoutError):
             return 0
-        ready = answer.get("engines_ready") if answer.get("admit_now") is True else 0
-        return ready * BATCHES_PER_READY_ENGINE if isinstance(ready, int) and ready > 0 else 0
+        if not isinstance(answer, dict) or answer.get("admit_now") is not True:
+            return 0
+        ready = answer.get("engines_ready")
+        return ready * BATCHES_PER_READY_ENGINE if type(ready) is int and ready > 0 else 0
 
     def _payload(self, query, documents, ids, budget):
         schema = {

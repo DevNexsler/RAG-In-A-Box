@@ -590,15 +590,22 @@ def test_queued_live_search_takes_a_freed_slot_before_an_earlier_background_one(
 def pools(monkeypatch):
     monkeypatch.setenv(qwen.RERANK_MODELS_ENV, "qwen-bulk,ds-flash-local")
     monkeypatch.setattr(qwen, "_CAPACITY", {})
+    monkeypatch.setattr(qwen, "_REFRESHING", set())
 
 
-def capacity_gateway(monkeypatch, ready, *, status=200, sent=None, asked=None):
-    """Fake LiteLLM: `ready` maps model -> engines ready now (0 means busy)."""
+def capacity_gateway(monkeypatch, ready, *, status=200, sent=None, asked=None, body=None):
+    """Fake LiteLLM: `ready` maps model -> engines ready now (0 means busy).
+
+    Capacity calls yield like a network round-trip, so concurrent batches overlap.
+    """
     async def answer(url, payload):
         if url.endswith("/inference/capacity"):
+            await asyncio.sleep(.01)
             if asked is not None:
                 asked.append(payload)
             engines = ready.get(payload["model"], 0)
+            if body is not None:
+                return httpx.Response(status, content=body, request=httpx.Request("POST", url))
             return httpx.Response(status, json={
                 "schema_version": 1, "workload_class": "live", "model": payload["model"],
                 "admit_now": engines > 0, "engines_ready": engines,
@@ -670,3 +677,41 @@ def test_fallback_batches_never_carry_a_router_priority(pools, monkeypatch, back
     sent.clear()
     scorer(background=background).rerank("query", hits(3))
     assert sent == [("qwen-bulk", qwen.BACKGROUND_PRIORITY if background else qwen.LIVE_PRIORITY)]
+
+
+def test_concurrent_batches_share_one_refresh_and_its_bound(pools, monkeypatch):
+    # Three batches of one search start together: each refetching would reset
+    # the credits, so all three would take the first group.
+    monkeypatch.setattr(qwen, "BATCHES_PER_READY_ENGINE", 1)
+    asked, sent = [], []
+    capacity_gateway(monkeypatch, {"qwen-bulk": 1, "ds-flash-local": 1}, sent=sent, asked=asked)
+    scorer().rerank("query", hits(32 * 3))
+    assert sorted(sent) == ["ds-flash-local", "qwen-bulk", "qwen-bulk"]
+    assert sorted(a["model"] for a in asked) == ["ds-flash-local", "qwen-bulk"]
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b'"ok"', b'{"admit_now": true, "engines_ready": true}',
+                                  b'{"admit_now": "yes", "engines_ready": 2}'])
+def test_malformed_capacity_answers_keep_todays_routing(pools, monkeypatch, body):
+    sent = []
+    capacity_gateway(monkeypatch, {}, sent=sent, body=body)
+    assert len(scorer().rerank("query", hits(3))) == 3, "a bad signal must never degrade the search"
+    assert sent == ["qwen-bulk"]
+
+
+def test_a_slow_capacity_answer_is_bounded_as_a_whole(pools, monkeypatch):
+    monkeypatch.setattr(qwen, "CAPACITY_TIMEOUT_SECONDS", .05)
+    sent = []
+
+    async def answer(url, payload):
+        if url.endswith("/inference/capacity"):
+            await asyncio.sleep(1)
+            return httpx.Response(200, json={"admit_now": True, "engines_ready": 1},
+                                  request=httpx.Request("POST", url))
+        sent.append(payload["model"])
+        return response(payload)
+    install(monkeypatch, answer)
+    began = time.monotonic()
+    assert len(scorer().rerank("query", hits(3))) == 3
+    assert sent == ["qwen-bulk"]
+    assert time.monotonic() - began < .5, "two groups, each bounded at 0.05 s"
