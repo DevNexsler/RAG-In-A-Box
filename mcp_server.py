@@ -1766,6 +1766,7 @@ def _file_search_impl(
     sort: str | None = None,
     include_diagnostics: bool = True,
     exact_identifier: bool = False,
+    background: bool = False,
 ) -> dict:
     # Validate
     if not query or not query.strip():
@@ -1887,7 +1888,7 @@ def _file_search_impl(
         # belong to the query), recency does the ordering. Widen the pool so
         # the newest hits aren't lost below the relevance cutoff, and skip the
         # reranker — its micro-ordering is discarded by the recency sort.
-        reranker = None if recent_sort or exact_identifier else build_reranker(config)
+        reranker = None if recent_sort or exact_identifier else build_reranker(config, background=background)
         pool_top_k = max(_RECENT_SORT_POOL, top_k) if recent_sort else top_k
 
         if exact_identifier:
@@ -3257,7 +3258,7 @@ if HAS_MCP and FastMCP is not None:
     # automatically via OTEL context propagation (asyncio.to_thread copies the
     # calling context, so the span survives the hop). Spans are no-ops unless
     # setup_tracing() ran with tracing.enabled: true.
-    _TOOL_SPAN_ARG_ALLOWLIST = ("top_k", "doc_id", "source", "source_name", "return_mode")
+    _TOOL_SPAN_ARG_ALLOWLIST = ("top_k", "doc_id", "source", "source_name", "return_mode", "background")
     _mcp_tracer = get_tracer("mcp")
 
     def _with_tool_span(fn, tool_name=None):
@@ -3354,6 +3355,7 @@ if HAS_MCP and FastMCP is not None:
         order_by: str | None = None,
         include_diagnostics: bool = False,
         exact_identifier: bool = False,
+        background: bool = False,
         k: int | None = None,
         n: int | None = None,
         max_results: int | None = None,
@@ -3389,6 +3391,10 @@ if HAS_MCP and FastMCP is not None:
                 writing), ranked by keyword score. No vector neighbours, no
                 recency boost, no re-rank; an empty result means no document
                 holds it. The response says "exact_identifier": true.
+            background: If true, the caller is a scheduled job that would
+                rather wait than get degraded results: re-ranking may wait
+                up to 180 s (live searches: 30 s) at a priority below live
+                searches. Leave false for interactive use.
             doc_id_prefix: Filter to docs under this vault-relative path prefix
                 (e.g., "Projects/" to search only the Projects folder).
                 Filters on rel_path (the vault-relative file path), not doc_id
@@ -3493,6 +3499,7 @@ if HAS_MCP and FastMCP is not None:
             sort=sort if sort is not None else order_by,
             include_diagnostics=include_diagnostics,
             exact_identifier=exact_identifier,
+            background=background,
         )
 
     @mcp.tool()
