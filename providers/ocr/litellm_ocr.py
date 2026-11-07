@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import math
 import threading
 from pathlib import Path
 from typing import Optional
@@ -25,6 +26,16 @@ _DESCRIBE_PROMPT = "Describe this image in detail for document search."
 # median image tokens. The 2026-10-16 sideways-receipt misread was LiteLLM's
 # orientation hook turning the photo the wrong way, not this cap.
 _DESCRIBE_MAX_EDGE = 1024
+
+# The `ocr` alias falls back to `ocr-cloud`, which refuses an image needing more
+# than 30000 patches of 32x32 px, identically on every retry. A 200-dpi render
+# of a phone-scanned PDF page (stored at 72 dpi, so 25x33 in) needs more:
+# #4514's pages needed 32085-44772 and were never OCR'd while the local hops
+# were down, while the 29492-patch page of the same PDF was read. The alias can
+# only accept what its narrowest hop does, so extract keeps full resolution up
+# to that budget and shrinks past it.
+_EXTRACT_PATCH_EDGE = 32
+_EXTRACT_MAX_PATCHES = 30000
 
 
 def _image_encoder(path: Path, prompt: str) -> list:
@@ -66,6 +77,51 @@ def _downscaled_describe_encoder(path: Path, prompt: str) -> list:
         return _image_encoder(path, prompt)
 
 
+def _extract_encoder(path: Path, prompt: str) -> list:
+    """Encode an image for the OCR EXTRACT call: unchanged when it fits the
+    `ocr` route's patch budget, otherwise shrunk just enough to fit it. Sent
+    unchanged too if the file is not a decodable image."""
+    from PIL import Image, ImageOps
+
+    path = Path(path)
+    try:
+        with Image.open(path) as img:
+            columns = math.ceil(img.width / _EXTRACT_PATCH_EDGE)
+            rows = math.ceil(img.height / _EXTRACT_PATCH_EDGE)
+            if columns * rows <= _EXTRACT_MAX_PATCHES:
+                img = None
+            else:
+                # Re-encoding drops the EXIF orientation tag (see describe).
+                img = ImageOps.exif_transpose(img).convert("RGB")
+    except (OSError, Image.DecompressionBombError) as exc:
+        logger.debug("extract patch fit skipped for %s (%s); sending as-is", path, exc)
+        img = None
+    if img is None:
+        return _image_encoder(path, prompt)
+
+    # The largest patch grid of the image's shape inside the budget, then the
+    # scale that fits the image into that grid.
+    width, height = img.size
+    grid_scale = math.sqrt(
+        _EXTRACT_MAX_PATCHES * _EXTRACT_PATCH_EDGE**2 / (width * height)
+    )
+    scale = min(
+        math.floor(width * grid_scale / _EXTRACT_PATCH_EDGE) * _EXTRACT_PATCH_EDGE / width,
+        math.floor(height * grid_scale / _EXTRACT_PATCH_EDGE) * _EXTRACT_PATCH_EDGE / height,
+    )
+    img = img.resize(
+        (max(1, math.floor(width * scale)), max(1, math.floor(height * scale))),
+        Image.LANCZOS,
+    )
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+    ]
+
+
 class LiteLLMOCR(OCRProvider):
     def __init__(
         self,
@@ -93,7 +149,7 @@ class LiteLLMOCR(OCRProvider):
             self.endpoint,
             extract_model,
             _EXTRACT_PROMPT,
-            _image_encoder,
+            _extract_encoder,
             api_key=api_key,
             timeout=timeout,
         )

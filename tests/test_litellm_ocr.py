@@ -1,9 +1,12 @@
+import base64
+import io
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
+from PIL import Image
 
 from core.resilience import is_transient
 from providers.ocr import build_ocr_provider
@@ -87,6 +90,70 @@ def test_extract_uses_jpeg_mime_for_jpg(monkeypatch, tmp_path):
     assert content[1]["image_url"]["url"] == (
         "data:image/jpeg;base64,aW1hZ2U="
     )
+
+
+def _ocr_cloud_patches(width: int, height: int) -> int:
+    """Patches `ocr-cloud` counts for an image: 32x32 px tiles, partial tiles
+    included. Matched the counts in its 400s exactly (#4514)."""
+    return -(-width // 32) * -(-height // 32)
+
+
+def _posted_image(captured) -> tuple[str, bytes]:
+    url = captured["json"]["messages"][0]["content"][1]["image_url"]["url"]
+    header, encoded = url.split(",", 1)
+    return header, base64.b64decode(encoded)
+
+
+def test_extract_shrinks_a_page_over_the_ocr_cloud_patch_budget(
+    monkeypatch, tmp_path
+):
+    """#4514: a phone-scanned PDF page (1755x2443 pt at 72 dpi) renders at 200
+    dpi to 4875x6787 px = 32589 patches, which `ocr-cloud` refuses (limit
+    30000) on every retry, so the page was never OCR'd while the local hops
+    were down. The page sent must fit the alias's narrowest hop."""
+    page = tmp_path / "page.png"
+    Image.new("RGB", (4875, 6787), "white").save(page)
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return _response(url, "page text")
+
+    monkeypatch.setattr(
+        "providers.fallback.litellm_fallback.httpx.post", fake_post
+    )
+    provider = LiteLLMOCR("http://lite/v1", "ocr", "vision", api_key="k")
+
+    assert provider.extract(page) == "page text"
+    header, data = _posted_image(captured)
+    assert header == "data:image/png;base64"
+    sent = Image.open(io.BytesIO(data))
+    assert _ocr_cloud_patches(*sent.size) <= 30000
+    # Shrunk only as far as the budget needs, aspect ratio kept.
+    assert _ocr_cloud_patches(*sent.size) > 29000
+    assert abs(sent.width / sent.height - 4875 / 6787) < 0.01
+
+
+def test_extract_sends_a_page_within_the_budget_byte_for_byte(
+    monkeypatch, tmp_path
+):
+    """Page 1 of the same PDF (4645x6439 px, 29492 patches) was read fine;
+    a page that fits keeps its full resolution and its exact bytes."""
+    page = tmp_path / "page.png"
+    Image.new("RGB", (4645, 6439), "white").save(page)
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return _response(url, "text")
+
+    monkeypatch.setattr(
+        "providers.fallback.litellm_fallback.httpx.post", fake_post
+    )
+    provider = LiteLLMOCR("http://lite/v1", "ocr", "vision", api_key="k")
+
+    assert provider.extract(page) == "text"
+    assert _posted_image(captured) == ("data:image/png;base64", page.read_bytes())
 
 
 def test_describe_routes_to_vision_alias(monkeypatch, tmp_path):
