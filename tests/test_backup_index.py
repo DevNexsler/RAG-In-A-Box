@@ -3,7 +3,8 @@
 Only the docker CLI is replaced. The fake daemon holds the one image the
 production container runs (releases tag it doc-organizer:main-<sha>; no
 :latest exists) and, like the real daemon, refuses to run any other image.
-The real backup_index.sh, gzip check, publish step and retention run as-is.
+The real backup_index.sh, its in-container script, gzip check, publish step and
+retention run as-is; tar and chown inside that script are stand-ins.
 """
 import json
 import os
@@ -15,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEPLOYED_IMAGE = "sha256:" + "2b" * 32
 
 FAKE_DOCKER = f"""#!{sys.executable}
-import io, json, os, sys, tarfile
+import json, os, subprocess, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_DOCKER_LOG"], "a") as log:
     log.write(json.dumps(args) + "\\n")
@@ -41,21 +42,33 @@ elif args[0] == "run":
         sys.stderr.write(f"Unable to find image '{{image}}' locally\\n")
         sys.exit(125)
     partial = rest[-3].replace("/backup", mounts["/backup"], 1)
-    with tarfile.open(partial, "w:gz") as archive:
-        member = tarfile.TarInfo("./record")
-        member.size = 8
-        archive.addfile(member, io.BytesIO(b"fixture\\n"))
+    sys.exit(subprocess.run(["sh", "-c", rest[2], "sh", partial, *rest[-2:]]).returncode)
 else:
     sys.exit("unexpected docker call: " + " ".join(args))
+"""
+
+
+FAKE_TAR = f"""#!{sys.executable}
+import io, os, sys, tarfile
+with tarfile.open(sys.argv[sys.argv.index("-czf") + 1], "w:gz") as archive:
+    member = tarfile.TarInfo("./record")
+    member.size = 8
+    archive.addfile(member, io.BytesIO(b"fixture\\n"))
+sys.exit(int(os.environ.get("FAKE_TAR_EXIT", "0")))
+"""
+
+FAKE_CHOWN = """#!/bin/sh
+[ -z "$FAKE_CHOWN_REFUSED" ] || { echo "chown: Operation not permitted" >&2; exit 1; }
 """
 
 
 def run_backup(tmp_path, **env_overrides):
     commands = tmp_path / "bin"
     commands.mkdir()
-    docker = commands / "docker"
-    docker.write_text(FAKE_DOCKER)
-    docker.chmod(0o755)
+    for name, body in (("docker", FAKE_DOCKER), ("tar", FAKE_TAR), ("chown", FAKE_CHOWN)):
+        command = commands / name
+        command.write_text(body)
+        command.chmod(0o755)
     backups = tmp_path / "backups"
     log = tmp_path / "docker.jsonl"
     env = {k: v for k, v in os.environ.items() if not k.startswith("DOC_BACKUP_")}
@@ -83,4 +96,18 @@ def test_backup_without_a_production_container_fails_before_writing(tmp_path):
     assert completed.returncode != 0
     assert "No such object: missing" in completed.stderr
     assert not [call for call in calls if call[0] == "run"]
+    assert not list(backups.glob("index-*"))
+
+
+def test_backup_survives_a_share_that_refuses_chown(tmp_path):
+    completed, _, backups = run_backup(tmp_path, FAKE_CHOWN_REFUSED="1")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "chown refused" in completed.stderr
+    assert len(list(backups.glob("index-*.tar.gz"))) == 1
+    assert not list(backups.glob("*.partial"))
+
+
+def test_backup_still_fails_when_tar_fails(tmp_path):
+    completed, _, backups = run_backup(tmp_path, FAKE_TAR_EXIT="2")
+    assert completed.returncode != 0
     assert not list(backups.glob("index-*"))
