@@ -69,7 +69,9 @@ docker run --rm --network none --entrypoint sh \
       --exclude="*.corrupt" --exclude="indexer.log*" .
     status=$?
     if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then exit "$status"; fi
-    chown "$2:$3" "$1"
+    # A squashing NFS export refuses chown and assigns its own owner; the
+    # gzip check below still proves the host can read the archive.
+    chown "$2:$3" "$1" || echo "backup: chown refused, keeping server-assigned owner" >&2
   ' sh "/backup/${PARTIAL}" "$(id -u)" "$(id -g)"
 
 gzip -t "${BACKUP_DIR}/${PARTIAL}"
