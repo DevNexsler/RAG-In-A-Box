@@ -4,7 +4,8 @@ Candidate remains unmerged and undeployed. See
 [candidate validation evidence](reranking-validation.md) for measured local latency.
 
 `search.reranker.provider` defaults to `qwen-bulk`, the existing local LiteLLM
-alias. Requests use top-level `priority: 0`, `temperature: 0`,
+alias (see [Model groups](#model-groups) for the deployed list). Requests use
+top-level `priority: 0` (5 for background searches), `temperature: 0`,
 `chat_template_kwargs: {enable_thinking: false}`, `num_retries: 0` and
 `disable_fallbacks: true`. The adapter never selects `qwen-fast` or another
 provider. LiteLLM must retain its local-only definition of `qwen-bulk`.
@@ -24,6 +25,31 @@ Outside compose, an explicit provider in YAML still applies. For a deliberate
 paid rollback, set `DOC_ORGANIZER_RERANKER_PROVIDER=deepinfra`, configure the
 legacy model/base URL and `DEEPINFRA_API_KEY`, and restart the service. There is
 no automatic paid fallback. Unknown providers fail configuration explicitly.
+
+## Model groups
+
+`DOC_ORGANIZER_RERANK_MODELS` lists LiteLLM model groups in preference order.
+Compose defaults it to `rerank-decision,qwen-bulk`; outside compose an unset
+value means `qwen-bulk` alone. For each batch the adapter asks
+`POST /v1/inference/capacity` (`workload_class: live`) and sends the batch to the
+first group that can start it now. When none can, or the signal is unavailable,
+the batch queues on the first group. There is no retry on another group after
+an error: a failed batch degrades the search to cosine as before.
+
+`rerank-decision` is a LiteLLM alias (LiteLLM-Setup PR #376). It takes this
+adapter's exact request and returns the same `{"scores": {...}}` completion. It
+scores on the KnowLine decision model, then falls back to `qwen-bulk` and then
+`ds-flash-local` inside LiteLLM, skipping a backend with no capacity. Its
+capacity answer covers that whole chain. `qwen-bulk` stays second so a batch
+can still go straight to it when the alias reports no capacity or its capacity
+check fails. Every group gets the batch's `priority` (0 live, 5 background);
+LiteLLM drops it itself for groups that its Router scheduler would queue.
+The calling key must be allowed to use `rerank-decision`.
+
+Rollback: set `DOC_ORGANIZER_RERANK_MODELS=qwen-bulk,ds-flash-local` (the old
+default) or `qwen-bulk` and recreate the container.
+
+## Budgets
 
 Each operation retains the existing digit-aware aggregate 64k estimate and
 4,000-character passage heads. Query heads are capped at 2,000 characters.

@@ -54,7 +54,7 @@ TIMEOUT_SECONDS = 30.0
 BACKGROUND_TIMEOUT_SECONDS = 180.0
 LIVE_PRIORITY = 0
 BACKGROUND_PRIORITY = 5
-# LiteLLM model groups in preference order, e.g. "qwen-bulk,ds-flash-local".
+# LiteLLM model groups in preference order, e.g. "rerank-decision,qwen-bulk".
 # Each batch goes to the first group LiteLLM reports as able to start it now
 # (POST /v1/inference/capacity, workload_class=live); when none is, or the
 # signal is unavailable, it queues on the first. Unset keeps qwen-bulk alone.
@@ -384,13 +384,12 @@ class QwenBulkReranker(Reranker):
             payload["model"] = await self._choose_model(client, budget)
             if payload["model"] != rerank_models()[0]:
                 logger.info("Qwen bulk reranker batch routed to %s", payload["model"])
-                # LiteLLM queues a request with a nonzero top-level priority in its
-                # Redis-backed Router scheduler unless the coordinator owns the
-                # group, and concurrent pushes crash it ("'<' not supported between
-                # 'tuple' and 'list'", HTTP 500): 2+ background batches on
-                # ds-flash-local degraded the search. Without it, the fallback
-                # deployment's own vLLM priority applies (ds-flash-local: 10).
-                payload.pop("priority", None)
+            # Every group keeps the batch's priority. Dropping it here on later
+            # groups (2026-11-04, ds-flash-local HTTP 500s) is no longer needed:
+            # LiteLLM strips a priority bound for its Router scheduler itself
+            # (LiteLLM-Setup b7534b6), while coordinator groups and the
+            # rerank-decision alias pass it to vLLM. Without it a qwen-bulk
+            # batch behind rerank-decision would run at bulk priority 10.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Qwen bulk reranker deadline exhausted")
