@@ -38,7 +38,7 @@ models**, or fallback chains.
 | Embeddings | Qwen3-Embedding-8B via OpenRouter |
 | LLM enrichment | GPT-4.1 Mini via OpenRouter |
 | OCR + image description | LiteLLM aliases `ocr` + `vision`; proxy owns local/cloud fallback. Gemini, DeepSeek OCR2, and Ollama remain legacy direct adapters. |
-| Reranker | Local LiteLLM qwen-bulk, priority 0, no paid fallback |
+| Reranker | Local LiteLLM `rerank-decision` (KnowLine, then qwen-bulk), priority 0, no paid fallback |
 | Vector + FTS | LanceDB + tantivy (BM25) |
 | Orchestration | Prefect 3.x |
 

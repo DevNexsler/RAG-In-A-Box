@@ -59,7 +59,7 @@ def test_default_and_compose_migrate_legacy_provider(monkeypatch):
     env = yaml.safe_load(Path("docker-compose.yml").read_text())["services"]["doc-organizer"]["environment"]
     assert "DOC_ORGANIZER_RERANKER_PROVIDER=${DOC_ORGANIZER_RERANKER_PROVIDER:-qwen-bulk}" in env
     assert "LITELLM_BASE_URL=${LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}" in env
-    assert "DOC_ORGANIZER_RERANK_MODELS=${DOC_ORGANIZER_RERANK_MODELS:-qwen-bulk,ds-flash-local}" in env
+    assert "DOC_ORGANIZER_RERANK_MODELS=${DOC_ORGANIZER_RERANK_MODELS:-rerank-decision,qwen-bulk}" in env
 
 
 def test_gateway_credentials_precedence_and_no_paid_fallback(monkeypatch):
@@ -659,9 +659,10 @@ def test_a_ready_answer_admits_a_bounded_number_of_batches(pools, monkeypatch):
 
 
 @pytest.mark.parametrize("background", [False, True])
-def test_fallback_batches_never_carry_a_router_priority(pools, monkeypatch, background):
-    # 2026-11-04: LiteLLM's Router scheduler 500s on concurrent prioritized
-    # requests to a group its coordinator does not own.
+def test_fallback_batches_keep_their_priority(pools, monkeypatch, background):
+    # LiteLLM strips a Router-scheduler priority itself since 2026-11-04, so a
+    # later group keeps the batch's lane instead of running at bulk priority.
+    priority = qwen.BACKGROUND_PRIORITY if background else qwen.LIVE_PRIORITY
     sent = []
     async def answer(url, payload):
         if url.endswith("/inference/capacity"):
@@ -672,11 +673,43 @@ def test_fallback_batches_never_carry_a_router_priority(pools, monkeypatch, back
         return response(payload)
     install(monkeypatch, answer)
     scorer(background=background).rerank("query", hits(3))
-    assert sent == [("ds-flash-local", None)]
+    assert sent == [("ds-flash-local", priority)]
     monkeypatch.setenv(qwen.RERANK_MODELS_ENV, "qwen-bulk")
     sent.clear()
     scorer(background=background).rerank("query", hits(3))
-    assert sent == [("qwen-bulk", qwen.BACKGROUND_PRIORITY if background else qwen.LIVE_PRIORITY)]
+    assert sent == [("qwen-bulk", priority)]
+
+
+@pytest.mark.parametrize(("ready", "expected"), [
+    # The alias answers for its whole chain (KnowLine, qwen-bulk, ds-flash-local).
+    ({"rerank-decision": 2, "qwen-bulk": 1}, "rerank-decision"),
+    # Alias busy or its capacity answer missing, qwen-bulk ready: go direct.
+    ({"qwen-bulk": 1}, "qwen-bulk"),
+    # Nothing ready: queue on the alias, which queues on KnowLine.
+    ({}, "rerank-decision"),
+])
+@pytest.mark.parametrize("background", [False, True])
+def test_rerank_decision_default_routes_with_the_batch_priority(monkeypatch, ready, expected, background):
+    monkeypatch.setattr(qwen, "_CAPACITY", {})
+    monkeypatch.setattr(qwen, "_REFRESHING", set())
+    from pathlib import Path
+    env = yaml.safe_load(Path("docker-compose.yml").read_text())["services"]["doc-organizer"]["environment"]
+    default = next(e for e in env if e.startswith(qwen.RERANK_MODELS_ENV + "="))
+    monkeypatch.setenv(qwen.RERANK_MODELS_ENV, default.split(":-", 1)[1].rstrip("}"))
+    sent = []
+
+    async def answer(url, payload):
+        if url.endswith("/inference/capacity"):
+            ready_now = ready.get(payload["model"], 0)
+            return httpx.Response(200, json={
+                "model": payload["model"], "workload_class": "live", "admit_now": ready_now > 0,
+                "engines_ready": ready_now, "available_requests": ready_now,
+            }, request=httpx.Request("POST", url))
+        sent.append((payload["model"], payload.get("priority")))
+        return response(payload)
+    install(monkeypatch, answer)
+    assert len(scorer(background=background).rerank("query", hits(3))) == 3
+    assert sent == [(expected, qwen.BACKGROUND_PRIORITY if background else qwen.LIVE_PRIORITY)]
 
 
 def test_concurrent_batches_share_one_refresh_and_its_bound(pools, monkeypatch):
