@@ -26,28 +26,28 @@ paid rollback, set `DOC_ORGANIZER_RERANKER_PROVIDER=deepinfra`, configure the
 legacy model/base URL and `DEEPINFRA_API_KEY`, and restart the service. There is
 no automatic paid fallback. Unknown providers fail configuration explicitly.
 
-## Model groups
+## Model
 
-`DOC_ORGANIZER_RERANK_MODELS` lists LiteLLM model groups in preference order.
-Compose defaults it to `rerank-decision,qwen-bulk`; outside compose an unset
-value means `qwen-bulk` alone. For each batch the adapter asks
-`POST /v1/inference/capacity` (`workload_class: live`) and sends the batch to the
-first group that can start it now. When none can, or the signal is unavailable,
-the batch queues on the first group. There is no retry on another group after
-an error: a failed batch degrades the search to cosine as before.
+Every batch goes to one LiteLLM model, `DOC_ORGANIZER_RERANK_MODEL`, which
+defaults to `rerank-decision`. The adapter does not check capacity or choose a
+pool: LiteLLM does. There is no retry on another model after an error: a failed
+batch degrades the search to cosine as before.
 
-`rerank-decision` is a LiteLLM alias (LiteLLM-Setup PR #376). It takes this
-adapter's exact request and returns the same `{"scores": {...}}` completion. It
-scores on the KnowLine decision model, then falls back to `qwen-bulk` and then
-`ds-flash-local` inside LiteLLM, skipping a backend with no capacity. Its
-capacity answer covers that whole chain. `qwen-bulk` stays second so a batch
-can still go straight to it when the alias reports no capacity or its capacity
-check fails. Every group gets the batch's `priority` (0 live, 5 background);
-LiteLLM drops it itself for groups that its Router scheduler would queue.
-The calling key must be allowed to use `rerank-decision`.
+`rerank-decision` is a LiteLLM alias (LiteLLM-Setup PRs #376 and #378). It
+takes this adapter's exact request and returns the same `{"scores": {...}}`
+completion. It scores on the KnowLine decision model, waiting up to 20 s in
+KnowLine's line when the line is short, then falls back to `qwen-bulk` and then
+`ds-flash-local` inside LiteLLM. The batch's `priority` (0 live, 5 background)
+goes with it; LiteLLM drops it itself for groups that its Router scheduler
+would queue. The calling key must be allowed to use `rerank-decision`.
 
-Rollback: set `DOC_ORGANIZER_RERANK_MODELS=qwen-bulk,ds-flash-local` (the old
-default) or `qwen-bulk` and recreate the container.
+Until 2026-11-13 the adapter took a list of groups and asked
+`POST /v1/inference/capacity` before each batch, sending it to the first group
+that could start it at once. That sent bursts straight to `qwen-bulk` past
+KnowLine's line (27 batches in the first hour after the line went live), so it
+was removed.
+
+Rollback: set `DOC_ORGANIZER_RERANK_MODEL=qwen-bulk` and recreate the container.
 
 ## Budgets
 
@@ -71,7 +71,7 @@ than it gives up its turn and degrades the search to cosine instead of
 holding a slot it cannot use (#4484). With no successes yet, every batch is
 sent. One 45-second maximum covers preprocessing, semaphore wait and all
 batches (30 s until 2026-11-13: LiteLLM's `rerank-decision` alias may now hold
-a batch up to 10 s in KnowLine's line, then needs room for a fallback); a shorter YAML `timeout` or environment override reduces that budget.
+a batch up to 20 s in KnowLine's line, then needs room for a fallback); a shorter YAML `timeout` or environment override reduces that budget.
 The environment timeout applies only to Qwen; explicit DeepInfra keeps its
 configured timeout and legacy ten-second default.
 Each gateway request receives the remaining budget in
