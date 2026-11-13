@@ -56,7 +56,7 @@ services:
       # Overrides legacy mounted DeepInfra config; workers inherit this env.
       # Set deepinfra explicitly only when paid reranking is intended.
       - DOC_ORGANIZER_RERANKER_PROVIDER=${DOC_ORGANIZER_RERANKER_PROVIDER:-qwen-bulk}
-      - DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS=${DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS:-30}
+      - DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS=${DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS:-45}
       # Rerank batches take the first group LiteLLM reports ready, else the
       # first. rerank-decision (LiteLLM) tries KnowLine, then qwen-bulk, then
       # ds-flash-local itself. Rollback: set qwen-bulk,ds-flash-local.

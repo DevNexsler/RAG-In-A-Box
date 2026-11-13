@@ -129,7 +129,7 @@ def test_sync_interface_inside_async_consumer_keeps_deadline_and_cancel_context(
     assert ended.is_set()
 
 
-def test_thirty_second_deadline_reaches_gateway_and_config_can_shorten_it(monkeypatch):
+def test_forty_five_second_deadline_reaches_gateway_and_config_can_shorten_it(monkeypatch):
     remaining = []
 
     async def answer(url, payload):
@@ -140,7 +140,7 @@ def test_thirty_second_deadline_reaches_gateway_and_config_can_shorten_it(monkey
     scorer().rerank("query", hits())
     scorer(timeout=120).rerank("query", hits())
     scorer(timeout=.5).rerank("query", hits())
-    assert all(29 < deadline <= 30 for deadline in remaining[:2])
+    assert all(44 < deadline <= 45 for deadline in remaining[:2])
     assert 0 < remaining[2] <= .5
 
 
@@ -149,13 +149,13 @@ def test_compose_timeout_migrates_legacy_config_without_changing_paid_opt_in(mon
 
     monkeypatch.setenv("LITELLM_API_KEY", "local-test-key")
     monkeypatch.setenv("DOC_ORGANIZER_RERANKER_PROVIDER", "qwen-bulk")
-    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS", "45")
     config = {"search": {"reranker": {"enabled": True, "provider": "deepinfra", "timeout": 10,
                                        "api_key": "paid-test-key"}}}
     migrated = build_reranker(config)
-    assert migrated.timeout == 30 and migrated.api_key == "local-test-key"
+    assert migrated.timeout == 45 and migrated.api_key == "local-test-key"
     env = yaml.safe_load(Path("docker-compose.yml").read_text())["services"]["doc-organizer"]["environment"]
-    assert "DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS=${DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS:-30}" in env
+    assert "DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS=${DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS:-45}" in env
     monkeypatch.setenv("DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS", "0.5")
     assert build_reranker(config).timeout == .5
     for invalid in ["0", "nan", "inf", "invalid"]:
@@ -176,7 +176,7 @@ def test_maps_reversed_keys_to_original_documents_and_bounds_payload(monkeypatch
         assert payload["temperature"] == 0 and payload["num_retries"] == 0
         assert payload["disable_fallbacks"] is True
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-        assert 0 < payload["metadata"]["inference_deadline_seconds"] <= 30
+        assert 0 < payload["metadata"]["inference_deadline_seconds"] <= 45
         passages = json.loads(payload["messages"][1]["content"])["passages"]
         assert len(passages) <= 32
         assert all(0 < len(p["text"]) <= 4000 for p in passages)
@@ -530,7 +530,7 @@ def test_background_budget_and_priority_reach_gateway_without_changing_live(monk
     scorer(background=True, timeout=.5).rerank("query", hits())
     (live, live_ceiling, background, short) = sent
     assert live[0] == live_ceiling[0] == qwen.LIVE_PRIORITY == 0
-    assert 29 < live[1] <= 30 and 29 < live_ceiling[1] <= 30
+    assert 44 < live[1] <= 45 and 44 < live_ceiling[1] <= 45
     assert background[0] == short[0] == qwen.BACKGROUND_PRIORITY
     assert qwen.LIVE_PRIORITY < qwen.BACKGROUND_PRIORITY < 10  # gateway bulk lanes send 10
     assert 179 < background[1] <= 180
@@ -540,12 +540,12 @@ def test_background_budget_and_priority_reach_gateway_without_changing_live(monk
 def test_factory_background_ignores_live_timeout_override(monkeypatch):
     monkeypatch.setenv("LITELLM_API_KEY", "local-test-key")
     monkeypatch.setenv("DOC_ORGANIZER_RERANKER_PROVIDER", "qwen-bulk")
-    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS", "45")
     config = {"search": {"reranker": {"enabled": True, "provider": "deepinfra", "timeout": 10,
                                        "api_key": "paid-test-key"}}}
     live = build_reranker(config)
     background = build_reranker(config, background=True)
-    assert (live.timeout, live.priority) == (30, qwen.LIVE_PRIORITY)
+    assert (live.timeout, live.priority) == (45, qwen.LIVE_PRIORITY)
     assert (background.timeout, background.priority) == (180, qwen.BACKGROUND_PRIORITY)
     monkeypatch.setenv("DOC_ORGANIZER_RERANKER_PROVIDER", "deepinfra")
     assert build_reranker(config, background=True).timeout == 10

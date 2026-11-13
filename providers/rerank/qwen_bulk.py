@@ -46,7 +46,9 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 32
 PROMPT_TOKEN_BUDGET = 16_000
 QUERY_CHARS = 2000
-TIMEOUT_SECONDS = 30.0
+# 45 s: LiteLLM's rerank-decision alias may hold a batch up to 10 s in KnowLine's
+# line before its 15 s attempt, and still needs room for a qwen-bulk fallback.
+TIMEOUT_SECONDS = 45.0
 # A scheduled job (the comms review) can wait out a busy lane: at 30 s its
 # searches degraded and the review refused cosine scores, failing for days.
 # Its later deadline already queues it behind live searches here; the lower
