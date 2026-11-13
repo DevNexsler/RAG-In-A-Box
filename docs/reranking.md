@@ -18,7 +18,7 @@ environment. `file_status` probes the selected adapter with the same credentials
 and validates its output, with a five-second budget.
 
 Compose defaults `DOC_ORGANIZER_RERANKER_PROVIDER=qwen-bulk` and
-`DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS=30`. These deliberately override old
+`DOC_ORGANIZER_RERANKER_TIMEOUT_SECONDS=45`. These deliberately override old
 mounted `config.yaml` files that still select DeepInfra with a ten-second budget.
 The adapter also ignores their legacy model field: its alias is fixed.
 Outside compose, an explicit provider in YAML still applies. For a deliberate
@@ -69,8 +69,9 @@ each freed slot to the most-starved batch, so a batch whose search has less
 time left than the 90th percentile of recent successful requests no larger
 than it gives up its turn and degrades the search to cosine instead of
 holding a slot it cannot use (#4484). With no successes yet, every batch is
-sent. One thirty-second maximum covers preprocessing, semaphore wait and all
-batches; a shorter YAML `timeout` or environment override reduces that budget.
+sent. One 45-second maximum covers preprocessing, semaphore wait and all
+batches (30 s until 2026-11-13: LiteLLM's `rerank-decision` alias may now hold
+a batch up to 10 s in KnowLine's line, then needs room for a fallback); a shorter YAML `timeout` or environment override reduces that budget.
 The environment timeout applies only to Qwen; explicit DeepInfra keeps its
 configured timeout and legacy ten-second default.
 Each gateway request receives the remaining budget in
@@ -86,9 +87,9 @@ uses the original absolute deadline, including handoff time. Async callers can
 also await `arerank` directly.
 
 The MCP server adds no whole-search deadline: retrieval and fallback can add
-time outside reranking. Configure caller timeouts above 30 seconds. Staging and
-live test clients use 45-second HTTP timeouts; the live client also sets an
-explicit 45-second MCP response timeout. Python MCP transport otherwise defaults
+time outside reranking. Configure caller timeouts above 45 seconds. Staging and
+live test clients use 60-second HTTP timeouts; the live client also sets an
+explicit 60-second MCP response timeout. Python MCP transport otherwise defaults
 to 30 seconds (300 seconds for SSE reads), and `ClientSession` has no default
 response deadline. Health probing retains its separate five-second cap.
 The deployed comms-review semantic SOR caller uses its `McpClient` default of

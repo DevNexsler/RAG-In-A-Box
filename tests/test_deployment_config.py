@@ -241,7 +241,8 @@ def test_dockerignore_excludes_generated_repository_directories():
 def test_shipped_reranker_timeout_stays_within_search_budget(config_path, monkeypatch):
     """Bound inline local inference before honest cosine degradation.
 
-    Thirty seconds admits measured local tails without restoring the old 120s.
+    Forty-five seconds admits a short wait in KnowLine's line plus a fallback
+    without restoring the old 120s.
     """
     monkeypatch.setenv("LITELLM_API_KEY", "test-key")
     config = yaml.safe_load(Path(config_path).read_text())

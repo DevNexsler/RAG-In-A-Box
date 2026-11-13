@@ -42,7 +42,7 @@ def test_real_gateway_mcp_semantic_search(tmp_path, monkeypatch, count):
             passages = json.loads(payload["messages"][1]["content"])["passages"]
             wire.append({"passages": len(passages), "remaining_s": round(
                 payload["metadata"]["inference_deadline_seconds"], 3)})
-            assert 0 < payload["metadata"]["inference_deadline_seconds"] <= 30
+            assert 0 < payload["metadata"]["inference_deadline_seconds"] <= 45
         return await original_post(client, url, **kwargs)
     monkeypatch.setattr(httpx.AsyncClient, "post", measured_post)
     monkeypatch.setattr(mcp_server.mcp, "_session_manager", None)
@@ -60,8 +60,8 @@ def test_real_gateway_mcp_semantic_search(tmp_path, monkeypatch, count):
         assert server.started, "isolated MCP server failed to start"
 
         async def run():
-            async with streamablehttp_client(f"http://127.0.0.1:{port}/mcp", timeout=45) as (read, write, _):
-                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=45)) as session:
+            async with streamablehttp_client(f"http://127.0.0.1:{port}/mcp", timeout=60) as (read, write, _):
+                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=60)) as session:
                     await session.initialize()
                     began = time.monotonic()
                     result = tool_payload(await session.call_tool("file_search", {
