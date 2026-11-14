@@ -15,6 +15,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 import mcp_server
+from providers.rerank.qwen_bulk import rerank_model
 from tests.e2e.client import tool_payload
 from tests.qwen_search_support import ANSWER_ID, QUERY, corpus
 
@@ -36,7 +37,7 @@ def test_real_gateway_mcp_semantic_search(tmp_path, monkeypatch, count):
     async def measured_post(client, url, **kwargs):
         if str(url) == os.environ["LITELLM_BASE_URL"].rstrip("/") + "/chat/completions":
             payload = kwargs["json"]
-            assert payload["priority"] == 0 and payload["model"] == "qwen-bulk"
+            assert payload["priority"] == 0 and payload["model"] == rerank_model()
             assert payload["chat_template_kwargs"] == {"enable_thinking": False}
             assert payload["num_retries"] == 0 and payload["disable_fallbacks"] is True
             passages = json.loads(payload["messages"][1]["content"])["passages"]

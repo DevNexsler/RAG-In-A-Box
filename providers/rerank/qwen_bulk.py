@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 32
 PROMPT_TOKEN_BUDGET = 16_000
 QUERY_CHARS = 2000
-# 45 s: LiteLLM's rerank-decision alias may hold a batch up to 10 s in KnowLine's
+# 45 s: LiteLLM's rerank-decision alias may hold a batch up to 20 s in KnowLine's
 # line before its 15 s attempt, and still needs room for a qwen-bulk fallback.
 TIMEOUT_SECONDS = 45.0
 # A scheduled job (the comms review) can wait out a busy lane: at 30 s its
@@ -56,19 +56,13 @@ TIMEOUT_SECONDS = 45.0
 BACKGROUND_TIMEOUT_SECONDS = 180.0
 LIVE_PRIORITY = 0
 BACKGROUND_PRIORITY = 5
-# LiteLLM model groups in preference order, e.g. "rerank-decision,qwen-bulk".
-# Each batch goes to the first group LiteLLM reports as able to start it now
-# (POST /v1/inference/capacity, workload_class=live); when none is, or the
-# signal is unavailable, it queues on the first. Unset keeps qwen-bulk alone.
-RERANK_MODELS_ENV = "DOC_ORGANIZER_RERANK_MODELS"
-CAPACITY_TTL_SECONDS = 1.0  # LiteLLM scrapes engine metrics once a second
-CAPACITY_TIMEOUT_SECONDS = 0.5
-# A "ready" answer is a snapshot, not a lease: without a bound, every batch in
-# flight would land on the same fallback within one refresh.
-BATCHES_PER_READY_ENGINE = 4
-_CAPACITY_LOCK = threading.Lock()
-_CAPACITY = {}  # model -> [fetched_at, batches it may still take]
-_REFRESHING = set()  # models whose answer one batch is refetching now
+# The LiteLLM model every batch goes to. LiteLLM owns capacity: the
+# rerank-decision alias waits in KnowLine's line when it is short and falls
+# back to qwen-bulk, then ds-flash-local, when it is not. Choosing a pool here
+# as well sent bursts straight to qwen-bulk past that line (27 batches in the
+# first hour, 2026-11-13). Rollback: set it to qwen-bulk.
+RERANK_MODEL_ENV = "DOC_ORGANIZER_RERANK_MODEL"
+DEFAULT_RERANK_MODEL = "rerank-decision"
 _SYSTEM = """Score each passage's relevance to the document search query from 0 to 1.
 0 means irrelevant, 0.5 partial evidence, 1 direct evidence answering the query.
 Use one decimal place at most; choose from 0, 0.1, 0.2, ..., 1.
@@ -112,27 +106,8 @@ def _normalize(values):
     return [(value - low) / (high - low) for value in values] if high > low else [1.0] * len(values)
 
 
-def rerank_models():
-    models = tuple(m.strip() for m in os.getenv(RERANK_MODELS_ENV, "").split(",") if m.strip())
-    return models or ("qwen-bulk",)
-
-
-def _take_capacity(model, now):
-    """Spend one batch of a fresh ready answer.
-
-    None means the caller must refetch it; "wait" means another batch already
-    is. Call with _CAPACITY_LOCK held.
-    """
-    entry = _CAPACITY.get(model)
-    if entry is None or now - entry[0] >= CAPACITY_TTL_SECONDS:
-        if model in _REFRESHING:
-            return "wait"
-        _REFRESHING.add(model)
-        return None
-    if entry[1] <= 0:
-        return False
-    entry[1] -= 1
-    return True
+def rerank_model():
+    return os.getenv(RERANK_MODEL_ENV, "").strip() or DEFAULT_RERANK_MODEL
 
 
 def _request_seconds(passages):
@@ -152,11 +127,10 @@ class QwenBulkReranker(Reranker):
     synchronous MCP workers also observe the dispatcher's cancellation event.
     """
 
-    model = "qwen-bulk"
-
     def __init__(self, api_key=None, base_url=None, timeout=TIMEOUT_SECONDS, *, background=False):
         if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Reranker timeout must be positive and finite")
+        self.model = rerank_model()
         self.timeout = min(timeout, BACKGROUND_TIMEOUT_SECONDS if background else TIMEOUT_SECONDS)
         self.priority = BACKGROUND_PRIORITY if background else LIVE_PRIORITY
         self.api_key = api_key or os.getenv("LITELLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY", "")
@@ -244,60 +218,6 @@ class QwenBulkReranker(Reranker):
             await asyncio.sleep(0.01)
         parent.cancel()
 
-    async def _choose_model(self, client, tokens):
-        """First group LiteLLM says can start this batch now, else the first."""
-        models = rerank_models()
-        if len(models) == 1:
-            return models[0]
-        for model in models:
-            if await self._has_capacity(client, model, tokens):
-                return model
-        return models[0]
-
-    async def _has_capacity(self, client, model, tokens):
-        # Batches of every search share one refresh per model: if each
-        # refetched, each would reset the credits and the bound would not hold.
-        waited_until = time.monotonic() + 2 * CAPACITY_TIMEOUT_SECONDS
-        while True:
-            with _CAPACITY_LOCK:
-                taken = _take_capacity(model, time.monotonic())
-            if taken is None:
-                batches = 0
-                try:
-                    batches = await self._ready_batches(client, model, tokens)
-                finally:
-                    with _CAPACITY_LOCK:
-                        _CAPACITY[model] = [time.monotonic(), batches]
-                        _REFRESHING.discard(model)
-            elif taken == "wait":
-                if time.monotonic() >= waited_until:
-                    return False
-                await asyncio.sleep(0.01)
-            else:
-                return taken
-
-    async def _ready_batches(self, client, model, tokens):
-        try:
-            # One bound for the whole call; httpx applies its timeout per phase.
-            async with asyncio.timeout(CAPACITY_TIMEOUT_SECONDS):
-                response = await client.post(
-                    f"{self.base_url}/inference/capacity",
-                    json={"model": model, "workload_class": "live", "request_tokens": tokens},
-                    timeout=CAPACITY_TIMEOUT_SECONDS,
-                )
-            answer = response.json() if response.status_code == 200 else {}
-        except (httpx.HTTPError, ValueError, TimeoutError):
-            return 0
-        if not isinstance(answer, dict) or answer.get("admit_now") is not True:
-            return 0
-        # LiteLLM counts the live requests its ready engines can still take
-        # before each hits its live_max_inflight; older answers lack it.
-        available = answer.get("available_requests")
-        if type(available) is int:
-            return max(0, available)
-        ready = answer.get("engines_ready")
-        return ready * BATCHES_PER_READY_ENGINE if type(ready) is int and ready > 0 else 0
-
     def _payload(self, query, documents, ids, budget):
         schema = {
             "type": "object", "properties": {"scores": {
@@ -383,15 +303,11 @@ class QwenBulkReranker(Reranker):
                             heapq.heappop(_WAITING)
                 if not acquired:
                     await asyncio.sleep(0.01)
-            payload["model"] = await self._choose_model(client, budget)
-            if payload["model"] != rerank_models()[0]:
-                logger.info("Qwen bulk reranker batch routed to %s", payload["model"])
-            # Every group keeps the batch's priority. Dropping it here on later
-            # groups (2026-11-04, ds-flash-local HTTP 500s) is no longer needed:
-            # LiteLLM strips a priority bound for its Router scheduler itself
-            # (LiteLLM-Setup b7534b6), while coordinator groups and the
-            # rerank-decision alias pass it to vLLM. Without it a qwen-bulk
-            # batch behind rerank-decision would run at bulk priority 10.
+            # The batch keeps its priority on every backend: LiteLLM strips a
+            # priority bound for its Router scheduler itself (LiteLLM-Setup
+            # b7534b6), while coordinator groups and the rerank-decision alias
+            # pass it to vLLM. Without it a qwen-bulk fallback would run at bulk
+            # priority 10.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Qwen bulk reranker deadline exhausted")
