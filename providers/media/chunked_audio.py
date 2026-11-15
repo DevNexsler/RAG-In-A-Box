@@ -21,7 +21,8 @@ class ChunkedAudioProvider:
                  chunk_size_mb: float | None = None,
                  max_file_size_mb: float, max_parts: int = 256,
                  no_speech_fallback=None, large_audio_provider=None,
-                 max_local_audio_seconds: float = 600):
+                 max_local_audio_seconds: float = 600,
+                 accept_unconfirmed_silence: bool = False):
         self.provider = provider
         self.max_bytes = int(max_file_size_mb * 1024 * 1024)
         if (chunk_seconds is None) == (chunk_size_mb is None):
@@ -43,6 +44,9 @@ class ChunkedAudioProvider:
         # pieces this long; a piece that still fails is marked, not retried.
         self.blocked_piece_seconds = 300.0
         self.no_speech_fallback = no_speech_fallback
+        # Local-only routing: a complete blank or explicit no-speech answer is a
+        # silent segment (upstream #3835), not something a cloud model confirms.
+        self.accept_unconfirmed_silence = accept_unconfirmed_silence
         self.large_audio_provider = large_audio_provider
         self.max_local_audio_seconds = float(max_local_audio_seconds)
         if not math.isfinite(self.max_local_audio_seconds) or self.max_local_audio_seconds <= 0:
@@ -128,6 +132,9 @@ class ChunkedAudioProvider:
             # stop) and its prompt asks for nothing when there is no speech,
             # so a complete empty answer is a verified silent segment -- long
             # recordings have hours of them.
+            return "[No speech detected]"
+        if (self.accept_unconfirmed_silence and not large and isinstance(text, str)
+                and (not text.strip() or self._no_speech_marker(text))):
             return "[No speech detected]"
         if not isinstance(text, str) or not text.strip():
             raise TransientError("Audio segment returned no verified transcript")
@@ -218,7 +225,13 @@ class ChunkedAudioProvider:
                 try:
                     text = self._transcribe_part(part, seconds)
                 except AudioSpanUntranscribable as exc:
-                    text = self._transcribe_blocked_part(part, seconds, offset, exc.reason)
+                    if seconds <= self.blocked_piece_seconds:
+                        # Already piece-sized (e.g. 60 s local parts): re-splitting
+                        # would resend the same span, so mark it.
+                        span = f"{self._timestamp(offset)}–{self._timestamp(offset + seconds)}"
+                        text = f"[Audio {span} not transcribed: {exc.marker} ({exc.reason})]"
+                    else:
+                        text = self._transcribe_blocked_part(part, seconds, offset, exc.reason)
                 results.append(
                     f"[Audio segment {i}/{len(parts)} "
                     f"{self._timestamp(offset)}–{self._timestamp(offset + seconds)}]\n"

@@ -96,6 +96,11 @@ class LiteLLMFallback:
             data = resp.json()
             choice = data["choices"][0]
             if self.require_complete and choice.get("finish_reason") not in {"stop", "end_turn"}:
+                if choice.get("finish_reason") == "length":
+                    # A bounded audio part that exhausts its output is looping;
+                    # chunked callers mark that span instead of failing it all.
+                    from providers.media.openrouter_media import AudioTranscriptTruncated
+                    raise AudioTranscriptTruncated("length")
                 raise TransientError("Audio transcript response did not finish completely")
             return (choice["message"]["content"] or "").strip()
 

@@ -159,9 +159,17 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
     # Opt-in byte-size audio chunking (Mac mini long-audio routing): each part
     # must finish completely, so request the model's full output allowance.
     byte_chunks = media_cfg.get("audio_chunk_size_mb") is not None
+    # "local" keeps every audio request on the LiteLLM route: no OpenRouter
+    # long-audio route and no OpenRouter no-speech confirmation. Unset keeps
+    # the mixed routing the large-provider options describe.
+    route = media_cfg.get("audio_transcription_route", "mixed")
+    if route not in {"mixed", "local"}:
+        raise ValueError("media.audio_transcription_route must be mixed or local")
+    local_only = route == "local"
+    strict_audio = byte_chunks or local_only
     complete_audio = ({"require_complete": True,
                        "max_tokens": media_cfg.get("audio_max_output_tokens", 16384)}
-                      if byte_chunks else {})
+                      if strict_audio else {})
 
     video = LiteLLMFallback(
         endpoint, media_cfg.get("video_model", "video"),
@@ -173,7 +181,7 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
          "Do not summarize or skip speech. If multiple speakers are clear, label them only "
          "as Speaker 1, Speaker 2; do not infer identity. Never invent or reconstruct "
          "dialogue; if there is no speech at all, return nothing. Return plain text only."
-         if byte_chunks else _AUDIO_TRANSCRIBE_PROMPT),
+         if strict_audio else _AUDIO_TRANSCRIBE_PROMPT),
         audio_encoder, api_key=api_key, timeout=timeout, **complete_audio,
     )
     primary = _LiteLLMMediaProvider(video.run, audio.run, max_file_size_mb=max_mb)
@@ -208,6 +216,8 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
     large_provider = media_cfg.get("audio_large_provider")
     if large_provider not in {None, "openrouter"}:
         raise ValueError("media.audio_large_provider must be openrouter when configured")
+    if local_only and large_provider:
+        raise ValueError("media.audio_large_provider conflicts with audio_transcription_route: local")
     if large_provider and (not byte_chunks or or_audio is None):
         raise ValueError("Large-audio routing requires byte chunks and configured OpenRouter audio")
     if media_cfg.get("audio_chunk_seconds") is not None or byte_chunks:
@@ -218,7 +228,8 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
             chunk_seconds=media_cfg.get("audio_chunk_seconds"),
             chunk_size_mb=media_cfg.get("audio_chunk_size_mb"),
             max_file_size_mb=max_mb,
-            no_speech_fallback=or_audio,
+            no_speech_fallback=None if local_only else or_audio,
+            accept_unconfirmed_silence=local_only,
             large_audio_provider=or_audio if large_provider else None,
             max_local_audio_seconds=media_cfg.get("audio_local_max_seconds", 600),
         )
