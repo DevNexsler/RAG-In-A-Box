@@ -107,6 +107,21 @@ media:
     top_p: 1.0
   video_model: "qwen/qwen3.5-397b-a17b"
   max_file_size_mb: 800
+  # With provider: litellm, optionally split audio into files up to this size.
+  # Keeps originals unchanged; temporary 16 kHz mono PCM WAV parts are uploaded
+  # sequentially and joined in order only after every transcript completes.
+  # Requires ffmpeg/ffprobe and a backend duration limit covering each chunk
+  # (55 MiB of this WAV format is about 30 minutes). Video behavior is unchanged.
+  # audio_chunk_size_mb: 55
+  # audio_max_output_tokens: 16384  # use the selected model's output allowance
+  # Optional: keep short clips local, route longer parts through OpenRouter.
+  # audio_large_provider: openrouter
+  # audio_local_max_seconds: 600
+  # openrouter_fallback:
+  #   audio_model: google/gemini-3.5-flash
+  #   audio_reasoning: {effort: minimal}
+  # Alternatively use duration chunks; do not configure both chunk modes.
+  # audio_chunk_seconds: 60
   timeout: 300
   # base_url: "https://openrouter.ai/api/v1"  # override for staging/self-hosted gateways
   #

@@ -75,6 +75,52 @@ _VIDEO_MIME_BY_EXT = {
 _AUDIO_ENDPOINTS = {"audio/transcriptions", "chat/completions"}
 
 
+# Provider finish reasons that mean the model declined this audio's content
+# (e.g. Gemini's recitation filter on a long repeated jingle), as opposed to
+# running out of output. Retrying the same bytes returns the same refusal.
+AUDIO_BLOCK_REASONS = frozenset({
+    "RECITATION", "SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII",
+})
+
+
+class AudioSpanUntranscribable(TransientError):
+    """This audio span produced no complete transcript for a content reason.
+
+    Retrying the same bytes tends to fail the same way, so a caller that can
+    re-split the span (ChunkedAudioProvider) narrows it instead of failing the
+    whole recording. Without that caller it stays a retryable TransientError.
+    """
+
+    marker = "provider output did not complete"
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+class AudioTranscriptBlocked(AudioSpanUntranscribable):
+    """The provider declined to transcribe this audio's content."""
+
+    marker = "provider declined"
+
+    def __init__(self, reason: str):
+        super().__init__(f"Audio transcript blocked by provider ({reason})", reason)
+
+
+class AudioTranscriptAborted(AudioSpanUntranscribable):
+    """The provider ended the generation with an error (seen on looping output)."""
+
+    def __init__(self, reason: str):
+        super().__init__("Audio transcript response did not finish completely", reason)
+
+
+class AudioTranscriptTruncated(AudioSpanUntranscribable):
+    """The output limit ran out: for a bounded audio part, a degenerate loop."""
+
+    def __init__(self, reason: str):
+        super().__init__("Audio transcript response did not finish completely", reason)
+
+
 @dataclass(frozen=True)
 class AudioModelRoute:
     """One audio model plus the OpenRouter request contract it supports."""
@@ -124,6 +170,9 @@ class OpenRouterMediaProvider:
         audio_base_url: str | None = None,
         timeout: float = 300.0,
         max_file_size_mb: float = 800.0,
+        require_complete_audio: bool = False,
+        audio_max_output_tokens: int | None = None,
+        audio_reasoning: dict | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.base_url = base_url.rstrip("/")
@@ -140,6 +189,9 @@ class OpenRouterMediaProvider:
         self.video_model = video_model
         self.timeout = timeout
         self.max_file_size_bytes = int(max_file_size_mb * 1024 * 1024)
+        self.require_complete_audio = require_complete_audio
+        self.audio_max_output_tokens = audio_max_output_tokens
+        self.audio_reasoning = None if audio_reasoning is None else dict(audio_reasoning)
 
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY not set. Set it in .env or pass api_key.")
@@ -267,6 +319,11 @@ class OpenRouterMediaProvider:
             "model": model,
             "messages": [{"role": "user", "content": content}],
         }
+        audio = any(part.get("type") == "input_audio" for part in content)
+        if audio and self.audio_max_output_tokens is not None:
+            payload["max_tokens"] = self.audio_max_output_tokens
+        if audio and self.audio_reasoning is not None:
+            payload["reasoning"] = self.audio_reasoning
         payload.setdefault("temperature", 0.0)
         response = httpx.post(
             f"{base_url or self.base_url}/chat/completions",
@@ -276,6 +333,16 @@ class OpenRouterMediaProvider:
         )
         raise_for_status(response)  # a permanent 4xx keeps OpenRouter's reason
         data = response.json()
+        if audio and self.require_complete_audio and data["choices"][0].get("finish_reason") not in {"stop", "end_turn"}:
+            choice = data["choices"][0]
+            native = str(choice.get("native_finish_reason") or "").upper()
+            if native in AUDIO_BLOCK_REASONS or choice.get("finish_reason") == "content_filter":
+                raise AudioTranscriptBlocked(native or "content_filter")
+            if native == "MAX_TOKENS" or choice.get("finish_reason") == "length":
+                raise AudioTranscriptTruncated(native or "length")
+            if choice.get("finish_reason") == "error":
+                raise AudioTranscriptAborted(native or "provider error")
+            raise TransientError("Audio transcript response did not finish completely")
         message = data["choices"][0]["message"]
         content_value = message.get("content", "")
         if isinstance(content_value, list):

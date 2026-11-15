@@ -156,6 +156,20 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
     timeout = media_cfg.get("timeout", 300.0)
     api_key = media_cfg.get("api_key")  # else LiteLLMFallback reads LITELLM_*_KEY
     max_mb = media_cfg.get("max_file_size_mb", 800.0)
+    # Opt-in byte-size audio chunking (Mac mini long-audio routing): each part
+    # must finish completely, so request the model's full output allowance.
+    byte_chunks = media_cfg.get("audio_chunk_size_mb") is not None
+    # "local" keeps every audio request on the LiteLLM route: no OpenRouter
+    # long-audio route and no OpenRouter no-speech confirmation. Unset keeps
+    # the mixed routing the large-provider options describe.
+    route = media_cfg.get("audio_transcription_route", "mixed")
+    if route not in {"mixed", "local"}:
+        raise ValueError("media.audio_transcription_route must be mixed or local")
+    local_only = route == "local"
+    strict_audio = byte_chunks or local_only
+    complete_audio = ({"require_complete": True,
+                       "max_tokens": media_cfg.get("audio_max_output_tokens", 16384)}
+                      if strict_audio else {})
 
     video = LiteLLMFallback(
         endpoint, media_cfg.get("video_model", "video"),
@@ -163,13 +177,21 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
     )
     audio = LiteLLMFallback(
         endpoint, media_cfg.get("audio_model", "transcribe"),
-        _AUDIO_TRANSCRIBE_PROMPT, audio_encoder, api_key=api_key, timeout=timeout,
+        ("Transcribe all speech in this audio faithfully and completely for document search. "
+         "Do not summarize or skip speech. If multiple speakers are clear, label them only "
+         "as Speaker 1, Speaker 2; do not infer identity. Never invent or reconstruct "
+         "dialogue; if there is no speech at all, return nothing. Return plain text only."
+         if strict_audio else _AUDIO_TRANSCRIBE_PROMPT),
+        audio_encoder, api_key=api_key, timeout=timeout, **complete_audio,
     )
     primary = _LiteLLMMediaProvider(video.run, audio.run, max_file_size_mb=max_mb)
 
     # OpenRouter as the video fallback (reverse of the legacy openrouter-primary
     # layout). Audio has none: its reachable-empty is a clean blank (#3835).
     video_fb = None
+    # OpenRouter audio is used only by the opt-in chunked path below (large-part
+    # routing and no-speech confirmation); it is never a generic audio fallback.
+    or_audio = None
     if os.environ.get("OPENROUTER_API_KEY"):
         or_cfg = media_cfg.get("openrouter_fallback", {}) or {}
         audio_models = _openrouter_audio_routes(or_cfg, default_fallbacks=())
@@ -180,12 +202,39 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
             video_model=or_cfg.get("video_model", DEFAULT_VIDEO_MODEL),
             timeout=timeout,
             max_file_size_mb=max_mb,
+            **({"require_complete_audio": True,
+                "audio_max_output_tokens": media_cfg.get("audio_max_output_tokens", 16384),
+                "audio_reasoning": or_cfg.get("audio_reasoning")}
+               if byte_chunks else {}),
         )
         video_fb = or_provider.analyze_video
+        or_audio = or_provider.transcribe_audio
 
     from providers.media.fallback import MediaFallbackProvider
 
-    return MediaFallbackProvider(primary, video_fallback=video_fb)
+    wrapped = MediaFallbackProvider(primary, video_fallback=video_fb)
+    large_provider = media_cfg.get("audio_large_provider")
+    if large_provider not in {None, "openrouter"}:
+        raise ValueError("media.audio_large_provider must be openrouter when configured")
+    if local_only and large_provider:
+        raise ValueError("media.audio_large_provider conflicts with audio_transcription_route: local")
+    if large_provider and (not byte_chunks or or_audio is None):
+        raise ValueError("Large-audio routing requires byte chunks and configured OpenRouter audio")
+    if media_cfg.get("audio_chunk_seconds") is not None or byte_chunks:
+        from providers.media.chunked_audio import ChunkedAudioProvider
+
+        return ChunkedAudioProvider(
+            wrapped,
+            chunk_seconds=media_cfg.get("audio_chunk_seconds"),
+            chunk_size_mb=media_cfg.get("audio_chunk_size_mb"),
+            max_file_size_mb=max_mb,
+            no_speech_fallback=None if local_only else or_audio,
+            accept_unconfirmed_silence=local_only,
+            large_audio_provider=or_audio if large_provider else None,
+            max_local_audio_seconds=media_cfg.get("audio_local_max_seconds", 600),
+            max_parts=int(media_cfg.get("audio_max_parts", 256)),
+        )
+    return wrapped
 
 
 def build_media_provider(config: dict) -> MediaProvider | None:
