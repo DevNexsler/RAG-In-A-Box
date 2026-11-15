@@ -122,6 +122,12 @@ class ChunkedAudioProvider:
         large = self.large_audio_provider is not None and seconds > self.max_local_audio_seconds
         text = (self.large_audio_provider(path) if large
                 else self.provider.transcribe_audio(path))
+        if large and isinstance(text, str) and not text.strip():
+            # The large route requires a complete response (finish_reason
+            # stop) and its prompt asks for nothing when there is no speech,
+            # so a complete empty answer is a verified silent segment -- long
+            # recordings have hours of them.
+            return "[No speech detected]"
         if not isinstance(text, str) or not text.strip():
             raise TransientError("Audio segment returned no verified transcript")
         if self._no_speech_marker(text) and not large:

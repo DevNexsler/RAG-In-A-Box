@@ -145,3 +145,21 @@ def test_looping_part_is_resplit_and_only_the_still_looping_piece_is_marked(tmp_
     assert "words from part-00001.wav" in text
     assert text.count("not transcribed: provider output did not complete (MAX_TOKENS)") == 1
     assert "[Audio 00:03:20–00:05:00 not transcribed" in text
+
+
+def test_complete_empty_large_part_is_a_silent_segment_but_local_empty_is_not(tmp_path):
+    part = tmp_path / "part.wav"
+    with wave.open(str(part), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(b"\0\0" * 16000 * 2)
+    local = Mock()
+    local.transcribe_audio.return_value = ""
+    provider = ChunkedAudioProvider(local, chunk_size_mb=10, max_file_size_mb=60,
+                                    large_audio_provider=lambda path: "  ",
+                                    max_local_audio_seconds=1)
+    assert provider._transcribe_part(part, 2.0) == "[No speech detected]"
+    with pytest.raises(TransientError, match="no verified transcript"):
+        provider._transcribe_part(part, 0.5)  # short part: local route
+
