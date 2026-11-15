@@ -15,7 +15,9 @@ import pytest
 
 from core.resilience import TransientError
 from providers.media.chunked_audio import ChunkedAudioProvider
-from providers.media.openrouter_media import AudioTranscriptBlocked, OpenRouterMediaProvider
+from providers.media.openrouter_media import (
+    AudioTranscriptBlocked, AudioTranscriptTruncated, OpenRouterMediaProvider,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -41,15 +43,27 @@ def test_alternate_reports_a_content_refusal_distinctly(tmp_path, monkeypatch, f
     assert isinstance(caught.value, TransientError)  # callers without chunking keep retry semantics
 
 
-def test_alternate_truncation_is_still_an_incomplete_response(tmp_path, monkeypatch):
+@pytest.mark.parametrize("finish,native", [("length", "MAX_TOKENS"), ("length", None)])
+def test_alternate_truncation_is_an_incomplete_response(tmp_path, monkeypatch, finish, native):
     path = tmp_path / "part.wav"
     path.write_bytes(b"audio")
-    monkeypatch.setattr(httpx, "post", Mock(return_value=_response("length", "MAX_TOKENS", "partial")))
+    monkeypatch.setattr(httpx, "post", Mock(return_value=_response(finish, native, "loop loop")))
+    provider = OpenRouterMediaProvider(["audio"], "video", api_key="test",
+                                       require_complete_audio=True)
+    with pytest.raises(AudioTranscriptTruncated, match="finish completely") as caught:
+        provider.transcribe_audio(path)
+    assert not isinstance(caught.value, AudioTranscriptBlocked)
+
+
+def test_alternate_unknown_incomplete_reason_is_a_plain_transient(tmp_path, monkeypatch):
+    path = tmp_path / "part.wav"
+    path.write_bytes(b"audio")
+    monkeypatch.setattr(httpx, "post", Mock(return_value=_response(None, None, "partial")))
     provider = OpenRouterMediaProvider(["audio"], "video", api_key="test",
                                        require_complete_audio=True)
     with pytest.raises(TransientError, match="finish completely") as caught:
         provider.transcribe_audio(path)
-    assert not isinstance(caught.value, AudioTranscriptBlocked)
+    assert not isinstance(caught.value, (AudioTranscriptBlocked, AudioTranscriptTruncated))
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
@@ -106,3 +120,28 @@ def test_other_part_failures_still_fail_the_recording(tmp_path):
                                     large_audio_provider=large, max_local_audio_seconds=10)
     with pytest.raises(TransientError, match="finish completely"):
         provider.transcribe_audio(source)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+                    reason="ffmpeg/ffprobe required")
+def test_looping_part_is_resplit_and_only_the_still_looping_piece_is_marked(tmp_path):
+    source = tmp_path / "recording.wav"
+    with wave.open(str(source), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(b"\0\0" * 16000 * 700)
+
+    def large(path):
+        if path.name in {"part-00000.wav", "piece-00002.wav"}:
+            raise AudioTranscriptTruncated("MAX_TOKENS")
+        return f"words from {path.name}"
+
+    provider = ChunkedAudioProvider(Mock(), chunk_size_mb=10, max_file_size_mb=60,
+                                    large_audio_provider=large, max_local_audio_seconds=10)
+    provider.blocked_piece_seconds = 100
+    text = provider.transcribe_audio(source)
+    assert "words from piece-00000.wav" in text and "words from piece-00001.wav" in text
+    assert "words from part-00001.wav" in text
+    assert text.count("not transcribed: provider output did not complete (MAX_TOKENS)") == 1
+    assert "[Audio 00:03:20–00:05:00 not transcribed" in text

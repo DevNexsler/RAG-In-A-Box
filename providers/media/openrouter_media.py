@@ -83,12 +83,35 @@ AUDIO_BLOCK_REASONS = frozenset({
 })
 
 
-class AudioTranscriptBlocked(TransientError):
+class AudioSpanUntranscribable(TransientError):
+    """This audio span produced no complete transcript for a content reason.
+
+    Retrying the same bytes tends to fail the same way, so a caller that can
+    re-split the span (ChunkedAudioProvider) narrows it instead of failing the
+    whole recording. Without that caller it stays a retryable TransientError.
+    """
+
+    marker = "provider output did not complete"
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+class AudioTranscriptBlocked(AudioSpanUntranscribable):
     """The provider declined to transcribe this audio's content."""
 
+    marker = "provider declined"
+
     def __init__(self, reason: str):
-        super().__init__(f"Audio transcript blocked by provider ({reason})")
-        self.reason = reason
+        super().__init__(f"Audio transcript blocked by provider ({reason})", reason)
+
+
+class AudioTranscriptTruncated(AudioSpanUntranscribable):
+    """The output limit ran out: for a bounded audio part, a degenerate loop."""
+
+    def __init__(self, reason: str):
+        super().__init__("Audio transcript response did not finish completely", reason)
 
 
 @dataclass(frozen=True)
@@ -308,6 +331,8 @@ class OpenRouterMediaProvider:
             native = str(choice.get("native_finish_reason") or "").upper()
             if native in AUDIO_BLOCK_REASONS or choice.get("finish_reason") == "content_filter":
                 raise AudioTranscriptBlocked(native or "content_filter")
+            if native == "MAX_TOKENS" or choice.get("finish_reason") == "length":
+                raise AudioTranscriptTruncated(native or "length")
             raise TransientError("Audio transcript response did not finish completely")
         message = data["choices"][0]["message"]
         content_value = message.get("content", "")

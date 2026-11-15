@@ -11,7 +11,7 @@ from threading import Timer
 import wave
 
 from core.resilience import TransientError
-from providers.media.openrouter_media import AudioTranscriptBlocked, MediaFileTooLargeError
+from providers.media.openrouter_media import AudioSpanUntranscribable, MediaFileTooLargeError
 
 
 class ChunkedAudioProvider:
@@ -38,8 +38,9 @@ class ChunkedAudioProvider:
         elif not math.isfinite(self.chunk_seconds) or self.chunk_seconds <= 0:
             raise ValueError("media.audio_chunk_seconds must be finite and positive")
         self.max_parts = max_parts
-        # A part the provider declines (AudioTranscriptBlocked) is re-split into
-        # pieces this long; a piece still declined is marked, not retried.
+        # A part the provider cannot transcribe for a content reason (declined,
+        # or a looping output that exhausts the token limit) is re-split into
+        # pieces this long; a piece that still fails is marked, not retried.
         self.blocked_piece_seconds = 300.0
         self.no_speech_fallback = no_speech_fallback
         self.large_audio_provider = large_audio_provider
@@ -132,7 +133,7 @@ class ChunkedAudioProvider:
         return text
 
     def _transcribe_blocked_part(self, path, seconds, offset, reason):
-        """Re-split a declined part so only the declined span is left out.
+        """Re-split a part that failed for a content reason; mark only what still fails.
 
         The marker names the span and the provider's reason, so the gap is
         visible in the transcript instead of failing the whole recording on
@@ -156,8 +157,8 @@ class ChunkedAudioProvider:
             span = f"{self._timestamp(start)}–{self._timestamp(start + piece_seconds)}"
             try:
                 texts.append(self._transcribe_part(piece, piece_seconds).strip())
-            except AudioTranscriptBlocked as exc:
-                texts.append(f"[Audio {span} not transcribed: provider declined ({exc.reason})]")
+            except AudioSpanUntranscribable as exc:
+                texts.append(f"[Audio {span} not transcribed: {exc.marker} ({exc.reason})]")
             start += piece_seconds
         if abs((start - offset) - seconds) > 1:
             raise TransientError("Declined-part pieces do not cover the part")
@@ -205,7 +206,7 @@ class ChunkedAudioProvider:
             for i, (part, seconds) in enumerate(zip(parts, durations), 1):
                 try:
                     text = self._transcribe_part(part, seconds)
-                except AudioTranscriptBlocked as exc:
+                except AudioSpanUntranscribable as exc:
                     text = self._transcribe_blocked_part(part, seconds, offset, exc.reason)
                 results.append(
                     f"[Audio segment {i}/{len(parts)} "
