@@ -118,8 +118,9 @@ class ChunkedAudioProvider:
         except OSError as exc:
             raise TransientError("Audio segmentation tool failed") from exc
 
-    def _transcribe_part(self, path, seconds):
-        large = self.large_audio_provider is not None and seconds > self.max_local_audio_seconds
+    def _transcribe_part(self, path, seconds, *, force_large=False):
+        large = self.large_audio_provider is not None and (
+            force_large or seconds > self.max_local_audio_seconds)
         text = (self.large_audio_provider(path) if large
                 else self.provider.transcribe_audio(path))
         if large and isinstance(text, str) and not text.strip():
@@ -162,7 +163,11 @@ class ChunkedAudioProvider:
             piece_seconds = self._duration(piece)
             span = f"{self._timestamp(start)}–{self._timestamp(start + piece_seconds)}"
             try:
-                texts.append(self._transcribe_part(piece, piece_seconds).strip())
+                # Pieces stay on the route their part used: a re-split tail piece
+                # is often seconds long, and the short local route is not where
+                # this content was being transcribed.
+                texts.append(self._transcribe_part(
+                    piece, piece_seconds, force_large=True).strip())
             except AudioSpanUntranscribable as exc:
                 texts.append(f"[Audio {span} not transcribed: {exc.marker} ({exc.reason})]")
             start += piece_seconds

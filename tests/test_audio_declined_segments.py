@@ -163,3 +163,30 @@ def test_complete_empty_large_part_is_a_silent_segment_but_local_empty_is_not(tm
     with pytest.raises(TransientError, match="no verified transcript"):
         provider._transcribe_part(part, 0.5)  # short part: local route
 
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"),
+                    reason="ffmpeg/ffprobe required")
+def test_resplit_tail_piece_stays_on_the_large_route(tmp_path):
+    source = tmp_path / "recording.wav"
+    with wave.open(str(source), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(b"\0\0" * 16000 * 400)
+    local = Mock()
+    local.transcribe_audio.side_effect = AssertionError("re-split pieces must not use the local route")
+    routed = []
+
+    def large(path):
+        routed.append(path.name)
+        if path.name == "part-00000.wav":
+            raise AudioTranscriptTruncated("MAX_TOKENS")
+        return ""  # silent pieces, including the seconds-long tail
+
+    provider = ChunkedAudioProvider(local, chunk_size_mb=10, max_file_size_mb=60,
+                                    large_audio_provider=large, max_local_audio_seconds=60)
+    provider.blocked_piece_seconds = 100  # 327.7 s part -> 100, 100, 100, 27.7 s pieces
+    text = provider.transcribe_audio(source)
+    assert routed.count("piece-00003.wav") == 1
+    assert "[No speech detected]" in text
+
