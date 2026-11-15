@@ -16,7 +16,8 @@ import pytest
 from core.resilience import TransientError
 from providers.media.chunked_audio import ChunkedAudioProvider
 from providers.media.openrouter_media import (
-    AudioTranscriptBlocked, AudioTranscriptTruncated, OpenRouterMediaProvider,
+    AudioTranscriptAborted, AudioTranscriptBlocked, AudioTranscriptTruncated,
+    OpenRouterMediaProvider,
 )
 
 pytestmark = pytest.mark.unit
@@ -189,4 +190,15 @@ def test_resplit_tail_piece_stays_on_the_large_route(tmp_path):
     text = provider.transcribe_audio(source)
     assert routed.count("piece-00003.wav") == 1
     assert "[No speech detected]" in text
+
+
+def test_alternate_provider_error_finish_is_an_aborted_span(tmp_path, monkeypatch):
+    path = tmp_path / "part.wav"
+    path.write_bytes(b"audio")
+    monkeypatch.setattr(httpx, "post", Mock(return_value=_response("error", None, "a email. a email.")))
+    provider = OpenRouterMediaProvider(["audio"], "video", api_key="test",
+                                       require_complete_audio=True)
+    with pytest.raises(AudioTranscriptAborted, match="finish completely") as caught:
+        provider.transcribe_audio(path)
+    assert caught.value.reason == "provider error"
 

@@ -107,6 +107,13 @@ class AudioTranscriptBlocked(AudioSpanUntranscribable):
         super().__init__(f"Audio transcript blocked by provider ({reason})", reason)
 
 
+class AudioTranscriptAborted(AudioSpanUntranscribable):
+    """The provider ended the generation with an error (seen on looping output)."""
+
+    def __init__(self, reason: str):
+        super().__init__("Audio transcript response did not finish completely", reason)
+
+
 class AudioTranscriptTruncated(AudioSpanUntranscribable):
     """The output limit ran out: for a bounded audio part, a degenerate loop."""
 
@@ -333,6 +340,8 @@ class OpenRouterMediaProvider:
                 raise AudioTranscriptBlocked(native or "content_filter")
             if native == "MAX_TOKENS" or choice.get("finish_reason") == "length":
                 raise AudioTranscriptTruncated(native or "length")
+            if choice.get("finish_reason") == "error":
+                raise AudioTranscriptAborted(native or "provider error")
             raise TransientError("Audio transcript response did not finish completely")
         message = data["choices"][0]["message"]
         content_value = message.get("content", "")
