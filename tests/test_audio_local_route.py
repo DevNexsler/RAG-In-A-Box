@@ -120,3 +120,12 @@ def test_local_client_reports_a_looping_part_as_truncated(tmp_path, monkeypatch)
     with pytest.raises(AudioTranscriptTruncated, match="finish completely"):
         client.run(path)
 
+
+def test_part_budget_is_configurable(monkeypatch):
+    monkeypatch.setenv("LITELLM_API_KEY", "test")
+    default = build_media_provider(_config(audio_transcription_route="local", audio_chunk_seconds=60))
+    assert default.max_parts == 256
+    raised = build_media_provider(_config(audio_transcription_route="local", audio_chunk_seconds=60,
+                                          audio_max_parts=1500))
+    assert raised.max_parts == 1500
+

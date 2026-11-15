@@ -232,6 +232,7 @@ def _build_litellm_media_provider(media_cfg: dict) -> MediaProvider:
             accept_unconfirmed_silence=local_only,
             large_audio_provider=or_audio if large_provider else None,
             max_local_audio_seconds=media_cfg.get("audio_local_max_seconds", 600),
+            max_parts=int(media_cfg.get("audio_max_parts", 256)),
         )
     return wrapped
 
