@@ -124,6 +124,9 @@ class OpenRouterMediaProvider:
         audio_base_url: str | None = None,
         timeout: float = 300.0,
         max_file_size_mb: float = 800.0,
+        require_complete_audio: bool = False,
+        audio_max_output_tokens: int | None = None,
+        audio_reasoning: dict | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self.base_url = base_url.rstrip("/")
@@ -140,6 +143,9 @@ class OpenRouterMediaProvider:
         self.video_model = video_model
         self.timeout = timeout
         self.max_file_size_bytes = int(max_file_size_mb * 1024 * 1024)
+        self.require_complete_audio = require_complete_audio
+        self.audio_max_output_tokens = audio_max_output_tokens
+        self.audio_reasoning = None if audio_reasoning is None else dict(audio_reasoning)
 
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY not set. Set it in .env or pass api_key.")
@@ -267,6 +273,11 @@ class OpenRouterMediaProvider:
             "model": model,
             "messages": [{"role": "user", "content": content}],
         }
+        audio = any(part.get("type") == "input_audio" for part in content)
+        if audio and self.audio_max_output_tokens is not None:
+            payload["max_tokens"] = self.audio_max_output_tokens
+        if audio and self.audio_reasoning is not None:
+            payload["reasoning"] = self.audio_reasoning
         payload.setdefault("temperature", 0.0)
         response = httpx.post(
             f"{base_url or self.base_url}/chat/completions",
@@ -276,6 +287,8 @@ class OpenRouterMediaProvider:
         )
         raise_for_status(response)  # a permanent 4xx keeps OpenRouter's reason
         data = response.json()
+        if audio and self.require_complete_audio and data["choices"][0].get("finish_reason") not in {"stop", "end_turn"}:
+            raise TransientError("Audio transcript response did not finish completely")
         message = data["choices"][0]["message"]
         content_value = message.get("content", "")
         if isinstance(content_value, list):

@@ -62,7 +62,8 @@ class LiteLLMFallback:
     def __init__(self, endpoint: str, model: str, prompt: str, encoder: Encoder,
                  *, api_key: str | None = None, timeout: float = 300.0,
                  attempts: int = DEFAULT_ATTEMPTS,
-                 backoff: tuple[float, ...] = DEFAULT_BACKOFF):
+                 backoff: tuple[float, ...] = DEFAULT_BACKOFF,
+                 require_complete: bool = False, max_tokens: int | None = None):
         self.base_url = endpoint.rstrip("/")
         self.model = model
         self.prompt = prompt
@@ -70,6 +71,8 @@ class LiteLLMFallback:
         self.timeout = timeout
         self.attempts = attempts
         self.backoff = backoff
+        self.require_complete = require_complete
+        self.max_tokens = max_tokens
         self.api_key = (api_key or os.environ.get("LITELLM_API_KEY", "")
                         or os.environ.get("LITELLM_MASTER_KEY", ""))
 
@@ -79,6 +82,8 @@ class LiteLLMFallback:
         payload = {"model": self.model,
                    "messages": [{"role": "user", "content": content}],
                    "temperature": 0.0}
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
         headers = {"Authorization": f"Bearer {self.api_key}",
                    "Content-Type": "application/json"}
 
@@ -89,7 +94,10 @@ class LiteLLMFallback:
             # its body, which is what names the misconfiguration below (#1662).
             raise_for_status(resp)
             data = resp.json()
-            return (data["choices"][0]["message"]["content"] or "").strip()
+            choice = data["choices"][0]
+            if self.require_complete and choice.get("finish_reason") not in {"stop", "end_turn"}:
+                raise TransientError("Audio transcript response did not finish completely")
+            return (choice["message"]["content"] or "").strip()
 
         # call_with_retry re-raises the transient exc UNCHANGED on exhaustion, so an
         # unreachable endpoint propagates as a transient error to resolve_with_fallback.
