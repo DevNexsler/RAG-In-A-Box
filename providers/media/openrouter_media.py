@@ -75,6 +75,22 @@ _VIDEO_MIME_BY_EXT = {
 _AUDIO_ENDPOINTS = {"audio/transcriptions", "chat/completions"}
 
 
+# Provider finish reasons that mean the model declined this audio's content
+# (e.g. Gemini's recitation filter on a long repeated jingle), as opposed to
+# running out of output. Retrying the same bytes returns the same refusal.
+AUDIO_BLOCK_REASONS = frozenset({
+    "RECITATION", "SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII",
+})
+
+
+class AudioTranscriptBlocked(TransientError):
+    """The provider declined to transcribe this audio's content."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"Audio transcript blocked by provider ({reason})")
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class AudioModelRoute:
     """One audio model plus the OpenRouter request contract it supports."""
@@ -288,6 +304,10 @@ class OpenRouterMediaProvider:
         raise_for_status(response)  # a permanent 4xx keeps OpenRouter's reason
         data = response.json()
         if audio and self.require_complete_audio and data["choices"][0].get("finish_reason") not in {"stop", "end_turn"}:
+            choice = data["choices"][0]
+            native = str(choice.get("native_finish_reason") or "").upper()
+            if native in AUDIO_BLOCK_REASONS or choice.get("finish_reason") == "content_filter":
+                raise AudioTranscriptBlocked(native or "content_filter")
             raise TransientError("Audio transcript response did not finish completely")
         message = data["choices"][0]["message"]
         content_value = message.get("content", "")

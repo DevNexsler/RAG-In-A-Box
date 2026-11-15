@@ -11,7 +11,7 @@ from threading import Timer
 import wave
 
 from core.resilience import TransientError
-from providers.media.openrouter_media import MediaFileTooLargeError
+from providers.media.openrouter_media import AudioTranscriptBlocked, MediaFileTooLargeError
 
 
 class ChunkedAudioProvider:
@@ -38,6 +38,9 @@ class ChunkedAudioProvider:
         elif not math.isfinite(self.chunk_seconds) or self.chunk_seconds <= 0:
             raise ValueError("media.audio_chunk_seconds must be finite and positive")
         self.max_parts = max_parts
+        # A part the provider declines (AudioTranscriptBlocked) is re-split into
+        # pieces this long; a piece still declined is marked, not retried.
+        self.blocked_piece_seconds = 300.0
         self.no_speech_fallback = no_speech_fallback
         self.large_audio_provider = large_audio_provider
         self.max_local_audio_seconds = float(max_local_audio_seconds)
@@ -128,6 +131,38 @@ class ChunkedAudioProvider:
                 raise TransientError("No-speech confirmation returned no transcript")
         return text
 
+    def _transcribe_blocked_part(self, path, seconds, offset, reason):
+        """Re-split a declined part so only the declined span is left out.
+
+        The marker names the span and the provider's reason, so the gap is
+        visible in the transcript instead of failing the whole recording on
+        every index run (a 13.75 h Plaud recording failed 39 times on one
+        jingle the provider's recitation filter declined).
+        """
+        pieces_dir = Path(tempfile.mkdtemp(prefix="blocked-", dir=Path(path).parent))
+        self._run([
+            "ffmpeg", "-nostdin", "-v", "error", "-i", str(path),
+            "-f", "segment", "-segment_time", str(self.blocked_piece_seconds),
+            "-reset_timestamps", "1", "-c", "copy",
+            str(pieces_dir / "piece-%05d.wav"),
+        ], timeout=300)
+        pieces = sorted(pieces_dir.glob("piece-*.wav"))
+        if not pieces:
+            raise TransientError("Audio segmentation produced no pieces for a declined part")
+        texts = []
+        start = offset
+        for piece in pieces:
+            piece_seconds = self._duration(piece)
+            span = f"{self._timestamp(start)}–{self._timestamp(start + piece_seconds)}"
+            try:
+                texts.append(self._transcribe_part(piece, piece_seconds).strip())
+            except AudioTranscriptBlocked as exc:
+                texts.append(f"[Audio {span} not transcribed: provider declined ({exc.reason})]")
+            start += piece_seconds
+        if abs((start - offset) - seconds) > 1:
+            raise TransientError("Declined-part pieces do not cover the part")
+        return "\n".join(texts)
+
     def transcribe_audio(self, file_path):
         path = Path(file_path).resolve()
         duration = self._duration(path)
@@ -168,7 +203,10 @@ class ChunkedAudioProvider:
             ]
             offset = 0.0
             for i, (part, seconds) in enumerate(zip(parts, durations), 1):
-                text = self._transcribe_part(part, seconds)
+                try:
+                    text = self._transcribe_part(part, seconds)
+                except AudioTranscriptBlocked as exc:
+                    text = self._transcribe_blocked_part(part, seconds, offset, exc.reason)
                 results.append(
                     f"[Audio segment {i}/{len(parts)} "
                     f"{self._timestamp(offset)}–{self._timestamp(offset + seconds)}]\n"
