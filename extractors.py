@@ -13,6 +13,7 @@ Supported formats:
 - Spreadsheets (.xlsx, .xls): openpyxl extracts headers + text-only cells.
 - Plain text (.txt): UTF-8 reader with error replacement.
 - Calendars (.ics, or iCalendar bytes under any suffix): event fields as text.
+- Email (.eml): headers, plain-text (or HTML-reduced) body, attachment names.
 """
 
 import json
@@ -988,6 +989,120 @@ def extract_calendar(file_path: str | Path) -> ExtractionResult:
 
 
 # ---------------------------------------------------------------------------
+# Email (eml)
+# ---------------------------------------------------------------------------
+
+#: Headers that say who wrote to whom, when, and about what.
+EMAIL_HEADERS = ("From", "To", "Cc", "Date", "Subject")
+_HTML_BLOCK_TAGS = {"br", "p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"}
+
+
+def _html_to_text(markup: str) -> str:
+    """Visible text of an HTML body; block tags become line breaks."""
+    from html.parser import HTMLParser
+
+    class _Text(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.parts: list[str] = []
+            self._skip = 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("style", "script", "head"):
+                self._skip += 1
+            elif tag in _HTML_BLOCK_TAGS:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in ("style", "script", "head"):
+                self._skip = max(0, self._skip - 1)
+            elif tag in _HTML_BLOCK_TAGS:
+                self.parts.append("\n")
+
+        def handle_data(self, data):
+            if not self._skip:
+                self.parts.append(data)
+
+    parser = _Text()
+    parser.feed(markup)
+    parser.close()
+    text = "".join(parser.parts).replace("\xa0", " ")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def extract_email(file_path: str | Path) -> ExtractionResult:
+    """Render an RFC 822 message as text: headers, body, attachment names.
+
+    The plain-text body is preferred; an HTML-only message is reduced to its
+    visible text. Attachments are listed by name, not extracted — saved
+    attachments are indexed as files of their own. Subject, sender and date
+    fill the title, author and created fields. Recipients and attachment
+    names stay in the text only: any other frontmatter key becomes a new Lance
+    column, and widening the schema drops the vector index until a rebuild.
+    """
+    import email
+    from email import policy
+    from email.utils import parsedate_to_datetime
+
+    try:
+        with open(file_path, "rb") as f:
+            msg = email.message_from_binary_file(f, policy=policy.default)
+    except Exception as e:
+        logger.warning("Email parse failed for %s: %s", file_path, e)
+        note_degradation("email_parse_failed")
+        return ExtractionResult.from_text("", primary_content=False)
+
+    def header(name: str) -> str:
+        try:
+            return " ".join(str(msg.get(name, "") or "").split())
+        except Exception:  # malformed header the policy cannot decode
+            return ""
+
+    lines = [f"{name}: {value}" for name in EMAIL_HEADERS if (value := header(name))]
+
+    body = ""
+    try:
+        part = msg.get_body(preferencelist=("plain", "html"))
+        if part is not None:
+            content = part.get_content()
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            body = _html_to_text(content) if part.get_content_type() == "text/html" else content.strip()
+    except Exception as e:
+        logger.warning("Email body decode failed for %s: %s", file_path, e)
+        note_degradation("email_body_decode_failed")
+
+    attachments = []
+    for part in msg.walk():
+        if part.is_multipart() or part.get_content_disposition() not in ("attachment", "inline"):
+            continue
+        name = part.get_filename()
+        if name:
+            attachments.append(" ".join(name.split()))
+    if attachments:
+        lines.append("Attachments: " + "; ".join(attachments))
+
+    text = "\n".join(lines)
+    if body:
+        text = f"{text}\n\n{body}" if text else body
+
+    fm: dict = {}
+    if subject := header("Subject"):
+        fm["title"] = subject
+    if sender := header("From"):
+        fm["author"] = sender
+    if raw_date := header("Date"):
+        try:
+            fm["created"] = parsedate_to_datetime(raw_date).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            pass
+    # Headers alone still say who wrote to whom; a message without them or a
+    # body is empty.
+    return ExtractionResult.from_text(text, frontmatter=fm, primary_content=bool(body or lines))
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -1037,6 +1152,8 @@ def extract_text(
         return extract_plaintext(file_path)
     elif ext == "ics":
         return extract_calendar(file_path)
+    elif ext == "eml":
+        return extract_email(file_path)
     elif ext in ("xlsx", "xls"):
         return extract_excel(file_path)
     elif ext in ("docx", "doc", "pptx", "html", "htm", "epub", "rtf", "csv"):

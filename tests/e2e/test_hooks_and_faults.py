@@ -535,6 +535,37 @@ async def test_calendar_attachment_deposited_as_bin_indexes_its_event(indexed_co
     assert all(c["content_status"] == "complete" for c in chunks), chunks
 
 
+async def test_saved_email_indexes_headers_and_body(indexed_corpus, mcp_session):
+    """Saved .eml messages (evidence packets, exported threads) were never
+    extracted: no headers or body reached the index."""
+    stem = f"mail-{uuid.uuid4().hex[:8]}"
+    message = (
+        "From: Pat Sender <pat@example.com>\r\n"
+        "To: Sam Recipient <sam@example.com>\r\n"
+        "Date: Tue, 03 Nov 2026 18:55:29 -0500\r\n"
+        f"Subject: Notice {stem}\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        "Please cure the default within ten days.\r\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        deposit = Path(tmp) / f"{stem}.eml"
+        deposit.write_text(message)
+        _compose_cp_into_documents(deposit)
+
+    result = await mcp_session.call_tool_json(
+        "file_index_document", {"target": deposit.name, "source_name": "documents"})
+    assert result.get("status") == "indexed", result
+
+    chunks = await mcp_session.call_tool_json(
+        "file_get_doc_chunks", {"doc_id": result["doc_id"]})
+    assert isinstance(chunks, list) and chunks, chunks
+    text = "\n".join(c.get("text") or "" for c in chunks)
+    assert f"Subject: Notice {stem}" in text, chunks
+    assert "From: Pat Sender <pat@example.com>" in text, chunks
+    assert "Please cure the default within ten days." in text, chunks
+    assert all(c["content_status"] == "complete" for c in chunks), chunks
+
+
 async def test_reindexed_document_has_no_stale_chunks(indexed_corpus, api, mcp_session):
     """A re-indexed document's rows must be exactly the new ones.
 
