@@ -3445,7 +3445,12 @@ def _process_doc_task(
             rel_path=rel_path,
             abs_path=str(doc.get("abs_path", "")),
             text=sanitized_event_text,
-            metadata=doc_meta,
+            # text_origin rides on the callback only: storing it would add a
+            # metadata sub-field and widen the whole Lance table.
+            metadata=(
+                {**doc_meta, "text_origin": result.text_origin}
+                if getattr(result, "text_origin", None) else doc_meta
+            ),
             chunks=chunks,
         )
         _dispatch_document_indexed_event(config, event, logger)

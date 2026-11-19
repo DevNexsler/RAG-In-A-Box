@@ -100,6 +100,18 @@ CONTENT_PARTIAL = "partial"     # something failed, but content was still obtain
 CONTENT_MISSING = "missing"     # something failed and no content was obtained
 
 
+# How a document's primary content was produced, as reported to callback
+# consumers. Only ``text_layer`` is read from the file itself; the others are
+# written by a model and can be wrong.
+TEXT_ORIGIN_TEXT_LAYER = "text_layer"        # the file's own text (PDF text layer, md, docx, ...)
+TEXT_ORIGIN_OCR = "ocr"                      # page images read by an OCR model
+TEXT_ORIGIN_VISION = "vision"                # a vision model describing an image or video
+TEXT_ORIGIN_TRANSCRIPTION = "transcription"  # a speech model transcribing audio
+TEXT_ORIGINS = frozenset({
+    TEXT_ORIGIN_TEXT_LAYER, TEXT_ORIGIN_OCR, TEXT_ORIGIN_VISION, TEXT_ORIGIN_TRANSCRIPTION,
+})
+
+
 @dataclass
 class ExtractionResult:
     """Result of extracting text from a document."""
@@ -111,6 +123,10 @@ class ExtractionResult:
     #: than its contents. Extractors whose content path can fail set this; the
     #: rest are content-only and leave the default.
     primary_content: bool = True
+    #: How the primary content was produced (``TEXT_ORIGINS``), or None when
+    #: there is none. Set by ``extract_text``; reported to ``document.indexed``
+    #: consumers so they can tell file text from model-made text.
+    text_origin: str | None = None
 
     def content_status(self, failures: list[str]) -> str:
         """Classify what actually landed, given this document's extraction
@@ -991,6 +1007,25 @@ def extract_calendar(file_path: str | Path) -> ExtractionResult:
 # Dispatcher
 # ---------------------------------------------------------------------------
 
+def _text_origin(ext: str, result: ExtractionResult) -> str | None:
+    """How ``result``'s primary content was produced, by the extractor that ran.
+
+    A PDF is ``ocr`` as soon as one page's text came from OCR: part of it was
+    model-read. Video notes come from a multimodal model watching the file, so
+    they count as ``vision``. A document without primary content has none.
+    """
+    if not result.primary_content or not result.full_text.strip():
+        return None
+    if ext == "pdf":
+        ocr_used = any(page.was_ocr and page.text.strip() for page in result.pages)
+        return TEXT_ORIGIN_OCR if ocr_used else TEXT_ORIGIN_TEXT_LAYER
+    if ext in IMAGE_EXTENSIONS or ext in VIDEO_EXTENSIONS:
+        return TEXT_ORIGIN_VISION
+    if ext in AUDIO_EXTENSIONS:
+        return TEXT_ORIGIN_TRANSCRIPTION
+    return TEXT_ORIGIN_TEXT_LAYER
+
+
 def extract_text(
     file_path: str | Path,
     ext: str,
@@ -1000,7 +1035,10 @@ def extract_text(
     min_text_chars: int = 200,
     ocr_page_limit: int = 200,
 ) -> ExtractionResult:
-    """Route using media bytes, retaining original paths and identifiers."""
+    """Route using media bytes, retaining original paths and identifiers.
+
+    The result's ``text_origin`` records which kind of extractor produced it.
+    """
     ext = ext.lower().lstrip(".")
     try:
         ext = detect_media_format(file_path, ext)
@@ -1010,6 +1048,24 @@ def extract_text(
     if ext == "bin":
         note_degradation("unrecognized_media_format")
         return ExtractionResult.from_text("", primary_content=False)
+    result = _route_extract_text(
+        file_path, ext, ocr_provider, media_provider,
+        pdf_strategy, min_text_chars, ocr_page_limit,
+    )
+    result.text_origin = _text_origin(ext, result)
+    return result
+
+
+def _route_extract_text(
+    file_path: str | Path,
+    ext: str,
+    ocr_provider: Optional[OCRProvider],
+    media_provider: Optional[MediaProvider],
+    pdf_strategy: str,
+    min_text_chars: int,
+    ocr_page_limit: int,
+) -> ExtractionResult:
+    """The extractor for one detected format (``extract_text`` probes it)."""
     if ext == "md":
         return extract_markdown(file_path)
     elif ext == "pdf":
