@@ -44,6 +44,7 @@ sources:
         - "**/*.tif"
         - "**/*.tiff"
         - "**/*.bin"
+        - "**/*.eml"
         - "**/*.mp3"
         - "**/*.mp4"
       exclude:

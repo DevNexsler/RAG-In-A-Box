@@ -1250,3 +1250,109 @@ def test_fallback_chain_dark_mode_outage_degrades_transient_through_extract_imag
     degs = collect_degradations()
     assert [d.reason for d in degs] == ["ocr_describe_failed"]
     assert degs[0].transient is True                       # transient -> #60 never caps
+
+
+# --- Email extraction ---
+
+def _write_eml(tmp_path, name, msg):
+    path = tmp_path / name
+    path.write_bytes(bytes(msg))
+    return path
+
+
+def _multipart_email():
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["From"] = "Pat Sender <pat@example.com>"
+    msg["To"] = "Sam Recipient <sam@example.com>"
+    msg["Cc"] = "lee@example.com"
+    msg["Date"] = "Tue, 03 Nov 2026 18:55:29 -0500"
+    msg["Subject"] = "Notice to Cure"
+    msg.set_content("Please cure the default within 10 days.\n")
+    msg.add_alternative("<html><body><p>HTML copy that must not be used</p></body></html>", subtype="html")
+    msg.add_attachment(b"%PDF-1.4 fake", maintype="application", subtype="pdf", filename="Notice.pdf")
+    return msg
+
+
+def test_email_indexes_headers_plain_body_and_attachment_names(tmp_path):
+    """An .eml reads as who/when/subject, the plain body, and attachment names;
+    no OCR or media provider is called and the HTML alternative is not doubled in."""
+    from extractors import extract_text
+
+    class NoMediaModel:
+        def __getattr__(self, name):
+            raise AssertionError(f"email sent to a media model ({name})")
+
+    path = _write_eml(tmp_path, "notice.eml", _multipart_email())
+    result = extract_text(path, "eml", ocr_provider=NoMediaModel(), media_provider=NoMediaModel())
+
+    lines = result.full_text.splitlines()
+    assert lines[:6] == [
+        "From: Pat Sender <pat@example.com>",
+        "To: Sam Recipient <sam@example.com>",
+        "Cc: lee@example.com",
+        "Date: Tue, 03 Nov 2026 18:55:29 -0500",
+        "Subject: Notice to Cure",
+        "Attachments: Notice.pdf",
+    ]
+    assert "Please cure the default within 10 days." in result.full_text
+    assert "HTML copy" not in result.full_text
+    assert result.frontmatter["title"] == "Notice to Cure"
+    assert result.frontmatter["author"] == "Pat Sender <pat@example.com>"
+    assert result.frontmatter["created"] == "2026-11-03 18:55:29"
+    # Only existing metadata fields: a new frontmatter key would widen the Lance schema.
+    assert set(result.frontmatter) == {"title", "author", "created"}
+    assert result.primary_content is True
+
+
+def test_email_html_only_body_reduced_to_visible_text(tmp_path):
+    from email.message import EmailMessage
+    from extractors import extract_email
+
+    msg = EmailMessage()
+    msg["From"] = "a@example.com"
+    msg["Subject"] = "Roof"
+    msg.set_content(
+        "<html><head><style>p{color:red}</style></head><body>"
+        "<p>First&nbsp;line</p><div>Second line<br>Third</div><script>x()</script></body></html>",
+        subtype="html",
+    )
+    result = extract_email(_write_eml(tmp_path, "html.eml", msg))
+
+    body = result.full_text.split("\n\n", 1)[1]
+    assert body.splitlines() == ["First line", "", "Second line", "Third"]
+    assert "color" not in result.full_text and "x()" not in result.full_text
+
+
+def test_email_decodes_encoded_headers_and_legacy_charset(tmp_path):
+    """RFC 2047 subjects and a latin-1 body decode to text, not mojibake."""
+    from extractors import extract_email
+
+    raw = (
+        b"From: =?utf-8?q?Jos=C3=A9_Garc=C3=ADa?= <jose@example.com>\r\n"
+        b"Subject: =?utf-8?b?UmU6IFJvb2YgZXN0aW1hdGUg4oCUIGZpbmFs?=\r\n"
+        b"Date: not a date\r\n"
+        b"Content-Type: text/plain; charset=iso-8859-1\r\n"
+        b"Content-Transfer-Encoding: quoted-printable\r\n\r\n"
+        b"Caf=E9 meeting at 10.\r\n"
+    )
+    path = tmp_path / "legacy.eml"
+    path.write_bytes(raw)
+    result = extract_email(path)
+
+    assert "From: José García <jose@example.com>" in result.full_text
+    assert result.frontmatter["title"] == "Re: Roof estimate — final"
+    assert "Café meeting at 10." in result.full_text
+    assert "created" not in result.frontmatter  # unparseable Date is dropped, not guessed
+
+
+def test_email_without_headers_or_body_is_missing_content(tmp_path):
+    from extractors import extract_email
+
+    path = tmp_path / "empty.eml"
+    path.write_bytes(b"")
+    result = extract_email(path)
+
+    assert result.full_text == ""
+    assert result.primary_content is False
