@@ -117,7 +117,8 @@ def main() -> None:
             chunks = -1
         dt = round(time.time() - t0, 1)
         verdict = ("INDEXED" if chunks > 0
-                   else ("EMPTY/0-chunk" if st == "indexed" else "FAILED"))
+                   else ("EMPTY/0-chunk" if st in ("indexed", "not_indexable")
+                         else "FAILED"))
         if verdict == "INDEXED":
             indexed += 1
         elif verdict.startswith("EMPTY"):

@@ -248,3 +248,30 @@ async def test_rest_index_document_separates_outside_scan_from_missing(
     )
     assert missing.status_code == 404, missing.text
     assert missing.json()["reason"] == "not_found"
+
+
+async def test_rest_index_document_answers_not_indexable_for_contentless_deposit(
+    indexed_corpus, api
+):
+    """#4603: a deposit with no extractable text is processed, ledgered as
+    no_text_extracted and never produces a document.indexed callback. The
+    request that processed it and a later retrigger both answer the terminal
+    not_indexable, which the depositor records instead of waiting forever."""
+    name = f"blank-{uuid.uuid4().hex[:8]}.md"
+    # Whitespace only, varied per run so a rerun is not an exact-content copy.
+    content = b"\n" + b" " * (1 + uuid.uuid4().int % 4096) + b"\n"
+    upload = await api.post("/api/upload", files={"file": (name, content)})
+    assert upload.status_code == 201, upload.text
+    rel_path = upload.json()["rel_path"]
+
+    answers = [
+        await api.post("/api/index/document", json={"rel_path": rel_path})
+        for _ in ("processed", "retrigger")
+    ]
+    for answer in answers:
+        assert answer.status_code == 200, answer.text
+        body = answer.json()
+        assert body["status"] == "not_indexable", body
+        assert body["reason"] == "no_text_extracted", body
+        assert body["doc_id"].startswith("documents::"), body
+    assert answers[0].json() == answers[1].json()

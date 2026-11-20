@@ -5101,6 +5101,27 @@ def _not_indexable_answer(rel_path: str, reason: str, source_name: str) -> dict:
     }
 
 
+def _skip_verdict_answer(
+    record: dict, skip_reasons: Sequence[str], source_name: str
+) -> dict | None:
+    """The terminal answer for a document whose skip is a verdict on its bytes.
+
+    ``content_terminal_skip_reasons`` owns which skips mean "while unchanged
+    this document will not produce an index row" (no text extracted,
+    unreadable, quarantined, ...). Such a document gets no document.indexed
+    callback, so the requester must hear ``not_indexable`` rather than
+    ``indexed`` or a retryable ``skipped`` (#4603). A dedupe skip is not a
+    verdict (the canonical carries the content and the callback): None.
+    """
+    terminal = content_terminal_skip_reasons({"reasons": list(skip_reasons)})
+    if not terminal:
+        return None
+    return {
+        **_not_indexable_answer(record["rel_path"], terminal[0], source_name),
+        "doc_id": record["doc_id"],
+    }
+
+
 def resolve_single_record(
     config: dict, source_name: str, target: str, doc_id_store: DocIDStore
 ) -> dict | None:
@@ -5498,6 +5519,9 @@ def _index_document_unlocked(
                 str(record["doc_id"]), {}
             )
             reasons = entry.get("reasons", []) if isinstance(entry, dict) else []
+            verdict = _skip_verdict_answer(record, reasons, request.source_name)
+            if verdict is not None:
+                return verdict
             return {
                 "status": "skipped",
                 "reason": reasons[0] if reasons else "skip_ledger",
@@ -5528,6 +5552,9 @@ def _index_document_unlocked(
     # Signal serving processes to reopen their cached store handle so the doc
     # is searchable immediately. FTS visibility still awaits the next sweep.
     _update_index_metadata_after_single_doc(index_root, store)
+    verdict = _skip_verdict_answer(record, collect_skips(), request.source_name)
+    if verdict is not None:
+        return verdict
     return {
         "status": "indexed",
         "doc_id": record["doc_id"],
@@ -5647,7 +5674,10 @@ def _service_index_queue(config: dict, table_name: str) -> int:
         served_doc_ids = {
             str(result["doc_id"])
             for result in results.values()
-            if result.get("status") == "indexed" and result.get("doc_id")
+            # Both outcomes settle the doc for this run; a not_indexable one
+            # processed again by the sweep would re-pay its extraction.
+            if result.get("status") in ("indexed", "not_indexable")
+            and result.get("doc_id")
         }
     except Exception:
         _get_logger().exception("Serving queued index requests mid-sweep failed")
@@ -5672,7 +5702,9 @@ def _service_index_queue(config: dict, table_name: str) -> int:
             _update_run_progress(queued=int(progress["queued"]) + len(results))
             for result in results.values():
                 skip_reasons: tuple[str, ...] = ()
-                if result.get("status") == "skipped" and result.get("reason"):
+                if result.get("status") in ("skipped", "not_indexable") and result.get(
+                    "reason"
+                ):
                     skip_reasons = (str(result["reason"]),)
                 _advance_run_progress(skip_reasons=skip_reasons)
     return len(results)

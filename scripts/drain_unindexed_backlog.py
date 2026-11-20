@@ -112,7 +112,7 @@ def main() -> None:
         dt = round(time.time() - t0, 1)
         if st == "indexed":
             ok += 1
-        elif st == "skipped":
+        elif st in ("skipped", "not_indexable"):
             skip += 1
         else:
             fail += 1

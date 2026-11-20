@@ -4128,6 +4128,9 @@ if HAS_MCP and FastMCP is not None:
             - {"status": "skipped", "reason": "unchanged", "doc_id": ...}
             - {"status": "not_indexable", "reason": "outside_scan", ...} for
               an existing file the source's scan does not select (terminal).
+            - {"status": "not_indexable", "reason": <skip reason>, "doc_id": ...}
+              when the file's content will not index while unchanged, e.g.
+              "no_text_extracted" (terminal; no document.indexed follows).
             - {"status": "error", "reason": "not_found", ...}
             - {"error": true, "code": ..., "message": ...} on failure.
         """

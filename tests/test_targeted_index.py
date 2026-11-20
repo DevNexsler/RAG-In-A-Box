@@ -585,9 +585,9 @@ def test_index_document_flow_parks_unchanged_mangled_pdf(tmp_path):
     first, _ = _run_single_doc(tmp_path, root, f, None)
     second, second_store = _run_single_doc(tmp_path, root, f, None)
 
-    assert first["status"] == "indexed"
-    assert second["status"] == "skipped"
-    assert second["reason"] == "corrupt_mangled_binary"
+    # A content verdict answers not_indexable on both requests (#4603).
+    assert first["status"] == second["status"] == "not_indexable"
+    assert first["reason"] == second["reason"] == "corrupt_mangled_binary"
     second_store.upsert_nodes.assert_not_called()
 
 
@@ -613,7 +613,7 @@ def test_index_document_flow_skip_outcome_clears_stale_degraded_entry(tmp_path):
 
     result, _ = _run_single_doc(tmp_path, root, f, None)
 
-    assert result["status"] == "indexed"
+    assert result["status"] == "not_indexable"  # #4603
     assert "documents::00bak" in _ledger(tmp_path, "skip_docs.json")["docs"]
     assert "documents::00bak" not in _ledger(
         tmp_path, "degraded_docs.json"
@@ -646,6 +646,68 @@ def test_index_document_flow_degraded_outcome_clears_stale_skip_entry(tmp_path):
     assert result["status"] == "indexed"
     assert "documents::00bal" in _ledger(tmp_path, "degraded_docs.json")["docs"]
     assert "documents::00bal" not in _ledger(tmp_path, "skip_docs.json")["docs"]
+
+
+def test_index_document_flow_contentless_doc_answers_not_indexable(tmp_path):
+    """#4603: processing that records a content verdict (no_text_extracted)
+    writes no row, so no document.indexed callback follows. The requester gets
+    the terminal answer on the request that processed the doc and on a
+    retrigger that hits the skip ledger. `indexed` would tell it to wait for a
+    writeback that never arrives."""
+    root, f = _make_attachment(
+        tmp_path, "email-attachments/blank@00wav@.txt", data=b" \n\t\n"
+    )
+
+    first, first_store = _run_single_doc(tmp_path, root, f, None)
+    retrigger, retrigger_store = _run_single_doc(tmp_path, root, f, None)
+
+    expected = {
+        "status": "not_indexable",
+        "reason": "no_text_extracted",
+        "doc_id": "documents::00wav",
+        "rel_path": "email-attachments/blank@00wav@.txt",
+        "source_name": "documents",
+    }
+    assert first == expected
+    assert retrigger == expected
+    assert _ledger(tmp_path, "skip_docs.json")["docs"]["documents::00wav"][
+        "reasons"
+    ] == ["no_text_extracted"]
+    first_store.upsert_nodes.assert_not_called()
+    retrigger_store.upsert_nodes.assert_not_called()
+
+
+def test_index_document_flow_dedupe_ledger_hit_stays_skipped(tmp_path):
+    """A dedupe skip is no verdict on the doc's bytes: the canonical carries
+    the content and the callback. It keeps the retryable `skipped` answer."""
+    import time
+
+    root, f = _make_attachment(
+        tmp_path, "email-attachments/copy@00dup@.txt", data=b"hello text"
+    )
+    index_root = tmp_path / "index"
+    index_root.mkdir(parents=True)
+    record = fiv.resolve_single_record(
+        _fs_config(root, index_root),
+        "documents",
+        str(f),
+        DocIDStore(index_root / "doc_registry.db"),
+    )
+    (index_root / "skip_docs.json").write_text(json.dumps({
+        "docs": {
+            record["doc_id"]: {
+                "reasons": ["duplicate_of:00can"],
+                "change_key": fiv._change_key(record),
+                "skipped_at": time.time(),
+            }
+        }
+    }))
+
+    result, store = _run_single_doc(tmp_path, root, f, None)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "duplicate_of:00can"
+    store.upsert_nodes.assert_not_called()
 
 
 def test_index_document_flow_missing_file_returns_error(tmp_path):

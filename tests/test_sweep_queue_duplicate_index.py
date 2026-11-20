@@ -52,6 +52,48 @@ def test_service_index_queue_reconciles_sweep_insert_snapshot(tmp_path, config):
     fiv._RUNTIME.clear()
 
 
+def test_service_index_queue_counts_terminal_answer_as_served(tmp_path, config):
+    """#4603: a queued doc processed to a not_indexable verdict was handled by
+    this run. The sweep must not process it a second time, and the run report
+    counts it as a skip."""
+    fiv._RUNTIME.clear()
+    fiv._RUNTIME.update(
+        {
+            "store": object(),
+            "doc_id_store": object(),
+            "index_root": tmp_path,
+            "storage_insert_doc_ids": {"documents::blank"},
+            "config": config,
+        }
+    )
+    queue = IndexRequestQueue(tmp_path)
+    queue.enqueue("chunks", "documents", "blank.wav")
+    fiv._initialize_run_progress()
+    fiv._update_run_progress(queued=0)
+
+    with patch.object(
+        fiv,
+        "_index_document_unlocked",
+        return_value={
+            "status": "not_indexable",
+            "reason": "no_text_extracted",
+            "doc_id": "documents::blank",
+            "rel_path": "blank.wav",
+            "source_name": "documents",
+        },
+    ):
+        assert fiv._service_index_queue(config, "chunks") == 1
+
+    try:
+        assert "documents::blank" in fiv._RUNTIME["sweep_served_doc_ids"]
+        assert "documents::blank" not in fiv._RUNTIME["storage_insert_doc_ids"]
+        progress = fiv._RUNTIME["run_progress"]
+        assert progress["skipped"] == 1
+        assert progress["skip_reasons"] == {"no_text_extracted": 1}
+    finally:
+        fiv._RUNTIME.clear()
+
+
 def test_process_doc_task_skips_sweep_served_doc():
     """A sweep worker must not touch the store for a checkpoint-served doc."""
     store = MagicMock()
