@@ -113,6 +113,29 @@ class StrandedCohortError(ValueError):
     """
 
 
+def document_origin(db_path: str | Path, doc_id: str) -> dict[str, str] | None:
+    """The depositor recorded for ``doc_id``, read without opening the registry for writing.
+
+    For callers on the indexing path: a reader in WAL mode waits on no writer,
+    and nothing here creates or migrates a table.
+    """
+    candidates = [doc_id] + ([doc_id.split("::", 1)[-1]] if "::" in doc_id else [])
+    connection = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True, timeout=5)
+    try:
+        for candidate in candidates:
+            row = connection.execute(
+                "SELECT system, ref FROM document_origins WHERE doc_id = ?", (candidate,)
+            ).fetchone()
+            if row is not None:
+                return {"system": row[0], "ref": row[1]}
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+    finally:
+        connection.close()
+    return None
+
+
 class DocIDStore:
     """SQLite-backed persistent document ID registry.
 
@@ -228,6 +251,17 @@ class DocIDStore:
                 doc_id     TEXT PRIMARY KEY,
                 cohort_key TEXT NOT NULL,
                 reset_at   REAL NOT NULL
+            )
+        """)
+        # Who deposited a document and what it is in their system. Recorded at
+        # acceptance, so a depositor can be told about its own documents by
+        # the identity it already holds instead of by a path.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS document_origins (
+                doc_id      TEXT PRIMARY KEY,
+                system      TEXT NOT NULL,
+                ref         TEXT NOT NULL,
+                recorded_at REAL NOT NULL
             )
         """)
         c.execute(
@@ -433,6 +467,9 @@ class DocIDStore:
             self._conn.execute(
                 "DELETE FROM dedupe_cohort_resets WHERE doc_id = ?", (stored_key,)
             )
+            self._conn.execute(
+                "DELETE FROM document_origins WHERE doc_id = ?", (stored_key,)
+            )
             if row:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO retired_ids (doc_id, retired_at, last_path) "
@@ -441,6 +478,28 @@ class DocIDStore:
                 )
                 self._log(self.DELETED, stored_key, row[0])
             self._conn.commit()
+
+    def record_origin(self, doc_id: str, system: str, ref: str) -> None:
+        """Record who deposited ``doc_id``. The first origin stands; a replay is a no-op."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO document_origins (doc_id, system, ref, recorded_at) "
+                "VALUES (?, ?, ?, ?)",
+                (doc_id, system, ref, time.time()),
+            )
+            self._conn.commit()
+
+    def origin(self, doc_id: str) -> dict[str, str] | None:
+        """The depositor of ``doc_id`` (exact or source-namespaced), if one was recorded."""
+        candidates = [doc_id] + ([doc_id.split("::", 1)[-1]] if "::" in doc_id else [])
+        with self._lock:
+            for candidate in candidates:
+                row = self._conn.execute(
+                    "SELECT system, ref FROM document_origins WHERE doc_id = ?", (candidate,)
+                ).fetchone()
+                if row is not None:
+                    return {"system": row[0], "ref": row[1]}
+        return None
 
     def is_retired(self, doc_id: str) -> bool:
         """Return True if this ID was previously used and then deleted.

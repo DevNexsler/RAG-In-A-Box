@@ -8,17 +8,29 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import uuid
 
+from core.artifacts import is_communication_sidecar_payload
 from core.index_request_queue import IndexRequestQueue
 from doc_id_store import DocIDStore, extract_id_from_filename, inject_id_into_filename, strip_id_from_filename
 
 STAGING_PREFIX = '.organizer-accept-'
+ORIGIN_SYSTEM = re.compile(r'[a-z0-9][a-z0-9._-]{0,63}')
+ORIGIN_REF_MAX = 200
+# Below the form parser's own per-field ceiling, so this is the limit a caller meets.
+SIDECAR_MAX_BYTES = 500_000
+# Other containers and the host's agents read the documents tree.
+PUBLISHED_MODE = 0o644
 
 
 class AcceptanceConflict(ValueError):
     """A retry changed its input, or publication would overwrite existing bytes."""
+
+
+class InvalidAcceptance(AcceptanceConflict):
+    """The request itself is malformed; a retry with the same input cannot succeed."""
 
 
 @contextmanager
@@ -51,18 +63,53 @@ def _mkdir(path: Path):
         _sync_directory(path.parent)
 
 
-def _write_journal(path: Path, record: dict):
+def _write_journal(path: Path, record: dict, *, mode: int | None = None):
     _mkdir(path.parent)
-    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
+    with tempfile.NamedTemporaryFile(
+        mode='w', dir=path.parent, prefix=STAGING_PREFIX, delete=False,
+    ) as stream:
         temporary = Path(stream.name)
         try:
             json.dump(record, stream)
             stream.flush()
+            if mode is not None:
+                os.fchmod(stream.fileno(), mode)
             os.fsync(stream.fileno())
             os.replace(temporary, path)
             _sync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def checked_origin(origin) -> dict | None:
+    """``{system, ref}`` naming the depositor and its own record, or a refusal."""
+    if origin is None:
+        return None
+    if not isinstance(origin, dict) or set(origin) != {'system', 'ref'}:
+        raise InvalidAcceptance('Origin must name exactly a system and a ref')
+    system, ref = origin['system'], origin['ref']
+    if not isinstance(system, str) or not ORIGIN_SYSTEM.fullmatch(system):
+        raise InvalidAcceptance('Invalid origin system')
+    if not isinstance(ref, str) or not ref.strip() or len(ref) > ORIGIN_REF_MAX or ref != ref.strip():
+        raise InvalidAcceptance('Invalid origin ref')
+    return {'system': system, 'ref': ref}
+
+
+def checked_sidecar(sidecar, filename: str) -> dict | None:
+    """Attachment metadata the indexer reads beside the file, or a refusal.
+
+    Only the communication sidecar the scanner already keeps out of the index
+    is taken: any other JSON beside a document would be indexed as one.
+    """
+    if sidecar is None:
+        return None
+    if Path(filename).suffix.lower() == '.json':
+        raise InvalidAcceptance('A JSON document cannot carry a sidecar')
+    if not is_communication_sidecar_payload(sidecar):
+        raise InvalidAcceptance('Sidecar is not communication attachment metadata')
+    if len(json.dumps(sidecar).encode()) > SIDECAR_MAX_BYTES:
+        raise InvalidAcceptance('Sidecar exceeds size limit')
+    return sidecar
 
 
 class DocumentAcceptance:
@@ -96,12 +143,22 @@ class DocumentAcceptance:
             _sync_directory(target.parent)
         elif not stage.exists() or not os.path.samefile(stage, target):
             raise AcceptanceConflict('Acceptance destination already exists')
+        if record.get('sidecar') is not None:
+            # Beside the file, before indexing is queued: the indexer reads it
+            # as the document's communication context.
+            # Written once and then left alone: the indexer adds to it, and a
+            # retry of this acceptance must not undo that.
+            sidecar = self._path(receipt['sidecar_rel_path'])
+            if not os.path.lexists(sidecar):
+                _write_journal(sidecar, record['sidecar'], mode=PUBLISHED_MODE)
         if self.registry.is_retired(record['id']):
             raise AcceptanceConflict('Accepted identity was retired; staff review required')
         previous = self.registry.lookup_path(record['id'])
         if previous not in (None, receipt['rel_path']):
             raise AcceptanceConflict('Accepted identity belongs to another path')
         self.registry.register(record['id'], receipt['rel_path'], source_name=record['source_name'])
+        if record.get('origin') is not None:
+            self.registry.record_origin(record['id'], **record['origin'])
         IndexRequestQueue(Path(self.registry.db_path).parent).enqueue(
             table_name=record['table_name'], source_name=record['source_name'],
             target=receipt['rel_path'], force=False,
@@ -122,15 +179,35 @@ class DocumentAcceptance:
             if record['root'] == str(self.root):
                 self._finish(path, record)
 
-    def accept(self, directory: Path, filename: str, content: bytes, *, idempotency_key: str | None = None):
+    def accept(self, directory: Path, filename: str, content: bytes, *,
+               idempotency_key: str | None = None, origin: dict | None = None,
+               sidecar: dict | None = None):
+        """Publish ``content`` under a new identity and queue its indexing.
+
+        ``origin`` names the depositing system and its own record; it is
+        returned on the receipt and on the document's ``document.indexed``
+        event. ``sidecar`` is the communication attachment metadata, written
+        beside the file under the file's own name.
+
+        An ``Idempotency-Key`` covers the bytes, the destination and the
+        origin. The sidecar is not part of it: a retry carries metadata built
+        at another moment (a fetch time, an edited message body), and the
+        first acceptance's stands.
+        """
         directory = directory.resolve()
         if not directory.is_relative_to(self.root):
             raise AcceptanceConflict('Acceptance directory escapes documents root')
         filename = strip_id_from_filename(Path(filename).name)
         if not filename or filename.startswith('.'):
             raise AcceptanceConflict('Invalid filename')
+        origin = checked_origin(origin)
+        sidecar = checked_sidecar(sidecar, filename)
         digest = hashlib.sha256(content).hexdigest()
         fingerprint = [str(self.root), self.source_name, str(directory.relative_to(self.root)), filename, digest]
+        if origin is not None:
+            # Appended only when given, so receipts journalled before origins
+            # existed still replay under their key.
+            fingerprint.append({'origin': origin})
         key = hashlib.sha256(json.dumps([str(self.root), idempotency_key or str(uuid.uuid4())]).encode()).hexdigest()
         pending = self.journal / 'pending' / (key + '.json')
         completed = self.journal / 'receipts' / pending.name
@@ -155,6 +232,16 @@ class DocumentAcceptance:
                         raise AcceptanceConflict('Run an identity scan to recover existing filename IDs first')
             if interrupted:
                 return self._finish(pending, interrupted)
+            sidecar_path = (directory / filename).with_suffix('.json')
+            if sidecar is not None and directory.is_dir() and any(
+                Path(strip_id_from_filename(entry.name)).stem == Path(filename).stem
+                for entry in directory.iterdir() if not entry.name.startswith(STAGING_PREFIX)
+            ):
+                # A sidecar belongs to every document of its name in the folder,
+                # so the name must be this document's alone. Refused before an
+                # identity is spent or a byte is published.
+                raise AcceptanceConflict(
+                    'Another document of this name is here; its metadata would be shared')
             _mkdir(directory)
             doc_id = self.registry.next_id()
             target = directory / inject_id_into_filename(filename, doc_id)
@@ -169,6 +256,7 @@ class DocumentAcceptance:
                 try:
                     stream.write(content)
                     stream.flush()
+                    os.fchmod(stream.fileno(), PUBLISHED_MODE)
                     os.fsync(stream.fileno())
                 except BaseException:
                     stage.unlink(missing_ok=True)
@@ -178,9 +266,16 @@ class DocumentAcceptance:
                        'rel_path': target.relative_to(self.root).as_posix(),
                        'filename': filename, 'sha256': digest, 'size': len(content),
                        'index_status': 'pending'}
+            if origin is not None:
+                receipt['origin'] = origin
+            if sidecar is not None:
+                # Without the identity tag, as depositors have always written
+                # it: the scan re-issues any tag it finds on a sidecar.
+                receipt['sidecar_rel_path'] = sidecar_path.relative_to(self.root).as_posix()
             record = {'root': str(self.root), 'id': doc_id, 'source_name': self.source_name,
                       'table_name': self.table_name, 'stage': stage.relative_to(self.root).as_posix(),
-                      'fingerprint': fingerprint, 'receipt': receipt}
+                      'fingerprint': fingerprint, 'receipt': receipt,
+                      'origin': origin, 'sidecar': sidecar}
             try:
                 _write_journal(pending, record)
             except BaseException:

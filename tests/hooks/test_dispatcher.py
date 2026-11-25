@@ -289,3 +289,29 @@ def test_send_http_event_rejects_terminal_status_even_if_configured_accepted(mon
     )
 
     assert result == HookSendResult(False, "no_match", False, http_status=200)
+
+
+def test_a_hook_naming_origins_hears_only_about_their_documents():
+    config = {"enabled": True, "hooks": [
+        {"name": "cds", "url": "http://cds", "events": ["document.indexed"], "origins": ["comm-data-store"]},
+        {"name": "everything", "url": "http://all", "events": ["document.indexed"]},
+    ]}
+    mine = {"event": "document.indexed", "origin": {"system": "comm-data-store", "ref": "message_media:1"}}
+    theirs = {"event": "document.indexed", "origin": {"system": "quo", "ref": "mm:2"}}
+    unowned = {"event": "document.indexed"}
+
+    def names(event):
+        return [hook["name"] for hook in matching_hooks(config, "document.indexed", event)]
+
+    assert names(mine) == ["cds", "everything"]
+    assert names(theirs) == ["everything"]
+    assert names(unowned) == ["everything"]
+    # Asked without an event (which hooks exist for this event name): no origin, so
+    # an origin-bound hook is not one of them.
+    assert [hook["name"] for hook in matching_hooks(config, "document.indexed")] == ["everything"]
+
+
+def test_a_malformed_origins_filter_matches_nothing():
+    config = {"enabled": True, "hooks": [{"name": "cds", "url": "http://cds", "origins": "comm-data-store"}]}
+    event = {"event": "document.indexed", "origin": {"system": "comm-data-store", "ref": "1"}}
+    assert matching_hooks(config, "document.indexed", event) == []

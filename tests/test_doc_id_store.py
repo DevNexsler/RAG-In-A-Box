@@ -1101,3 +1101,19 @@ class TestSourceNameMigration:
         assert store.is_retired("alpha::00001")
 
         store.close()
+
+
+def test_origin_is_recorded_once_and_leaves_with_the_document(tmp_path):
+    store = DocIDStore(tmp_path / "registry.db")
+    try:
+        doc_id = store.next_id()
+        store.register(doc_id, "a/lease.pdf")
+        assert store.origin(doc_id) is None
+        store.record_origin(doc_id, "comm-data-store", "message_media:7001")
+        store.record_origin(doc_id, "quo", "mm:9")  # the first depositor stands
+        assert store.origin(doc_id) == {"system": "comm-data-store", "ref": "message_media:7001"}
+        assert store.origin(f"documents::{doc_id}") == store.origin(doc_id)
+        store.delete(doc_id)
+        assert store.origin(doc_id) is None
+    finally:
+        store.close()
