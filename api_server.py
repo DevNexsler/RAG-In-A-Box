@@ -83,7 +83,7 @@ def _read_origin_and_sidecar(form) -> tuple[dict | None, dict | None] | JSONResp
     return origin, sidecar
 
 
-async def _read_upload(request: Request) -> tuple[Path, str, bytes] | JSONResponse:
+async def _read_upload(request: Request, *, deposit: bool = False) -> tuple[Path, str, bytes] | JSONResponse:
     """Upload a file to documents_root.
 
     Multipart form data:
@@ -110,9 +110,10 @@ async def _read_upload(request: Request) -> tuple[Path, str, bytes] | JSONRespon
     if not filename:
         return _api_error("missing_filename", "File has no filename")
 
-    # Validate extension
+    # Validate extension. A depositing system hands over what it was sent: the
+    # file is kept whatever its type, and the indexer skips what it cannot read.
     ext = Path(filename).suffix.lower()
-    if ext not in _ALLOWED_EXTENSIONS:
+    if ext not in _ALLOWED_EXTENSIONS and not (deposit and form.get("origin_system")):
         return _api_error("invalid_file_type", f"File type '{ext}' not allowed. Allowed: {sorted(_ALLOWED_EXTENSIONS)}")
 
     # Sanitize filename — prevent path traversal
@@ -170,7 +171,7 @@ async def accept_document(request: Request) -> JSONResponse:
     index_root = request.app.state.index_root
     if index_root is None:
         return _api_error("acceptance_unavailable", "Persistent identity registry is not configured", 503)
-    parts = await _read_upload(request)
+    parts = await _read_upload(request, deposit=True)
     if isinstance(parts, JSONResponse):
         return parts
     extras = _read_origin_and_sidecar(request.state.upload_form)
@@ -206,6 +207,41 @@ async def accept_document(request: Request) -> JSONResponse:
         logger.exception("Document acceptance interrupted; retry with the same Idempotency-Key")
         return _api_error("acceptance_interrupted", "Retry with the same Idempotency-Key", 503)
     return JSONResponse(receipt, status_code=201)
+
+
+async def accepted_receipt(request: Request) -> JSONResponse:
+    """The receipt of a completed acceptance, by its ``Idempotency-Key`` header.
+
+    For a depositor that lost the answer: 200 with the receipt and
+    ``current_rel_path`` (where the document is now, null once it is gone),
+    404 when nothing was accepted under the key.
+    """
+    index_root = request.app.state.index_root
+    if index_root is None:
+        return _api_error("acceptance_unavailable", "Persistent identity registry is not configured", 503)
+    key = request.headers.get("idempotency-key")
+    if not key:
+        return _api_error("missing_idempotency_key", "Idempotency-Key header is required")
+    from starlette.concurrency import run_in_threadpool
+    from document_acceptance import DocumentAcceptance
+    from doc_id_store import DocIDStore
+
+    def read():
+        if not (index_root / "doc_registry.db").exists():
+            return None
+        registry = DocIDStore(index_root / "doc_registry.db")
+        try:
+            return DocumentAcceptance(request.app.state.documents_root, registry).receipt(key)
+        finally:
+            registry.close()
+    try:
+        receipt = await run_in_threadpool(read)
+    except (OSError, ValueError, sqlite3.Error):
+        logger.exception("Acceptance receipt lookup failed")
+        return _api_error("acceptance_interrupted", "Retry the lookup", 503)
+    if receipt is None:
+        return _api_error("not_accepted", "Nothing was accepted under this Idempotency-Key", 404)
+    return JSONResponse(receipt)
 
 
 async def download(request: Request) -> FileResponse | JSONResponse:
@@ -412,6 +448,7 @@ def build_api_app(documents_root: Path, *, index_root: Path | None = None,
     routes = [
         Route("/upload", upload, methods=["POST"]),
         Route("/documents/accept", accept_document, methods=["POST"]),
+        Route("/documents/accept", accepted_receipt, methods=["GET"]),
         Route("/search", search, methods=["POST"]),
         Route("/index/document", index_document, methods=["POST"]),
         Route("/documents", list_documents, methods=["GET"]),

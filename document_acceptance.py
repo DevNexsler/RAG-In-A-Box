@@ -112,6 +112,15 @@ def checked_sidecar(sidecar, filename: str) -> dict | None:
     return sidecar
 
 
+def _is_sidecar_file(entry: Path, sidecar_path: Path) -> bool:
+    if entry.name != sidecar_path.name or entry.is_symlink() or not entry.is_file():
+        return False
+    try:
+        return is_communication_sidecar_payload(json.loads(entry.read_text()))
+    except (OSError, ValueError):
+        return False
+
+
 class DocumentAcceptance:
     """Accept bytes once, return durable identity, recover interrupted publication."""
 
@@ -172,6 +181,22 @@ class DocumentAcceptance:
         _sync_directory(stage.parent)
         return receipt
 
+    def _journal_name(self, idempotency_key: str) -> str:
+        return hashlib.sha256(json.dumps([str(self.root), idempotency_key]).encode()).hexdigest() + '.json'
+
+    def receipt(self, idempotency_key: str) -> dict | None:
+        """What a completed acceptance under this key answered, or None.
+
+        A depositor that lost the answer asks here before sending the bytes
+        again. The receipt is the acceptance as it happened; ``current_rel_path``
+        is where the document is now, None once it is gone.
+        """
+        try:
+            record = json.loads((self.journal / 'receipts' / self._journal_name(idempotency_key)).read_text())
+        except FileNotFoundError:
+            return None
+        return {**record['receipt'], 'current_rel_path': self.registry.lookup_path(record['id'])}
+
     def recover(self):
         """Caller holds identity_lock; scanner recovers before adjudicating filenames."""
         for path in sorted((self.journal / 'pending').glob('*.json')):
@@ -208,8 +233,7 @@ class DocumentAcceptance:
             # Appended only when given, so receipts journalled before origins
             # existed still replay under their key.
             fingerprint.append({'origin': origin})
-        key = hashlib.sha256(json.dumps([str(self.root), idempotency_key or str(uuid.uuid4())]).encode()).hexdigest()
-        pending = self.journal / 'pending' / (key + '.json')
+        pending = self.journal / 'pending' / self._journal_name(idempotency_key or str(uuid.uuid4()))
         completed = self.journal / 'receipts' / pending.name
         with identity_lock(self.registry):
             interrupted = None
@@ -235,7 +259,10 @@ class DocumentAcceptance:
             sidecar_path = (directory / filename).with_suffix('.json')
             if sidecar is not None and directory.is_dir() and any(
                 Path(strip_id_from_filename(entry.name)).stem == Path(filename).stem
-                for entry in directory.iterdir() if not entry.name.startswith(STAGING_PREFIX)
+                for entry in directory.iterdir()
+                # Metadata whose file is gone is no other document: it stays,
+                # and the file deposited now is the one it describes.
+                if not entry.name.startswith(STAGING_PREFIX) and not _is_sidecar_file(entry, sidecar_path)
             ):
                 # A sidecar belongs to every document of its name in the folder,
                 # so the name must be this document's alone. Refused before an

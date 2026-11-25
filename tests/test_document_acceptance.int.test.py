@@ -514,3 +514,70 @@ def test_an_unreadable_registry_loses_no_event(roots, monkeypatch, caplog):
     import logging
     flow._dispatch_document_indexed_event({'index_root': str(index), 'event_hooks': {}}, event, logging.getLogger('t'))
     assert queued == [event]
+
+
+async def _receipt(app, key):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        return await client.get('/documents/accept', headers={'Idempotency-Key': key} if key else {})
+
+
+@pytest.mark.anyio
+async def test_a_depositor_that_lost_the_answer_reads_the_receipt_back(roots):
+    """Asked by key, with no bytes: what was answered, and where the document is now."""
+    docs, index = roots
+    app = build_api_app(docs, index_root=index)
+    assert (await _receipt(app, 'lost')).status_code == 404
+    assert (await _receipt(app, None)).status_code == 400
+    accepted = (await _accept(app, key='lost', data={**ORIGIN, 'sidecar': json.dumps(SIDECAR)})).json()
+
+    found = await _receipt(app, 'lost')
+
+    assert found.status_code == 200
+    assert found.json() == {**accepted, 'current_rel_path': accepted['rel_path']}
+    assert (await _receipt(app, 'another key')).status_code == 404
+    # Nothing was accepted, queued or written by asking.
+    assert len(list(docs.glob('*.pdf'))) == 1
+    assert pending_backlog(index, 'chunks')['pending'] == 1
+
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        doc_id = accepted['doc_id'].split('::')[1]
+        registry.update_path(doc_id, 'filed/lease.pdf')
+        assert (await _receipt(app, 'lost')).json()['current_rel_path'] == 'filed/lease.pdf'
+        registry.delete(doc_id)
+    finally:
+        registry.close()
+    gone = (await _receipt(app, 'lost')).json()
+    assert (gone['doc_id'], gone['rel_path'], gone['current_rel_path']) == (
+        accepted['doc_id'], accepted['rel_path'], None)
+
+
+@pytest.mark.anyio
+async def test_a_depositing_system_hands_over_any_type_of_file(roots):
+    """What a tenant sent is kept whatever its type; a bare upload keeps its list."""
+    docs, index = roots
+    app = build_api_app(docs, index_root=index)
+    bare = await _accept(app, name='plans.zip', content=b'PK\x03\x04')
+    assert (bare.status_code, bare.json()['code']) == (400, 'invalid_file_type')
+    deposited = await _accept(app, name='plans.zip', content=b'PK\x03\x04', key='zip',
+                              data={**ORIGIN, 'sidecar': json.dumps(SIDECAR)})
+    assert deposited.status_code == 201
+    assert (docs / deposited.json()['rel_path']).read_bytes() == b'PK\x03\x04'
+    assert (await _accept(app, name='empty.zip', content=b'', data=ORIGIN)).json()['code'] == 'empty_file'
+
+
+@pytest.mark.anyio
+async def test_metadata_whose_file_is_gone_does_not_block_the_file(roots):
+    """Only another document of the name is a namesake; its own leftover metadata is not."""
+    docs, index = roots
+    app = build_api_app(docs, index_root=index)
+    (docs / 'lease.json').write_text(json.dumps({**SIDECAR, 'left': 'behind'}))
+
+    restored = await _accept(app, data={**ORIGIN, 'sidecar': json.dumps(SIDECAR)})
+
+    assert restored.status_code == 201
+    assert json.loads((docs / 'lease.json').read_text())['left'] == 'behind'
+    # A JSON file of the name that is not attachment metadata is a document.
+    (docs / 'note.json').write_text(json.dumps({'title': 'a record'}))
+    refused = await _accept(app, name='note.pdf', key='n', data={**ORIGIN, 'sidecar': json.dumps(SIDECAR)})
+    assert (refused.status_code, refused.json()['code']) == (409, 'acceptance_conflict')
