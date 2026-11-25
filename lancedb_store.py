@@ -3633,6 +3633,35 @@ def _looks_like_corrupt_lance_error(exc: Exception) -> bool:
     return any(marker in message for marker in _CORRUPT_LANCE_MARKERS)
 
 
+def _set_aside_torn_manifests(lance_path: Path, logger_obj: logging.Logger) -> list[Path]:
+    """Move zero-byte manifests out of ``_versions`` so Lance opens the last complete commit.
+
+    Lance renames a fully written manifest into place, so an empty one is a
+    commit a host crash cut off before its bytes reached disk. Lance resolves
+    the latest version from this directory, so while one sits at the head no
+    open can succeed — not even the version listing below (#4635: two torn
+    commits kept chunks.lance unopenable for two days). The torn commits never
+    completed, so nothing is lost; they move to ``<table>.lance.torn/`` as
+    evidence instead of being deleted.
+    """
+    versions_dir = lance_path / "_versions"
+    torn = sorted(p for p in versions_dir.glob("*.manifest") if p.stat().st_size == 0)
+    if not torn:
+        return []
+    aside_dir = Path(f"{lance_path}.torn") / "_versions"
+    aside_dir.mkdir(parents=True, exist_ok=True)
+    for path in torn:
+        shutil.move(str(path), str(aside_dir / path.name))
+    logger_obj.warning(
+        "Set aside %d torn (zero-byte) Lance manifest(s) from %s into %s: %s",
+        len(torn),
+        versions_dir,
+        aside_dir,
+        ", ".join(p.name for p in torn),
+    )
+    return torn
+
+
 def recover_corrupt_table(
     index_root: str | Path,
     table_name: str,
@@ -3647,6 +3676,14 @@ def recover_corrupt_table(
         return None
 
     active_logger.warning("Corruption detected — attempting auto-recovery for %s", lance_path)
+
+    if _set_aside_torn_manifests(lance_path, active_logger):
+        try:
+            return LanceDBStore(index_root, table_name)
+        except Exception as exc:
+            if not _looks_like_corrupt_lance_error(exc):
+                raise
+            active_logger.warning("Still unreadable after setting aside torn commits: %s", exc)
 
     try:
         dataset = lance.dataset(str(lance_path))
