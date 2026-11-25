@@ -244,6 +244,16 @@ different inputs returns 409. Without a key, each request accepts a new document
 The receipt records the accepted revision; later file edits or moves do not change
 that historical hash/path. Resolve the ID again and verify bytes before later reuse.
 
+A depositor that lost the answer asks for it without sending the bytes again:
+`GET /api/documents/accept` with the same `Idempotency-Key` returns the receipt plus
+`current_rel_path` (where the document is now; `null` once it is gone), or 404 when
+nothing was accepted under the key.
+
+A deposit that names its `origin_system` may be of any file type: the file is kept as
+it was sent and the indexer skips what it cannot read. Without an origin the upload
+type list applies. Attachment metadata left beside a file that is gone does not block
+depositing that file again; the metadata already there stays.
+
 Existing files are never overwritten. Client-supplied `@XXXXX@` tokens are stripped
 before assigning a fresh identity. If an empty/rebuilt registry has surviving IDs
 in filesystem-source filenames, acceptance returns 409 until an identity scan has
@@ -269,6 +279,7 @@ curl "http://localhost:7788/api/documents/?directory=2-Area&limit=50" \
 |---|---|---|
 | `/api/upload` | POST | Upload a file (multipart form: `file` + optional `directory`) |
 | `/api/documents/accept` | POST | Accept/register bytes, return real ID/hash, queue indexing; optional `Idempotency-Key`, depositor `origin_system` + `origin_ref`, attachment metadata `sidecar` |
+| `/api/documents/accept` | GET | Receipt of a completed acceptance, by `Idempotency-Key` header, with `current_rel_path` |
 | `/api/documents/{rel_path}` | GET | Download a file by its path under `documents_root` |
 | `/api/documents/` | GET | List files (query params: `directory`, `limit`, `offset`) |
 
