@@ -123,7 +123,7 @@ from providers.embed.base import EmbedProvider
 from providers.media import DEFAULT_VIDEO_MODEL, build_media_provider
 from providers.ocr import build_ocr_provider
 from doc_id_store import (
-    DocIDStore, StrandedCohortError, extract_id_from_filename,
+    DocIDStore, StrandedCohortError, document_origin, extract_id_from_filename,
     inject_id_into_filename,
     strip_id_from_filename as _strip_id_from_filename,
 )
@@ -2396,11 +2396,7 @@ def _with_document_origin(config: dict, event: dict[str, Any]) -> dict[str, Any]
     registry_path = Path(config["index_root"]) / "doc_registry.db"
     if not registry_path.exists():
         return event
-    registry = DocIDStore(registry_path)
-    try:
-        origin = registry.origin(str(event.get("doc_id") or ""))
-    finally:
-        registry.close()
+    origin = document_origin(registry_path, str(event.get("doc_id") or ""))
     return {**event, "origin": origin} if origin else event
 
 
@@ -2411,7 +2407,13 @@ def _dispatch_document_indexed_event(
 ) -> None:
     """Persist and attempt one callback without failing the index operation."""
     try:
-        event = _with_document_origin(config, event)
+        try:
+            event = _with_document_origin(config, event)
+        except Exception:
+            # The event still goes to every hook that is not bound to an origin.
+            warning = "document origin unavailable; origin-bound hooks not notified"
+            _RUNTIME.setdefault("_warnings", []).append(warning)
+            logger.warning(warning)
         outbox = HookOutbox(config["index_root"])
         deliveries = queue_event(config.get("event_hooks"), event, outbox)
         outcomes = send_enqueued(outbox, deliveries, logger=logger)

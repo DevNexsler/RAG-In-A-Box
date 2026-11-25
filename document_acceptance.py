@@ -19,7 +19,10 @@ from doc_id_store import DocIDStore, extract_id_from_filename, inject_id_into_fi
 STAGING_PREFIX = '.organizer-accept-'
 ORIGIN_SYSTEM = re.compile(r'[a-z0-9][a-z0-9._-]{0,63}')
 ORIGIN_REF_MAX = 200
-SIDECAR_MAX_BYTES = 2_000_000
+# Below the form parser's own per-field ceiling, so this is the limit a caller meets.
+SIDECAR_MAX_BYTES = 500_000
+# Other containers and the host's agents read the documents tree.
+PUBLISHED_MODE = 0o644
 
 
 class AcceptanceConflict(ValueError):
@@ -60,7 +63,7 @@ def _mkdir(path: Path):
         _sync_directory(path.parent)
 
 
-def _write_journal(path: Path, record: dict):
+def _write_journal(path: Path, record: dict, *, mode: int | None = None):
     _mkdir(path.parent)
     with tempfile.NamedTemporaryFile(
         mode='w', dir=path.parent, prefix=STAGING_PREFIX, delete=False,
@@ -69,6 +72,8 @@ def _write_journal(path: Path, record: dict):
         try:
             json.dump(record, stream)
             stream.flush()
+            if mode is not None:
+                os.fchmod(stream.fileno(), mode)
             os.fsync(stream.fileno())
             os.replace(temporary, path)
             _sync_directory(path.parent)
@@ -141,12 +146,11 @@ class DocumentAcceptance:
         if record.get('sidecar') is not None:
             # Beside the file, before indexing is queued: the indexer reads it
             # as the document's communication context.
+            # Written once and then left alone: the indexer adds to it, and a
+            # retry of this acceptance must not undo that.
             sidecar = self._path(receipt['sidecar_rel_path'])
-            if not sidecar.exists():
-                _write_journal(sidecar, record['sidecar'])
-            elif json.loads(sidecar.read_text()) != record['sidecar']:
-                raise AcceptanceConflict(
-                    'Another attachment of this name already has different metadata here')
+            if not os.path.lexists(sidecar):
+                _write_journal(sidecar, record['sidecar'], mode=PUBLISHED_MODE)
         if self.registry.is_retired(record['id']):
             raise AcceptanceConflict('Accepted identity was retired; staff review required')
         previous = self.registry.lookup_path(record['id'])
@@ -183,7 +187,12 @@ class DocumentAcceptance:
         ``origin`` names the depositing system and its own record; it is
         returned on the receipt and on the document's ``document.indexed``
         event. ``sidecar`` is the communication attachment metadata, written
-        beside the file. Both are part of what an ``Idempotency-Key`` covers.
+        beside the file under the file's own name.
+
+        An ``Idempotency-Key`` covers the bytes, the destination and the
+        origin. The sidecar is not part of it: a retry carries metadata built
+        at another moment (a fetch time, an edited message body), and the
+        first acceptance's stands.
         """
         directory = directory.resolve()
         if not directory.is_relative_to(self.root):
@@ -195,10 +204,10 @@ class DocumentAcceptance:
         sidecar = checked_sidecar(sidecar, filename)
         digest = hashlib.sha256(content).hexdigest()
         fingerprint = [str(self.root), self.source_name, str(directory.relative_to(self.root)), filename, digest]
-        if origin is not None or sidecar is not None:
-            # Appended only when given, so receipts journalled before these
-            # fields existed still replay under their key.
-            fingerprint.append({'origin': origin, 'sidecar': sidecar})
+        if origin is not None:
+            # Appended only when given, so receipts journalled before origins
+            # existed still replay under their key.
+            fingerprint.append({'origin': origin})
         key = hashlib.sha256(json.dumps([str(self.root), idempotency_key or str(uuid.uuid4())]).encode()).hexdigest()
         pending = self.journal / 'pending' / (key + '.json')
         completed = self.journal / 'receipts' / pending.name
@@ -224,10 +233,15 @@ class DocumentAcceptance:
             if interrupted:
                 return self._finish(pending, interrupted)
             sidecar_path = (directory / filename).with_suffix('.json')
-            if sidecar is not None and sidecar_path.exists() and json.loads(sidecar_path.read_text()) != sidecar:
-                # Refused before an identity is spent or a byte is published.
+            if sidecar is not None and directory.is_dir() and any(
+                Path(strip_id_from_filename(entry.name)).stem == Path(filename).stem
+                for entry in directory.iterdir() if not entry.name.startswith(STAGING_PREFIX)
+            ):
+                # A sidecar belongs to every document of its name in the folder,
+                # so the name must be this document's alone. Refused before an
+                # identity is spent or a byte is published.
                 raise AcceptanceConflict(
-                    'Another attachment of this name already has different metadata here')
+                    'Another document of this name is here; its metadata would be shared')
             _mkdir(directory)
             doc_id = self.registry.next_id()
             target = directory / inject_id_into_filename(filename, doc_id)
@@ -242,6 +256,7 @@ class DocumentAcceptance:
                 try:
                     stream.write(content)
                     stream.flush()
+                    os.fchmod(stream.fileno(), PUBLISHED_MODE)
                     os.fsync(stream.fileno())
                 except BaseException:
                     stage.unlink(missing_ok=True)

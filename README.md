@@ -227,6 +227,10 @@ The receipt returns `origin` and `sidecar_rel_path`; the document's
 `document.indexed` event carries the same `origin`, and a hook configured with
 `origins: [...]` receives only those systems' documents. The depositor stores the
 returned `doc_id` and is matched by it from then on, never by path.
+An `Idempotency-Key` covers the bytes, the destination and the origin; a retry
+gets its receipt back even if it rebuilt the sidecar, and the first sidecar stands.
+A sidecar is found by name, so a deposit that carries one is refused (409) when
+another document of that name is already in the folder.
 
 Acceptance publishes complete bytes, registers identity, and durably queues targeted
 indexing. It runs no extraction, enrichment, or embedding. The configured scheduler

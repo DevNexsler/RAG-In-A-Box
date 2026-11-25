@@ -113,6 +113,29 @@ class StrandedCohortError(ValueError):
     """
 
 
+def document_origin(db_path: str | Path, doc_id: str) -> dict[str, str] | None:
+    """The depositor recorded for ``doc_id``, read without opening the registry for writing.
+
+    For callers on the indexing path: a reader in WAL mode waits on no writer,
+    and nothing here creates or migrates a table.
+    """
+    candidates = [doc_id] + ([doc_id.split("::", 1)[-1]] if "::" in doc_id else [])
+    connection = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True, timeout=5)
+    try:
+        for candidate in candidates:
+            row = connection.execute(
+                "SELECT system, ref FROM document_origins WHERE doc_id = ?", (candidate,)
+            ).fetchone()
+            if row is not None:
+                return {"system": row[0], "ref": row[1]}
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+    finally:
+        connection.close()
+    return None
+
+
 class DocIDStore:
     """SQLite-backed persistent document ID registry.
 

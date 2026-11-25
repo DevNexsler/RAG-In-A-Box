@@ -256,8 +256,11 @@ event_hooks:
     #   url: "http://comm-data-store-hooks:8090/hooks/doc-indexed"
     #   events: ["document.indexed"]
     #   accepted_statuses: ["updated", "duplicate"]
-    #   origins: ["comm-data-store"]         # only documents this system deposited through
-    #                                        # /api/documents/accept (origin_system); omit for all
+    #   origins: ["comm-data-store"]         # ONLY documents this system deposited through
+    #                                        # /api/documents/accept (origin_system). Files it
+    #                                        # still writes into the folder itself carry no origin
+    #                                        # and are NOT delivered: add this only once every
+    #                                        # depositor behind the hook uses accept. Omit for all.
     #   timeout_seconds: 5
     #   secret_env: "COMM_DATA_STORE_HOOK_SECRET"
 

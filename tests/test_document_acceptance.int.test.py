@@ -330,18 +330,6 @@ async def test_origin_and_sidecar_are_accepted_with_the_file(roots):
 
 
 @pytest.mark.anyio
-async def test_a_key_covers_origin_and_sidecar(roots):
-    docs, index = roots
-    app = build_api_app(docs, index_root=index)
-    data = {**ORIGIN, 'sidecar': json.dumps(SIDECAR)}
-    assert (await _accept(app, data=data)).status_code == 201
-    other_owner = await _accept(app, data={**data, 'origin_ref': 'message_media:7002'})
-    assert (other_owner.status_code, other_owner.json()['code']) == (409, 'acceptance_conflict')
-    other_context = await _accept(app, data={**ORIGIN, 'sidecar': json.dumps({**SIDECAR, 'schema_version': 2})})
-    assert other_context.status_code == 409
-
-
-@pytest.mark.anyio
 @pytest.mark.parametrize('data', [
     {'origin_system': 'comm-data-store'},
     {'origin_ref': 'message_media:1'},
@@ -373,24 +361,6 @@ async def test_acceptance_without_an_origin_is_unchanged(roots):
         registry.close()
 
 
-def test_an_interrupted_acceptance_recovers_its_origin_and_sidecar(roots, monkeypatch):
-    docs, index = roots
-    registry = DocIDStore(index / 'doc_registry.db')
-    try:
-        acceptance = DocumentAcceptance(docs, registry)
-        origin = {'system': 'comm-data-store', 'ref': 'message_media:7001'}
-        monkeypatch.setattr(DocumentAcceptance, '_finish', lambda *a, **k: (_ for _ in ()).throw(OSError('crash')))
-        with pytest.raises(OSError):
-            acceptance.accept(docs, 'lease.pdf', b'%PDF lease', idempotency_key='k', origin=origin, sidecar=SIDECAR)
-        monkeypatch.undo()
-        receipt = acceptance.accept(docs, 'lease.pdf', b'%PDF lease', idempotency_key='k', origin=origin, sidecar=SIDECAR)
-        assert registry.origin(receipt['doc_id']) == origin
-        assert json.loads((docs / receipt['sidecar_rel_path']).read_text()) == SIDECAR
-        assert not any(path.name.startswith('.organizer-accept-') for path in docs.iterdir())
-    finally:
-        registry.close()
-
-
 def test_the_indexed_event_names_the_depositor(roots):
     from flow_index_vault import _with_document_origin
     docs, index = roots
@@ -406,17 +376,141 @@ def test_the_indexed_event_names_the_depositor(roots):
     assert _with_document_origin(config, event) == {**event, 'origin': owned['origin']}
     event = {'event': 'document.indexed', 'doc_id': plain['doc_id']}
     assert _with_document_origin(config, event) == event
+    # A registry from before origins existed has no such table: no origin, no error.
+    import sqlite3
+    with sqlite3.connect(index / 'doc_registry.db') as connection:
+        connection.execute('DROP TABLE document_origins')
+    assert _with_document_origin(config, {'event': 'document.indexed', 'doc_id': owned['doc_id']}) == {
+        'event': 'document.indexed', 'doc_id': owned['doc_id']}
 
 
-def test_same_name_with_other_metadata_is_refused_before_anything_is_published(roots):
+@pytest.mark.anyio
+async def test_a_key_covers_the_origin_but_not_the_metadata(roots):
+    """A depositor's retry rebuilds its metadata (a fetch time, an edited body);
+    it must get its receipt back, not a refusal it can never get past."""
+    docs, index = roots
+    app = build_api_app(docs, index_root=index)
+    data = {**ORIGIN, 'sidecar': json.dumps(SIDECAR)}
+    first = await _accept(app, data=data)
+    assert first.status_code == 201
+    later = {**SIDECAR, 'media': {**SIDECAR['media'], 'fetched_at': '2026-11-25T01:00:00+00:00'}}
+    retry = await _accept(app, data={**ORIGIN, 'sidecar': json.dumps(later)})
+    assert (retry.status_code, retry.json()) == (201, first.json())
+    assert json.loads((docs / first.json()['sidecar_rel_path']).read_text()) == SIDECAR
+    assert len(list(docs.glob('*.pdf'))) == 1
+    other_owner = await _accept(app, data={**data, 'origin_ref': 'message_media:7002'})
+    assert (other_owner.status_code, other_owner.json()['code']) == (409, 'acceptance_conflict')
+
+
+@pytest.mark.anyio
+async def test_a_sidecar_needs_a_name_no_other_document_in_the_folder_has(roots):
+    """A sidecar is found by name, so it would also describe a namesake."""
+    docs, index = roots
+    app = build_api_app(docs, index_root=index)
+    (docs / 'lease.docx').write_bytes(b'someone else\'s lease')
+    refused = await _accept(app, data={'sidecar': json.dumps(SIDECAR)})
+    assert (refused.status_code, refused.json()['code']) == (409, 'acceptance_conflict')
+    assert sorted(path.name for path in docs.iterdir()) == ['lease.docx']
+    assert pending_backlog(index, 'chunks')['pending'] == 0
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        assert registry.count() == 0
+    finally:
+        registry.close()
+    # Without a sidecar the namesake is no obstacle, and a second attachment of
+    # the same name with its own metadata is refused the same way.
+    assert (await _accept(app, key='plain')).status_code == 201
+    assert (await _accept(app, key='two', name='other.pdf', data={'sidecar': json.dumps(SIDECAR)})).status_code == 201
+    again = await _accept(app, key='three', name='other.pdf', content=b'%PDF b', data={'sidecar': json.dumps(SIDECAR)})
+    assert again.status_code == 409
+
+
+def _crash_at(monkeypatch, step):
+    """Make publication die just before ``step`` (a name ``_finish`` calls)."""
+    import document_acceptance as module
+
+    def crash(*args, **kwargs):
+        raise OSError('crash')
+    if step == 'sidecar':
+        real = module._write_journal
+        monkeypatch.setattr(module, '_write_journal', lambda path, record, **kw: (
+            crash() if path.suffix == '.json' and 'document-acceptance' not in path.parts
+            else real(path, record, **kw)))
+    elif step == 'register':
+        monkeypatch.setattr(DocIDStore, 'register', crash)
+    elif step == 'receipt':
+        real_replace = module.os.replace
+        monkeypatch.setattr(module.os, 'replace', lambda src, dst: (
+            crash() if 'receipts' in Path(dst).parts else real_replace(src, dst)))
+
+
+@pytest.mark.parametrize('step', ['sidecar', 'register', 'receipt'])
+def test_an_acceptance_interrupted_anywhere_recovers_whole(roots, monkeypatch, step):
+    docs, index = roots
+    registry = DocIDStore(index / 'doc_registry.db')
+    origin = {'system': 'comm-data-store', 'ref': 'message_media:7001'}
+    try:
+        acceptance = DocumentAcceptance(docs, registry)
+        with monkeypatch.context() as patch:
+            _crash_at(patch, step)
+            with pytest.raises(OSError):
+                acceptance.accept(docs, 'lease.pdf', b'%PDF lease', idempotency_key='k', origin=origin, sidecar=SIDECAR)
+        if step == 'receipt':
+            # Indexing was queued before the crash and has since added to the sidecar.
+            sidecar = docs / 'lease.json'
+            sidecar.write_text(json.dumps({**SIDECAR, 'context': {'thread': 'added by the indexer'}}))
+        acceptance.recover()  # what every identity scan runs first
+        receipt = acceptance.accept(docs, 'lease.pdf', b'%PDF lease', idempotency_key='k', origin=origin,
+                                    sidecar={**SIDECAR, 'schema_version': 1, 'retry': True})
+        assert registry.origin(receipt['doc_id']) == origin
+        stored = json.loads((docs / receipt['sidecar_rel_path']).read_text())
+        assert stored['message'] == SIDECAR['message'] and 'retry' not in stored
+        if step == 'receipt':
+            assert stored['context'] == {'thread': 'added by the indexer'}
+        assert sorted(path.name for path in docs.iterdir()) == sorted([Path(receipt['rel_path']).name, 'lease.json'])
+        assert pending_backlog(index, 'chunks')['pending'] == 1
+        assert registry.count() == 1
+    finally:
+        registry.close()
+
+
+def test_what_is_published_is_readable_by_the_other_readers_of_the_tree(roots):
+    docs, index = roots
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        receipt = DocumentAcceptance(docs, registry).accept(docs, 'lease.pdf', b'%PDF', sidecar=SIDECAR)
+    finally:
+        registry.close()
+    assert (docs / receipt['rel_path']).stat().st_mode & 0o777 == 0o644
+    assert (docs / receipt['sidecar_rel_path']).stat().st_mode & 0o777 == 0o644
+
+
+def test_a_receipt_journalled_before_origins_existed_still_replays(roots):
     docs, index = roots
     registry = DocIDStore(index / 'doc_registry.db')
     try:
         acceptance = DocumentAcceptance(docs, registry)
-        acceptance.accept(docs, 'lease.pdf', b'%PDF one', sidecar=SIDECAR)
-        with pytest.raises(Exception, match='different metadata'):
-            acceptance.accept(docs, 'lease.pdf', b'%PDF two', sidecar={**SIDECAR, 'schema_version': 2})
-        assert sorted(path.suffix for path in docs.iterdir()) == ['.json', '.pdf']
-        assert registry.count() == 1
+        receipt = acceptance.accept(docs, 'memo.pdf', b'%PDF memo', idempotency_key='old')
+        (journalled,) = (index / 'document-acceptance' / 'receipts').glob('*.json')
+        record = json.loads(journalled.read_text())
+        assert len(record['fingerprint']) == 5  # the shape every earlier release wrote
+        for key in ('origin', 'sidecar'):
+            record.pop(key)
+        journalled.write_text(json.dumps(record))
+        assert acceptance.accept(docs, 'memo.pdf', b'%PDF memo', idempotency_key='old') == receipt
     finally:
         registry.close()
+
+
+def test_an_unreadable_registry_loses_no_event(roots, monkeypatch, caplog):
+    """The origin is an addition to the event; failing to read it must not cost the callback."""
+    import flow_index_vault as flow
+    docs, index = roots
+    queued = []
+    monkeypatch.setattr(flow, 'document_origin', lambda *a: (_ for _ in ()).throw(RuntimeError('locked')))
+    monkeypatch.setattr(flow, 'queue_event', lambda hooks, event, outbox: queued.append(event) or [])
+    monkeypatch.setattr(flow, 'send_enqueued', lambda *a, **k: {'retry_pending': 0, 'redrive_required': 0})
+    event = {'event': 'document.indexed', 'doc_id': 'documents::00001'}
+    import logging
+    flow._dispatch_document_indexed_event({'index_root': str(index), 'event_hooks': {}}, event, logging.getLogger('t'))
+    assert queued == [event]
