@@ -223,17 +223,13 @@ async def accepted_receipt(request: Request) -> JSONResponse:
     if not key:
         return _api_error("missing_idempotency_key", "Idempotency-Key header is required")
     from starlette.concurrency import run_in_threadpool
-    from document_acceptance import DocumentAcceptance
-    from doc_id_store import DocIDStore
+    from document_acceptance import accepted_receipt as read_receipt
 
     def read():
-        if not (index_root / "doc_registry.db").exists():
+        registry_db = index_root / "doc_registry.db"
+        if not registry_db.exists():
             return None
-        registry = DocIDStore(index_root / "doc_registry.db")
-        try:
-            return DocumentAcceptance(request.app.state.documents_root, registry).receipt(key)
-        finally:
-            registry.close()
+        return read_receipt(request.app.state.documents_root, registry_db, key)
     try:
         receipt = await run_in_threadpool(read)
     except (OSError, ValueError, sqlite3.Error):
