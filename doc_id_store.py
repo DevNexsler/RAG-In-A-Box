@@ -376,6 +376,22 @@ class DocIDStore:
             ).fetchone()
             return row[0] if row else None
 
+    @staticmethod
+    def read_path(db_path: str | Path, doc_id: str) -> str | None:
+        """The rel_path for a doc_id, read without opening the registry for writing.
+
+        A reader of the write-ahead log is not held up by a writer, so this
+        answers while an acceptance or a scan is mid-transaction.
+        """
+        conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True, timeout=30)
+        try:
+            row = conn.execute(
+                "SELECT rel_path FROM doc_registry WHERE doc_id = ?", (doc_id,)
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
     def stored_file_identity(self, doc_id: str) -> tuple[int, bytes] | None:
         """Return the (size_bytes, content_hash) recorded for a doc_id.
 

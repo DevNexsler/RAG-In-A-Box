@@ -2,6 +2,7 @@
 import concurrent.futures
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -550,6 +551,27 @@ async def test_a_depositor_that_lost_the_answer_reads_the_receipt_back(roots):
     gone = (await _receipt(app, 'lost')).json()
     assert (gone['doc_id'], gone['rel_path'], gone['current_rel_path']) == (
         accepted['doc_id'], accepted['rel_path'], None)
+
+
+@pytest.mark.anyio
+async def test_a_receipt_is_read_while_the_registry_is_being_written(roots):
+    """A lookup only reads: an acceptance or a scan mid-write does not turn it away."""
+    docs, index = roots
+    app = build_api_app(docs, index_root=index)
+    accepted = (await _accept(app, key='held', data=ORIGIN)).json()
+    writer = sqlite3.connect(index / 'doc_registry.db', timeout=0)
+    try:
+        writer.execute('BEGIN IMMEDIATE')
+        writer.execute("UPDATE doc_registry SET rel_path = rel_path")
+
+        found = await _receipt(app, 'held')
+        missing = await _receipt(app, 'never deposited')
+    finally:
+        writer.rollback()
+        writer.close()
+
+    assert (found.status_code, found.json()['current_rel_path']) == (200, accepted['rel_path'])
+    assert missing.status_code == 404
 
 
 @pytest.mark.anyio

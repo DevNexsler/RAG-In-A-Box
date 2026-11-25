@@ -121,6 +121,28 @@ def _is_sidecar_file(entry: Path, sidecar_path: Path) -> bool:
         return False
 
 
+def _journal_name(root: Path, idempotency_key: str) -> str:
+    return hashlib.sha256(json.dumps([str(root), idempotency_key]).encode()).hexdigest() + '.json'
+
+
+def accepted_receipt(root: Path, registry_db: Path, idempotency_key: str) -> dict | None:
+    """What a completed acceptance under this key answered, or None.
+
+    A depositor that lost the answer asks here before sending the bytes
+    again. The receipt is the acceptance as it happened; ``current_rel_path``
+    is where the document is now, None once it is gone.
+
+    Asking only reads: no registry is opened for writing, so a lookup is
+    answered while an acceptance or a scan holds the registry.
+    """
+    journal = Path(registry_db).parent / 'document-acceptance'
+    try:
+        record = json.loads((journal / 'receipts' / _journal_name(Path(root).resolve(), idempotency_key)).read_text())
+    except FileNotFoundError:
+        return None
+    return {**record['receipt'], 'current_rel_path': DocIDStore.read_path(registry_db, record['id'])}
+
+
 class DocumentAcceptance:
     """Accept bytes once, return durable identity, recover interrupted publication."""
 
@@ -182,20 +204,7 @@ class DocumentAcceptance:
         return receipt
 
     def _journal_name(self, idempotency_key: str) -> str:
-        return hashlib.sha256(json.dumps([str(self.root), idempotency_key]).encode()).hexdigest() + '.json'
-
-    def receipt(self, idempotency_key: str) -> dict | None:
-        """What a completed acceptance under this key answered, or None.
-
-        A depositor that lost the answer asks here before sending the bytes
-        again. The receipt is the acceptance as it happened; ``current_rel_path``
-        is where the document is now, None once it is gone.
-        """
-        try:
-            record = json.loads((self.journal / 'receipts' / self._journal_name(idempotency_key)).read_text())
-        except FileNotFoundError:
-            return None
-        return {**record['receipt'], 'current_rel_path': self.registry.lookup_path(record['id'])}
+        return _journal_name(self.root, idempotency_key)
 
     def recover(self):
         """Caller holds identity_lock; scanner recovers before adjudicating filenames."""
