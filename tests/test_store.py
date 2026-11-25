@@ -3804,6 +3804,46 @@ def test_open_store_with_recovery_recovers_known_corruption():
     recover.assert_called_once()
 
 
+def test_open_store_with_recovery_sets_aside_torn_commits(tmp_path):
+    """A host crash mid-commit leaves zero-byte manifests at the head (#4635).
+
+    Lance resolves the latest version from ``_versions/``, so an empty head
+    manifest makes every open fail with ``Invalid range 0..0`` — including
+    recovery's own version listing, which froze indexing for two days. The
+    torn commits never completed: recovery must reopen the last complete
+    commit in place, keeping its history, and the table must accept writes.
+    """
+    import lance
+
+    seed = LanceDBStore(tmp_path, "chunks")
+    seed.upsert_nodes([_make_node("a.md", "c:0", "hello", [0.1] * 768)])
+    seed.upsert_nodes([_make_node("b.md", "c:0", "world", [0.2] * 768)])
+    table_path = tmp_path / "chunks.lance"
+    committed = {v["version"] for v in lance.dataset(str(table_path)).versions()}
+
+    versions_dir = table_path / "_versions"
+    names = [int(p.stem) for p in versions_dir.glob("*.manifest")]
+    inverted = max(names) > 2**63  # V2 naming stores u64::MAX - version
+    latest = 2**64 - 1 - min(names) if inverted else max(names)
+    torn = []
+    for version in (latest + 1, latest + 2):
+        torn_path = versions_dir / f"{2**64 - 1 - version if inverted else version}.manifest"
+        torn_path.write_bytes(b"")
+        torn.append(torn_path)
+
+    store = open_store_with_recovery(tmp_path, "chunks")
+
+    assert sorted(store.list_doc_ids()) == ["a.md", "b.md"]
+    # Reopened in place, not rebuilt from a snapshot: every commit survives.
+    assert committed <= {v["version"] for v in lance.dataset(str(table_path)).versions()}
+    assert all(p.stat().st_size > 0 for p in versions_dir.glob("*.manifest"))
+    assert {p.name for p in (tmp_path / "chunks.lance.torn" / "_versions").iterdir()} == {
+        path.name for path in torn
+    }
+    store.upsert_nodes([_make_node("c.md", "c:0", "again", [0.3] * 768)])
+    assert sorted(LanceDBStore(tmp_path, "chunks").list_doc_ids()) == ["a.md", "b.md", "c.md"]
+
+
 def test_open_store_with_recovery_reraises_non_corruption():
     error = RuntimeError("bad config")
 
