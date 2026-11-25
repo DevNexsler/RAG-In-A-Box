@@ -281,3 +281,142 @@ def test_retry_recovers_owned_publication_before_first_registry_commit(roots, mo
         assert len(list(docs.iterdir())) == 1
     finally:
         registry.close()
+
+
+SIDECAR = {
+    'schema_version': 1,
+    'message': {'source': 'tenantcloud_api', 'message_id': 'm-51', 'body': 'Signed lease attached.'},
+    'media': {'media_index': 0, 'media_type': 'application/pdf', 'original_filename': 'lease.pdf'},
+}
+ORIGIN = {'origin_system': 'comm-data-store', 'origin_ref': 'message_media:7001'}
+
+
+async def _accept(app, *, data=None, key='origin', name='lease.pdf', content=b'%PDF lease'):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        return await client.post('/documents/accept', files={'file': (name, content)},
+                                 data=data or {}, headers={'Idempotency-Key': key})
+
+
+@pytest.mark.anyio
+async def test_origin_and_sidecar_are_accepted_with_the_file(roots):
+    """One call deposits the bytes, their attachment metadata and who they belong to."""
+    docs, index = roots
+    app = build_api_app(docs, index_root=index)
+    data = {'directory': 'tenantcloud-attachments/unit-4b', **ORIGIN, 'sidecar': json.dumps(SIDECAR)}
+    response = await _accept(app, data=data)
+    assert response.status_code == 201, response.text
+    receipt = response.json()
+    assert receipt['origin'] == {'system': 'comm-data-store', 'ref': 'message_media:7001'}
+    target = docs / receipt['rel_path']
+    # The sidecar sits beside the file under the name it was deposited with:
+    # only the document carries the identity tag.
+    assert receipt['sidecar_rel_path'] == 'tenantcloud-attachments/unit-4b/lease.json'
+    assert json.loads((docs / receipt['sidecar_rel_path']).read_text()) == SIDECAR
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        assert registry.origin(receipt['doc_id']) == receipt['origin']
+        # The scanner reads the sidecar as the file's context, never as a document.
+        from sources.filesystem import _find_communication_sidecar
+        assert _find_communication_sidecar(target) == docs / receipt['sidecar_rel_path']
+        records = scan_filesystem_records(docs, ['**/*.pdf', '**/*.json'], [], doc_id_store=registry)
+        assert [record['rel_path'] for record in records] == [receipt['rel_path']]
+        assert (docs / receipt['sidecar_rel_path']).exists()
+    finally:
+        registry.close()
+    # A replay answers the same receipt and leaves one file, one sidecar, one request.
+    assert (await _accept(app, data=data)).json() == receipt
+    assert sorted(path.name for path in target.parent.iterdir()) == sorted([target.name, 'lease.json'])
+    assert pending_backlog(index, 'chunks')['pending'] == 1
+
+
+@pytest.mark.anyio
+async def test_a_key_covers_origin_and_sidecar(roots):
+    docs, index = roots
+    app = build_api_app(docs, index_root=index)
+    data = {**ORIGIN, 'sidecar': json.dumps(SIDECAR)}
+    assert (await _accept(app, data=data)).status_code == 201
+    other_owner = await _accept(app, data={**data, 'origin_ref': 'message_media:7002'})
+    assert (other_owner.status_code, other_owner.json()['code']) == (409, 'acceptance_conflict')
+    other_context = await _accept(app, data={**ORIGIN, 'sidecar': json.dumps({**SIDECAR, 'schema_version': 2})})
+    assert other_context.status_code == 409
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('data', [
+    {'origin_system': 'comm-data-store'},
+    {'origin_ref': 'message_media:1'},
+    {'origin_system': 'Comm Data Store', 'origin_ref': 'message_media:1'},
+    {'origin_system': 'comm-data-store', 'origin_ref': ' '},
+    {'origin_system': 'comm-data-store', 'origin_ref': 'x' * 201},
+    {'sidecar': '{not json'},
+    {'sidecar': json.dumps(['not', 'an', 'object'])},
+    # Any other JSON beside a document would be indexed as a document.
+    {'sidecar': json.dumps({'invoice': 12, 'total': '1450.00'})},
+])
+async def test_a_malformed_origin_or_sidecar_deposits_nothing(roots, data):
+    docs, index = roots
+    response = await _accept(build_api_app(docs, index_root=index), data=data)
+    assert response.status_code == 400, response.text
+    assert list(docs.iterdir()) == []
+    assert pending_backlog(index, 'chunks')['pending'] == 0
+
+
+@pytest.mark.anyio
+async def test_acceptance_without_an_origin_is_unchanged(roots):
+    docs, index = roots
+    receipt = (await _accept(build_api_app(docs, index_root=index))).json()
+    assert set(receipt) == {'accepted', 'doc_id', 'rel_path', 'filename', 'sha256', 'size', 'index_status'}
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        assert registry.origin(receipt['doc_id']) is None
+    finally:
+        registry.close()
+
+
+def test_an_interrupted_acceptance_recovers_its_origin_and_sidecar(roots, monkeypatch):
+    docs, index = roots
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        acceptance = DocumentAcceptance(docs, registry)
+        origin = {'system': 'comm-data-store', 'ref': 'message_media:7001'}
+        monkeypatch.setattr(DocumentAcceptance, '_finish', lambda *a, **k: (_ for _ in ()).throw(OSError('crash')))
+        with pytest.raises(OSError):
+            acceptance.accept(docs, 'lease.pdf', b'%PDF lease', idempotency_key='k', origin=origin, sidecar=SIDECAR)
+        monkeypatch.undo()
+        receipt = acceptance.accept(docs, 'lease.pdf', b'%PDF lease', idempotency_key='k', origin=origin, sidecar=SIDECAR)
+        assert registry.origin(receipt['doc_id']) == origin
+        assert json.loads((docs / receipt['sidecar_rel_path']).read_text()) == SIDECAR
+        assert not any(path.name.startswith('.organizer-accept-') for path in docs.iterdir())
+    finally:
+        registry.close()
+
+
+def test_the_indexed_event_names_the_depositor(roots):
+    from flow_index_vault import _with_document_origin
+    docs, index = roots
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        owned = DocumentAcceptance(docs, registry).accept(
+            docs, 'lease.pdf', b'%PDF lease', origin={'system': 'comm-data-store', 'ref': 'message_media:7001'})
+        plain = DocumentAcceptance(docs, registry).accept(docs, 'memo.pdf', b'%PDF memo')
+    finally:
+        registry.close()
+    config = {'index_root': str(index)}
+    event = {'event': 'document.indexed', 'doc_id': owned['doc_id']}
+    assert _with_document_origin(config, event) == {**event, 'origin': owned['origin']}
+    event = {'event': 'document.indexed', 'doc_id': plain['doc_id']}
+    assert _with_document_origin(config, event) == event
+
+
+def test_same_name_with_other_metadata_is_refused_before_anything_is_published(roots):
+    docs, index = roots
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        acceptance = DocumentAcceptance(docs, registry)
+        acceptance.accept(docs, 'lease.pdf', b'%PDF one', sidecar=SIDECAR)
+        with pytest.raises(Exception, match='different metadata'):
+            acceptance.accept(docs, 'lease.pdf', b'%PDF two', sidecar={**SIDECAR, 'schema_version': 2})
+        assert sorted(path.suffix for path in docs.iterdir()) == ['.json', '.pdf']
+        assert registry.count() == 1
+    finally:
+        registry.close()

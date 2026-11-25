@@ -2391,6 +2391,19 @@ def _build_duplicate_document_indexed_event(
     )
 
 
+def _with_document_origin(config: dict, event: dict[str, Any]) -> dict[str, Any]:
+    """Name the depositor of the event's document, when acceptance recorded one."""
+    registry_path = Path(config["index_root"]) / "doc_registry.db"
+    if not registry_path.exists():
+        return event
+    registry = DocIDStore(registry_path)
+    try:
+        origin = registry.origin(str(event.get("doc_id") or ""))
+    finally:
+        registry.close()
+    return {**event, "origin": origin} if origin else event
+
+
 def _dispatch_document_indexed_event(
     config: dict,
     event: dict[str, Any],
@@ -2398,6 +2411,7 @@ def _dispatch_document_indexed_event(
 ) -> None:
     """Persist and attempt one callback without failing the index operation."""
     try:
+        event = _with_document_origin(config, event)
         outbox = HookOutbox(config["index_root"])
         deliveries = queue_event(config.get("event_hooks"), event, outbox)
         outcomes = send_enqueued(outbox, deliveries, logger=logger)

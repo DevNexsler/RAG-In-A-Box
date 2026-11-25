@@ -16,7 +16,7 @@ def queue_event(
     outbox: HookOutbox,
 ) -> list[HookDelivery]:
     """Persist one delivery row for every matching HTTP hook."""
-    hooks = matching_hooks(config, str(event.get("event") or ""))
+    hooks = matching_hooks(config, str(event.get("event") or ""), event)
     return [outbox.enqueue(event, hook) for hook in hooks]
 
 

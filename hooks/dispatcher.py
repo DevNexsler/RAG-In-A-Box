@@ -19,8 +19,22 @@ def _event_matches(hook: dict[str, Any], event_name: str) -> bool:
     return event_name in {str(item) for item in events}
 
 
-def matching_hooks(config: dict[str, Any] | None, event_name: str) -> list[dict[str, Any]]:
-    """Return configured HTTP hooks whose event filters match event_name."""
+def _origin_matches(hook: dict[str, Any], event: dict[str, Any] | None) -> bool:
+    """A hook that names ``origins`` hears only about documents those systems deposited."""
+    origins = hook.get("origins")
+    if not origins:
+        return True
+    if not isinstance(origins, list):
+        return False
+    origin = (event or {}).get("origin")
+    system = origin.get("system") if isinstance(origin, dict) else None
+    return system in {str(item) for item in origins}
+
+
+def matching_hooks(
+    config: dict[str, Any] | None, event_name: str, event: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Return configured HTTP hooks whose event and origin filters match."""
     if not config or not config.get("enabled", False):
         return []
     hooks = config.get("hooks")
@@ -32,6 +46,7 @@ def matching_hooks(config: dict[str, Any] | None, event_name: str) -> list[dict[
         if isinstance(hook, dict)
         and str(hook.get("type") or "http") == "http"
         and _event_matches(hook, event_name)
+        and _origin_matches(hook, event)
     ]
 
 
@@ -54,7 +69,7 @@ def dispatch_event(
         return ["event_hooks.hooks ignored: expected list"]
 
     warnings: list[str] = []
-    for hook in matching_hooks(config, str(event.get("event") or "")):
+    for hook in matching_hooks(config, str(event.get("event") or ""), event):
         try:
             result = sender(hook, event)
         except Exception:

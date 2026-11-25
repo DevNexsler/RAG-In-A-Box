@@ -4,6 +4,7 @@ Separate from MCP server — mounted alongside it in server.py.
 Requires the same API_KEY auth when set.
 """
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -55,6 +56,31 @@ def _safe_subpath(base: Path, user_input: str) -> Path | None:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+
+def _read_origin_and_sidecar(form) -> tuple[dict | None, dict | None] | JSONResponse:
+    """Optional acceptance fields: who deposits the file, and its attachment metadata.
+
+        origin_system, origin_ref: the depositing system and its own record id
+            (both or neither).
+        sidecar: JSON object, the communication attachment metadata.
+    """
+    system, ref = form.get("origin_system"), form.get("origin_ref")
+    if (system is None) != (ref is None):
+        return _api_error("invalid_origin", "origin_system and origin_ref go together")
+    if system is not None and not (isinstance(system, str) and isinstance(ref, str)):
+        return _api_error("invalid_origin", "origin_system and origin_ref must be text")
+    origin = {"system": system, "ref": ref} if system is not None else None
+    raw = form.get("sidecar")
+    if raw is None:
+        return origin, None
+    if not isinstance(raw, str):
+        return _api_error("invalid_sidecar", "sidecar must be a JSON text field")
+    try:
+        sidecar = json.loads(raw)
+    except ValueError:
+        return _api_error("invalid_sidecar", "sidecar is not JSON")
+    return origin, sidecar
 
 
 async def _read_upload(request: Request) -> tuple[Path, str, bytes] | JSONResponse:
@@ -110,6 +136,7 @@ async def _read_upload(request: Request) -> tuple[Path, str, bytes] | JSONRespon
     if len(content) == 0:
         return _api_error("empty_file", "Uploaded file is empty")
 
+    request.state.upload_form = form
     return target_dir, safe_name, content
 
 
@@ -146,8 +173,12 @@ async def accept_document(request: Request) -> JSONResponse:
     parts = await _read_upload(request)
     if isinstance(parts, JSONResponse):
         return parts
+    extras = _read_origin_and_sidecar(request.state.upload_form)
+    if isinstance(extras, JSONResponse):
+        return extras
+    origin, sidecar = extras
     from starlette.concurrency import run_in_threadpool
-    from document_acceptance import AcceptanceConflict, DocumentAcceptance
+    from document_acceptance import AcceptanceConflict, DocumentAcceptance, InvalidAcceptance
     from doc_id_store import DocIDStore
 
     def accept():
@@ -159,11 +190,16 @@ async def accept_document(request: Request) -> JSONResponse:
                 source_name=request.app.state.source_name,
                 table_name=request.app.state.table_name,
                 identity_roots=request.app.state.identity_roots,
-            ).accept(*parts, idempotency_key=request.headers.get("idempotency-key"))
+            ).accept(
+                *parts, idempotency_key=request.headers.get("idempotency-key"),
+                origin=origin, sidecar=sidecar,
+            )
         finally:
             registry.close()
     try:
         receipt = await run_in_threadpool(accept)
+    except InvalidAcceptance as exc:
+        return _api_error("invalid_acceptance", str(exc))
     except AcceptanceConflict as exc:
         return _api_error("acceptance_conflict", str(exc), 409)
     except (OSError, RuntimeError, sqlite3.Error):

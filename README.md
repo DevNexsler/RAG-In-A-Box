@@ -217,6 +217,17 @@ curl -X POST http://localhost:7788/api/documents/accept \
 #     "sha256": "...", "size": 84521, "index_status": "pending"}
 ```
 
+A depositing system can name itself and its own record, and send the attachment
+metadata it would otherwise write beside the file:
+```bash
+  -F "origin_system=comm-data-store" -F "origin_ref=message_media:7001" \
+  -F 'sidecar={"schema_version":1,"message":{...},"media":{...}}'
+```
+The receipt returns `origin` and `sidecar_rel_path`; the document's
+`document.indexed` event carries the same `origin`, and a hook configured with
+`origins: [...]` receives only those systems' documents. The depositor stores the
+returned `doc_id` and is matched by it from then on, never by path.
+
 Acceptance publishes complete bytes, registers identity, and durably queues targeted
 indexing. It runs no extraction, enrichment, or embedding. The configured scheduler
 drains the existing queue asynchronously; with the scheduler disabled, run the usual
@@ -253,7 +264,7 @@ curl "http://localhost:7788/api/documents/?directory=2-Area&limit=50" \
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/upload` | POST | Upload a file (multipart form: `file` + optional `directory`) |
-| `/api/documents/accept` | POST | Accept/register bytes, return real ID/hash, queue indexing; optional `Idempotency-Key` |
+| `/api/documents/accept` | POST | Accept/register bytes, return real ID/hash, queue indexing; optional `Idempotency-Key`, depositor `origin_system` + `origin_ref`, attachment metadata `sidecar` |
 | `/api/documents/{rel_path}` | GET | Download a file by its path under `documents_root` |
 | `/api/documents/` | GET | List files (query params: `directory`, `limit`, `offset`) |
 

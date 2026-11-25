@@ -256,6 +256,8 @@ event_hooks:
     #   url: "http://comm-data-store-hooks:8090/hooks/doc-indexed"
     #   events: ["document.indexed"]
     #   accepted_statuses: ["updated", "duplicate"]
+    #   origins: ["comm-data-store"]         # only documents this system deposited through
+    #                                        # /api/documents/accept (origin_system); omit for all
     #   timeout_seconds: 5
     #   secret_env: "COMM_DATA_STORE_HOOK_SECRET"
 

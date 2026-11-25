@@ -35,6 +35,11 @@ def is_communication_sidecar(path: Path, *, max_bytes: int = 2_000_000) -> bool:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
+    return is_communication_sidecar_payload(payload)
+
+
+def is_communication_sidecar_payload(payload: object) -> bool:
+    """Return true for parsed attachment metadata the scanner keeps out of the index."""
     if not isinstance(payload, dict):
         return False
 
