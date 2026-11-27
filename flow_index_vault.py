@@ -409,13 +409,90 @@ def _semantic_subsplit(text: str, semantic_splitter) -> list[str]:
     return [n.text for n in nodes if n.text.strip()]
 
 
+# NLTK (seen on 3.10.4) runs the sentence tokenizer's regex under ONE wall-clock
+# deadline (nltk.redos.DEFAULT_TIMEOUT, 5 s) for a whole text: the scan is lazy,
+# so the deadline also covers the tokenizer's own per-sentence work and every
+# moment this thread waits for the interpreter. A large table (a 24 MB workbook
+# is ~44M characters, ~44 s of splitting) can never finish inside it, and a
+# half-megabyte CSV misses it whenever the indexer is busy. The TimeoutError
+# then read as a provider outage, so the document was deferred and retried on
+# every run without ever being indexed. Handing the splitter bounded pieces
+# keeps each scan a small fraction of the deadline however long the text is.
+_SENTENCE_SPLIT_SEGMENT_CHARS = 200_000
+
+
+def _bounded_text_segments(text: str, limit: int) -> list[str]:
+    """Cut *text* into pieces of at most *limit* characters, preferring to cut
+    after a newline, else after whitespace, else exactly at the limit."""
+    if len(text) <= limit:
+        return [text]
+    segments: list[str] = []
+    start = 0
+    while len(text) - start > limit:
+        window_end = start + limit
+        cut = text.rfind("\n", start, window_end)
+        if cut <= start:
+            cut = text.rfind(" ", start, window_end)
+        end = cut + 1 if cut > start else window_end
+        segments.append(text[start:end])
+        start = end
+    if start < len(text):
+        segments.append(text[start:])
+    return segments
+
+
+def _split_without_sentences(splitter, text: str) -> list[str]:
+    """Chunk *text* on whitespace only, to the splitter's own size and overlap."""
+    from llama_index.core.node_parser import TokenTextSplitter
+
+    return TokenTextSplitter(
+        chunk_size=splitter.chunk_size,
+        chunk_overlap=splitter.chunk_overlap,
+    ).split_text(text)
+
+
+def _split_text_bounded(
+    splitter, text: str, max_chunks: int | None = None
+) -> list[str]:
+    """``splitter.split_text`` that cannot fail on the sentence time limit.
+
+    Text is split in bounded pieces (see _SENTENCE_SPLIT_SEGMENT_CHARS). A piece
+    that still exceeds the tokenizer's deadline is chunked on whitespace instead:
+    the limit is a property of the text and the load, never of a provider, so
+    deferring the document for a later run cannot be relied on to help.
+
+    With *max_chunks*, splitting stops at the first piece boundary after more
+    than that many chunks exist. The caller keeps at most *max_chunks* of them,
+    so the rest of a huge text is never split at all; returning one more than
+    the cap keeps the caller able to tell that the text was cut short.
+    """
+    chunks: list[str] = []
+    for segment in _bounded_text_segments(text, _SENTENCE_SPLIT_SEGMENT_CHARS):
+        if max_chunks is not None and len(chunks) > max_chunks:
+            break
+        try:
+            chunks.extend(splitter.split_text(segment))
+        except TimeoutError:
+            _get_logger().warning(
+                "Sentence splitting exceeded its time limit on a %d-character "
+                "piece; chunking that piece on whitespace instead",
+                len(segment),
+            )
+            note_degradation("sentence_split_time_limit", transient=False)
+            chunks.extend(_split_without_sentences(splitter, segment))
+    return chunks
+
+
 def _split_section(
     text: str,
     splitter,
     semantic_splitter=None,
     semantic_threshold: int = 0,
+    max_chunks: int | None = None,
 ) -> list[str]:
     """Split a text section into chunks.
+
+    *max_chunks* is how many the caller can still keep; see _split_text_bounded.
 
     If the section exceeds *semantic_threshold* and a semantic splitter is
     available, it first finds topic boundaries via embedding similarity,
@@ -426,9 +503,17 @@ def _split_section(
         sub_sections = _semantic_subsplit(text, semantic_splitter)
         chunks: list[str] = []
         for sub in sub_sections:
-            chunks.extend(splitter.split_text(sub))
+            if max_chunks is not None and len(chunks) > max_chunks:
+                break
+            chunks.extend(
+                _split_text_bounded(
+                    splitter,
+                    sub,
+                    None if max_chunks is None else max_chunks - len(chunks),
+                )
+            )
         return chunks
-    return splitter.split_text(text)
+    return _split_text_bounded(splitter, text, max_chunks)
 
 
 class _DocumentChunkBudget:
@@ -441,8 +526,13 @@ class _DocumentChunkBudget:
         self._kept = 0
         self._reported = False
 
+    @property
+    def remaining(self) -> int:
+        """How many more chunks this document may keep."""
+        return max(0, self._max_chunks - self._kept)
+
     def take(self, chunks: list[str]) -> list[str]:
-        remaining = max(0, self._max_chunks - self._kept)
+        remaining = self.remaining
         kept = chunks[:remaining]
         self._kept += len(kept)
         if len(chunks) > remaining and not self._reported:
@@ -3314,7 +3404,8 @@ def _process_doc_task(
                 page_body = collapse_runaway_repetition(page_body)
                 raw_chunks = chunk_budget.take(
                     _split_section(
-                        page_body, splitter, semantic_splitter, semantic_threshold
+                        page_body, splitter, semantic_splitter, semantic_threshold,
+                        max_chunks=chunk_budget.remaining,
                     )
                 )
                 ctx = _build_chunk_context(doc_meta, page=page_text.page)
@@ -3346,8 +3437,11 @@ def _process_doc_task(
             all_sections: list[str] = []
 
             for heading_ctx, section_text in sections:
+                if len(all_raw) > chunk_budget.remaining:
+                    break  # already past what this document may keep
                 raw_chunks = _split_section(
-                    section_text, splitter, semantic_splitter, semantic_threshold
+                    section_text, splitter, semantic_splitter, semantic_threshold,
+                    max_chunks=chunk_budget.remaining - len(all_raw),
                 )
                 ctx = _build_chunk_context(
                     doc_meta, section=heading_ctx if heading_ctx else None
@@ -3387,7 +3481,8 @@ def _process_doc_task(
             loc_prefix = source_type if source_type in ("img", "audio", "video") else ""
             raw_chunks = chunk_budget.take(
                 _split_section(
-                    full_text, splitter, semantic_splitter, semantic_threshold
+                    full_text, splitter, semantic_splitter, semantic_threshold,
+                    max_chunks=chunk_budget.remaining,
                 )
             )
             ctx = _build_chunk_context(doc_meta)
