@@ -70,7 +70,7 @@ def test_queue_event_persists_only_matching_http_hooks_and_preserves_event_id(tm
     assert sent == [({"name": "match", "type": "http", "events": ["document.indexed"]}, event)]
 
 
-def test_retryable_failures_redrive_after_five_sends(tmp_path, monkeypatch):
+def test_retryable_failures_redrive_after_the_last_scheduled_send(tmp_path, monkeypatch):
     from hooks.delivery import drain_due
     import core.hook_outbox
 
@@ -78,18 +78,18 @@ def test_retryable_failures_redrive_after_five_sends(tmp_path, monkeypatch):
     outbox = HookOutbox(tmp_path)
     outbox.enqueue({"event_id": "evt-1", "doc_id": "documents::a"}, {"name": "cds"})
 
-    for now in (100, 101, 106, 136):
+    for now in (100, 101, 106, 136, 256, 856, 4456, 26056):
         assert drain_due(outbox, limit=1, sender=lambda hook, item: HookSendResult(False, "timeout", True), now=now) == {
             "accepted": 0,
             "retry_pending": 1,
             "redrive_required": 0,
         }
-    assert drain_due(outbox, limit=1, sender=lambda hook, item: HookSendResult(False, "timeout", True), now=256) == {
+    assert drain_due(outbox, limit=1, sender=lambda hook, item: HookSendResult(False, "timeout", True), now=69256) == {
         "accepted": 0,
         "retry_pending": 0,
         "redrive_required": 1,
     }
-    assert outbox.due(limit=1, now=1_000) == []
+    assert outbox.due(limit=1, now=1_000_000) == []
 
 
 def test_send_enqueued_only_sends_rows_from_this_dispatch(tmp_path):
