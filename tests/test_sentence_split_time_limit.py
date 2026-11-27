@@ -93,7 +93,45 @@ def test_other_splitter_errors_still_propagate():
 def test_split_section_routes_through_the_bounded_splitter(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
-        fiv, "_split_text_bounded", lambda splitter, text: calls.append(text) or [text]
+        fiv,
+        "_split_text_bounded",
+        lambda splitter, text, max_chunks=None: calls.append((text, max_chunks)) or [text],
     )
     assert fiv._split_section("body text", object()) == ["body text"]
-    assert calls == ["body text"]
+    assert fiv._split_section("more", object(), max_chunks=5) == ["more"]
+    assert calls == [("body text", None), ("more", 5)]
+
+
+def test_splitting_stops_once_the_caller_cannot_keep_more(monkeypatch):
+    """A 24 MB workbook made ~9,000 chunks for a document that keeps 64."""
+    monkeypatch.setattr(fiv, "_SENTENCE_SPLIT_SEGMENT_CHARS", 5_000)
+    pieces: list[int] = []
+
+    class OneChunkPerPiece:
+        chunk_size, chunk_overlap = 64, 8
+
+        def split_text(self, piece):
+            pieces.append(len(piece))
+            return [piece]
+
+    text = _table(4000)
+    total = len(fiv._bounded_text_segments(text, 5_000))
+    chunks = fiv._split_text_bounded(OneChunkPerPiece(), text, max_chunks=3)
+    assert total > 10
+    assert len(chunks) == 4 and len(pieces) == 4  # one past the cap, then stop
+    assert "".join(chunks) == text[: sum(pieces)]
+    assert len(fiv._split_text_bounded(OneChunkPerPiece(), text)) == total
+
+
+def test_budget_reports_what_is_left_and_still_flags_a_cut_document():
+    class Log:
+        warned = 0
+
+        def warning(self, *args):
+            type(self).warned += 1
+
+    budget = fiv._DocumentChunkBudget("documents::x", 3, Log())
+    assert budget.remaining == 3
+    assert budget.take(["a", "b"]) == ["a", "b"] and budget.remaining == 1
+    assert budget.take(["c", "d"]) == ["c"] and budget.remaining == 0
+    assert Log.warned == 1
