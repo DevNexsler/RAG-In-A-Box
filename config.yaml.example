@@ -254,7 +254,7 @@ event_hooks:
     # - name: "comm-data-store"
     #   type: "http"
     #   url: "http://comm-data-store-hooks:8090/hooks/doc-indexed"
-    #   events: ["document.indexed"]
+    #   events: ["document.indexed", "document.not_indexable"]
     #   accepted_statuses: ["updated", "duplicate"]
     #   origins: ["comm-data-store"]         # ONLY documents this system deposited through
     #                                        # /api/documents/accept (origin_system). Files it

@@ -517,6 +517,75 @@ def test_an_unreadable_registry_loses_no_event(roots, monkeypatch, caplog):
     assert queued == [event]
 
 
+def _announced(monkeypatch):
+    import flow_index_vault as flow
+    queued = []
+    monkeypatch.setattr(flow, 'queue_event', lambda hooks, event, outbox: queued.append(event) or [])
+    monkeypatch.setattr(flow, 'send_enqueued', lambda *a, **k: {'retry_pending': 0, 'redrive_required': 0})
+    return flow, queued
+
+
+@pytest.mark.parametrize('known_id', [True, False])
+def test_a_depositor_hears_that_its_document_will_not_be_indexed(roots, monkeypatch, known_id):
+    """No document.indexed can come for it, so the same channel says so, by document id."""
+    docs, index = roots
+    flow, queued = _announced(monkeypatch)
+    origin = {'system': 'comm-data-store', 'ref': 'message_media:7001'}
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        receipt = DocumentAcceptance(docs, registry).accept(docs, 'plans.zip', b'PK', origin=origin)
+        source_name = receipt['doc_id'].split('::')[0]
+        # The scan's answer for a file it does not select carries no id; a content verdict does.
+        answer = {'status': 'not_indexable', 'reason': 'outside_scan',
+                  'rel_path': receipt['rel_path'], 'source_name': source_name,
+                  **({'doc_id': receipt['doc_id']} if known_id else {})}
+        flow._announce_not_indexable({'index_root': str(index), 'event_hooks': {}}, answer, registry)
+    finally:
+        registry.close()
+
+    (event,) = queued
+    assert {key: event[key] for key in ('event', 'doc_id', 'rel_path', 'reason', 'origin')} == {
+        'event': 'document.not_indexable', 'doc_id': receipt['doc_id'],
+        'rel_path': receipt['rel_path'], 'reason': 'outside_scan', 'origin': origin,
+    }
+    assert 'text' not in event and 'chunks' not in event
+
+
+def test_a_file_nobody_deposited_is_not_announced(roots, monkeypatch):
+    docs, index = roots
+    flow, queued = _announced(monkeypatch)
+    registry = DocIDStore(index / 'doc_registry.db')
+    try:
+        receipt = DocumentAcceptance(docs, registry).accept(docs, 'plans.zip', b'PK')
+        answer = {'status': 'not_indexable', 'reason': 'outside_scan',
+                  'rel_path': receipt['rel_path'], 'source_name': receipt['doc_id'].split('::')[0]}
+        flow._announce_not_indexable({'index_root': str(index), 'event_hooks': {}}, answer, registry)
+        flow._announce_not_indexable({'index_root': str(index), 'event_hooks': {}},
+                                     {**answer, 'rel_path': 'never/seen.zip'}, registry)
+    finally:
+        registry.close()
+    assert queued == []
+
+
+def test_a_queued_request_that_ends_not_indexable_is_announced(roots, monkeypatch):
+    import flow_index_vault as flow
+    from core.index_request_queue import IndexRequestQueue
+    docs, index = roots
+    queue = IndexRequestQueue(index)
+    queue.enqueue('chunks', 'documents', 'plans.zip')
+    queue.enqueue('chunks', 'documents', 'lease.pdf')
+    answers = {'plans.zip': {'status': 'not_indexable', 'reason': 'outside_scan', 'rel_path': 'plans.zip'},
+               'lease.pdf': {'status': 'indexed', 'doc_id': 'documents::00001', 'rel_path': 'lease.pdf'}}
+    monkeypatch.setattr(flow, '_index_document_unlocked', lambda config, request, *a: answers[request.target])
+    announced = []
+    monkeypatch.setattr(flow, '_announce_not_indexable', lambda config, result, store: announced.append(result))
+
+    flow._drain_index_requests({'index_root': str(index)}, queue, 'chunks', None, None, limit=10)
+
+    assert announced == [{'source_name': 'documents', **answers['plans.zip']}]
+    assert pending_backlog(index, 'chunks')['pending'] == 0
+
+
 async def _receipt(app, key):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
         return await client.get('/documents/accept', headers={'Idempotency-Key': key} if key else {})

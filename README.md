@@ -227,6 +227,11 @@ The receipt returns `origin` and `sidecar_rel_path`; the document's
 `document.indexed` event carries the same `origin`, and a hook configured with
 `origins: [...]` receives only those systems' documents. The depositor stores the
 returned `doc_id` and is matched by it from then on, never by path.
+A deposited document that will not be indexed (a type the scan does not select,
+or content with nothing to index) sends `document.not_indexable` instead, with
+the same `doc_id` and `origin` and a `reason`; list it in the hook's `events` to
+receive it. A callback the receiver does not accept is tried again for about a
+day (1 s, 5 s, 30 s, 2 min, 10 min, 1 h, 6 h, 12 h) before it needs a redrive.
 An `Idempotency-Key` covers the bytes, the destination and the origin; a retry
 gets its receipt back even if it rebuilt the sidecar, and the first sidecar stands.
 A sidecar is found by name, so a deposit that carries one is refused (409) when
