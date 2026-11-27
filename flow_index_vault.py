@@ -409,6 +409,71 @@ def _semantic_subsplit(text: str, semantic_splitter) -> list[str]:
     return [n.text for n in nodes if n.text.strip()]
 
 
+# NLTK (seen on 3.10.4) runs the sentence tokenizer's regex under ONE wall-clock
+# deadline (nltk.redos.DEFAULT_TIMEOUT, 5 s) for a whole text: the scan is lazy,
+# so the deadline also covers the tokenizer's own per-sentence work and every
+# moment this thread waits for the interpreter. A large table (a 24 MB workbook
+# is ~44M characters, ~44 s of splitting) can never finish inside it, and a
+# half-megabyte CSV misses it whenever the indexer is busy. The TimeoutError
+# then read as a provider outage, so the document was deferred and retried on
+# every run without ever being indexed. Handing the splitter bounded pieces
+# keeps each scan a small fraction of the deadline however long the text is.
+_SENTENCE_SPLIT_SEGMENT_CHARS = 200_000
+
+
+def _bounded_text_segments(text: str, limit: int) -> list[str]:
+    """Cut *text* into pieces of at most *limit* characters, preferring to cut
+    after a newline, else after whitespace, else exactly at the limit."""
+    if len(text) <= limit:
+        return [text]
+    segments: list[str] = []
+    start = 0
+    while len(text) - start > limit:
+        window_end = start + limit
+        cut = text.rfind("\n", start, window_end)
+        if cut <= start:
+            cut = text.rfind(" ", start, window_end)
+        end = cut + 1 if cut > start else window_end
+        segments.append(text[start:end])
+        start = end
+    if start < len(text):
+        segments.append(text[start:])
+    return segments
+
+
+def _split_without_sentences(splitter, text: str) -> list[str]:
+    """Chunk *text* on whitespace only, to the splitter's own size and overlap."""
+    from llama_index.core.node_parser import TokenTextSplitter
+
+    return TokenTextSplitter(
+        chunk_size=splitter.chunk_size,
+        chunk_overlap=splitter.chunk_overlap,
+    ).split_text(text)
+
+
+def _split_text_bounded(splitter, text: str) -> list[str]:
+    """``splitter.split_text`` that cannot fail on the sentence time limit.
+
+    Text is split in bounded pieces (see _SENTENCE_SPLIT_SEGMENT_CHARS). A piece
+    that still exceeds the tokenizer's deadline is chunked on whitespace instead:
+    the limit is a property of the text and the load, never of a provider, so
+    retrying the document later cannot help and it must not be deferred.
+    """
+    chunks: list[str] = []
+    for segment in _bounded_text_segments(text, _SENTENCE_SPLIT_SEGMENT_CHARS):
+        try:
+            chunks.extend(splitter.split_text(segment))
+        except TimeoutError:
+            _get_logger().warning(
+                "Sentence splitting exceeded its time limit on a %d-character "
+                "piece; chunking that piece on whitespace instead",
+                len(segment),
+            )
+            note_degradation("sentence_split_time_limit", transient=False)
+            chunks.extend(_split_without_sentences(splitter, segment))
+    return chunks
+
+
 def _split_section(
     text: str,
     splitter,
@@ -426,9 +491,9 @@ def _split_section(
         sub_sections = _semantic_subsplit(text, semantic_splitter)
         chunks: list[str] = []
         for sub in sub_sections:
-            chunks.extend(splitter.split_text(sub))
+            chunks.extend(_split_text_bounded(splitter, sub))
         return chunks
-    return splitter.split_text(text)
+    return _split_text_bounded(splitter, text)
 
 
 class _DocumentChunkBudget:
