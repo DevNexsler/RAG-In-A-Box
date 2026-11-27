@@ -23,6 +23,31 @@ def public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_document_not_indexable_event(
+    *,
+    doc_id: str,
+    source_name: str,
+    rel_path: str,
+    reason: str,
+    occurred_at: str | None = None,
+) -> dict[str, Any]:
+    """Build the event that says a document will produce no document.indexed.
+
+    A depositor waits on the indexed callback; this is the other answer, so it
+    never waits on one that cannot come.
+    """
+    return {
+        "event": "document.not_indexable",
+        "event_id": str(uuid4()),
+        "version": 1,
+        "occurred_at": occurred_at or datetime.now(timezone.utc).isoformat(),
+        "doc_id": doc_id,
+        "source_name": source_name,
+        "rel_path": rel_path,
+        "reason": reason,
+    }
+
+
 def build_document_indexed_event(
     *,
     doc_id: str,

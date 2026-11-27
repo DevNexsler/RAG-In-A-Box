@@ -15,7 +15,10 @@ from urllib.parse import urlsplit
 from core.sqlite_init import initializing_database
 
 
-RETRY_DELAYS_SECONDS = (1, 5, 30, 120)
+# Quick tries for a blip, then patient ones: a receiver that is down, or one
+# that answers "not yet" because its own record of a deposited document has not
+# been committed, is given about a day before a person has to redrive.
+RETRY_DELAYS_SECONDS = (1, 5, 30, 120, 600, 3600, 21600, 43200)
 # A claimed delivery stops being due for this long. It bounds one send, so it
 # only has to outlast a hook timeout; a drain that dies mid-send releases its
 # delivery again once the lease expires instead of stranding it.
@@ -248,7 +251,7 @@ class HookOutbox:
         now: float | None = None,
     ) -> HookDelivery | None:
         attempt = delivery.attempts + 1
-        if attempt >= 5:
+        if attempt > len(RETRY_DELAYS_SECONDS):
             return self.redrive_required(delivery, outcome, error, attempts=attempt)
         base = time.time() if now is None else float(now)
         return self._transition(

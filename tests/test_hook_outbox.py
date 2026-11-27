@@ -89,18 +89,18 @@ def test_outbox_persists_generic_error_without_secret_text(tmp_path):
 
 
 def test_retry_uses_bounded_backoff_then_requires_redrive(tmp_path):
-    """Fails if retries use wrong delay or deliver past fifth failure."""
+    """Fails if retries use wrong delay or deliver past the last scheduled one."""
     outbox = HookOutbox(tmp_path)
     delivery = outbox.enqueue({"event_id": "evt-1"}, {"name": "cds"})
 
-    for expected_attempt, delay in enumerate((1, 5, 30, 120), start=1):
+    for expected_attempt, delay in enumerate((1, 5, 30, 120, 600, 3600, 21600, 43200), start=1):
         delivery = outbox.retry(delivery, "transport_error", "timeout", now=100)
         assert delivery.attempts == expected_attempt
         assert delivery.next_attempt_at == 100 + delay
     delivery = outbox.retry(delivery, "transport_error", "timeout", now=100)
 
     assert delivery.status == "redrive_required"
-    assert outbox.due(limit=1, now=1_000) == []
+    assert outbox.due(limit=1, now=1_000_000) == []
 
 
 def test_complete_deletes_accepted_delivery_and_stale_transition_is_ignored(tmp_path):

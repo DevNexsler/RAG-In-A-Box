@@ -167,7 +167,7 @@ event_hooks:
     # - name: "comm-data-store"
     #   type: "http"
     #   url: "http://comm-data-store-hooks:8090/hooks/doc-indexed"
-    #   events: ["document.indexed"]
+    #   events: ["document.indexed", "document.not_indexable"]
     #   timeout_seconds: 5
     #   secret_env: "COMM_DATA_STORE_HOOK_SECRET"
 

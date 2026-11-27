@@ -131,7 +131,7 @@ from core.tracing import get_tracer, setup_tracing
 from memory_observer import MemoryObserver
 from core.hook_outbox import HookOutbox
 from hooks.delivery import drain_due, queue_event, send_enqueued
-from hooks.events import build_document_indexed_event
+from hooks.events import build_document_indexed_event, build_document_not_indexable_event
 from lancedb_store import (
     LanceDBStore,
     compaction_is_due,
@@ -2427,6 +2427,36 @@ def _dispatch_document_indexed_event(
         warning = "hook delivery unavailable"
         _RUNTIME.setdefault("_warnings", []).append(warning)
         logger.warning(warning)
+
+
+def _announce_not_indexable(config: dict, result: dict, doc_id_store: DocIDStore) -> None:
+    """Tell a document's depositor that it will not be indexed.
+
+    Only a deposited document is announced: its depositor holds the document
+    id and is waiting on a callback, where a file found by the scan has no one
+    waiting. Never raises; the index request is already settled.
+    """
+    logger = _get_logger()
+    try:
+        rel_path = str(result.get("rel_path") or "")
+        source_name = str(result.get("source_name") or "")
+        doc_id = str(result.get("doc_id") or doc_id_store.lookup_id(rel_path) or "")
+        if not doc_id or not source_name:
+            return
+        if "::" not in doc_id:
+            doc_id = f"{source_name}::{doc_id}"
+        if document_origin(Path(config["index_root"]) / "doc_registry.db", doc_id) is None:
+            return
+        event = build_document_not_indexable_event(
+            doc_id=doc_id,
+            source_name=source_name,
+            rel_path=rel_path,
+            reason=str(result.get("reason") or ""),
+        )
+    except Exception:
+        logger.warning("not-indexable announcement unavailable")
+        return
+    _dispatch_document_indexed_event(config, event, logger)
 
 
 def _retry_only_if_transient(task, task_run, state) -> bool:
@@ -5636,6 +5666,10 @@ def _drain_index_requests(
             continue
         queue.complete(request)
         results[key] = result
+        if result.get("status") == "not_indexable":
+            _announce_not_indexable(
+                config, {"source_name": request.source_name, **result}, doc_id_store
+            )
         if on_progress is not None:
             on_progress()
     return results
